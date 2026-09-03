@@ -134,6 +134,20 @@ idA = (Path(projB) / ".aht" / ".project-id").read_text()
 idC = (Path(projC) / ".aht" / ".project-id").read_text()
 ck(idA != idC, "copy has a fresh uuid")
 
+print("\n[3b] copying a PARENT folder duplicates the nested project too")
+(roots / "box").mkdir()
+shutil.copytree(projC, str(roots / "box" / "projC"))
+r = run("reconcile", "--notify", extra_env={"AHT_ASSUME": "Duplicate"})
+d = json.loads(r.stdout)
+nested = os.path.realpath(str(roots / "box" / "projC"))
+ck(any(c["copy_path"] == nested for c in d["applied_copies"]),
+   "nested copy inside a pasted parent was detected")
+ck((tools / "claude" / enc(nested)).is_dir(),
+   "nested copy got its own claude store at its own key")
+ck((Path(nested) / ".aht" / ".project-id").read_text()
+   != (Path(projC) / ".aht" / ".project-id").read_text(),
+   "nested copy has a fresh uuid")
+
 print("\n[4] hook backstop: transcript-authoritative claude + generic backends")
 shutil.move(projB, str(roots / "projD"))
 projD = os.path.realpath(str(roots / "projD"))

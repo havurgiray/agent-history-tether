@@ -107,6 +107,24 @@ ENCD=$(W encode 'Z:\tmp\aht-smoke\roots\projD')
 [ -f "$T/tools/claude/$ENCD/s1.jsonl" ] || fail "claude history not restored at new key"
 W backup --list | grep -qi 'projD' || fail "backup --list empty"
 
+echo "== copy-paste: the Duplicate option =="
+cp -r "$T/roots/projD" "$T/roots/projCopy"
+AHT_ASSUME=Duplicate W reconcile --notify > "$T/copy.json"
+grep -q 'projCopy' "$T/copy.json" || fail "copy not detected"
+ENCP=$(W encode 'Z:\tmp\aht-smoke\roots\projCopy')
+[ -d "$T/tools/claude/$ENCP" ] || fail "claude history not duplicated for the copy"
+A=$(cat "$T/roots/projD/.aht/.project-id")
+B=$(cat "$T/roots/projCopy/.aht/.project-id")
+[ "$A" != "$B" ] || fail "copy did not get a fresh id"
+
+echo "== copy-paste a PARENT with a nested tethered project =="
+mkdir "$T/roots/box"
+cp -r "$T/roots/projD" "$T/roots/box/projD"
+AHT_ASSUME=Duplicate W reconcile --notify > "$T/copy2.json"
+ENCN=$(W encode 'Z:\tmp\aht-smoke\roots\box\projD')
+[ -d "$T/tools/claude/$ENCN" ] || fail "nested parent-copy not duplicated"
+[ -f "$T/roots/box/projD/.aht/.project-id" ] || fail "nested copy has no marker"
+
 TRAY="$(dirname "$EXE")/aht-tray.exe"
 if [ -f "$TRAY" ]; then
   echo "== tray selftest (headless) =="

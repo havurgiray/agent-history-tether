@@ -104,6 +104,7 @@ CONFIG_DEFAULTS = {
     "scan_max_depth":   7,
     "extra_prune_dirs": [],
     "dialog_timeout":   180,
+    "log_level":        "info",      # debug | info | warn | error
     "watcher_owner":    "agent",     # agent (LaunchAgent/systemd/RunKey) | none
     "backup_enabled":   True,
     "backup_interval_hours": 24.0,
@@ -141,6 +142,11 @@ def _coerce(key: str, raw: str):
         return float(raw)
     if isinstance(d, int) and not isinstance(d, bool):
         return int(raw)
+    if key == "log_level":
+        v = raw.strip().lower()
+        if v not in LOG_LEVELS:
+            raise ValueError(f"log_level expects one of {sorted(LOG_LEVELS)}")
+        return v
     if key == "backend_roots":
         try:
             obj = json.loads(raw)
@@ -191,7 +197,7 @@ def load_config() -> dict:
         if not isinstance(data, dict):
             raise ValueError("config is not a JSON object")
     except Exception as e:
-        log(f"config load failed ({e}); using defaults")
+        warn(f"config load failed ({e}); using defaults")
         data = {}
     _CONFIG_CACHE.update(path=str(p), mtime=mtime, data=data)
     return data
@@ -250,14 +256,34 @@ def prune_dirs() -> set:
 # Small utilities
 # --------------------------------------------------------------------------- #
 
-def log(msg: str) -> None:
+LOG_LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
+LOG_MAX_BYTES = 5_000_000            # rotate to aht.log.1 beyond this
+
+def log(msg: str, level: str = "info") -> None:
+    """Leveled, size-rotated logging.  The threshold comes from the config
+    CACHE only (never a fresh load) so a broken config can't recurse."""
     try:
+        threshold = str(_CONFIG_CACHE["data"].get("log_level", "info"))
+        if LOG_LEVELS.get(level, 20) < LOG_LEVELS.get(threshold, 20):
+            return
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         aht_home().mkdir(parents=True, exist_ok=True)
-        with open(log_path(), "a") as fh:
-            fh.write(f"[{ts}] {msg}\n")
+        p = log_path()
+        try:
+            if p.stat().st_size > LOG_MAX_BYTES:
+                os.replace(p, p.with_suffix(".log.1"))
+        except OSError:
+            pass
+        with open(p, "a") as fh:
+            fh.write(f"[{ts}] [{level.upper():<5}] {msg}\n")
     except Exception:
         pass
+
+def warn(msg: str) -> None:
+    log(msg, "warn")
+
+def error(msg: str) -> None:
+    log(msg, "error")
 
 def new_uuid() -> str:
     return _uuid.uuid4().hex
@@ -699,7 +725,7 @@ def load_registry() -> dict:
         data.setdefault("declined_moves", {})
         return data
     except Exception as e:
-        log(f"registry load failed ({e}); starting fresh but keeping old file")
+        warn(f"registry load failed ({e}); starting fresh but keeping old file")
         return {"version": 2, "projects": {}, "declined_moves": {}}
 
 def save_registry(reg: dict) -> None:
@@ -1044,7 +1070,7 @@ def _ensure_linux_emblems() -> bool:
                            capture_output=True, timeout=30)
         return True
     except Exception as e:
-        log(f"emblem generation failed: {e}")
+        warn(f"emblem generation failed: {e}")
         return False
 
 def _badge_macos(path, marks) -> None:
@@ -1108,7 +1134,7 @@ def apply_badge(path, marks) -> None:
         elif IS_LINUX:
             _badge_linux(path, marks)
     except Exception as e:
-        log(f"badge failed for {path}: {e}")
+        warn(f"badge failed for {path}: {e}")
 
 def find_git_repos(roots: list) -> set:
     found = set()
@@ -1295,7 +1321,7 @@ def backup_pass(only_uid=None) -> list:
             results.append(_snapshot_project(uid, entry))
         except Exception as e:
             results.append({"uuid": uid, "status": "failed", "error": str(e)})
-            log(f"BACKUP failed for {entry.get('real_path')}: {e}")
+            error(f"BACKUP failed for {entry.get('real_path')}: {e}")
     _touch_backup_stamp()
     return results
 
@@ -1309,7 +1335,7 @@ def maybe_auto_backup() -> None:
         if done:
             log(f"BACKUP auto pass: {done} project(s) snapshotted")
     except Exception as e:
-        log(f"BACKUP auto pass failed: {e}")
+        error(f"BACKUP auto pass failed: {e}")
 
 def _spawn_auto_backup() -> None:
     try:
@@ -1442,7 +1468,7 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(f, dst)
                 except Exception as e:
-                    log(f"RESTORE pre-rewrite backup failed {f}: {e}")
+                    warn(f"RESTORE pre-rewrite backup failed {f}: {e}")
                     continue
                 todo.setdefault(b.name, (b, set()))[1].add(f)
         for b, files in todo.values():
@@ -1450,7 +1476,7 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
                 try:
                     rewrites += b.rewrite_file(f, old_real, new_real)
                 except Exception as e:
-                    log(f"RESTORE rewrite failed {f}: {e}")
+                    warn(f"RESTORE rewrite failed {f}: {e}")
     return {"added": added, "existing_kept": skipped,
             "cwd_rewrites": rewrites, "per_backend": per_backend}
 
@@ -1607,7 +1633,7 @@ def _apply_dir_moves(b: DirBackend, reg: dict, moves: list) -> None:
                 or (own is not None and own != m["uuid"] and own not in moving)
                 or (own is None and tgt.exists())):
             m["stores"][b.name] = "conflict-target-occupied"
-            log(f"CONFLICT [{b.name}] {m['from']} -> {m['to']}: target "
+            error(f"CONFLICT [{b.name}] {m['from']} -> {m['to']}: target "
                 f"{tgt.name} occupied; store left intact")
         else:
             safe.append((m, src, tgt))
@@ -1620,7 +1646,7 @@ def _apply_dir_moves(b: DirBackend, reg: dict, moves: list) -> None:
             staged.append((m, tmp, tgt, src))
         except OSError as e:
             m["stores"][b.name] = "stage-failed"
-            log(f"MOVE [{b.name}] stage failed {src.name}: {e}")
+            error(f"MOVE [{b.name}] stage failed {src.name}: {e}")
     for m, tmp, tgt, orig in staged:
         try:
             if tgt.exists():
@@ -1639,13 +1665,13 @@ def _apply_dir_moves(b: DirBackend, reg: dict, moves: list) -> None:
                         comp_new.parent.mkdir(parents=True, exist_ok=True)
                         os.rename(str(comp_old), str(comp_new))
                 except OSError as e:
-                    log(f"MOVE [{b.name}] companion rename failed: {e}")
+                    warn(f"MOVE [{b.name}] companion rename failed: {e}")
         except OSError as e:
-            log(f"MOVE [{b.name}] place failed -> {tgt.name}: {e}")
+            error(f"MOVE [{b.name}] place failed -> {tgt.name}: {e}")
             try:
                 os.rename(str(tmp), str(orig))
             except OSError as e2:
-                log(f"MOVE [{b.name}] restore FAILED: {e2} (kept at {tmp})")
+                error(f"MOVE [{b.name}] restore FAILED: {e2} (kept at {tmp})")
             m["stores"][b.name] = "place-failed"
 
 def _apply_file_moves(b: FilesBackend, reg: dict, moves: list) -> None:
@@ -1666,7 +1692,7 @@ def _apply_file_moves(b: FilesBackend, reg: dict, moves: list) -> None:
                 shutil.copy2(f, dst)
         except Exception as e:
             m["stores"][b.name] = "backup-failed-skipped"
-            log(f"MOVE [{b.name}] pre-rewrite backup failed ({e}); "
+            error(f"MOVE [{b.name}] pre-rewrite backup failed ({e}); "
                 f"sessions left untouched")
             continue
         n = 0
@@ -1674,7 +1700,7 @@ def _apply_file_moves(b: FilesBackend, reg: dict, moves: list) -> None:
             try:
                 n += b.rewrite_file(f, old, new)
             except Exception as e:
-                log(f"MOVE [{b.name}] rewrite failed {f}: {e}")
+                error(f"MOVE [{b.name}] rewrite failed {f}: {e}")
         m["stores"][b.name] = f"rewrote-{n}-values-in-{len(files)}-file(s)"
         log(f"MOVE [{b.name}] {old} -> {new}: rewrote {n} cwd value(s) "
             f"in {len(files)} file(s); originals backed up to {bdir}")
@@ -1689,7 +1715,7 @@ def apply_moves(reg: dict, moves: list) -> tuple:
             elif b.kind == "files" and b.available():
                 _apply_file_moves(b, reg, moves)
         except Exception as e:
-            log(f"MOVE backend {b.name} failed wholesale: {e}")
+            error(f"MOVE backend {b.name} failed wholesale: {e}")
     applied, conflicts = [], []
     for m in moves:
         vals = list(m["stores"].values())
@@ -1757,7 +1783,7 @@ def apply_copies(reg: dict, copies: list, copy_history: bool = True) -> list:
             done.append(c)
         except Exception as e:
             c["status"] = "failed"
-            log(f"COPY failed {c['copy_path']}: {e}")
+            error(f"COPY failed {c['copy_path']}: {e}")
     return done
 
 def apply_news(reg: dict, news: list) -> None:
@@ -1837,7 +1863,7 @@ def cmd_adopt(args):
         try:
             cwds = b.collect_cwds()
         except Exception as e:
-            log(f"ADOPT {b.name} cwd sweep failed: {e}")
+            warn(f"ADOPT {b.name} cwd sweep failed: {e}")
             continue
         for cwd in sorted(cwds):
             rp = os.path.realpath(cwd)
@@ -2164,7 +2190,7 @@ def cmd_hook(args):
                                 elif b.kind == "files" and b.available():
                                     _apply_file_moves(b, reg, [m])
                             except Exception as e:
-                                log(f"HOOK backend {b.name}: {e}")
+                                error(f"HOOK backend {b.name}: {e}")
                         _register(reg, uid, cwd)
                         save_registry(reg)
                         log(f"HOOK relink {entry['real_path']} -> {cwd} "
@@ -2188,9 +2214,9 @@ def cmd_hook(args):
                     save_registry(reg)
                     log(f"HOOK tag-new {cwd}")
     except TimeoutError:
-        log("HOOK lock timeout; will retry next session")
+        warn("HOOK lock timeout; will retry next session")
     except Exception as e:
-        log(f"HOOK error: {e}")
+        error(f"HOOK error: {e}")
     try:
         if cwd != home:
             apply_badge(cwd, desired_marks(cwd, True))
@@ -2307,6 +2333,8 @@ def cmd_status(args):
         "backends": backend_status(),
         "watcher": watcher_status(),
         "backups": backup_status(),
+        "log": {"path": str(log_path()),
+                "recent_problems": recent_log_problems()},
         "hook_installed": hook_installed(),
         "gui_dialogs": gui_dialogs_available(),
         "policies": {"moves": cfg_get("move_policy"),
@@ -2546,6 +2574,9 @@ def cmd_doctor(args):
             ck("backup store writable", True, backups_root())
         except Exception as e:
             ck("backup store writable", False, e)
+    nprob = recent_log_problems()
+    ck("no warnings/errors logged in the last 24h", nprob == 0,
+       f"{nprob} — inspect with:  aht logs --errors")
     missing = [e["real_path"] for e in reg.get("projects", {}).values()
                if not os.path.isdir(e["real_path"])]
     ck("no missing project folders", not missing, f"{len(missing)} missing")
@@ -2718,6 +2749,51 @@ def cmd_restore(args):
             print(f"   note: {note}")
     return 0
 
+def cmd_logs(args):
+    """Show recent log lines; --errors filters to warnings + errors."""
+    lines = []
+    for f in (log_path().with_suffix(".log.1"), log_path()):
+        try:
+            lines += f.read_text(errors="replace").splitlines()
+        except OSError:
+            pass
+    if args.watcher:
+        try:
+            lines += [f"[watcher-stream] {ln}" for ln in
+                      (aht_home() / "aht-watcher.log")
+                      .read_text(errors="replace").splitlines()[-args.lines:]]
+        except OSError:
+            pass
+    if args.errors:
+        lines = [ln for ln in lines if "[WARN " in ln or "[ERROR" in ln]
+    out = lines[-args.lines:]
+    if not out:
+        print("no matching log lines" + (" — the log is clean" if args.errors
+                                         else f" yet ({log_path()})"))
+    for ln in out:
+        print(ln)
+    return 0
+
+def recent_log_problems(hours: float = 24.0) -> int:
+    """warn+error lines younger than `hours` (doctor + status surface this)."""
+    cutoff = time.time() - hours * 3600
+    n = 0
+    for f in (log_path().with_suffix(".log.1"), log_path()):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for ln in text.splitlines():
+            if "[WARN " not in ln and "[ERROR" not in ln:
+                continue
+            try:
+                ts = time.mktime(time.strptime(ln[1:20], "%Y-%m-%d %H:%M:%S"))
+                if ts >= cutoff:
+                    n += 1
+            except Exception:
+                n += 1
+    return n
+
 def cmd_backends(args):
     """Where each agent CLI's history store lives — and how to point aht at it
     when a tool's store was not found automatically."""
@@ -2803,10 +2879,11 @@ COMMANDS:
   aht tag <folder> --apply        start tethering a folder
   aht keys <path>                 show each backend's key for a path
   aht backends                    store locations (--set-root when not found)
+  aht logs [--errors]             recent log lines / just warnings + errors
   aht encode <path>               claude's dirname encoding for a path
 
 Data:  ~/.aht/  (registry.json, config.json, backups/, aht.log)
-Docs:  README.md, linux/README.md, macos/README.md, windows/README.md
+Docs:  README.md
 """
 
 def cmd_about(_args):
@@ -2983,6 +3060,14 @@ def build_parser():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_doctor)
 
+    s = sub.add_parser("logs", help="show recent log lines "
+                       "(--errors: warnings + errors only)")
+    s.add_argument("-n", "--lines", type=int, default=50)
+    s.add_argument("--errors", action="store_true")
+    s.add_argument("--watcher", action="store_true",
+                   help="include the watcher's stream log")
+    s.set_defaults(fn=cmd_logs)
+
     s = sub.add_parser("backends",
                        help="each agent CLI's store location (override with "
                             "--set-root when not found automatically)")
@@ -3030,7 +3115,14 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    return args.fn(args) or 0
+    try:
+        return args.fn(args) or 0
+    except (SystemExit, KeyboardInterrupt, BrokenPipeError):
+        raise
+    except Exception:
+        import traceback
+        error("UNCAUGHT " + traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     sys.exit(main())

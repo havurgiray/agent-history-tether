@@ -67,7 +67,6 @@ def write_service() -> None:
         UNIT_DIR.mkdir(parents=True, exist_ok=True)
         UNIT.write_text(f"""[Unit]
 Description=aht — keep Claude Code history tethered to project folders
-Documentation=https://github.com/havurgiray/aht
 After=graphical-session.target
 
 [Service]

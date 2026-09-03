@@ -96,7 +96,7 @@ name=/path`, or point-and-click via every tray's *Settings ▸ Agent CLI
 Locations* page), `move_policy`, `copy_policy`, `new_policy`,
 `notifications`, `icons_enabled` / `icons_agent` / `icons_git`,
 `debounce_seconds`, `scan_max_depth`, `extra_prune_dirs`, `dialog_timeout`,
-`watcher_owner`, `backup_enabled` / `backup_interval_hours` / `backup_keep` /
+`watcher_owner`, `log_level`, `backup_enabled` / `backup_interval_hours` / `backup_keep` /
 `backup_dir`, `linux_emblem_method` / `linux_agent_emblem` / `linux_git_emblem`.
 
 Every platform has a tray with the same menu (status, reconcile now,
@@ -119,8 +119,11 @@ toggle): the compiled menu-bar tray on macOS, `aht-tray.exe` on Windows,
 ## Commands
 
 `status` · `doctor` · `adopt` · `reconcile` · `projects` · `orphans --match` ·
-`bind` · `prune` · `forget` · `backup` / `backup --list` / `restore` ·
-`config` · `roots` / `reload` · `icons --refresh` · `tag` · `keys <path>`
+`suggest-matches` · `bind` · `prune` · `forget` · `backup` / `backup --list` /
+`restore` · `backends [--set-root]` ·
+`config` · `roots` / `reload` · `icons --refresh` · `logs [--errors]`
+(leveled `[WARN]`/`[ERROR]` lines, size-rotated at `~/.aht/aht.log`) ·
+`tag` · `keys <path>`
 (each backend's store key for a path) · `encode` · `hook` · `version`.
 Run `aht` with no arguments for the full help screen; every `--json` output is
 a stable machine interface (it's what the trays use).
@@ -137,3 +140,20 @@ never touch real agent data.  Honest limits: the Cursor/OpenCode/Copilot
 layouts are implemented from best-effort knowledge and self-verify at runtime
 (they no-op rather than guess); the tray UIs need a real
 desktop of each OS for full exercise.
+
+## License
+
+Copyright (C) 2026 Giray Havur
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the [GNU Affero General Public License](LICENSE) as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.  It is distributed in
+the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+PURPOSE.  See the [license text](LICENSE) for details.
+
+**Commercial licensing available — contact me.**  If the AGPL terms do
+not fit how your organization wants to use or redistribute aht, write to
+[agent.history.tether@gmail.com](mailto:agent.history.tether@gmail.com) for a commercial
+license.

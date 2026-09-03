@@ -83,6 +83,7 @@ W status --json > "$T/status.json"
 grep -q '"name": "gemini"' "$T/status.json" || fail "status lacks backend table"
 grep -q '"tracked": 1' "$T/status.json" || fail "expected 1 tracked project"
 W doctor > /dev/null || fail "doctor crashed"
+W logs > /dev/null || fail "logs crashed"
 W projects > /dev/null || fail "projects crashed"
 W backends | grep -q 'kimi' || fail "backends page missing"
 W config --set move_policy=apply --no-reload > /dev/null

@@ -66,7 +66,8 @@ def write_service() -> None:
     if have_systemd_user():
         UNIT_DIR.mkdir(parents=True, exist_ok=True)
         UNIT.write_text(f"""[Unit]
-Description=aht — keep Claude Code history tethered to project folders
+Description=aht - keep AI coding agents' histories tethered to project folders
+Documentation=https://github.com/havurgiray/agent-history-tether
 After=graphical-session.target
 
 [Service]

@@ -54,6 +54,32 @@ aht doctor            # check every piece
 > markers are read automatically, so previously tagged folders carry straight
 > over via `aht adopt --apply`.
 
+## Pause or uninstall
+
+**Pause watching** (temporary — no uninstall needed): every tray has *Pause
+Watching*; resume the same way.  While paused, the Claude SessionStart hook
+still protects any project you open.
+
+**Uninstall** removes the watcher, the hook, the tray autostart and the `aht`
+command.  No agent's history is EVER touched by uninstalling:
+
+| platform | command |
+|---|---|
+| macOS | `./uninstall.sh` |
+| Linux | `cd linux && ./uninstall.sh` |
+| Windows | `aht uninstall` |
+
+Optional flags (macOS/Windows; Linux clears emblems via the tray's *Clear all
+emblems* instead):
+
+- `--remove-icons` — also clear the folder badges aht applied
+- `--purge` — also remove the `.aht/.project-id` markers and aht's own
+  registry/config under `~/.aht` (every agent's history still stays intact)
+
+Leftovers by design: the histories themselves, backups under `~/.aht/backups`
+(delete by hand if unwanted), and on Windows the exe files (delete them
+yourself — a running exe can't remove itself).
+
 ## How it works
 
 - **Marker**: `.aht/.project-id` (a UUID) travels with the folder on

@@ -781,7 +781,7 @@ def cmd_uninstall(argv) -> int:
                 pass
         for p in (aht.registry_path(),
                   aht.registry_path().with_suffix(".json.bak"),
-                  aht.lock_path()):
+                  aht.config_path(), aht.lock_path()):
             try:
                 Path(p).unlink()
             except OSError:

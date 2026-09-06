@@ -1,0 +1,93 @@
+name: release
+
+# Tag vX.Y.Z (matching VERSION in aht.py) to build every artifact and publish
+# a GitHub release; run it by hand (workflow_dispatch) to build and test the
+# artifacts without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.arch }}
+      - name: version
+        id: v
+        shell: bash
+        run: echo "version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' aht.py)" >> "$GITHUB_OUTPUT"
+      - name: build
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller==6.*"
+          python windows/src/make_icons.py windows/app.ico
+          cd windows
+          python -m PyInstaller --clean -y --distpath dist --workpath build aht.spec
+      - name: smoke test the real exe
+        shell: bash
+        env:
+          AHT_SMOKE_NATIVE: "1"
+        run: |
+          sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht.exe"
+          sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht.exe"
+      - name: package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item windows/dist/aht.exe, windows/dist/aht-tray.exe, LICENSE, README.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "aht-${{ steps.v.outputs.version }}-windows-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: aht-*-windows-*.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS app (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build, sign (ad-hoc) and selftest
+        run: macos/build_app.sh --test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: macos/build/aht-*-macos-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the tag must match VERSION in aht.py
+        run: |
+          v="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' aht.py)"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != v$v"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: .github/release-notes.md
+          generate_release_notes: true

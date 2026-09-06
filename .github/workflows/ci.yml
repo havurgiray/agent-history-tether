@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: core tests (${{ matrix.os }}, python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.12" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: run the suites
+        run: AHT_PY="$(command -v python)" tests/run_tests.sh
+
+  macos-app:
+    name: macOS app bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build and selftest
+        run: macos/build_app.sh --host-only --test
+
+  windows:
+    name: Windows exe (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller==6.*"
+          python windows/src/make_icons.py windows/app.ico
+          cd windows
+          python -m PyInstaller --clean -y --distpath dist --workpath build aht.spec
+      - name: smoke test the real exe
+        shell: bash
+        env:
+          AHT_SMOKE_NATIVE: "1"
+        run: |
+          sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht.exe"
+          sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht.exe"

@@ -2,12 +2,18 @@
 """Generate app.ico (the aht loop on a slate disc) for the exes' embedded icon.
 Runs on the BUILD HOST (any OS) — uses only the core's pure-Python
 rasteriser.  build.sh / build_windows.bat call this before PyInstaller."""
+import os
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1]))          # the shared core, aht.py
+if os.name == "nt":
+    # the core imports fcntl at load time; on a Windows build host use the
+    # same shim the frozen exe registers (see aht_main.py)
+    import win_fcntl
+    sys.modules.setdefault("fcntl", win_fcntl)
 from winbadge import ico_bytes, infinity_overlay  # noqa: E402
 import aht  # noqa: E402
 

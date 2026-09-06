@@ -2912,6 +2912,43 @@ def cmd_version(args):
     print(f"aht {VERSION} ({sys.platform}, python {platform.python_version()})")
     return 0
 
+def _installer_script(name: str):
+    """The platform installer shipped next to this core — in a checkout, in
+    the installed tools dir, or in aht.app's Resources folder."""
+    here = Path(__file__).resolve().parent
+    for c in (here / f"{name}.py", here / "linux" / f"{name}.py"):
+        if c.is_file():
+            return c
+    return None
+
+def cmd_install(args):
+    if not (IS_MAC or IS_LINUX):
+        print("on Windows the installer is built into the exe:  aht.exe install")
+        return 2
+    script = _installer_script("install")
+    if script is None:
+        print("no installer found next to aht.py — run install.sh from a checkout")
+        return 2
+    cmd = [sys.executable, str(script)]
+    # launched through aht.app's `aht` command: install from the bundle so the
+    # watcher and hook get that (possibly newer) core and its prebuilt binaries
+    src = args.src or os.environ.get("AHT_BUNDLE_RESOURCES")
+    if src and IS_MAC:
+        cmd += ["--src", src]
+    return subprocess.call(cmd)
+
+def cmd_uninstall(args):
+    if not (IS_MAC or IS_LINUX):
+        print("on Windows the uninstaller is built into the exe:  aht.exe uninstall")
+        return 2
+    script = _installer_script("uninstall")
+    if script is None:
+        print("no uninstaller found next to aht.py — run uninstall.sh from a checkout")
+        return 2
+    flags = [f for f, on in (("--remove-icons", args.remove_icons),
+                             ("--purge", args.purge)) if on]
+    return subprocess.call([sys.executable, str(script)] + flags)
+
 ABOUT = """\
 agent-history-tether  (aht)
 
@@ -2951,6 +2988,7 @@ COMMANDS:
   aht backends                    store locations (--set-root when not found)
   aht logs [--errors]             recent log lines / just warnings + errors
   aht encode <path>               claude's dirname encoding for a path
+  aht install | uninstall         set up / remove the watcher, hook and command
 
 Data:  ~/.aht/  (registry.json, config.json, backups/, aht.log)
 Docs:  README.md
@@ -3149,6 +3187,19 @@ def build_parser():
     s.set_defaults(fn=cmd_backends)
 
     s = sub.add_parser("version"); s.set_defaults(fn=cmd_version)
+
+    s = sub.add_parser("install", help="set up the watcher, the Claude hook and "
+                       "the aht command on this machine (macOS/Linux)")
+    s.add_argument("--src", help="install from this folder, e.g. an aht.app's "
+                   "Contents/Resources (default: where this aht.py lives)")
+    s.set_defaults(fn=cmd_install)
+    s = sub.add_parser("uninstall", help="remove the automation; no agent's "
+                       "history is ever touched")
+    s.add_argument("--remove-icons", action="store_true", dest="remove_icons",
+                   help="also clear the folder badges aht applied")
+    s.add_argument("--purge", action="store_true",
+                   help="also remove the markers, registry and config")
+    s.set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("roots")
     s.add_argument("--add", nargs="*")

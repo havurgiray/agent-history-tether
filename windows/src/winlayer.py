@@ -809,7 +809,7 @@ WINDOWS COMMANDS (this build):
 Installed at: %LOCALAPPDATA%\\aht\\aht.exe
 Data:  %USERPROFILE%\\.aht\\registry.json,  config.json
 Logs:  %USERPROFILE%\\.aht\\aht.log,  aht-watcher.log
-Badges: folders get a coral agent sparkle / git "+" icon via a hidden
+Badges: folders get per-agent discs / a git "+" icon via a hidden
         desktop.ini + .claude\\aht-badge.ico that travel with the folder;
         refresh with `aht icons --refresh`, remove with
         `aht uninstall --remove-icons`.

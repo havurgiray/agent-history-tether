@@ -124,13 +124,13 @@ shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
                                       ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
-CORAL = (217, 119, 87)          # the agent sparkle
+CORAL = (217, 119, 87)          # the tray mark when watching
 GRAY = (140, 140, 140)          # paused
 
 
-def sparkle_pixels(s, rgb):
-    from winbadge import sparkle_overlay
-    return sparkle_overlay(s, cx=0.5, cy=0.5, scale=0.94, rgb=rgb)
+def mark_pixels(s, rgb):
+    from winbadge import infinity_overlay
+    return infinity_overlay(s, rgb=rgb)
 
 
 SM_CXSMICON = 49
@@ -139,7 +139,7 @@ SM_CXSMICON = 49
 def tray_icon_size():
     """The size the notification area actually wants at the current DPI
     (16 at 100%, 24 at 150%, …).  Drawing at exactly this size — instead of
-    handing Windows a 32px icon to squeeze — is what keeps the sparkle crisp.
+    handing Windows a 32px icon to squeeze — is what keeps the loop crisp.
     Only meaningful once the process is DPI-aware (winlayer.activate())."""
     try:
         s = int(user32.GetSystemMetrics(SM_CXSMICON))
@@ -152,7 +152,7 @@ def tray_icon_size():
 
 def make_icon(rgb, size=None):
     s = size or tray_icon_size()
-    px = bytes(sparkle_pixels(s, rgb))
+    px = bytes(mark_pixels(s, rgb))
     color = gdi32.CreateBitmap(s, s, 1, 32, px)
     mask = gdi32.CreateBitmap(s, s, 1, 1, None)
     ii = ICONINFO(True, 0, 0, mask, color)
@@ -718,7 +718,7 @@ def selftest():
         winlayer.activate()
         assert aht.VERSION
         for rgb in (CORAL, GRAY):
-            px = sparkle_pixels(32, rgb)
+            px = mark_pixels(32, rgb)
             assert len(px) == 32 * 32 * 4 and any(px)
         cmd = winlayer.self_cmd("version")
         assert cmd and cmd[0]

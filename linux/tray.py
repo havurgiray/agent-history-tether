@@ -29,11 +29,9 @@ import fcntl
 import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
 import threading
-import zlib
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -81,43 +79,15 @@ def notify(title, msg):
 
 
 # --------------------------------------------------------------------------- #
-# Icon generation (pure stdlib: the coral sparkle as a small PNG)
+# Icon generation (the aht loop as a small PNG, via the core's rasteriser)
 # --------------------------------------------------------------------------- #
-
-def _sparkle_rgba(s, rgb):
-    buf = bytearray(s * s * 4)
-    c = (s - 1) / 2.0
-    k = 32.0 / (s * 0.94)
-    aa = (s * 0.94) / 32.0
-    for y in range(s):
-        dy = abs(y - c) * k
-        for x in range(s):
-            dx = abs(x - c) * k
-            a = min((14.0 - (dx + dy)) / 2.0, (6.5 - dx * dy) / 3.0) * aa
-            a = 0.0 if a < 0 else (1.0 if a > 1 else a)
-            if a > 0:
-                i = (y * s + x) * 4
-                buf[i], buf[i + 1], buf[i + 2] = rgb
-                buf[i + 3] = int(a * 255)
-    return bytes(buf)
-
-
-def _png(s, rgba):
-    raw = b"".join(b"\x00" + rgba[y * s * 4:(y + 1) * s * 4] for y in range(s))
-    def chunk(t, d):
-        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", s, s, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
-
 
 def write_icons() -> Path:
     d = aht.aht_home() / "aht-icons"
     d.mkdir(parents=True, exist_ok=True)
     for name, rgb in ((ICON_ACTIVE, CORAL), (ICON_PAUSED, GRAY)):
-        p = d / f"{name}.png"
-        if not p.is_file():
-            p.write_bytes(_png(22, _sparkle_rgba(22, rgb)))
+        # always rewritten: it is tiny, and a stale file would keep an old mark
+        (d / f"{name}.png").write_bytes(aht._png_bytes(22, aht.infinity_rgba(22, rgb)))
     return d
 
 

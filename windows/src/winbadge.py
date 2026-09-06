@@ -74,6 +74,19 @@ def sparkle_overlay(s, cx=0.72, cy=0.70, scale=0.46, rgb=CORAL):
     return buf
 
 
+def rgba_to_bgra(buf):
+    out = bytearray(buf)
+    out[0::4], out[2::4] = buf[2::4], buf[0::4]
+    return out
+
+
+def infinity_overlay(s, rgb=CORAL, bg=None, **kw):
+    """The aht mark (an infinity loop) as straight-alpha BGRA, rendered by
+    the core's shared rasteriser so every platform draws the same shape."""
+    import aht
+    return rgba_to_bgra(aht.infinity_rgba(s, rgb, bg=bg, **kw))
+
+
 def plus_overlay(s, cx=0.46, cy=0.60, scale=0.32, rgb=INK):
     """A bold "+" centred at (cx,cy)·s (the visual centre of the folder body)."""
     buf = bytearray(s * s * 4)

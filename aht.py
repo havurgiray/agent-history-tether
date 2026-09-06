@@ -1044,6 +1044,76 @@ def _png_bytes(d: int, rgba) -> bytes:
             + chunk(b"IHDR", struct.pack(">IIBBBBB", d, d, 8, 6, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
+def infinity_rgba(d: int, rgb=(255, 255, 255), bg=None, span: float = 0.46,
+                  thickness: float = 0.07) -> bytearray:
+    """d×d straight-alpha RGBA of the aht mark: an infinity loop (a tether
+    with no loose end) stroked in `rgb` — on a transparent ground for the
+    tray icons, or on a filled disc of color `bg` for the app icons.  One
+    renderer for the Windows/Linux trays and the release artwork, so every
+    platform draws the same shape (the macOS menu bar uses the matching SF
+    Symbol)."""
+    import math
+    c = (d - 1) / 2.0
+    a = d * span                     # lemniscate half-span
+    w = max(0.9, d * thickness)      # stroke half-width
+    ro, ri = w + 0.5, w - 0.5        # soft edge: solid inside ri, nothing past ro
+    cov = [0.0] * (d * d)
+    n = max(96, int(d * 6))          # curve samples, ~0.35 px apart
+    for i in range(n):
+        t = 2.0 * math.pi * i / n
+        s, co = math.sin(t), math.cos(t)
+        k = 1.0 + s * s
+        px, py = c + a * co / k, c + a * s * co / k      # lemniscate of Bernoulli
+        for y in range(max(0, int(py - ro)), min(d - 1, int(py + ro) + 1) + 1):
+            dy = y - py
+            oo = ro * ro - dy * dy
+            if oo <= 0.0:
+                continue
+            row = y * d
+            hx = oo ** 0.5
+            xa = max(0, int(math.ceil(px - hx)))
+            xb = min(d - 1, int(math.floor(px + hx)))
+            ii = ri * ri - dy * dy
+            if ii > 0.0:
+                hi = ii ** 0.5
+                xi0 = max(xa, int(math.ceil(px - hi)))
+                xi1 = min(xb, int(math.floor(px + hi)))
+            else:
+                xi0, xi1 = xb + 1, xb
+            if xi1 >= xi0:                                # solid core of the stroke
+                cov[row + xi0:row + xi1 + 1] = [1.0] * (xi1 - xi0 + 1)
+            for x in list(range(xa, xi0)) + list(range(xi1 + 1, xb + 1)):
+                v = ro - ((x - px) ** 2 + dy * dy) ** 0.5
+                if v > cov[row + x]:
+                    cov[row + x] = 1.0 if v > 1.0 else v
+    buf = bytearray(d * d * 4)
+    r_bg = d * 0.47
+    for y in range(d):
+        dy = y - c
+        for x in range(d):
+            j = y * d + x
+            g = cov[j]
+            ab = _c01(r_bg - ((x - c) ** 2 + dy * dy) ** 0.5 + 0.5) if bg else 0.0
+            alpha = g + ab * (1.0 - g)
+            if alpha <= 0.0:
+                continue
+            if ab > 0.0 and g < 1.0:                      # stroke over the disc
+                col = tuple(int((rgb[i] * g + bg[i] * ab * (1.0 - g)) / alpha)
+                            for i in range(3))
+            else:
+                col = rgb
+            i4 = j * 4
+            buf[i4], buf[i4 + 1], buf[i4 + 2] = col
+            buf[i4 + 3] = int(alpha * 255 + 0.5)
+    return buf
+
+APP_ICON_RGB = (51, 58, 66)          # slate disc behind the white loop
+
+def app_icon_png(d: int) -> bytes:
+    """The release/app icon at d×d as PNG bytes."""
+    return _png_bytes(d, infinity_rgba(d, (255, 255, 255), bg=APP_ICON_RGB,
+                                       span=0.34, thickness=0.058))
+
 EMBLEM_VERSION = 1
 
 def _ensure_linux_emblems() -> bool:

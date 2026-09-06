@@ -106,7 +106,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let img = NSImage(systemSymbolName: "sparkles",
+        let img = NSImage(systemSymbolName: "infinity",
                           accessibilityDescription: "aht")
         img?.isTemplate = true
         item.button?.image = img

@@ -335,6 +335,39 @@ r = run("status", "--json")
 ck(json.loads(r.stdout)["log"]["recent_problems"] >= 1,
    "status counts recent problems")
 
+print("\n[13] shared artwork (the infinity mark) + install/uninstall entry points")
+probe = r"""
+import sys; sys.path.insert(0, sys.argv[1]); import aht
+d = 24
+b = aht.infinity_rgba(d, (10, 20, 30))
+a = [b[i * 4 + 3] for i in range(d * d)]
+row = lambda y: a[y * d:(y + 1) * d]
+mid = row(11)
+mirror = max(abs(p - q) for p, q in zip(mid, mid[::-1]))
+flip = max(abs(p - q) for p, q in zip(row(11), row(12)))
+print("size", len(b) == d * d * 4)
+print("solid", max(a) == 255)
+print("crossing", mid[11] > 0 and mid[12] > 0)
+print("tips", mid[1] > 0 and mid[22] > 0)
+print("hollow-lobes", mid[6] == 0 and mid[17] == 0)
+print("corners", a[0] == 0 and a[d - 1] == 0 and a[d * d - 1] == 0)
+print("symmetric", mirror <= 2 and flip <= 2)
+print("color", b[(11 * d + 11) * 4] == 10 and b[(11 * d + 11) * 4 + 2] == 30)
+p = aht.app_icon_png(32)
+print("png", p[:8] == b"\x89PNG\r\n\x1a\n")
+"""
+r = subprocess.run([PY, "-c", probe, str(HERE.parent)], capture_output=True, text=True)
+ck(r.returncode == 0 and "False" not in r.stdout,
+   "infinity mark: solid symmetric loop, hollow lobes, transparent corners"
+   + ("" if r.returncode == 0 else f" ({r.stderr.strip()[-200:]})"))
+for line in r.stdout.split("\n"):
+    if "False" in line:
+        print("        failed check:", line)
+r = run("install", "--help")
+ck(r.returncode == 0 and "--src" in r.stdout, "aht install --help (no side effects)")
+r = run("uninstall", "--help")
+ck(r.returncode == 0 and "--purge" in r.stdout, "aht uninstall --help")
+
 shutil.rmtree(sb, ignore_errors=True)
 print("\nCORE RESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")
 for f in FAILS:

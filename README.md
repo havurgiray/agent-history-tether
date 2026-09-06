@@ -1,3 +1,5 @@
+![agent-history-tether: move the project, keep the agent memory](docs/banner.jpg)
+
 # agent-history-tether  (`aht`)
 
 > **Move a project folder and your AI coding agents forget everything about

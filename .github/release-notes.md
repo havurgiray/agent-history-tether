@@ -9,6 +9,6 @@
 
 Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `scoop install aht` (Windows, after adding the `havurgiray/scoop-bucket` bucket). Linux installs from the checkout (`linux/install.sh`).
 
-**Unsigned builds.** macOS will say the app is from an unidentified developer: install through Homebrew (`--no-quarantine`), or allow it once under System Settings > Privacy & Security. Windows SmartScreen shows "unknown publisher" on first run: choose *More info > Run anyway*. The checksums above let you verify what you downloaded.
+**Unsigned builds.** The app is ad-hoc signed, so macOS blocks its first launch (downloaded or Homebrew-installed alike): allow it once under System Settings > Privacy & Security > Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/aht.app`. Windows SmartScreen shows "unknown publisher" on first run: choose *More info > Run anyway*. The checksums above let you verify what you downloaded.
 
 Every artifact was built and smoke-tested on the matching CI runner before publishing.

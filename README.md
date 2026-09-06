@@ -43,7 +43,7 @@ or a package manager:
 
 | platform | how |
 |---|---|
-| **macOS 13+** (Apple Silicon and Intel) | `brew install --cask --no-quarantine havurgiray/tap/aht` then `aht install` — or download `aht-<version>-macos-universal.zip`, drag `aht.app` to Applications, open it and accept *Set Up aht on This Mac*.  The app **is** the menu bar tray (look for the ∞ icon) and carries the core, the FSEvents watcher and the badge tool prebuilt, so no compiler is needed |
+| **macOS 13+** (Apple Silicon and Intel) | `brew install --cask havurgiray/tap/aht` then `aht install` — or download `aht-<version>-macos-universal.zip`, drag `aht.app` to Applications, open it and accept *Set Up aht on This Mac* (first launch: see the note on unsigned builds below).  The app **is** the menu bar tray (look for the ∞ icon) and carries the core, the FSEvents watcher and the badge tool prebuilt, so no compiler is needed |
 | **Windows 11** (x64 and ARM64) | `scoop bucket add havurgiray https://github.com/havurgiray/scoop-bucket` then `scoop install aht` — or `winget install havurgiray.aht` — or download the zip for your CPU; then `aht install` (registers the logon watcher + hook; `aht-tray.exe` is the tray) |
 | **Linux** | from a checkout: `cd linux && ./install.sh` (systemd user watcher + hook + `aht`); tray: `python3 linux/tray.py` (needs PyGObject + AppIndicator; GNOME also needs the AppIndicator shell extension) |
 
@@ -53,13 +53,15 @@ Command Line Tools), `cd linux && ./install.sh` on Linux, or build the exes
 on Windows (`windows\build_windows.bat`; or `windows/build.sh` via
 Docker+Wine from macOS/Linux) and run `aht.exe install`.
 
-> **Unsigned builds.**  The macOS app is ad-hoc signed and the Windows exes
-> are unsigned, so a downloaded copy meets Gatekeeper ("unidentified
-> developer" — install through Homebrew with `--no-quarantine`, or allow it
-> once under *System Settings ▸ Privacy & Security*) and SmartScreen
-> ("unknown publisher" — *More info ▸ Run anyway*).  Every release ships
-> `SHA256SUMS.txt`, and every artifact is built and smoke-tested on GitHub's
-> runners for its exact platform before it is published.
+> **Unsigned builds.**  The macOS app is ad-hoc signed (no Apple Developer
+> ID yet), so Gatekeeper blocks the first launch of a downloaded *or*
+> Homebrew-installed copy ("Apple could not verify…"): allow it once under
+> *System Settings ▸ Privacy & Security ▸ Open Anyway*, or clear the flag
+> with `xattr -dr com.apple.quarantine /Applications/aht.app`.  The Windows
+> exes are unsigned, so SmartScreen shows "unknown publisher" on first run
+> (*More info ▸ Run anyway*).  Every release ships `SHA256SUMS.txt`, and
+> every artifact is built and smoke-tested on GitHub's runners for its exact
+> platform before it is published.
 
 Then, everywhere:
 

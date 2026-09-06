@@ -13,19 +13,18 @@ export WINEDEBUG=-all
 fail() { echo "WATCH FAIL: $*"; exit 1; }
 
 T=/tmp/aht-watch
-if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
-  RUN=""
-  WT="$(cygpath -w "$T")"
-else
-  RUN="wine"
-  WT='Z:\tmp\aht-watch'
-fi
+if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then RUN=""; else RUN="wine"; fi
 W() { $RUN "$EXE" "$@" | tr -d '\r'; }
 
 run_case() {
     BACKEND="$1"
     rm -rf "$T"
     mkdir -p "$T/home/.aht" "$T/roots/projA" "$T/tools/claude"
+    if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
+        WT="$(cygpath -w -l "$T")"       # long form: the runner's TEMP is 8.3
+    else
+        WT='Z:\tmp\aht-watch'
+    fi
     export AHT_HOME="$WT\\home\\.aht"
     export AHT_ROOTS="$WT\\roots"
     export AHT_ROOT_CLAUDE="$WT\\tools\\claude"

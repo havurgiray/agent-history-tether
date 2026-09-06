@@ -13,9 +13,14 @@ EXE="$1"
 export WINEDEBUG=-all
 
 T=/tmp/aht-smoke
+rm -rf "$T"
+mkdir -p "$T/home/.aht" "$T/roots/projA/src" \
+         "$T/tools/claude" "$T/tools/gemini" "$T/tools/codex/2026/08/29"
 if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
   RUN=""                                   # run the exe directly ...
-  WT="$(cygpath -w "$T")"                  # ... with Windows-style paths
+  WT="$(cygpath -w -l "$T")"               # ... with Windows-style paths in
+                                           # LONG form: the runner's TEMP is an
+                                           # 8.3 name, and the core realpaths
 else
   RUN="wine"
   WT='Z:\tmp\aht-smoke'                    # wine maps / to Z:
@@ -24,10 +29,6 @@ WTJ=$(printf '%s' "$WT" | sed 's/\\/\\\\/g')   # backslashes doubled for JSON
 
 W() { $RUN "$EXE" "$@" | tr -d '\r'; }
 fail() { echo "SMOKE FAIL: $*"; exit 1; }
-
-rm -rf "$T"
-mkdir -p "$T/home/.aht" "$T/roots/projA/src" \
-         "$T/tools/claude" "$T/tools/gemini" "$T/tools/codex/2026/08/29"
 
 export AHT_HOME="$WT\\home\\.aht"
 export AHT_ROOTS="$WT\\roots"

@@ -2,11 +2,13 @@
 //
 // A FRONT-END only: every action shells out to the same aht.py core the CLI,
 // the hook and the LaunchAgent watcher use, so no front-end can disagree with
-// another.  Compiled by install.py (swiftc, no dependencies); menu parity with
+// another.  Compiled by install.py (swiftc, no dependencies) or shipped
+// prebuilt as the executable of aht.app (macos/build_app.sh); menu parity with
 // the Windows tray (windows/src/aht_tray.py) and the Linux tray (linux/tray.py).
 //
-//   run:            ~/.aht/tools/agent-history-tether/aht-tray &
+//   run:            ~/.aht/tools/agent-history-tether/aht-tray &   (or open aht.app)
 //   start at login: toggle it in the menu (writes a LaunchAgent)
+//   from aht.app:   offers to install the core, watcher and hook on first launch
 import AppKit
 import Foundation
 
@@ -18,27 +20,41 @@ let TRAY_LABEL = "com.aht.tray"
 let TRAY_PLIST = HOME + "/Library/LaunchAgents/\(TRAY_LABEL).plist"
 let WATCHER_PLIST = HOME + "/Library/LaunchAgents/\(WATCHER_LABEL).plist"
 
+// When launched as aht.app, the core and the prebuilt binaries ship in the
+// bundle's Resources; a bare aht-tray binary has no bundle.
+let BUNDLE_RES: String? =
+    Bundle.main.bundlePath.hasSuffix(".app") ? Bundle.main.resourcePath : nil
+
 func ahtScript() -> String {
+    // the installed copy first: it is what the hook and the watcher run too
     let fm = FileManager.default
-    let candidates = [
-        TOOLS + "/aht.py",
-        URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
-            .appendingPathComponent("aht.py").path,
-        URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
-            .deletingLastPathComponent().appendingPathComponent("aht.py").path,
-    ]
+    var candidates = [TOOLS + "/aht.py"]
+    if let r = BUNDLE_RES { candidates.append(r + "/aht.py") }
+    candidates.append(URL(fileURLWithPath: CommandLine.arguments[0])
+        .deletingLastPathComponent().appendingPathComponent("aht.py").path)
     for c in candidates where fm.fileExists(atPath: c) { return c }
     return TOOLS + "/aht.py"
 }
 
+func coreVersion(_ path: String) -> [Int] {
+    let tag = "VERSION = \""
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    for line in text.components(separatedBy: "\n") where line.hasPrefix(tag) {
+        return line.dropFirst(tag.count).prefix { $0 != "\"" }
+            .split(separator: ".").compactMap { Int($0) }
+    }
+    return []
+}
+
 @discardableResult
-func sh(_ exe: String, _ args: [String]) -> (ok: Bool, out: String) {
+func sh(_ exe: String, _ args: [String], mergeStderr: Bool = false)
+    -> (ok: Bool, out: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     let out = Pipe()
     p.standardOutput = out
-    p.standardError = Pipe()
+    p.standardError = mergeStderr ? out : Pipe()
     do { try p.run() } catch { return (false, "") }
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
@@ -106,6 +122,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // the aht mark: a loop with no loose end (template = follows the bar's theme)
         let img = NSImage(systemSymbolName: "infinity",
                           accessibilityDescription: "aht")
         img?.isTemplate = true
@@ -116,6 +133,9 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cache.refresh()
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
             self.cache.refresh()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            self.offerInstallIfNeeded()
         }
     }
 
@@ -169,6 +189,11 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recent.submenu = sub
         menu.addItem(recent)
         add("Adopt This Mac's Projects…", #selector(adopt))
+        if BUNDLE_RES != nil {
+            let installed = FileManager.default.fileExists(atPath: TOOLS + "/aht.py")
+            add(installed ? "Reinstall / Update aht on This Mac…"
+                          : "Set Up aht on This Mac…", #selector(installFromApp))
+        }
         menu.addItem(.separator())
 
         menu.addItem(settingsSubmenu())
@@ -406,6 +431,61 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // ---- installing from the app bundle ----
+
+    func offerInstallIfNeeded() {
+        guard let res = BUNDLE_RES else { return }
+        let bundled = coreVersion(res + "/aht.py")
+        let bundledStr = bundled.map(String.init).joined(separator: ".")
+        let defaults = UserDefaults.standard
+        if !FileManager.default.fileExists(atPath: TOOLS + "/aht.py") {
+            // asked once per app version; the menu keeps the option available
+            guard defaults.string(forKey: "declinedSetup") != bundledStr else { return }
+            if alert("Set up aht on this Mac?",
+                     "This installs the background watcher (a LaunchAgent), the "
+                     + "Claude Code SessionStart hook and the `aht` terminal command "
+                     + "from this app.  No agent's history is touched, and "
+                     + "`aht uninstall` undoes it.", confirm: "Install") {
+                runInstall(res)
+            } else {
+                defaults.set(bundledStr, forKey: "declinedSetup")
+            }
+            return
+        }
+        let current = coreVersion(TOOLS + "/aht.py")
+        if current.lexicographicallyPrecedes(bundled) {
+            let currentStr = current.map(String.init).joined(separator: ".")
+            guard defaults.string(forKey: "declinedUpdate") != bundledStr else { return }
+            if alert("Update the installed aht core?",
+                     "This app carries aht \(bundledStr); the copy the watcher, the "
+                     + "hook and the command run is \(currentStr).  Updating keeps "
+                     + "every setting and history.", confirm: "Update") {
+                runInstall(res)
+            } else {
+                defaults.set(bundledStr, forKey: "declinedUpdate")
+            }
+        }
+    }
+
+    func runInstall(_ res: String) {
+        background {
+            let r = sh(PY, [res + "/install.py", "--src", res,
+                            "--keep-pid", String(getpid()),
+                            "--tray-exe", Bundle.main.executablePath ?? ""],
+                       mergeStderr: true)
+            DispatchQueue.main.async {
+                _ = self.alert(r.ok ? "aht is set up on this Mac" : "Install failed",
+                               r.out.isEmpty ? (r.ok ? "Done." : "See ~/.aht/aht.log")
+                                             : r.out)
+            }
+        }
+    }
+
+    @objc func installFromApp() {
+        guard let res = BUNDLE_RES else { return }
+        runInstall(res)
+    }
+
     @objc func revealProject(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         if FileManager.default.fileExists(atPath: path) {
@@ -505,7 +585,8 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? fm.removeItem(atPath: TRAY_PLIST)
             notifyUser("Autostart", "The tray no longer starts at login")
         } else {
-            let bin = TOOLS + "/aht-tray"
+            // whichever tray this is: the app bundle's executable or the bare binary
+            let bin = Bundle.main.executablePath ?? (TOOLS + "/aht-tray")
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -525,7 +606,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = alert("agent-history-tether",
                   "Keeps every AI coding agent's per-project history connected to "
                   + "its folder when you move, rename, copy or nest that folder — "
-                  + "Claude Code, Codex, Gemini, Cursor, OpenCode, Copilot.\n\n"
+                  + "Claude Code, Codex, Gemini, Cursor, OpenCode, Copilot, Kimi.\n\n"
                   + "This tray, the aht CLI, the hook and the watcher all drive "
                   + "the same core, registry and config.\n\nData: ~/.aht\n"
                   + "History is never deleted or overwritten.")

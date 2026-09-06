@@ -11,7 +11,9 @@ NAME = "agent-history-tether"
 TOOLS = HOME / ".aht/tools" / NAME
 SETTINGS = HOME / ".claude/settings.json"
 LABEL = "com.aht.watcher"
+TRAY_LABEL = "com.aht.tray"
 PLIST = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
+TRAY_PLIST = HOME / "Library/LaunchAgents" / f"{TRAY_LABEL}.plist"
 REG = HOME / ".aht/registry.json"
 CONFIG = HOME / ".aht/config.json"
 HOOK_TAIL = "aht.py hook"
@@ -57,11 +59,16 @@ def remove_agent():
     if PLIST.exists():
         PLIST.unlink()
     print("✓ watcher LaunchAgent unloaded and removed")
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{TRAY_LABEL}"], capture_output=True)
+    if TRAY_PLIST.exists():
+        TRAY_PLIST.unlink()
+        print("✓ tray autostart removed")
 
 def remove_command():
-    for d in (HOME/".npm-global/bin", Path("/usr/local/bin"), HOME/".local/bin"):
+    for d in (HOME/".npm-global/bin", Path("/usr/local/bin"), HOME/".local/bin", HOME/"bin"):
         w = d / "aht"
-        if w.exists():
+        # only our wrapper — a Homebrew link to aht.app's launcher belongs to brew
+        if w.is_file() and not w.is_symlink() and "aht.py" in w.read_text(errors="replace"):
             w.unlink()
             print(f"✓ removed `aht` command at {w}")
 
@@ -103,5 +110,5 @@ if __name__ == "__main__":
         remove_icons()
     if "--purge" in sys.argv:
         purge_markers()
-    print("\nAutomation removed. Your Claude history under ~/.claude/projects is untouched.")
-    print("Manage background items under System Settings ▸ General ▸ Login Items & Extensions.")
+    print("\nAutomation removed. No agent's history was touched.")
+    print("If aht.app is installed, drag it to the Trash to remove the tray as well.")

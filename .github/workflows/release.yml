@@ -22,8 +22,8 @@ jobs:
           - { runner: windows-11-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           architecture: ${{ matrix.arch }}
@@ -32,6 +32,7 @@ jobs:
         shell: bash
         run: echo "version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' aht.py)" >> "$GITHUB_OUTPUT"
       - name: build
+        shell: bash
         run: |
           python -m pip install --disable-pip-version-check "pyinstaller==6.*"
           python windows/src/make_icons.py windows/app.ico
@@ -50,7 +51,7 @@ jobs:
           New-Item -ItemType Directory -Force pkg | Out-Null
           Copy-Item windows/dist/aht.exe, windows/dist/aht-tray.exe, LICENSE, README.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath "aht-${{ steps.v.outputs.version }}-windows-${{ matrix.arch }}.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}
           path: aht-*-windows-*.zip
@@ -60,10 +61,10 @@ jobs:
     name: macOS app (universal)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: build, sign (ad-hoc) and selftest
         run: macos/build_app.sh --test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: macos/build/aht-*-macos-*.zip
@@ -75,18 +76,18 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: the tag must match VERSION in aht.py
         run: |
           v="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' aht.py)"
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != v$v"; exit 1; }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: checksums
         run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           body_path: .github/release-notes.md

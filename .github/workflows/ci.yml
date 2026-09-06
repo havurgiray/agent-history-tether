@@ -18,8 +18,8 @@ jobs:
           - { os: macos-latest, python: "3.12" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: run the suites
@@ -29,7 +29,7 @@ jobs:
     name: macOS app bundle
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: build and selftest
         run: macos/build_app.sh --host-only --test
 
@@ -37,11 +37,12 @@ jobs:
     name: Windows exe (x64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: build
+        shell: bash
         run: |
           python -m pip install --disable-pip-version-check "pyinstaller==6.*"
           python windows/src/make_icons.py windows/app.ico

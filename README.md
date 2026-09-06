@@ -208,5 +208,5 @@ PURPOSE.  See the [license text](LICENSE) for details.
 
 **Commercial licensing available — contact me.**  If the AGPL terms do
 not fit how your organization wants to use or redistribute aht, write to
-[agent.history.tether@gmail.com](mailto:agent.history.tether@gmail.com) for a commercial
+[havurgiray@gmail.com](mailto:havurgiray@gmail.com) for a commercial
 license.

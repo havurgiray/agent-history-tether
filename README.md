@@ -35,11 +35,29 @@ into the backup store first.  Disable any backend with
 
 ## Install
 
+**Prebuilt** — from the
+[releases page](https://github.com/havurgiray/agent-history-tether/releases)
+or a package manager:
+
 | platform | how |
 |---|---|
-| **macOS** (terminal + menu bar tray) | `./install.sh` — compiles the FSEvents watcher, badge tool and tray (needs Xcode CLT), registers the LaunchAgent + Claude hook, installs `aht` |
-| **Linux** (terminal + optional tray) | `cd linux && ./install.sh` — systemd user watcher + hook + `aht`; tray: `python3 linux/tray.py` (needs PyGObject + AppIndicator; GNOME also needs the AppIndicator shell extension) |
-| **Windows 11** (exe + tray) | build `aht.exe` + `aht-tray.exe` (`cd windows && ./build.sh` via Docker+Wine, or `build_windows.bat` on Windows), then `aht.exe install` |
+| **macOS 13+** (Apple Silicon and Intel) | `brew install --cask --no-quarantine havurgiray/tap/aht` then `aht install` — or download `aht-<version>-macos-universal.zip`, drag `aht.app` to Applications, open it and accept *Set Up aht on This Mac*.  The app **is** the menu bar tray (look for the ∞ icon) and carries the core, the FSEvents watcher and the badge tool prebuilt, so no compiler is needed |
+| **Windows 11** (x64 and ARM64) | `scoop bucket add havurgiray https://github.com/havurgiray/scoop-bucket` then `scoop install aht` — or `winget install havurgiray.aht` — or download the zip for your CPU; then `aht install` (registers the logon watcher + hook; `aht-tray.exe` is the tray) |
+| **Linux** | from a checkout: `cd linux && ./install.sh` (systemd user watcher + hook + `aht`); tray: `python3 linux/tray.py` (needs PyGObject + AppIndicator; GNOME also needs the AppIndicator shell extension) |
+
+**From source** (needs Python 3.9+): clone the repo, then `./install.sh` on
+macOS (compiles the Swift watcher, badge tool and tray — needs the Xcode
+Command Line Tools), `cd linux && ./install.sh` on Linux, or build the exes
+on Windows (`windows\build_windows.bat`; or `windows/build.sh` via
+Docker+Wine from macOS/Linux) and run `aht.exe install`.
+
+> **Unsigned builds.**  The macOS app is ad-hoc signed and the Windows exes
+> are unsigned, so a downloaded copy meets Gatekeeper ("unidentified
+> developer" — install through Homebrew with `--no-quarantine`, or allow it
+> once under *System Settings ▸ Privacy & Security*) and SmartScreen
+> ("unknown publisher" — *More info ▸ Run anyway*).  Every release ships
+> `SHA256SUMS.txt`, and every artifact is built and smoke-tested on GitHub's
+> runners for its exact platform before it is published.
 
 Then, everywhere:
 
@@ -65,7 +83,7 @@ command.  No agent's history is EVER touched by uninstalling:
 
 | platform | command |
 |---|---|
-| macOS | `./uninstall.sh` |
+| macOS | `aht uninstall` (or `./uninstall.sh` from a checkout); then drag `aht.app` to the Trash, or `brew uninstall --cask aht` |
 | Linux | `cd linux && ./uninstall.sh` |
 | Windows | `aht uninstall` |
 
@@ -128,8 +146,8 @@ Locations* page), `move_policy`, `copy_policy`, `new_policy`,
 Every platform has a tray with the same menu (status, reconcile now,
 pause/resume watching, recent projects, adopt with confirmation, the policy /
 notification / backup switches, badge controls, diagnostics, autostart
-toggle): the compiled menu-bar tray on macOS, `aht-tray.exe` on Windows,
-`linux/tray.py` on Linux.
+toggle), shown as an ∞ icon in the bar: `aht.app` (or the tray compiled by
+`install.sh`) on macOS, `aht-tray.exe` on Windows, `linux/tray.py` on Linux.
 
 ## Safety invariants
 
@@ -158,14 +176,19 @@ a stable machine interface (it's what the trays use).
 
 ```sh
 tests/run_tests.sh        # multi-backend core + Linux layer (any OS, fake stores)
-windows/build.sh          # builds the exes, then runs the wine smoke suites
+windows/build.sh          # builds the exes, then runs the smoke suites under wine
+macos/build_app.sh --test # builds aht.app, then runs the tray's headless selftest
 ```
 
 The suites fake every agent's store via `AHT_ROOT_*` env overrides, so they
-never touch real agent data.  Honest limits: the Cursor/OpenCode/Copilot
-layouts are implemented from best-effort knowledge and self-verify at runtime
-(they no-op rather than guess); the tray UIs need a real
-desktop of each OS for full exercise.
+never touch real agent data.  GitHub Actions runs the core suites (Linux and
+macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
+smoke-tests the Windows exe natively on every push; tagging `vX.Y.Z` builds
+the release artifacts (Windows x64 and ARM64 on native runners, the universal
+macOS app) and publishes them with checksums.  Honest limits: the
+Cursor/OpenCode/Copilot layouts are implemented from best-effort knowledge and
+self-verify at runtime (they no-op rather than guess); the tray UIs need a
+real desktop of each OS for full exercise.
 
 ## License
 

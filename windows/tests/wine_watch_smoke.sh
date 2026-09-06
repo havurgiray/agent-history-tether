@@ -1,8 +1,10 @@
 #!/bin/sh
 # Smoke test of the background watcher (change-notification backend + the
-# polling fallback) for aht, run INSIDE a wine container.  A project folder is
-# renamed while `aht watch --once` runs; the watcher must notice, reconcile
-# (forced Relink via AHT_ASSUME) and relink the fake claude store.
+# polling fallback) for aht.  Runs under wine (build.sh invokes it inside the
+# container) or natively on Windows from Git Bash with AHT_SMOKE_NATIVE=1.
+# A project folder is renamed while `aht watch --once` runs; the watcher must
+# notice, reconcile (forced Relink via AHT_ASSUME) and relink the fake claude
+# store.
 set -e
 
 EXE="$1"
@@ -10,30 +12,39 @@ EXE="$1"
 export WINEDEBUG=-all
 fail() { echo "WATCH FAIL: $*"; exit 1; }
 
+T=/tmp/aht-watch
+if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
+  RUN=""
+  WT="$(cygpath -w "$T")"
+else
+  RUN="wine"
+  WT='Z:\tmp\aht-watch'
+fi
+W() { $RUN "$EXE" "$@" | tr -d '\r'; }
+
 run_case() {
     BACKEND="$1"
-    T=/tmp/aht-watch
     rm -rf "$T"
     mkdir -p "$T/home/.aht" "$T/roots/projA" "$T/tools/claude"
-    export AHT_HOME='Z:\tmp\aht-watch\home\.aht'
-    export AHT_ROOTS='Z:\tmp\aht-watch\roots'
-    export AHT_ROOT_CLAUDE='Z:\tmp\aht-watch\tools\claude'
+    export AHT_HOME="$WT\\home\\.aht"
+    export AHT_ROOTS="$WT\\roots"
+    export AHT_ROOT_CLAUDE="$WT\\tools\\claude"
     for b in GEMINI CURSOR OPENCODE CODEX COPILOT KIMI; do
-        export AHT_ROOT_$b='Z:\tmp\aht-watch\tools\nope'
+        export "AHT_ROOT_$b=$WT\\tools\\nope"
     done
     export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1 AHT_ASSUME=Relink
 
-    ENCA=$(wine "$EXE" encode 'Z:\tmp\aht-watch\roots\projA' | tr -d '\r')
+    ENCA=$(W encode "$WT\\roots\\projA")
     mkdir -p "$T/tools/claude/$ENCA"
     printf '%s\n' '{"cwd":"x"}' > "$T/tools/claude/$ENCA/s1.jsonl"
-    wine "$EXE" tag 'Z:\tmp\aht-watch\roots\projA' --apply > /dev/null
+    W tag "$WT\\roots\\projA" --apply > /dev/null
 
     ( sleep 8; mv "$T/roots/projA" "$T/roots/projB" ) &
-    timeout 120 wine "$EXE" watch --once --no-startup-scan --debounce 1 \
+    timeout 120 $RUN "$EXE" watch --once --no-startup-scan --debounce 1 \
         --poll-interval 2 $BACKEND || fail "watcher ($BACKEND) did not exit cleanly"
     wait
 
-    ENCB=$(wine "$EXE" encode 'Z:\tmp\aht-watch\roots\projB' | tr -d '\r')
+    ENCB=$(W encode "$WT\\roots\\projB")
     [ -d "$T/tools/claude/$ENCB" ] || fail "watcher ($BACKEND) did not relink"
     echo "watch OK (${BACKEND:-notify} backend)"
 }

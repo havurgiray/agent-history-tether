@@ -1,36 +1,47 @@
 #!/bin/sh
-# End-to-end smoke test of the built aht.exe, run INSIDE a wine container
-# (build.sh invokes this).  Every backend root is a throwaway fake via the
-# AHT_ROOT_* overrides, so it never touches real agent data:
+# End-to-end smoke test of the built aht.exe.  Runs under wine (build.sh
+# invokes it inside the container) or natively on Windows from Git Bash with
+# AHT_SMOKE_NATIVE=1 (the release workflow does that on real x64 and ARM64
+# runners).  Every backend root is a throwaway fake via the AHT_ROOT_*
+# overrides, so it never touches real agent data:
 #   tag -> move+reconcile (claude+gemini dir renames, codex cwd rewrite) ->
-#   hook -> badges -> backup/restore -> tray selftest
+#   hook -> badges -> backup/restore -> copies -> tray selftest
 set -e
 
 EXE="$1"
 [ -n "$EXE" ] || { echo "usage: wine_smoke.sh /path/to/aht.exe"; exit 2; }
 export WINEDEBUG=-all
 
-W() { wine "$EXE" "$@" | tr -d '\r'; }
+T=/tmp/aht-smoke
+if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
+  RUN=""                                   # run the exe directly ...
+  WT="$(cygpath -w "$T")"                  # ... with Windows-style paths
+else
+  RUN="wine"
+  WT='Z:\tmp\aht-smoke'                    # wine maps / to Z:
+fi
+WTJ=$(printf '%s' "$WT" | sed 's/\\/\\\\/g')   # backslashes doubled for JSON
+
+W() { $RUN "$EXE" "$@" | tr -d '\r'; }
 fail() { echo "SMOKE FAIL: $*"; exit 1; }
 
-T=/tmp/aht-smoke
 rm -rf "$T"
 mkdir -p "$T/home/.aht" "$T/roots/projA/src" \
          "$T/tools/claude" "$T/tools/gemini" "$T/tools/codex/2026/08/29"
 
-export AHT_HOME='Z:\tmp\aht-smoke\home\.aht'
-export AHT_ROOTS='Z:\tmp\aht-smoke\roots'
-export AHT_ROOT_CLAUDE='Z:\tmp\aht-smoke\tools\claude'
-export AHT_ROOT_GEMINI='Z:\tmp\aht-smoke\tools\gemini'
-export AHT_ROOT_CURSOR='Z:\tmp\aht-smoke\tools\nope'
-export AHT_ROOT_OPENCODE='Z:\tmp\aht-smoke\tools\nope'
-export AHT_ROOT_CODEX='Z:\tmp\aht-smoke\tools\codex'
-export AHT_ROOT_COPILOT='Z:\tmp\aht-smoke\tools\nope'
-export AHT_ROOT_KIMI='Z:\tmp\aht-smoke\tools\nope'
+export AHT_HOME="$WT\\home\\.aht"
+export AHT_ROOTS="$WT\\roots"
+export AHT_ROOT_CLAUDE="$WT\\tools\\claude"
+export AHT_ROOT_GEMINI="$WT\\tools\\gemini"
+export AHT_ROOT_CURSOR="$WT\\tools\\nope"
+export AHT_ROOT_OPENCODE="$WT\\tools\\nope"
+export AHT_ROOT_CODEX="$WT\\tools\\codex"
+export AHT_ROOT_COPILOT="$WT\\tools\\nope"
+export AHT_ROOT_KIMI="$WT\\tools\\nope"
 export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1
 
-PROJA='Z:\tmp\aht-smoke\roots\projA'
-PROJB='Z:\tmp\aht-smoke\roots\projB'
+PROJA="$WT\\roots\\projA"
+PROJB="$WT\\roots\\projB"
 
 echo "== version =="
 W version
@@ -43,13 +54,13 @@ ENC_TEST=$(W encode 'C:\Users\test\My Project')
 # codex rollout with an embedded cwd
 ENCA=$(W encode "$PROJA")
 mkdir -p "$T/tools/claude/$ENCA"
-printf '%s\n' '{"cwd":"Z:\\tmp\\aht-smoke\\roots\\projA"}' \
+printf '%s\n' "{\"cwd\":\"$WTJ\\\\roots\\\\projA\"}" \
   > "$T/tools/claude/$ENCA/s1.jsonl"
 SHAA=$(W keys "$PROJA" | grep -A4 '"gemini"' | grep -o '[0-9a-f]\{64\}' | head -1)
 [ -n "$SHAA" ] || fail "could not read gemini key from aht keys"
 mkdir -p "$T/tools/gemini/$SHAA"
 echo '{"g":1}' > "$T/tools/gemini/$SHAA/chat.json"
-printf '%s\n' '{"type":"session_meta","payload":{"cwd":"Z:\\tmp\\aht-smoke\\roots\\projA","id":"x"}}' \
+printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$WTJ\\\\roots\\\\projA\",\"id\":\"x\"}}" \
   > "$T/tools/codex/2026/08/29/rollout-1.jsonl"
 
 echo "== tag detects stores =="
@@ -73,8 +84,8 @@ ls "$T/home/.aht/backups" > /dev/null 2>&1 || fail "pre-rewrite backup dir missi
 
 echo "== hook backstop =="
 mv "$T/roots/projB" "$T/roots/projC"
-printf '%s\n' '{"cwd":"Z:\\tmp\\aht-smoke\\roots\\projC"}' | wine "$EXE" hook
-ENCC=$(W encode 'Z:\tmp\aht-smoke\roots\projC')
+printf '%s\n' "{\"cwd\":\"$WTJ\\\\roots\\\\projC\"}" | $RUN "$EXE" hook
+ENCC=$(W encode "$WT\\roots\\projC")
 [ -d "$T/tools/claude/$ENCC" ] || fail "hook did not relink claude store"
 grep -q 'projC' "$T/home/.aht/registry.json" || fail "registry not re-pointed"
 
@@ -90,7 +101,7 @@ W config --set move_policy=apply --no-reload > /dev/null
 W config --json | grep -q '"move_policy": "apply"' || fail "config set/get"
 
 echo "== folder badges (desktop.ini + composited ico) =="
-env AHT_NO_ICONS= wine "$EXE" icons --refresh > /dev/null || fail "icons --refresh crashed"
+env AHT_NO_ICONS= $RUN "$EXE" icons --refresh > /dev/null || fail "icons --refresh crashed"
 [ -f "$T/roots/projC/.aht/aht-badge.ico" ] || fail "badge ico not written"
 [ -f "$T/roots/projC/desktop.ini" ] || fail "desktop.ini not written"
 grep -q 'aht-badge.ico' "$T/roots/projC/desktop.ini" || fail "IconResource not set"
@@ -101,9 +112,9 @@ grep -q '"backed-up": 1' "$T/bk.json" || fail "backup did not snapshot"
 grep -q '"codex"' "$T/home/.aht/backups"/*/*.meta.json || fail "snapshot does not span codex"
 rm -rf "$T/tools/claude/$ENCC"
 mv "$T/roots/projC" "$T/roots/projD"
-W restore 'Z:\tmp\aht-smoke\roots\projD' --apply --json > "$T/rs.json"
+W restore "$WT\\roots\\projD" --apply --json > "$T/rs.json"
 grep -q '"status": "restored"' "$T/rs.json" || fail "restore did not apply"
-ENCD=$(W encode 'Z:\tmp\aht-smoke\roots\projD')
+ENCD=$(W encode "$WT\\roots\\projD")
 [ -f "$T/tools/claude/$ENCD/s1.jsonl" ] || fail "claude history not restored at new key"
 W backup --list | grep -qi 'projD' || fail "backup --list empty"
 
@@ -111,7 +122,7 @@ echo "== copy-paste: the Duplicate option =="
 cp -r "$T/roots/projD" "$T/roots/projCopy"
 AHT_ASSUME=Duplicate W reconcile --notify > "$T/copy.json"
 grep -q 'projCopy' "$T/copy.json" || fail "copy not detected"
-ENCP=$(W encode 'Z:\tmp\aht-smoke\roots\projCopy')
+ENCP=$(W encode "$WT\\roots\\projCopy")
 [ -d "$T/tools/claude/$ENCP" ] || fail "claude history not duplicated for the copy"
 A=$(cat "$T/roots/projD/.aht/.project-id")
 B=$(cat "$T/roots/projCopy/.aht/.project-id")
@@ -121,14 +132,14 @@ echo "== copy-paste a PARENT with a nested tethered project =="
 mkdir "$T/roots/box"
 cp -r "$T/roots/projD" "$T/roots/box/projD"
 AHT_ASSUME=Duplicate W reconcile --notify > "$T/copy2.json"
-ENCN=$(W encode 'Z:\tmp\aht-smoke\roots\box\projD')
+ENCN=$(W encode "$WT\\roots\\box\\projD")
 [ -d "$T/tools/claude/$ENCN" ] || fail "nested parent-copy not duplicated"
 [ -f "$T/roots/box/projD/.aht/.project-id" ] || fail "nested copy has no marker"
 
 TRAY="$(dirname "$EXE")/aht-tray.exe"
 if [ -f "$TRAY" ]; then
   echo "== tray selftest (headless) =="
-  wine "$TRAY" --selftest || fail "tray selftest exited nonzero"
+  $RUN "$TRAY" --selftest || fail "tray selftest exited nonzero"
 fi
 
 echo ""

@@ -514,6 +514,44 @@ ck(json.loads((b4 / SID / "state.json").read_text())["cwd"] == projK4
    and (khome / "file-history" / b4.name).is_file(),
    "restored state.json cwd re-pointed; companions restored under new keys")
 
+print("\n[15] the store map follows reality after registration")
+(roots / "late").mkdir()
+late = os.path.realpath(str(roots / "late"))
+(tools / "kimi" / "sessions" / md5(late)).mkdir()       # empty dir = no history
+r = run("tag", late, "--apply")
+ck("(none yet)" in r.stdout, "an EMPTY store directory is not history")
+def stores_of(path):
+    reg = json.loads((sb / ".aht" / "registry.json").read_text())
+    return next((e.get("stores") or {} for e in reg["projects"].values()
+                 if e["real_path"] == path), None)
+ck(stores_of(late) == {}, "registered with an empty store map")
+(tools / "claude" / enc(late)).mkdir()
+(tools / "claude" / enc(late) / "s.jsonl").write_text('{"cwd":"x"}\n')
+r = subprocess.run([PY, CLI, "hook"], env=env, capture_output=True, text=True,
+                   input=json.dumps({"cwd": late}))
+ck(sorted(stores_of(late)) == ["claude"],
+   "hook: a session in a known folder refreshes its store map")
+lb = khome / "sessions" / kkey(late) / "session_late"
+lb.mkdir(parents=True)
+(lb / "state.json").write_text('{"id":"session_late","cwd":%s}' % json.dumps(late))
+day = tools / "codex" / "2026" / "09" / "18"
+day.mkdir(parents=True, exist_ok=True)
+(day / "rollout-late.jsonl").write_text(json.dumps(
+    {"type": "session_meta", "payload": {"cwd": late, "id": "y"}}) + "\n")
+r = run("reconcile", "--apply")
+ck(sorted(stores_of(late)) == ["claude", "codex", "kimi-code"],
+   f"reconcile picks up agents used after registration ({sorted(stores_of(late))})")
+r = subprocess.run([PY, "-c", marks_probe, str(HERE.parent), late], env=env,
+                   capture_output=True, text=True)
+ck(all(m in r.stdout for m in ("agent:claude", "agent:codex", "agent:kimi")),
+   f"badge marks follow ({r.stdout.strip()})")
+shutil.rmtree(tools / "claude" / enc(late))
+r = run("icons", "--refresh")
+ck(sorted(stores_of(late)) == ["codex", "kimi-code"],
+   "icons --refresh drops a store that no longer exists")
+r = run("logs", "-n", "400")
+ck("STORES " in r.stdout, "agent-list changes are logged")
+
 shutil.rmtree(sb, ignore_errors=True)
 print("\nCORE RESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")
 for f in FAILS:

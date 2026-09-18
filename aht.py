@@ -802,6 +802,61 @@ def detect_stores(real_path: str, include_files: bool = False) -> dict:
                 pass
     return out
 
+STORES_SCAN_INTERVAL = 600      # s between sweeps of the cwd-keyed session stores
+
+def current_stores(entry: dict, real_path: str, cwds: dict = None) -> dict:
+    """What a project's store map should be NOW.  Dir backends are looked up
+    live (a few stats); a recorded store that is not under today's key but
+    still exists is kept (a conflicted move leaves one like that).  The
+    cwd-keyed backends cost a sweep of their whole store, so they are only
+    re-evaluated when the caller did that sweep once (`cwds`: name -> set of
+    recorded cwds) and otherwise carried over as recorded."""
+    cached = (entry or {}).get("stores") or {}
+    out = {}
+    for b in enabled_backends():
+        if b.kind == "dir":
+            hit = b.find(real_path)
+            rec = cached.get(b.name)
+            if hit:
+                out[b.name] = hit[1].name
+            elif rec and b.available() and (b.root() / rec).is_dir() \
+                    and _dir_has_entries(b.root() / rec):
+                out[b.name] = rec
+        elif b.kind == "files":
+            if cwds is not None and b.name in cwds:
+                pre = real_path + os.sep
+                if any(c == real_path or c.startswith(pre) for c in cwds[b.name]):
+                    out[b.name] = FILE_STORE_SENTINEL
+            elif b.name in cached:
+                out[b.name] = cached[b.name]
+    return out
+
+def refresh_stores(reg: dict, only_paths=None, include_files: bool = False) -> list:
+    """Bring every project's recorded store map up to date (agents get used in
+    a folder long after it was registered).  Returns the folders whose AGENT
+    list changed — the ones whose badge is now wrong.  Caller holds the lock
+    and saves the registry when the result (or reg['_dirty']) says so."""
+    cwds = None
+    if include_files:
+        cwds = {b.name: b.collect_cwds() for b in enabled_backends()
+                if b.kind == "files" and b.available()}
+    want = {os.path.realpath(p) for p in only_paths} if only_paths else None
+    rebadge = []
+    for entry in reg.get("projects", {}).values():
+        real = os.path.realpath(entry.get("real_path") or "")
+        if (want is not None and real not in want) or not os.path.isdir(real):
+            continue
+        old = entry.get("stores") or {}
+        new = current_stores(entry, real, cwds)
+        if new != old:
+            entry["stores"] = new
+            reg["_dirty"] = True
+            if agents_of(new) != agents_of(old):
+                rebadge.append(real)
+                log(f"STORES {real}: {agents_of(old) or 'none'} -> "
+                    f"{agents_of(new) or 'none'}")
+    return rebadge
+
 # --------------------------------------------------------------------------- #
 # Platform seams: dialogs / notifications  (macOS + Linux here; Windows layer
 # patches these over — see windows/src/winlayer.py)
@@ -979,6 +1034,7 @@ def save_registry(reg: dict) -> None:
             shutil.copy2(p, p.with_suffix(".json.bak"))
         except Exception:
             pass
+    reg.pop("_dirty", None)
     tmp = p.with_suffix(".json.tmp")
     with open(tmp, "w") as fh:
         json.dump(reg, fh, indent=2, sort_keys=True)
@@ -2377,15 +2433,18 @@ def cmd_reconcile(args):
     copies = _selected(copies, "copy_path", only)
     news = _selected(news, "path", only)
 
-    def _stores_tag(uid):
-        agents = agents_of((reg["projects"].get(uid) or {}).get("stores"))
+    def _stores_tag(uid, keyed_path):
+        # stores are keyed by the path the project had when they were written,
+        # so a moved folder's histories are still found under its OLD path
+        agents = agents_of(current_stores(reg["projects"].get(uid),
+                                          os.path.realpath(keyed_path)))
         return ", ".join(agents) if agents else "no history yet"
 
     asked = False
     if pol["moves"] == "ask" and moves:
         asked = True
         names = "\n".join("• %s  →  %s\n   histories: %s"
-                          % (m["from"], m["to"], _stores_tag(m["uuid"]))
+                          % (m["from"], m["to"], _stores_tag(m["uuid"], m["from"]))
                           for m in moves[:8])
         extra = "" if len(moves) <= 8 else "\n…and %d more" % (len(moves) - 8)
         ans = ask_dialog("%d tethered project(s) moved or renamed:\n\n%s%s\n\n"
@@ -2396,7 +2455,7 @@ def cmd_reconcile(args):
     if pol["copies"] == "ask" and copies:
         asked = True
         names = "\n".join("• %s\n   histories: %s"
-                          % (c["copy_path"], _stores_tag(c["uuid"]))
+                          % (c["copy_path"], _stores_tag(c["uuid"], c["src"]))
                           for c in copies[:8])
         extra = "" if len(copies) <= 8 else "\n…and %d more" % (len(copies) - 8)
         ans = ask_dialog("%d tethered project folder(s) were copied:\n\n%s%s\n\n"
@@ -2462,6 +2521,19 @@ def cmd_reconcile(args):
             apply_badge(p, marks)
 
     if acted:
+        rebadge = []
+        with Lock():
+            reg = load_registry()
+            age = time.time() - float(reg.get("stores_scan_at", 0) or 0)
+            sweep = bool(args.apply) or age > STORES_SCAN_INTERVAL
+            rebadge = refresh_stores(reg, include_files=sweep)
+            if sweep:
+                reg["stores_scan_at"] = time.time()
+            if sweep or reg.get("_dirty"):
+                save_registry(reg)
+        if cfg_get("icons_enabled", True):
+            for p in rebadge:
+                apply_badge(p, desired_marks(p, True))
         maybe_auto_backup()
 
     if applied_moves or applied_copies or conflicts:
@@ -2565,6 +2637,9 @@ def cmd_hook(args):
                     _register(reg, nu, cwd)
                     save_registry(reg)
                     log(f"HOOK tag-new {cwd}")
+            refresh_stores(reg, only_paths=[cwd])
+            if reg.get("_dirty"):
+                save_registry(reg)
     except TimeoutError:
         warn("HOOK lock timeout; will retry next session")
     except Exception as e:
@@ -3350,10 +3425,12 @@ def cmd_icons(args):
         reg = load_registry()
         tpaths = tethered_paths(reg)
         gpaths = find_git_repos(roots)
-        plan = [(p, desired_marks(p, p in tpaths)) for p in sorted(tpaths | gpaths)]
         if args.refresh:
+            refresh_stores(reg, include_files=True)
+            reg["stores_scan_at"] = time.time()
             reg["git_repos"] = sorted(gpaths)
             save_registry(reg)
+        plan = [(p, desired_marks(p, p in tpaths)) for p in sorted(tpaths | gpaths)]
     both = tpaths & gpaths
     print(f"tethered projects: {len(tpaths)}   git repos under roots: "
           f"{len(gpaths)}   both: {len(both)}")

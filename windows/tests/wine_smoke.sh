@@ -15,7 +15,8 @@ export WINEDEBUG=-all
 T=/tmp/aht-smoke
 rm -rf "$T"
 mkdir -p "$T/home/.aht" "$T/roots/projA/src" \
-         "$T/tools/claude" "$T/tools/gemini" "$T/tools/codex/2026/08/29"
+         "$T/tools/claude" "$T/tools/gemini" "$T/tools/codex/2026/08/29" \
+         "$T/tools/kimi-code/sessions" "$T/tools/kimi-code/user-history"
 if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
   RUN=""                                   # run the exe directly ...
   WT="$(cygpath -w -l "$T")"               # ... with Windows-style paths in
@@ -39,6 +40,7 @@ export AHT_ROOT_OPENCODE="$WT\\tools\\nope"
 export AHT_ROOT_CODEX="$WT\\tools\\codex"
 export AHT_ROOT_COPILOT="$WT\\tools\\nope"
 export AHT_ROOT_KIMI="$WT\\tools\\nope"
+export AHT_ROOT_KIMI_CODE="$WT\\tools\\kimi-code\\sessions"
 export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1
 
 PROJA="$WT\\roots\\projA"
@@ -63,6 +65,12 @@ mkdir -p "$T/tools/gemini/$SHAA"
 echo '{"g":1}' > "$T/tools/gemini/$SHAA/chat.json"
 printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"$WTJ\\\\roots\\\\projA\",\"id\":\"x\"}}" \
   > "$T/tools/codex/2026/08/29/rollout-1.jsonl"
+# Kimi Code 2.x: a wd_<slug>_<hash12> bucket whose session records its cwd
+KIMA=$(W keys "$PROJA" | grep -o 'wd_[a-z0-9._-]*_[0-9a-f]\{12\}' | head -1)
+[ -n "$KIMA" ] || fail "could not read the kimi-code key from aht keys"
+mkdir -p "$T/tools/kimi-code/sessions/$KIMA/session_k1"
+printf '%s' "{\"id\":\"session_k1\",\"cwd\":\"$WTJ\\\\roots\\\\projA\",\"title\":\"t\"}" \
+  > "$T/tools/kimi-code/sessions/$KIMA/session_k1/state.json"
 
 echo "== tag detects stores =="
 TAG=$(W tag "$PROJA" --apply)
@@ -80,6 +88,13 @@ grep -q '"gemini": "renamed"' "$T/rec.json" || fail "gemini store not renamed"
 grep -q '"codex": "rewrote-' "$T/rec.json" || fail "codex cwd not rewritten"
 ENCB=$(W encode "$PROJB")
 [ -d "$T/tools/claude/$ENCB" ] || fail "claude dir not at new key"
+grep -q '"kimi-code": "renamed"' "$T/rec.json" || fail "kimi-code bucket not renamed"
+KIMB=$(W keys "$PROJB" | grep -o 'wd_[a-z0-9._-]*_[0-9a-f]\{12\}' | head -1)
+[ "$KIMA" != "$KIMB" ] || fail "kimi-code key did not change with the path"
+grep -q 'projB' "$T/tools/kimi-code/sessions/$KIMB/session_k1/state.json" \
+  || fail "kimi-code session cwd not re-pointed"
+grep -q '"title":"t"' "$T/tools/kimi-code/sessions/$KIMB/session_k1/state.json" \
+  || fail "kimi-code state.json was not edited surgically"
 grep -q 'projB' "$T/tools/codex/2026/08/29/rollout-1.jsonl" || fail "codex meta not re-pointed"
 ls "$T/home/.aht/backups" > /dev/null 2>&1 || fail "pre-rewrite backup dir missing"
 

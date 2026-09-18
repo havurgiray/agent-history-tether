@@ -23,7 +23,8 @@ env.update({"AHT_HOME": str(sb / ".aht"), "AHT_ROOTS": str(roots),
             "AHT_ROOT_CLAUDE": str(sb / "claude"),
             "AHT_NO_ICONS": "1", "AHT_NO_NOTIFY": "1", "AHT_NO_BACKUP": "1",
             "AHT_ASSUME": "Relink"})
-for b in ("GEMINI", "CURSOR", "OPENCODE", "CODEX", "COPILOT", "KIMI"):
+for b in ("GEMINI", "CURSOR", "OPENCODE", "CODEX", "COPILOT", "KIMI",
+          "KIMI_CODE"):
     env[f"AHT_ROOT_{b}"] = str(sb / "nope")
 
 enc = lambda p: re.sub(r"[^a-zA-Z0-9]", "-", p)

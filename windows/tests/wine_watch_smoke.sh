@@ -28,7 +28,7 @@ run_case() {
     export AHT_HOME="$WT\\home\\.aht"
     export AHT_ROOTS="$WT\\roots"
     export AHT_ROOT_CLAUDE="$WT\\tools\\claude"
-    for b in GEMINI CURSOR OPENCODE CODEX COPILOT KIMI; do
+    for b in GEMINI CURSOR OPENCODE CODEX COPILOT KIMI KIMI_CODE; do
         export "AHT_ROOT_$b=$WT\\tools\\nope"
     done
     export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1 AHT_ASSUME=Relink

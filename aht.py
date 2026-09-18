@@ -316,22 +316,54 @@ def _key_md5(p: str) -> str:
 def _key_dash(p: str) -> str:
     return p.replace(os.sep, "-")
 
+def _kimi_slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9._-]+", "-", name.lower())
+    s = re.sub(r"^-+|-+$", "", s)[:40]
+    s = re.sub(r"^-+|-+$", "", s)
+    return "workspace" if s in ("", ".", "..") else s
+
+def _key_kimicode(p: str) -> str:
+    """Kimi Code 2.x workspace bucket, `wd_<slug>_<sha256[:12]>` — a port of
+    encodeWorkDirKey() in the CLI's own source (workdir-slug.ts): the path is
+    slash-normalised, the leaf is slugified (40 chars max) and the hash covers
+    the whole normalised path."""
+    norm = re.sub(r"/+$", "", p.replace("\\", "/"))
+    return "wd_%s_%s" % (_kimi_slug(norm.split("/")[-1]),
+                         hashlib.sha256(norm.encode("utf-8")).hexdigest()[:12])
+
 def _xdg_data() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME",
                                str(Path.home() / ".local" / "share")))
 
+def _swap_json_path_values(text: str, keys: tuple, old: str, new: str) -> tuple:
+    """Re-point string values of the given JSON keys from `old` to `new`
+    (exact, or `old` as a path prefix) by editing ONLY those values in the raw
+    text, so every other byte of the file stays as the tool wrote it."""
+    old_in = json.dumps(old, ensure_ascii=False)[1:-1]
+    new_in = json.dumps(new, ensure_ascii=False)[1:-1]
+    pat = re.compile(r'("(?:%s)"\s*:\s*")%s(?=["/]|\\\\)'
+                     % ("|".join(re.escape(k) for k in keys), re.escape(old_in)))
+    return pat.subn(lambda m: m.group(1) + new_in, text)
+
 class Backend:
     kind = "stub"
 
-    def __init__(self, name, label, confidence, root_default, note=""):
+    def __init__(self, name, label, confidence, root_default, note="",
+                 agent=None):
         self.name = name
         self.label = label
         self.confidence = confidence
         self._root_default = root_default
         self.note = note
+        # the agent a store belongs to — what the badges and prompts show; two
+        # backends can serve one agent (a CLI that changed its store layout)
+        self.agent = agent or name
+
+    def _env_key(self) -> str:
+        return "AHT_ROOT_" + self.name.upper().replace("-", "_")
 
     def root(self) -> Path:
-        env = os.environ.get(f"AHT_ROOT_{self.name.upper()}")
+        env = os.environ.get(self._env_key())
         if env:
             return Path(env).expanduser()
         try:
@@ -344,7 +376,7 @@ class Backend:
                     else self._root_default).expanduser()
 
     def root_source(self) -> str:
-        if os.environ.get(f"AHT_ROOT_{self.name.upper()}"):
+        if os.environ.get(self._env_key()):
             return "env"
         try:
             if (cfg_get("backend_roots") or {}).get(self.name):
@@ -364,26 +396,228 @@ class DirBackend(Backend):
     kind = "dir"
 
     def __init__(self, name, label, confidence, root_default, keys,
-                 companion_subdir=None):
-        super().__init__(name, label, confidence, root_default)
+                 companion_subdir=None, **kw):
+        super().__init__(name, label, confidence, root_default, **kw)
         self.keys = keys
         self._companion = companion_subdir      # (sibling_dir, suffix) or None
 
-    def companion(self, key: str):
+    def companions(self, key: str, real_path: str, for_copy: bool = False) -> list:
+        """[(tag, path)] sibling files that belong to the store `key` of the
+        project at `real_path`.  The tag names the file inside a backup zip
+        (`<backend>/__aht_companion__<tag>`), so it must stay stable.
+        `for_copy` leaves out files that must not be shared by a duplicate."""
         if not self._companion:
-            return None
+            return []
         sub, suffix = self._companion
-        return self.root().parent / sub / (key + suffix)
+        return [(suffix, self.root().parent / sub / (key + suffix))]
 
     def find(self, real_path: str):
-        """-> (key_index, existing_store_dir) or None."""
+        """-> (key_index, existing_store_dir) or None.  An EMPTY directory is
+        not a store: tools leave those behind, and they hold no history."""
         if not self.available():
             return None
         for i, k in enumerate(self.keys):
             d = self.root() / k(real_path)
-            if d.is_dir():
+            if d.is_dir() and _dir_has_entries(d):
                 return i, d
         return None
+
+    # seams for stores that also record the project path INSIDE their files;
+    # each returns a short note for the log (or "")
+    def after_relink(self, uid, old_real, new_real, old_key, new_dir) -> str:
+        return ""
+
+    def after_copy(self, uid, src_real, new_real, new_dir) -> str:
+        return ""
+
+    def after_restore(self, uid, old_real, new_real, new_dir, added) -> str:
+        return ""
+
+def _dir_has_entries(d: Path) -> bool:
+    try:
+        with os.scandir(d) as it:
+            return next(it, None) is not None
+    except OSError:
+        return False
+
+class KimiCodeBackend(DirBackend):
+    """Kimi Code 2.x (`~/.kimi-code`, or $KIMI_CODE_HOME).  Sessions live in
+    `sessions/wd_<slug>_<hash12>/<session>/` and the session picker finds them
+    purely by that bucket name, so the rename is what reconnects a moved
+    project.  Around it the CLI also keeps, per project:
+      user-history/<md5(cwd)>.jsonl   prompt history        -> companion
+      file-history/<bucket>           retention ledger      -> companion
+      <session>/state.json  "cwd"     the dir a RESUMED session runs in
+      workspaces.json                 catalog: bucket -> {root, name}
+      session_index.jsonl             append-only {sessionId, sessionDir, workDir}
+      sessions/.index-dirty/          journal that makes the CLI re-read a session
+    Transcripts (wire.jsonl) mention paths too but are history: never edited.
+    workspace-trust/ is a security decision about a location: never carried."""
+
+    PATH_KEYS = ("cwd",)
+
+    def home(self) -> Path:
+        return self.root().parent
+
+    def companions(self, key: str, real_path: str, for_copy: bool = False) -> list:
+        h = self.home()
+        out = [(".jsonl", h / "user-history" / (_key_md5(real_path) + ".jsonl"))]
+        if not for_copy:
+            # the ledger names the ORIGINAL's session ids: a duplicate has its own
+            out.append((".file-history", h / "file-history" / key))
+        return out
+
+    def _sessions(self, bucket: Path) -> list:
+        try:
+            return sorted(d for d in bucket.iterdir()
+                          if d.is_dir() and (d / "state.json").is_file())
+        except OSError:
+            return []
+
+    def _repoint_state(self, state: Path, old: str, new: str) -> int:
+        text = state.read_text(encoding="utf-8")
+        text2, n = _swap_json_path_values(text, self.PATH_KEYS, old, new)
+        if n:
+            tmp = Path(str(state) + ".aht-tmp")
+            tmp.write_text(text2, encoding="utf-8")
+            os.replace(tmp, state)
+        return n
+
+    def _announce(self, sessions: list, work_dir: str) -> None:
+        """Tell the CLI about sessions at a new place the way it tells itself:
+        append to its session log (never rewritten — the CLI compacts stale
+        lines on its own) and leave a dirty mark so its index re-reads them."""
+        if not sessions:
+            return
+        idx = self.home() / "session_index.jsonl"
+        try:
+            if idx.is_file():
+                lines = "".join(json.dumps(
+                    {"sessionId": s.name, "sessionDir": str(s), "workDir": work_dir},
+                    ensure_ascii=False, separators=(",", ":")) + "\n"
+                    for s in sessions)
+                with open(idx, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    if fh.tell():
+                        fh.seek(-1, os.SEEK_END)
+                        if fh.read(1) != b"\n":
+                            lines = "\n" + lines
+                with open(idx, "a", encoding="utf-8") as fh:
+                    fh.write(lines)
+        except OSError as e:
+            warn(f"[{self.name}] session index not updated: {e}")
+        dirty = self.root() / ".index-dirty"
+        if dirty.is_dir():
+            ms = int(time.time() * 1000)
+            for s in sessions:
+                try:
+                    (dirty / f"{s.name}.{ms}").touch()
+                except OSError:
+                    pass
+
+    def _recatalog(self, old_real, new_real, old_key, new_key, bdir) -> bool:
+        """Rename the project's entry in workspaces.json.  Only when the file
+        is exactly the shape we know and the old entry points at old_real."""
+        cat = self.home() / "workspaces.json"
+        try:
+            data = json.loads(cat.read_text(encoding="utf-8"))
+            ws = data["workspaces"]
+            if data.get("version") != 1 or new_key in ws \
+                    or ws[old_key]["root"] != old_real:
+                return False
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        bdir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cat, bdir / cat.name)
+        entry = dict(ws[old_key], root=new_real)
+        if entry.get("name") == os.path.basename(old_real):
+            entry["name"] = os.path.basename(new_real)
+        data["workspaces"] = {(new_key if k == old_key else k):
+                              (entry if k == old_key else v) for k, v in ws.items()}
+        tmp = Path(str(cat) + ".aht-tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                       encoding="utf-8")
+        os.replace(tmp, cat)
+        return True
+
+    def after_relink(self, uid, old_real, new_real, old_key, new_dir) -> str:
+        sessions = self._sessions(new_dir)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        bdir = backups_root() / uid / "rewrites" / f"{self.name}-{stamp}"
+        n = 0
+        # as the path appears INSIDE a JSON file (backslashes, quotes escaped)
+        needle = json.dumps(old_real, ensure_ascii=False)[1:-1]
+        for s in sessions:
+            st = s / "state.json"
+            try:
+                if needle not in st.read_text(encoding="utf-8"):
+                    continue
+                dst = bdir / new_dir.name / s.name / st.name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(st, dst)               # mandatory pre-rewrite backup
+                n += self._repoint_state(st, old_real, new_real)
+            except Exception as e:
+                error(f"MOVE [{self.name}] cwd not re-pointed in {st}: {e}")
+        cataloged = False
+        try:
+            cataloged = self._recatalog(old_real, new_real, old_key,
+                                        new_dir.name, bdir)
+        except Exception as e:
+            warn(f"MOVE [{self.name}] workspace catalog left as is: {e}")
+        self._announce(sessions, new_real)
+        return (f"{len(sessions)} session(s), {n} cwd value(s) re-pointed"
+                + (", catalog entry renamed" if cataloged else ""))
+
+    def _fresh_id(self, session: Path) -> Path:
+        """Give a session (a copy we just made) an id of its own."""
+        nid = "session_" + str(_uuid.uuid4())
+        st = session / "state.json"
+        text = st.read_text(encoding="utf-8")
+        text = re.sub(r'("id"\s*:\s*")%s(")' % re.escape(session.name),
+                      lambda m: m.group(1) + nid + m.group(2), text, count=1)
+        st.write_text(text, encoding="utf-8")
+        tgt = session.parent / nid
+        os.rename(str(session), str(tgt))
+        return tgt
+
+    def _id_taken_elsewhere(self, session: Path) -> bool:
+        try:
+            return any((b / session.name).is_dir() for b in self.root().iterdir()
+                       if b.is_dir() and b != session.parent
+                       and not b.name.startswith("."))
+        except OSError:
+            return False
+
+    def after_copy(self, uid, src_real, new_real, new_dir) -> str:
+        """The CLI indexes sessions by id across ALL buckets, so a duplicate
+        keeps its content but gets ids of its own — the original stays the
+        sole owner of the ids it had."""
+        fresh = []
+        for s in self._sessions(new_dir):
+            try:
+                self._repoint_state(s / "state.json", src_real, new_real)
+                fresh.append(self._fresh_id(s))
+            except Exception as e:
+                warn(f"COPY [{self.name}] session {s.name} left as copied: {e}")
+        self._announce(fresh, new_real)
+        return f"{len(fresh)} session(s) duplicated under fresh ids"
+
+    def after_restore(self, uid, old_real, new_real, new_dir, added) -> str:
+        states = [f for f in added
+                  if f.name == "state.json" and f.parent.parent == new_dir]
+        n, sessions = 0, []
+        for st in states:
+            s = st.parent
+            try:
+                if old_real and old_real != new_real:
+                    n += self._repoint_state(st, old_real, new_real)
+                if self._id_taken_elsewhere(s):     # restored beside a live original
+                    s = self._fresh_id(s)
+            except Exception as e:
+                warn(f"RESTORE [{self.name}] {st}: {e}")
+            sessions.append(s)
+        self._announce(sessions, new_real)
+        return f"{len(sessions)} session(s), {n} cwd value(s) re-pointed"
 
 class FilesBackend(Backend):
     """Sessions in a global store with the project cwd embedded; relink =
@@ -518,7 +752,12 @@ BACKENDS = [
     FilesBackend("copilot", "GitHub Copilot CLI", "best-effort",
                  lambda: Path.home() / ".copilot" / "history-session-state",
                  ["*.json", "*.jsonl"]),
-    DirBackend("kimi", "Kimi Code", "verified",
+    KimiCodeBackend("kimi-code", "Kimi Code", "verified",
+                    lambda: Path(os.environ.get("KIMI_CODE_HOME")
+                                 or Path.home() / ".kimi-code") / "sessions",
+                    [_key_kimicode], agent="kimi"),
+    # the 1.x CLI's layout; the 2.x migration copies it and leaves it behind
+    DirBackend("kimi", "Kimi CLI 1.x", "verified",
                lambda: Path.home() / ".kimi" / "sessions", [_key_md5],
                companion_subdir=("user-history", ".jsonl")),
 ]
@@ -532,7 +771,11 @@ def enabled_backends() -> list:
 def agents_of(stores: dict) -> list:
     """The agents a project has history with, in stable backend order —
     what the relink prompt shows and what the badges draw."""
-    return [n for n in BACKEND_NAMES if n in (stores or {})]
+    out = []
+    for n in BACKEND_NAMES:
+        if n in (stores or {}) and BY_NAME[n].agent not in out:
+            out.append(BY_NAME[n].agent)
+    return out
 
 def claude_backend() -> DirBackend:
     return BY_NAME["claude"]
@@ -928,7 +1171,7 @@ def desired_marks(path, tethered) -> list:
         marks.append("git")
     if tethered and cfg_get("icons_agent", True):
         stores = tethered if isinstance(tethered, dict) else _stores_for_path(path)
-        agents = [n for n in BACKEND_NAMES if n in stores]
+        agents = agents_of(stores)
         if agents:
             marks += ["agent:" + n for n in agents]
         else:
@@ -1274,9 +1517,9 @@ def _project_sources(entry: dict) -> list:
                 for f in d.rglob("*"):
                     if f.is_file():
                         out.append((f, f"{b.name}/{f.relative_to(d)}"))
-                comp = b.companion(d.name)
-                if comp and comp.is_file():
-                    out.append((comp, f"{b.name}/__aht_companion__{comp.suffix}"))
+                for tag, comp in b.companions(d.name, real):
+                    if comp.is_file():
+                        out.append((comp, f"{b.name}/__aht_companion__{tag}"))
         elif b.kind == "files":
             for f in b.scan(real):
                 out.append((f, f"{b.name}/{f.relative_to(b.root())}"))
@@ -1470,6 +1713,7 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
     per_backend: dict = {}
     old_real = snap.get("real_path") or ""
     restored_files = []
+    added_in_dirs: dict = {}
     with zipfile.ZipFile(snap["zip"]) as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -1485,7 +1729,8 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
                 continue
             if b.kind == "dir":
                 if rel.startswith("__aht_companion__"):
-                    dest = b.companion(b.keys[0](new_real))
+                    dest = dict(b.companions(b.keys[0](new_real), new_real)).get(
+                        rel[len("__aht_companion__"):])
                     if dest is None:
                         skipped += 1
                         continue
@@ -1513,6 +1758,17 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
             per_backend[bname] = per_backend.get(bname, 0) + 1
             if b.kind == "files":
                 restored_files.append((b, dest))
+            elif not rel.startswith("__aht_companion__"):
+                added_in_dirs.setdefault(bname, []).append(dest)
+    for bname, files in added_in_dirs.items():
+        b = BY_NAME[bname]
+        try:
+            note = b.after_restore(snap.get("uuid", "unknown"), old_real, new_real,
+                                   b.root() / b.keys[0](new_real), files)
+            if note:
+                log(f"RESTORE [{bname}] {note}")
+        except Exception as e:
+            warn(f"RESTORE [{bname}] follow-up failed: {e}")
     if old_real and old_real != new_real:
         # re-point cwd in the restored session files AND in any live session
         # files still referencing the snapshot-era path (the live ones are
@@ -1701,7 +1957,8 @@ def _apply_dir_moves(b: DirBackend, reg: dict, moves: list) -> None:
         own = owner.get(tgt.name)
         if (tcount[tgt.name] > 1
                 or (own is not None and own != m["uuid"] and own not in moving)
-                or (own is None and tgt.exists())):
+                or (own is None and tgt.exists()
+                    and not (tgt.is_dir() and not _dir_has_entries(tgt)))):
             m["stores"][b.name] = "conflict-target-occupied"
             error(f"CONFLICT [{b.name}] {m['from']} -> {m['to']}: target "
                 f"{tgt.name} occupied; store left intact")
@@ -1719,23 +1976,36 @@ def _apply_dir_moves(b: DirBackend, reg: dict, moves: list) -> None:
             error(f"MOVE [{b.name}] stage failed {src.name}: {e}")
     for m, tmp, tgt, orig in staged:
         try:
+            if tgt.is_dir() and not _dir_has_entries(tgt):
+                tgt.rmdir()              # an empty placeholder holds no history
             if tgt.exists():
                 os.rename(str(tmp), str(orig))
                 m["stores"][b.name] = "conflict-race-restored"
                 continue
             os.rename(str(tmp), str(tgt))
             m["stores"][b.name] = "renamed"
-            comp_old = b.companion(orig.name)
-            comp_new = b.companion(tgt.name)
-            if comp_old and comp_old.is_file():
+            old_real = os.path.realpath(m["from"])
+            new_real = os.path.realpath(m["to"])
+            new_comps = dict(b.companions(tgt.name, new_real))
+            for tag, comp_old in b.companions(orig.name, old_real):
+                comp_new = new_comps.get(tag)
+                if comp_new is None or not comp_old.is_file():
+                    continue
                 try:
                     if comp_new.exists():
-                        log(f"MOVE [{b.name}] companion target exists; kept both")
+                        log(f"MOVE [{b.name}] companion {comp_new.name} exists; "
+                            f"kept both")
                     else:
                         comp_new.parent.mkdir(parents=True, exist_ok=True)
                         os.rename(str(comp_old), str(comp_new))
                 except OSError as e:
                     warn(f"MOVE [{b.name}] companion rename failed: {e}")
+            try:
+                note = b.after_relink(m["uuid"], old_real, new_real, orig.name, tgt)
+                if note:
+                    log(f"MOVE [{b.name}] {tgt.name}: {note}")
+            except Exception as e:
+                error(f"MOVE [{b.name}] follow-up failed for {tgt.name}: {e}")
         except OSError as e:
             error(f"MOVE [{b.name}] place failed -> {tgt.name}: {e}")
             try:
@@ -1835,16 +2105,28 @@ def apply_copies(reg: dict, copies: list, copy_history: bool = True) -> list:
                     if tgt.name in owner and owner[tgt.name]:
                         statuses[b.name] = "target-owned-skip"
                         continue
+                    fresh = not tgt.exists()
                     statuses[b.name] = safe_copy_tree(src, tgt)
-                    comp_src = b.companion(src.name)
-                    comp_tgt = b.companion(tgt.name)
-                    if comp_src and comp_src.is_file() and comp_tgt \
-                            and not comp_tgt.exists():
+                    src_real = os.path.realpath(c["src"])
+                    tgt_comps = dict(b.companions(tgt.name, new_real, for_copy=True))
+                    for tag, comp_src in b.companions(src.name, src_real,
+                                                      for_copy=True):
+                        comp_tgt = tgt_comps.get(tag)
+                        if comp_tgt is None or not comp_src.is_file() \
+                                or comp_tgt.exists():
+                            continue
                         try:
                             comp_tgt.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(comp_src, comp_tgt)
                         except OSError:
                             pass
+                    if fresh:
+                        try:
+                            note = b.after_copy(nu, src_real, new_real, tgt)
+                            if note:
+                                log(f"COPY [{b.name}] {tgt.name}: {note}")
+                        except Exception as e:
+                            warn(f"COPY [{b.name}] follow-up failed: {e}")
             _register(reg, nu, c["copy_path"])
             c["status"] = "duplicated" if copy_history else "claimed-no-history"
             c["stores"] = statuses
@@ -2963,7 +3245,8 @@ BACKENDS (aht status shows which are active on this machine):
   opencode  OpenCode              dir-rename, best-effort (self-verifying)
   codex     OpenAI Codex CLI      cwd rewrite, backup-first
   copilot   GitHub Copilot CLI    cwd rewrite, best-effort, backup-first
-  kimi      Kimi Code             dir-rename, verified (+ history file)
+  kimi-code Kimi Code 2.x         bucket rename + cwd re-point, verified
+  kimi      Kimi CLI 1.x          dir-rename, verified (+ history file)
 
 HOW:
   • a marker  .aht/.project-id  (a UUID) travels with each folder

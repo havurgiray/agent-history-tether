@@ -66,7 +66,11 @@ Docker+Wine from macOS/Linux) and run `aht.exe install`.
 > ID yet), so Gatekeeper blocks the first launch of a downloaded *or*
 > Homebrew-installed copy ("Apple could not verify…"): allow it once under
 > *System Settings ▸ Privacy & Security ▸ Open Anyway*, or clear the flag
-> with `xattr -dr com.apple.quarantine /Applications/aht.app`.  The Windows
+> with `xattr -dr com.apple.quarantine /Applications/aht.app`.  (macOS also
+> stamps that flag on the helper copies the app installs under `~/.aht`;
+> the installer clears it from those copies, and `aht doctor` checks that
+> the badge tool really runs.)  After an upgrade, run `aht install` again so
+> the watcher and the hook use the new core.  The Windows
 > exes are unsigned, so SmartScreen shows "unknown publisher" on first run
 > (*More info ▸ Run anyway*).  Every release ships `SHA256SUMS.txt`, and
 > every artifact is built and smoke-tested on GitHub's runners for its exact

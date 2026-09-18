@@ -1453,15 +1453,33 @@ def _ensure_linux_emblems() -> bool:
         warn(f"emblem generation failed: {e}")
         return False
 
+def _badge_tool():
+    return next((c for c in (Path(__file__).with_name("badge_icon"),
+                             aht_home() / "tools/agent-history-tether/badge_icon")
+                 if c.exists()), None)
+
+_BADGE_TOOL_WARNED = False
+
 def _badge_macos(path, marks) -> None:
-    b = next((c for c in (Path(__file__).with_name("badge_icon"),
-                          aht_home() / "tools/agent-history-tether/badge_icon")
-              if c.exists()), None)
+    global _BADGE_TOOL_WARNED
+    b = _badge_tool()
     if b is None:
+        if not _BADGE_TOOL_WARNED:
+            _BADGE_TOOL_WARNED = True
+            warn("badge tool missing; folder badges are not applied — "
+                 "run:  aht install")
         return
     cmd = [str(b), "set", str(path)] + list(marks) if marks \
         else [str(b), "clear", str(path)]
-    subprocess.run(cmd, capture_output=True, timeout=30)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        rc, err = r.returncode, (r.stderr or "").strip()
+    except OSError as e:                # macOS refused to run it (Gatekeeper)
+        rc, err = -1, str(e)
+    if rc != 0 and not _BADGE_TOOL_WARNED:
+        _BADGE_TOOL_WARNED = True       # once per run, not once per folder
+        warn(f"badge tool failed (exit {rc}) on {path}: {err[:160]} — "
+             f"if macOS blocked it, run:  aht install")
 
 def _badge_linux(path, marks) -> None:
     method = cfg_get("linux_emblem_method", "auto")
@@ -3012,6 +3030,27 @@ def cmd_doctor(args):
             ck("backup store writable", True, backups_root())
         except Exception as e:
             ck("backup store writable", False, e)
+    if IS_MAC and cfg_get("icons_enabled", True) \
+            and not os.environ.get("AHT_NO_ICONS"):
+        tool = _badge_tool()
+        ok, detail = False, "missing — run:  aht install"
+        if tool is not None:
+            import tempfile
+            out = Path(tempfile.gettempdir()) / f"aht-badge-check-{os.getpid()}.png"
+            try:
+                r = subprocess.run([str(tool), "preview", str(out), "agent:aht"],
+                                   capture_output=True, text=True, timeout=30)
+                ok = r.returncode == 0 and out.is_file()
+                detail = str(tool) if ok else (
+                    f"exit {r.returncode} — macOS may have blocked it; run:  aht install")
+            except OSError as e:
+                detail = f"{e} — macOS may have blocked it; run:  aht install"
+            finally:
+                try:
+                    out.unlink()
+                except OSError:
+                    pass
+        ck("folder badge tool runs", ok, detail)
     nprob = recent_log_problems()
     ck("no warnings/errors logged in the last 24h", nprob == 0,
        f"{nprob} — inspect with:  aht logs --errors")

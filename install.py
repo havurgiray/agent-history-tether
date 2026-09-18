@@ -72,6 +72,19 @@ def stage_files():
                 pass
     return prebuilt
 
+def unquarantine():
+    """macOS stamps com.apple.quarantine on every file written by a process
+    that was started from a quarantined app — which is how this installer runs
+    when aht.app sets itself up — and then refuses to run our own ad-hoc
+    signed helpers.  The user approved the app these files came out of, so
+    the copies we just wrote into OUR directory lose the inherited flag."""
+    targets = [p for p in TOOLS.iterdir() if p.is_file()] + [PLIST, TRAY_PLIST]
+    targets += [d / "aht" for d in COMMAND_DIRS]
+    for p in targets:
+        if p.is_file() and not p.is_symlink():
+            subprocess.run(["/usr/bin/xattr", "-d", "com.apple.quarantine", str(p)],
+                           capture_output=True)
+
 def compile_binaries(prebuilt):
     for binname, srcname in BINARIES.items():
         if binname in prebuilt or (binname == "aht-tray" and FROM_APP):
@@ -198,6 +211,7 @@ if __name__ == "__main__":
     write_plist()
     install_command()
     install_hook()
+    unquarantine()               # before launchd (or anyone) runs the helpers
     load_agent()
     if FROM_APP:
         stop_other_trays()

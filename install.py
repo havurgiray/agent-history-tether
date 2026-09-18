@@ -41,6 +41,18 @@ FROM_APP = ARGS.tray_exe is not None or ".app/Contents/Resources" in str(SRC)
 sys.path.insert(0, str(SRC))
 import aht                       # noqa: E402  the core: single source of truth for roots
 
+def _put(src: Path, dst: Path, mode=None) -> None:
+    """Install one file by writing a NEW file and renaming it over the old one.
+    Overwriting a signed binary in place leaves macOS with a stale signature
+    for that file and it kills the next launches (exit reason EXEC, SIGKILL);
+    a rename gives the new code its own inode, and a helper that is running
+    right now keeps its old one until it is restarted."""
+    tmp = dst.with_name(f".{dst.name}.aht-new")
+    shutil.copy2(src, tmp)
+    if mode is not None:
+        tmp.chmod(mode)
+    os.replace(tmp, dst)
+
 def stage_files():
     """Copy the tool into TOOLS: the sources always, and the prebuilt binaries
     when SRC carries them (aht.app does).  Returns the names copied prebuilt."""
@@ -49,19 +61,18 @@ def stage_files():
         return set()             # `aht install` re-run from the installed copy: repair in place
     for f in SOURCES:
         if (SRC / f).is_file():
-            shutil.copy2(SRC / f, TOOLS / f)
+            _put(SRC / f, TOOLS / f)
     tray_src = next((c for c in (SRC / "macos/tray.swift", SRC / "tray.swift")
                      if c.is_file()), None)
     if tray_src:
-        shutil.copy2(tray_src, TOOLS / "tray.swift")
+        _put(tray_src, TOOLS / "tray.swift")
     prebuilt = set()
     for name in BINARIES:
         if name == "aht-tray" and FROM_APP:
             continue             # the app itself is the tray
         b = SRC / name
         if b.is_file() and os.access(b, os.X_OK):
-            shutil.copy2(b, TOOLS / name)
-            (TOOLS / name).chmod(0o755)
+            _put(b, TOOLS / name, mode=0o755)
             prebuilt.add(name)
     if FROM_APP:
         # a stale standalone tray next to the core would be a second tray

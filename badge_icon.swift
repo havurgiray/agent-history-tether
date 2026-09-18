@@ -22,6 +22,13 @@ let AGENT_COLORS: [String: (CGFloat, CGFloat, CGFloat)] = [
     "kimi":     (124/255.0,  58/255.0, 237/255.0),
 ]
 let COUNT_COLOR: (CGFloat, CGFloat, CGFloat) = (51/255.0, 58/255.0, 66/255.0)
+// "agent:aht" = tethered, but no agent has history here yet.  Deliberately
+// unlike every agent's mark, so a missing agent never passes for a present one.
+let NEUTRAL_COLOR: (CGFloat, CGFloat, CGFloat) = (124/255.0, 132/255.0, 142/255.0)
+
+func colorFor(_ agent: String) -> (CGFloat, CGFloat, CGFloat) {
+    return AGENT_COLORS[agent] ?? NEUTRAL_COLOR
+}
 
 func folderBase(_ size: CGFloat) -> NSImage {
     let img = NSImage(size: NSSize(width: size, height: size))
@@ -40,7 +47,8 @@ func glyphFor(_ agent: String) -> String {
     case "codex": return "ring"
     case "copilot": return "bar"
     case "kimi": return "crescent"
-    default: return "asterisk"          // claude + neutral fallback
+    case "claude": return "asterisk"
+    default: return "infinity"          // the neutral mark
     }
 }
 
@@ -87,6 +95,18 @@ func drawDisc(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, d: CGFloat,
         ctx.addLine(to: CGPoint(x: cx + d * 0.22, y: cy - d * 0.16))
         ctx.addLine(to: CGPoint(x: cx - d * 0.22, y: cy - d * 0.16))
         ctx.closePath(); ctx.fillPath()
+    case "infinity":
+        ctx.setLineWidth(d * 0.12)
+        ctx.setLineJoin(.round)
+        let a = Double(d) * 0.27, n = 96
+        for i in 0...n {
+            let t = 2 * Double.pi * Double(i) / Double(n)
+            let k = 1 + sin(t) * sin(t)
+            let p = CGPoint(x: cx + CGFloat(a * cos(t) / k),
+                            y: cy + CGFloat(a * sin(t) * cos(t) / k))
+            if i == 0 { ctx.move(to: p) } else { ctx.addLine(to: p) }
+        }
+        ctx.closePath(); ctx.strokePath()
     case "crescent":
         ctx.fillEllipse(in: CGRect(x: cx - d * 0.24, y: cy - d * 0.24,
                                    width: d * 0.48, height: d * 0.48))
@@ -115,14 +135,14 @@ func drawAgents(_ ctx: CGContext, _ size: CGFloat, _ agents: [String]) {
     case 1:
         let d = size * 0.345
         drawDisc(ctx, cx: size - d/2 - inset, cy: d/2 + inset, d: d,
-                 rgb: AGENT_COLORS[agents[0]] ?? AGENT_COLORS["claude"]!,
+                 rgb: colorFor(agents[0]),
                  glyph: glyphFor(agents[0]))
     case 2:
         let d = size * 0.26, gap = size * 0.02
         var cx = size - d/2 - size * 0.04
         for a in agents.reversed() {
             drawDisc(ctx, cx: cx, cy: d/2 + inset, d: d,
-                     rgb: AGENT_COLORS[a] ?? AGENT_COLORS["claude"]!,
+                     rgb: colorFor(a),
                      glyph: glyphFor(a))
             cx -= d + gap
         }
@@ -131,7 +151,7 @@ func drawAgents(_ ctx: CGContext, _ size: CGFloat, _ agents: [String]) {
         var cx = size - d/2 - size * 0.04
         for a in agents.reversed() {
             drawDisc(ctx, cx: cx, cy: d/2 + inset, d: d,
-                     rgb: AGENT_COLORS[a] ?? AGENT_COLORS["claude"]!,
+                     rgb: colorFor(a),
                      glyph: glyphFor(a))
             cx -= d + gap
         }

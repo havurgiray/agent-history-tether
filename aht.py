@@ -1247,7 +1247,9 @@ AGENT_BADGES = {
     "codex":    ((16, 163, 127),  "ring"),
     "copilot":  ((110, 64, 201),  "bar"),
     "kimi":     ((124, 58, 237),  "crescent"),
-    "aht":      ((217, 119, 87),  "asterisk"),   # neutral fallback
+    # tethered, but no agent has history here yet — deliberately unlike any
+    # agent's mark, so a missing agent can never pass for a present one
+    "aht":      ((124, 132, 142), "infinity"),
 }
 COUNT_BADGE_RGB = (51, 58, 66)
 
@@ -1279,6 +1281,7 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
     r_out = d * 0.5 - 0.5           # white halo edge
     r_in = d * 0.42                 # colored disc
     import math
+    loop = _infinity_cov(d, 0.27, 0.06) if glyph == "infinity" else None
     for y in range(d):
         for x in range(d):
             dx, dy = x - c, y - c
@@ -1315,6 +1318,8 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
                 elif glyph == "crescent":
                     d2 = ((dx - d * 0.10) ** 2 + (dy + d * 0.08) ** 2) ** 0.5
                     g = _c01(d * 0.24 - dist + 0.5) * _c01(d2 - d * 0.20 + 0.5)
+                elif loop is not None:
+                    g = loop[y * d + x]
                 elif glyph in _DIGITS:
                     rows = _DIGITS[glyph]
                     cell = d * 0.115
@@ -1351,6 +1356,31 @@ def infinity_rgba(d: int, rgb=(255, 255, 255), bg=None, span: float = 0.46,
     renderer for the Windows/Linux trays and the release artwork, so every
     platform draws the same shape (the macOS menu bar uses the matching SF
     Symbol)."""
+    cov = _infinity_cov(d, span, thickness)
+    c = (d - 1) / 2.0
+    buf = bytearray(d * d * 4)
+    r_bg = d * 0.47
+    for y in range(d):
+        dy = y - c
+        for x in range(d):
+            j = y * d + x
+            g = cov[j]
+            ab = _c01(r_bg - ((x - c) ** 2 + dy * dy) ** 0.5 + 0.5) if bg else 0.0
+            alpha = g + ab * (1.0 - g)
+            if alpha <= 0.0:
+                continue
+            if ab > 0.0 and g < 1.0:                      # stroke over the disc
+                col = tuple(int((rgb[i] * g + bg[i] * ab * (1.0 - g)) / alpha)
+                            for i in range(3))
+            else:
+                col = rgb
+            i4 = j * 4
+            buf[i4], buf[i4 + 1], buf[i4 + 2] = col
+            buf[i4 + 3] = int(alpha * 255 + 0.5)
+    return buf
+
+def _infinity_cov(d: int, span: float, thickness: float) -> list:
+    """Per-pixel coverage (0..1) of an infinity loop centred in a d×d tile."""
     import math
     c = (d - 1) / 2.0
     a = d * span                     # lemniscate half-span
@@ -1385,26 +1415,7 @@ def infinity_rgba(d: int, rgb=(255, 255, 255), bg=None, span: float = 0.46,
                 v = ro - ((x - px) ** 2 + dy * dy) ** 0.5
                 if v > cov[row + x]:
                     cov[row + x] = 1.0 if v > 1.0 else v
-    buf = bytearray(d * d * 4)
-    r_bg = d * 0.47
-    for y in range(d):
-        dy = y - c
-        for x in range(d):
-            j = y * d + x
-            g = cov[j]
-            ab = _c01(r_bg - ((x - c) ** 2 + dy * dy) ** 0.5 + 0.5) if bg else 0.0
-            alpha = g + ab * (1.0 - g)
-            if alpha <= 0.0:
-                continue
-            if ab > 0.0 and g < 1.0:                      # stroke over the disc
-                col = tuple(int((rgb[i] * g + bg[i] * ab * (1.0 - g)) / alpha)
-                            for i in range(3))
-            else:
-                col = rgb
-            i4 = j * 4
-            buf[i4], buf[i4 + 1], buf[i4 + 2] = col
-            buf[i4 + 3] = int(alpha * 255 + 0.5)
-    return buf
+    return cov
 
 APP_ICON_RGB = (51, 58, 66)          # slate disc behind the white loop
 
@@ -1413,7 +1424,7 @@ def app_icon_png(d: int) -> bytes:
     return _png_bytes(d, infinity_rgba(d, (255, 255, 255), bg=APP_ICON_RGB,
                                        span=0.34, thickness=0.058))
 
-EMBLEM_VERSION = 1
+EMBLEM_VERSION = 2
 
 def _ensure_linux_emblems() -> bool:
     """Generate the per-agent + count emblems into the user icon theme once.

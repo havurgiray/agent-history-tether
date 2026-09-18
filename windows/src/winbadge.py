@@ -36,7 +36,7 @@ INK = (28, 26, 25)              # the git "+"
 SIZES = (16, 32, 48, 256)
 BADGE_REL = ".aht\\aht-badge.ico"
 ICON_LINE = f"IconResource={BADGE_REL},0"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 FILE_ATTRIBUTE_READONLY = 0x01
 FILE_ATTRIBUTE_HIDDEN = 0x02

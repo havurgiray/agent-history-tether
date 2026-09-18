@@ -52,7 +52,7 @@ import platform
 import subprocess
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")

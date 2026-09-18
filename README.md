@@ -26,7 +26,8 @@
 | `opencode` | OpenCode | `$XDG_DATA_HOME/opencode/project/<enc>` | rename dir | best-effort |
 | `codex` | OpenAI Codex CLI | `~/.codex/sessions/**/*.jsonl` (cwd inside) | rewrite cwd, **backup-first** | high (layout confirmed on a real install) |
 | `copilot` | GitHub Copilot CLI | `~/.copilot/history-session-state/**` | rewrite cwd, **backup-first** | best-effort |
-| `kimi` | Kimi Code | `~/.kimi/sessions/<md5(path)>` (+ `user-history/<md5>.jsonl` companion) | rename dir + companion | **verified** (mapped from a real install) |
+| `kimi-code` | Kimi Code 2.x | `~/.kimi-code/sessions/wd_<slug>_<sha256[:12]>` (+ prompt-history and file-history companions; the path is also recorded in each session's `state.json` and in the workspace catalog) | rename bucket + companions, re-point `cwd`, **backup-first** | **verified** (key function ported from the CLI's own source, layout mapped from a real install) |
+| `kimi` | Kimi CLI 1.x | `~/.kimi/sessions/<md5(path)>` (+ `user-history/<md5>.jsonl` companion) | rename dir + companion | **verified** (mapped from a real install; kept for machines the 2.x migration has not reached) |
 
 **Why "best-effort" is still safe:** dir-rename backends are *self-verifying* —
 aht only acts when `key(old_path)` names a directory that actually exists,
@@ -34,6 +35,14 @@ which proves the key formula matches that tool's reality; otherwise it does
 nothing.  Metadata-rewrite backends copy every file they are about to touch
 into the backup store first.  Disable any backend with
 `aht config --set backends=claude,gemini,…`.
+
+Two backends can serve one agent: Kimi changed its store layout between
+1.x and 2.x, so `kimi` and `kimi-code` both count as *Kimi* on badges and in
+prompts.  For Kimi Code, aht renames the session bucket (that is how the
+CLI finds sessions), re-points the `cwd` a resumed session would run in,
+renames the workspace's catalog entry, and appends to the CLI's session log
+instead of rewriting it.  Transcripts are never edited, and workspace
+*trust* is deliberately not carried to the new location — Kimi asks again.
 
 ## Install
 
@@ -124,7 +133,11 @@ yourself — a running exe can't remove itself).
 - **Badges — one symbol per agent**: a folder opened in several CLIs shows
   which ones.  Each agent gets a white-ringed disc in its own color with a
   distinct glyph — claude coral ✳, gemini blue ◆, codex teal ○, cursor black
-  ▲, opencode orange ■, copilot purple ▬, kimi violet ☾.  **1 agent** → one
+  ▲, opencode orange ■, copilot purple ▬, kimi violet ☾.  A tethered folder
+  no agent has history in yet shows a grey ∞ instead.  Badges follow reality:
+  the agent list is re-checked on every watcher pass, Claude session start
+  and `aht icons --refresh`, so an agent first used long after a folder was
+  tethered still gets its disc.  **1 agent** → one
   full-size disc (lower right); **2** → two smaller, side by side; **3** →
   three smaller still; **4 or more** → a single slate disc showing the
   *count*.  The git "+" (center) is independent and unaffected.  Rendered as
@@ -156,7 +169,8 @@ toggle), shown as an ∞ icon in the bar: `aht.app` (or the tray compiled by
 ## Safety invariants
 
 1. History is **never deleted or overwritten** — dir renames refuse occupied
-   targets (surfaced as conflicts, never merged); metadata rewrites are
+   targets (surfaced as conflicts, never merged; an *empty* directory left
+   behind by a tool holds no history and does not count as occupied); metadata rewrites are
    preceded by a mandatory backup copy; restores only add missing files.
 2. Adoption is **add-only** and store-corroborated (a backend's store must
    provably exist for the folder's exact path).

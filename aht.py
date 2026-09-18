@@ -3340,9 +3340,28 @@ def cmd_install(args):
     # launched through aht.app's `aht` command: install from the bundle so the
     # watcher and hook get that (possibly newer) core and its prebuilt binaries
     src = args.src or os.environ.get("AHT_BUNDLE_RESOURCES")
+    if not src and IS_MAC:
+        src = _app_bundle_resources()
     if src and IS_MAC:
         cmd += ["--src", src]
     return subprocess.call(cmd)
+
+def _app_bundle_resources():
+    """An installed aht.app that is at least as new as this core: the place to
+    (re)install from, since it carries the helpers prebuilt — a Mac without a
+    compiler can then still repair a missing badge tool or watcher."""
+    def ver(text):
+        m = re.search(r'^VERSION = "([0-9.]+)"', text, re.M)
+        return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+    for app in (Path("/Applications/aht.app"), Path.home() / "Applications/aht.app"):
+        res = app / "Contents" / "Resources"
+        try:
+            if ver((res / "aht.py").read_text(encoding="utf-8")) >= ver(
+                    f'VERSION = "{VERSION}"') and (res / "install.py").is_file():
+                return str(res)
+        except OSError:
+            continue
+    return None
 
 def cmd_uninstall(args):
     if not (IS_MAC or IS_LINUX):

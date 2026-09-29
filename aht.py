@@ -3969,7 +3969,7 @@ class Remote:
 
     def push_agent(self) -> None:
         """The other side runs this very file, so both ends always agree."""
-        r = self.sh('mkdir -p "$HOME/.aht/remote" && '
+        r = self.sh('mkdir -p "$HOME/.aht/remote" && chmod 700 "$HOME/.aht/remote" && '
                     'cat > "$HOME/.aht/remote/aht.py.new" && '
                     'mv "$HOME/.aht/remote/aht.py.new" "$HOME/.aht/remote/aht.py"',
                     stdin=Path(__file__).resolve().read_text(encoding="utf-8"))
@@ -4173,6 +4173,11 @@ def _agent_probe(req: dict) -> dict:
         info["path_exists"] = os.path.isdir(path)
         info["path_base"] = str(anc)
         info["path_writable"] = os.access(str(anc), os.W_OK | os.X_OK)
+        try:
+            info["path_open_to_others"] = bool(os.stat(path).st_mode & 0o077) \
+                if os.path.isdir(path) else None
+        except OSError:
+            info["path_open_to_others"] = None
         info["path_real"] = os.path.realpath(path)
         try:
             v = os.statvfs(str(anc))
@@ -5587,10 +5592,15 @@ def remote_checks(rem: Remote, info: dict) -> list:
        f"{get} rsync")
     ck("tmux there", tools.get("tmux"), tools.get("byobu") or tools.get("tmux")
        or "missing", f"{get} tmux")
-    same = info.get("home") == home or bool(
-        rem.agent("probe", path=home).get("path_exists"))
+    there = rem.agent("probe", path=home)
+    same = info.get("home") == home or bool(there.get("path_exists"))
     ck(f"{home} exists there", same, "projects keep their path" if same else "missing",
        f'sudo mkdir -p {shlex.quote(home)} && sudo chown "$USER" {shlex.quote(home)}')
+    if same and info.get("home") != home:
+        shut = not there.get("path_open_to_others")
+        ck(f"only you can look into {home} there", shut,
+           "yes" if shut else "other accounts on that machine can read your projects",
+           f"chmod 700 {shlex.quote(home)}", needed=False)
     ck("Claude Code there", info.get("claude"),
        f"{info.get('claude_version') or 'missing'} "
        f"(here: {claude_version(mine) if mine else 'missing'})",

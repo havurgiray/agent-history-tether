@@ -150,6 +150,77 @@ yourself — a running exe can't remove itself).
   (installed into the user icon theme; ≤3 emblems, a count emblem for 4+ —
   KDE's `.directory` fallback can show only one icon).
 
+## Handover: continue on another machine
+
+Hand a project to another machine of yours — say an always-on box at home —
+keep working on it there over ssh or from your phone, and take it back later.
+The files, the agent's history and the session itself move; nothing is
+installed on the other machine but what it needs anyway (python3, rsync 3,
+tmux or byobu, the agent CLI).  macOS and Linux, Claude Code sessions for now.
+
+```sh
+aht remote discover                      # machines of your network that qualify
+aht remote add homebox you@homebox       # ssh must work without a prompt
+aht remote check                         # what it still lacks, with the fix
+aht mirror ~/Desktop/paper --on          # optional: keep its copy there warm
+aht handover ~/Desktop/paper             # dry run: what would travel
+aht handover ~/Desktop/paper --apply     # send it, resume the session there
+aht attach ~/Desktop/paper               # open that session
+aht reclaim ~/Desktop/paper --apply      # bring files and history back
+```
+
+The macOS tray has the same under **Handover**: *Machine*, *Hand Over*,
+*Take Back*, *Open Session*, *Keep in Sync*, *Sync Now*.
+
+- **Any number of machines.**  `aht remote discover` lists the computers of
+  your Tailscale network and the hosts in `~/.ssh/config`; add as many as you
+  like, pick one per handover with `--to <name>` (the tray: *Machine*), and
+  `aht remote default <name>` sets the one used when none is named.  A
+  project remembers where it went, so taking it back needs no name.
+
+- **Same path on both sides.**  Agent CLIs key their history on the project's
+  absolute path, so `/Users/you/Desktop/paper` must exist under that very
+  path on the other machine — as a real folder, not a link.  On Linux, create
+  it once: `sudo mkdir -p /Users/you && sudo chown $USER /Users/you`.
+- **Nothing moves while something runs.**  An open agent session blocks the
+  transfer, working or idle, and no flag overrides that: exit it first.  So
+  does a background shell the session started, or any other program whose
+  working directory is inside the project (`--allow-processes` leaves those
+  behind).  On the way back the same holds for the other machine;
+  `reclaim --stop` ends a session there only if it is idle.
+- **Keep in Sync** copies a project in the background (every
+  `mirror_interval_minutes`) while the connection is good, so the handover
+  itself only sends the last changes.  Transfers are compressed (`rsync -z`).
+- **What travels**: the folder, the history store, the `/rewind` checkpoints
+  and, with `--include <path>`, files and folders outside the project
+  (remembered per project).  **What stays**: `node_modules`, `.venv`,
+  `__pycache__` and the like (rebuilt per machine), Finder's icon files,
+  temporary files, running processes.
+- **What the session knew travels in readable form too.**  A summary is
+  written to `.aht/handover/` — the last compaction, the latest exchanges,
+  open to-dos, the files it changed, the outside files it used — and the
+  resumed session is told on arrival that it changed machines, what did not
+  come along and where that summary is.  That folder carries its own
+  `.gitignore`, so excerpts of a conversation never land in a commit.
+- **The way back is three-way.**  Changes made there arrive; what changed
+  only here stays; what changed on *both* sides is kept in both versions
+  (`--prefer there` takes the other machine's instead).  Whatever a transfer
+  replaces or removes is set aside in `~/.aht/handover/<id>/replaced/` first.
+  A transcript only comes back if it *continues* the one that left.
+- **Same agent version on both sides.**  The handover installs this
+  machine's Claude Code version over there and keeps it from updating
+  itself.  The way back is refused if the other machine — or anything that
+  wrote into the returning history — used a newer version than this machine
+  has: update here first (`--ignore-version` overrides).
+- **A connection that survives the road.**  With mosh on both machines and
+  its UDP ports open, `aht attach` uses it: the terminal stays connected
+  through network changes and sleep.  aht tests the path once per machine
+  (`aht remote check` tests again) and uses ssh when it is blocked.
+- The folder shows a blue → badge while it is away, and a session started in
+  it meanwhile is warned.  With `handover_remote_control` (default on) the
+  session there is reachable from the Claude app, including permission
+  prompts.
+
 ## Settings
 
 One shared config (`~/.aht/config.json`) read by the CLI, the watchers, the
@@ -162,7 +233,11 @@ Locations* page), `move_policy`, `copy_policy`, `new_policy`,
 `notifications`, `icons_enabled` / `icons_agent` / `icons_git`,
 `debounce_seconds`, `scan_max_depth`, `extra_prune_dirs`, `dialog_timeout`,
 `watcher_owner`, `log_level`, `backup_enabled` / `backup_interval_hours` / `backup_keep` /
-`backup_dir`, `linux_emblem_method` / `linux_agent_emblem` / `linux_git_emblem`.
+`backup_dir`, `linux_emblem_method` / `linux_agent_emblem` / `linux_git_emblem`;
+for handover: `remotes` / `default_remote` (managed by `aht remote`),
+`mirror_interval_minutes`, `handover_excludes`, `handover_compress`,
+`handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
+`handover_mosh`, `rsync_path`, `terminal_app`.
 
 Every platform has a tray with the same menu (status, reconcile now,
 pause/resume watching, recent projects, adopt with confirmation, the policy /
@@ -181,6 +256,9 @@ toggle), shown as an ∞ icon in the bar: `aht.app` (or the tray compiled by
 3. All registry writes happen under one lock, never held across a dialog;
    folder swaps resolve via two-phase staging per backend.
 4. A prompt that cannot be shown (headless) always means **change nothing**.
+5. A project is **never transferred while something runs in it**, a
+   transcript only returns as a continuation of what left, and a transfer
+   sets aside what it replaces.
 
 ## Commands
 
@@ -190,7 +268,8 @@ toggle), shown as an ∞ icon in the bar: `aht.app` (or the tray compiled by
 `config` · `roots` / `reload` · `icons --refresh` · `logs [--errors]`
 (leveled `[WARN]`/`[ERROR]` lines, size-rotated at `~/.aht/aht.log`) ·
 `tag` · `keys <path>`
-(each backend's store key for a path) · `encode` · `hook` · `version`.
+(each backend's store key for a path) · `encode` · `hook` · `version` ·
+`remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here`.
 Run `aht` with no arguments for the full help screen; every `--json` output is
 a stable machine interface (it's what the trays use).
 
@@ -203,7 +282,8 @@ macos/build_app.sh --test # builds aht.app, then runs the tray's headless selfte
 ```
 
 The suites fake every agent's store via `AHT_ROOT_*` env overrides, so they
-never touch real agent data.  GitHub Actions runs the core suites (Linux and
+never touch real agent data; the handover tests use a folder that stands in
+for the other machine (they need rsync 3 and are skipped without it).  GitHub Actions runs the core suites (Linux and
 macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
 smoke-tests the Windows exe natively on every push; tagging `vX.Y.Z` builds
 the release artifacts (Windows x64 and ARM64 on native runners, the universal

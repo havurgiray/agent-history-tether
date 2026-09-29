@@ -93,6 +93,7 @@ final class StateCache {
     var status: [String: Any] = [:]
     var config: [String: Any] = [:]
     var projects: [[String: Any]] = []
+    var machines: [[String: Any]] = []     // discovered, for "Add Machine"
     var running = false
     private let q = DispatchQueue(label: "aht.tray.cache")
 
@@ -101,11 +102,14 @@ final class StateCache {
             let st = ahtJSON(["status", "--json"]) ?? [:]
             let cf = (ahtJSON(["config", "--json"])?["effective"] as? [String: Any]) ?? [:]
             let pj = (ahtJSON(["projects", "--json"])?["projects"] as? [[String: Any]]) ?? []
+            let mc = (ahtJSON(["remote", "discover", "--json"])?["machines"]
+                      as? [[String: Any]]) ?? []
             let run = watcherRunning()
             DispatchQueue.main.async {
                 self.status = st
                 self.config = cf
                 self.projects = pj
+                self.machines = mc
                 self.running = run
                 done?()
             }
@@ -163,6 +167,12 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add(disabled: "agents here: "
                 + (active.isEmpty ? "none detected" : active.joined(separator: " · ")))
         }
+        let away = (handoverInfo()["away"] as? [[String: Any]]) ?? []
+        if !away.isEmpty {
+            let hosts = Set(away.compactMap { $0["host"] as? String }).sorted()
+            add(disabled: "\(away.count) handed over to " + hosts.joined(separator: ", "))
+        }
+        if let w = working { add(disabled: "⏳ " + w) }
         menu.addItem(.separator())
 
         add("Reconcile Now", #selector(reconcile), key: "r")
@@ -188,6 +198,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         recent.submenu = sub
         menu.addItem(recent)
+        menu.addItem(handoverSubmenu())
         add("Adopt This Mac's Projects…", #selector(adopt))
         if BUNDLE_RES != nil {
             let installed = FileManager.default.fileExists(atPath: TOOLS + "/aht.py")
@@ -310,6 +321,378 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             aht(["backends", "--clear-root"] + names)
             notifyUser("Agent CLI locations", "Reset to defaults")
         }
+    }
+
+    // ---- handover: continue a project on another machine, and take it back ----
+
+    var working: String?            // a transfer in progress, shown in the menu
+
+    func handoverInfo() -> [String: Any] {
+        return (cache.status["handover"] as? [String: Any]) ?? [:]
+    }
+
+    func projectList(_ title: String, _ rows: [[String: Any]], _ sel: Selector,
+                     empty: String, checked: (([String: Any]) -> Bool)? = nil,
+                     note: (([String: Any]) -> String?)? = nil)
+        -> NSMenuItem {
+        let root = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let m = NSMenu()
+        if rows.isEmpty { m.addItem(mk(disabled: empty)) }
+        for p in rows {
+            let path = (p["real_path"] as? String) ?? (p["project"] as? String) ?? "?"
+            var label = (path as NSString).lastPathComponent
+            if let n = note?(p) { label += "  —  " + n }
+            let i = NSMenuItem(title: label, action: sel, keyEquivalent: "")
+            i.target = self
+            i.representedObject = path
+            i.toolTip = path
+            if let c = checked { i.state = c(p) ? .on : .off }
+            m.addItem(i)
+        }
+        root.submenu = m
+        return root
+    }
+
+    func remotes() -> [String: Any] {
+        return (handoverInfo()["remotes"] as? [String: Any]) ?? [:]
+    }
+    func target(_ name: String) -> String {
+        return ((remotes()[name] as? [String: Any])?["ssh"] as? String) ?? ""
+    }
+    /// The machine the menu's actions go to; chosen under "Machine".
+    func currentMachine() -> String? {
+        return handoverInfo()["default_remote"] as? String
+    }
+
+    func machineSubmenu() -> NSMenuItem {
+        let names = remotes().keys.sorted()
+        let cur = currentMachine()
+        let root = NSMenuItem(title: cur.map { "Machine: \($0)" } ?? "No Other Machine Yet",
+                              action: nil, keyEquivalent: "")
+        let m = NSMenu()
+        root.submenu = m
+        for n in names {
+            let i = NSMenuItem(title: "\(n)  —  \(target(n))",
+                               action: #selector(chooseMachine(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = n
+            i.state = (n == cur) ? .on : .off
+            m.addItem(i)
+        }
+        if let c = cur {
+            m.addItem(.separator())
+            m.addItem(mk("Check \(c)", #selector(checkRemote)))
+            if names.count > 1 { m.addItem(mk("Check All Machines", #selector(checkAll))) }
+            m.addItem(mk("Remove \(c)…", #selector(removeMachine)))
+            m.addItem(.separator())
+        }
+        let add = NSMenuItem(title: "Add Machine", action: nil, keyEquivalent: "")
+        let am = NSMenu()
+        for d in cache.machines where (d["added_as"] as? String) == nil {
+            let host = d["host"] as? String ?? "?"
+            var bits = [d["system"] as? String, d["via"] as? String].compactMap { $0 }
+            if let on = d["online"] as? Bool { bits.insert(on ? "online" : "offline", at: 0) }
+            let i = NSMenuItem(title: "\(host)  —  " + bits.joined(separator: ", "),
+                               action: #selector(addMachine(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = host
+            am.addItem(i)
+        }
+        if am.items.count > 0 { am.addItem(.separator()) }
+        am.addItem(mk("Other…", #selector(addMachine(_:))))
+        add.submenu = am
+        m.addItem(add)
+        return root
+    }
+
+    func handoverSubmenu() -> NSMenuItem {
+        let root = NSMenuItem(title: "Handover", action: nil, keyEquivalent: "")
+        let m = NSMenu()
+        root.submenu = m
+        let ho = handoverInfo()
+        if !(ho["supported"] as? Bool ?? true) {
+            m.addItem(mk(disabled: "Not available in this build"))
+            return root
+        }
+        m.addItem(machineSubmenu())
+        let recentFirst = cache.projects.sorted {
+            (($0["last_activity"] as? String) ?? "") > (($1["last_activity"] as? String) ?? "")
+        }
+        let away = recentFirst.filter { ($0["away"] as? String) != nil }
+        guard let name = currentMachine() else {
+            if !away.isEmpty {          // handed over before the machine was removed
+                m.addItem(projectList("Take Back", away, #selector(takeBack(_:)),
+                                      empty: "", note: { $0["away"] as? String }))
+            }
+            return root
+        }
+        if ho["rsync"] as? String == nil {
+            m.addItem(mk(disabled: "rsync 3 is missing — brew install rsync"))
+        }
+        m.addItem(.separator())
+        let here = recentFirst.filter {
+            ($0["exists"] as? Bool ?? false) && ($0["away"] as? String) == nil
+        }
+        m.addItem(projectList("Hand Over to \(name)", Array(here.prefix(15)),
+                              #selector(handOver(_:)), empty: "No tracked projects yet"))
+        m.addItem(projectList("Take Back", away, #selector(takeBack(_:)),
+                              empty: "Nothing is handed over",
+                              note: { ($0["away"] as? String).map { "on " + $0 } }))
+        m.addItem(projectList("Open Session", away, #selector(openSession(_:)),
+                              empty: "Nothing is handed over",
+                              note: { ($0["away"] as? String).map { "on " + $0 } }))
+        m.addItem(.separator())
+        m.addItem(projectList("Keep in Sync with \(name)", Array(here.prefix(15)),
+                              #selector(toggleMirror(_:)), empty: "No tracked projects yet",
+                              checked: { ($0["mirror"] as? String) == name },
+                              note: { p in
+                                  let at = p["mirror"] as? String
+                                  return (at != nil && at != name) ? "kept on \(at!)" : nil
+                              }))
+        m.addItem(mk("Sync Now", #selector(syncNow)))
+        return root
+    }
+
+    /// What stands in the way, in the core's own words; nil when nothing does.
+    func problems(_ d: [String: Any]) -> String? {
+        if d.isEmpty { return "aht gave no answer — see Open Log." }
+        var lines = (d["blockers"] as? [String]) ?? []
+        if let e = d["error"] as? String { lines.append(e) }
+        return lines.isEmpty ? nil : lines.map { "• " + $0 }.joined(separator: "\n\n")
+    }
+
+    func size(_ any: Any?) -> String {
+        let n = (any as? NSNumber)?.int64Value ?? 0
+        return ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    }
+
+    func busy(_ text: String?, _ work: @escaping () -> Void) {
+        DispatchQueue.main.async { self.working = text }
+        background {
+            work()
+            DispatchQueue.main.async { self.working = nil }
+        }
+    }
+
+    @objc func handOver(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        let name = (path as NSString).lastPathComponent
+        let to = currentMachine().map { ["--to", $0] } ?? []
+        busy("checking \(name)…") {
+            let plan = ahtJSON(["handover", path, "--json"] + to) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = self.alert("“\(name)” cannot be handed over now", why)
+                    return
+                }
+                let remote = plan["remote"] as? String ?? "the other machine"
+                let p = (plan["plan"] as? [String: Any]) ?? [:]
+                var body = "\(p["files"] as? Int ?? 0) file(s) to send "
+                    + "(\(self.size(p["bytes"]))), history \(self.size(p["history_bytes"])).\n"
+                    + "Session: \((plan["title"] as? String) ?? "the most recent one")\n"
+                if let v = p["install_claude"] as? String {
+                    body += "Claude Code \(v) gets installed on \(remote).\n"
+                }
+                let stay = (plan["outside_not_carried"] as? [String]) ?? []
+                if !stay.isEmpty {
+                    body += "\nFiles outside the project that stay here:\n"
+                        + stay.prefix(6).map { "• " + $0 }.joined(separator: "\n") + "\n"
+                }
+                body += "\nThe session is resumed there and this folder is marked as "
+                    + "away until you take it back."
+                guard self.alert("Hand “\(name)” over to \(remote)?", body,
+                                 confirm: "Hand Over") else { return }
+                self.busy("handing \(name) over…") {
+                    let d = ahtJSON(["handover", path, "--apply", "--json"] + to) ?? [:]
+                    DispatchQueue.main.async {
+                        if let why = self.problems(d) {
+                            _ = self.alert("The handover did not go through", why)
+                            return
+                        }
+                        let s = (d["sent"] as? [String: Any]) ?? [:]
+                        var done = "\(s["files"] as? Int ?? 0) file(s) sent, "
+                            + "\(self.size(s["wire_bytes"])) over the network."
+                        for w in (d["warnings"] as? [String]) ?? [] { done += "\n\n⚠ " + w }
+                        if self.alert("“\(name)” now runs on \(remote)", done,
+                                      confirm: "Open Session") {
+                            self.background { aht(["attach", path, "--window"]) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @objc func takeBack(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        let name = (path as NSString).lastPathComponent
+        busy("checking \(name)…") {
+            let plan = ahtJSON(["reclaim", path, "--stop", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = self.alert("“\(name)” cannot be taken back now", why)
+                    return
+                }
+                let remote = plan["remote"] as? String ?? "the other machine"
+                let p = ((plan["plan"] as? [String: Any])?["project"] as? [String: Int]) ?? [:]
+                var body = "\(p["take"] ?? 0) file(s) changed there, \(p["new"] ?? 0) new, "
+                    + "\(p["delete"] ?? 0) removed. Whatever they replace here is "
+                    + "set aside, not deleted.\n"
+                if plan["would_stop"] as? Bool ?? false {
+                    body += "\nThe idle session on \(remote) is ended first.\n"
+                }
+                let both = ((plan["conflicts"] as? [String: [String]]) ?? [:])
+                    .values.flatMap { $0 }
+                var extra: [String] = []
+                if both.isEmpty {
+                    guard self.alert("Take “\(name)” back from \(remote)?", body,
+                                     confirm: "Take Back") else { return }
+                } else {
+                    body += "\nChanged on BOTH machines:\n"
+                        + both.prefix(6).map { "• " + $0 }.joined(separator: "\n")
+                        + "\n\nKeep Both leaves your version in place and puts the one "
+                        + "from \(remote) next to it."
+                    let pick = self.choose("Take “\(name)” back from \(remote)?", body,
+                                           ["Keep Both", "Use the Versions from \(remote)",
+                                            "Cancel"])
+                    if pick == 2 { return }
+                    if pick == 1 { extra = ["--prefer", "there"] }
+                }
+                self.busy("taking \(name) back…") {
+                    let d = ahtJSON(["reclaim", path, "--stop", "--apply", "--json"]
+                                    + extra) ?? [:]
+                    DispatchQueue.main.async {
+                        if let why = self.problems(d) {
+                            _ = self.alert("Taking it back did not go through", why)
+                            return
+                        }
+                        var done = "The files and the history are on this Mac again."
+                        if let aside = d["set_aside"] as? String {
+                            done += "\n\nReplaced files are kept in:\n" + aside
+                        }
+                        for w in (d["warnings"] as? [String]) ?? [] { done += "\n\n⚠ " + w }
+                        if self.alert("“\(name)” is back", done,
+                                      confirm: "Continue the Session") {
+                            self.background { aht(["resume-here", path]) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @objc func openSession(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        background { aht(["attach", path, "--window"]) }
+    }
+
+    @objc func toggleMirror(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        let on = sender.state != .on
+        let to = currentMachine().map { ["--to", $0] } ?? []
+        background {
+            aht(["mirror", path] + (on ? ["--on"] + to : ["--off"]))
+            notifyUser("Keep in Sync", (path as NSString).lastPathComponent
+                       + (on ? ": on — the first sync runs in the background" : ": off"))
+        }
+    }
+
+    @objc func syncNow() {
+        busy("syncing…") {
+            let rows = (ahtJSON(["mirror", "--run", "--json"])?["mirrored"]
+                        as? [[String: Any]]) ?? []
+            let ok = rows.filter { $0["status"] as? String == "synced" }.count
+            notifyUser("Sync", rows.isEmpty ? "No project is kept in sync yet"
+                       : "\(ok) synced" + (ok < rows.count
+                                           ? ", \(rows.count - ok) skipped — see the log" : ""))
+        }
+    }
+
+    @objc func chooseMachine(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? String else { return }
+        background {
+            aht(["remote", "default", n])
+            notifyUser("Handover", "Machine: \(n)")
+        }
+    }
+
+    func check(_ args: [String], _ what: String) {
+        busy("checking \(what)…") {
+            let r = sh(PY, [ahtScript(), "remote", "check"] + args, mergeStderr: true)
+            DispatchQueue.main.async {
+                _ = self.alert(what, r.out.isEmpty ? "no answer — see Open Log" : r.out)
+            }
+        }
+    }
+    @objc func checkRemote() {
+        if let c = currentMachine() { check([c], c) }
+    }
+    @objc func checkAll() { check(["all"], "All machines") }
+
+    @objc func removeMachine() {
+        guard let c = currentMachine() else { return }
+        let held = cache.projects.filter { ($0["away_remote"] as? String) == c }
+            .compactMap { $0["real_path"] as? String }
+        if !held.isEmpty {
+            _ = alert("\(c) still holds handed-over projects",
+                      "Take these back first:\n"
+                      + held.map { "• " + $0 }.joined(separator: "\n"))
+            return
+        }
+        guard alert("Remove \(c)?",
+                    "aht forgets how to reach it. Nothing is deleted on either machine.",
+                    confirm: "Remove") else { return }
+        background { aht(["remote", "remove", c]) }
+    }
+
+    @objc func addMachine(_ sender: NSMenuItem) {
+        let host = sender.representedObject as? String
+        // the login used for the machines so far is the best guess for the next
+        let user = remotes().keys.sorted().compactMap { n -> String? in
+            let t = self.target(n)
+            return t.contains("@") ? String(t.split(separator: "@")[0]) : nil
+        }.first ?? NSUserName()
+        let a = NSAlert()
+        a.messageText = "Add a machine"
+        a.informativeText = "A machine you reach over ssh without a password prompt. "
+            + "aht checks it and tells you what it still needs."
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 56))
+        let name = NSTextField(frame: NSRect(x: 0, y: 30, width: 300, height: 24))
+        name.placeholderString = "a name for it"
+        name.stringValue = host ?? ""
+        let target = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        target.placeholderString = "user@host"
+        target.stringValue = host.map { "\(user)@\($0)" } ?? ""
+        box.addSubview(name)
+        box.addSubview(target)
+        name.nextKeyView = target
+        a.accessoryView = box
+        a.addButton(withTitle: "Check and Add")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = host == nil ? name : target
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let n = name.stringValue.trimmingCharacters(in: .whitespaces)
+        let t = target.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty, !t.isEmpty else { return }
+        busy("checking \(n)…") {
+            let r = sh(PY, [ahtScript(), "remote", "add", n, t], mergeStderr: true)
+            let more = r.ok ? sh(PY, [ahtScript(), "remote", "check", n],
+                                 mergeStderr: true).out : ""
+            DispatchQueue.main.async {
+                _ = self.alert(r.ok ? "\(n) is added" : "\(n) could not be added",
+                               r.ok ? more : r.out)
+            }
+        }
+    }
+
+    func choose(_ title: String, _ body: String, _ buttons: [String]) -> Int {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = body
+        for b in buttons { a.addButton(withTitle: b) }
+        NSApp.activate(ignoringOtherApps: true)
+        return a.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
     }
 
     func badgesSubmenu() -> NSMenuItem {

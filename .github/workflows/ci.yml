@@ -22,6 +22,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
+      - name: rsync 3 for the handover tests (macOS ships an older one)
+        if: runner.os == 'macOS'
+        run: brew install rsync
       - name: run the suites
         run: AHT_PY="$(command -v python)" tests/run_tests.sh
 

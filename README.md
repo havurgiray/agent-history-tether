@@ -181,7 +181,9 @@ The macOS tray has the same under **Handover**: *Machine*, *Hand Over*,
 - **Same path on both sides.**  Agent CLIs key their history on the project's
   absolute path, so `/Users/you/Desktop/paper` must exist under that very
   path on the other machine — as a real folder, not a link.  On Linux, create
-  it once: `sudo mkdir -p /Users/you && sudo chown $USER /Users/you`.
+  it once: `sudo mkdir -p /Users/you && sudo chown $USER /Users/you`; on a
+  machine other people use too, add `chmod 700 /Users/you` (`aht remote
+  check` tells you when that is missing).
 - **Nothing moves while something runs.**  An open agent session blocks the
   transfer, working or idle, and no flag overrides that: exit it first.  So
   does a background shell the session started, or any other program whose

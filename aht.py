@@ -38,9 +38,12 @@ SAFETY invariants (inherited, kept):
 
 from __future__ import annotations   # 3.9-safe
 
+import fnmatch
 import hashlib
 import os
 import re
+import shlex
+import stat
 import sys
 import json
 import uuid as _uuid
@@ -50,6 +53,7 @@ import time
 import argparse
 import platform
 import subprocess
+import unicodedata
 from pathlib import Path
 
 VERSION = "0.9.2"
@@ -113,6 +117,18 @@ CONFIG_DEFAULTS = {
     "linux_emblem_method": "auto",   # auto | gio | kde | both | none
     "linux_agent_emblem": "emblem-favorite",
     "linux_git_emblem":   "emblem-symbolic-link",
+    # handover: run a project on another machine of yours (see `aht remote`)
+    "remotes":          None,        # {name: {"ssh": "user@host"}}
+    "default_remote":   None,
+    "mirror_interval_minutes": 30,   # background sync of mirrored projects
+    "handover_excludes": [],         # extra names that never travel
+    "handover_compress": True,       # rsync -z: histories and code are text
+    "handover_remote_control": True, # reachable from the Claude app
+    "handover_carry_trust": True,    # a folder trusted here is trusted there
+    "handover_claude_args": [],      # extra arguments for the resumed session
+    "handover_mosh":    True,        # attach with mosh when both sides have it
+    "rsync_path":       None,        # None -> the newest rsync found
+    "terminal_app":     None,        # macOS: app that opens a session window
 }
 
 POLICY_CHOICES = {
@@ -147,6 +163,16 @@ def _coerce(key: str, raw: str):
         if v not in LOG_LEVELS:
             raise ValueError(f"log_level expects one of {sorted(LOG_LEVELS)}")
         return v
+    if key == "remotes":
+        try:
+            obj = json.loads(raw)
+            if not isinstance(obj, dict) or not all(
+                    isinstance(v, dict) for v in obj.values()):
+                raise ValueError("expects a JSON object of objects")
+        except Exception as e:
+            raise ValueError(f"{key}: {e} — prefer `aht remote add <name> "
+                             f"<user@host>`")
+        return obj
     if key == "backend_roots":
         try:
             obj = json.loads(raw)
@@ -1042,13 +1068,17 @@ def save_registry(reg: dict) -> None:
         os.fsync(fh.fileno())
     os.replace(tmp, p)
 
+REGISTRY_KEEP = ("mirror", "away", "returned", "extras")   # handover's records
+
 def _register(reg: dict, uid: str, real_path: str, stores=None) -> None:
+    prev = reg["projects"].get(uid) or {}
     reg["projects"][uid] = {
         "real_path": real_path,
         "stores": stores if stores is not None
         else detect_stores(real_path, include_files=True),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    reg["projects"][uid].update({k: prev[k] for k in REGISTRY_KEEP if k in prev})
 
 # claude-store helpers (used by the trays and orphan logic; the
 # "history dirs" concept is the claude backend's store root)
@@ -1208,12 +1238,15 @@ def list_real_dirs(roots: list, max_depth: int = None) -> list:
 def is_git(path) -> bool:
     return (Path(path) / ".git").exists()
 
-def _stores_for_path(path: str) -> dict:
+def _entry_for_path(path: str) -> dict:
     rp = os.path.realpath(path)
     for e in load_registry().get("projects", {}).values():
         if os.path.realpath(e["real_path"]) == rp:
-            return e.get("stores") or {}
+            return e
     return {}
+
+def _stores_for_path(path: str) -> dict:
+    return _entry_for_path(path).get("stores") or {}
 
 def desired_marks(path, tethered) -> list:
     """Marks a folder should carry.  `tethered` is False/True (True = look the
@@ -1226,9 +1259,12 @@ def desired_marks(path, tethered) -> list:
     if is_git(path) and cfg_get("icons_git", True):
         marks.append("git")
     if tethered and cfg_get("icons_agent", True):
-        stores = tethered if isinstance(tethered, dict) else _stores_for_path(path)
+        entry = _entry_for_path(path)
+        stores = tethered if isinstance(tethered, dict) else entry.get("stores") or {}
         agents = agents_of(stores)
-        if agents:
+        if entry.get("away"):
+            marks.append("agent:away")    # the live copy is on another machine
+        elif agents:
             marks += ["agent:" + n for n in agents]
         else:
             marks.append("agent:aht")     # tethered, no history yet: neutral mark
@@ -1250,6 +1286,8 @@ AGENT_BADGES = {
     # tethered, but no agent has history here yet — deliberately unlike any
     # agent's mark, so a missing agent can never pass for a present one
     "aht":      ((124, 132, 142), "infinity"),
+    # handed over: the work goes on elsewhere — shown INSTEAD of the agents
+    "away":     ((37, 99, 235),   "arrow"),
 }
 COUNT_BADGE_RGB = (51, 58, 66)
 
@@ -1318,6 +1356,11 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
                 elif glyph == "crescent":
                     d2 = ((dx - d * 0.10) ** 2 + (dy + d * 0.08) ** 2) ** 0.5
                     g = _c01(d * 0.24 - dist + 0.5) * _c01(d2 - d * 0.20 + 0.5)
+                elif glyph == "arrow":                  # points right: gone out
+                    if -d * 0.26 <= dx <= d * 0.04:     # shaft
+                        g = _c01(d * 0.065 - abs(dy) + 0.5)
+                    if d * 0.02 <= dx <= d * 0.28:      # head
+                        g = max(g, _c01((d * 0.28 - dx) * 0.85 - abs(dy) + 0.5))
                 elif loop is not None:
                     g = loop[y * d + x]
                 elif glyph in _DIGITS:
@@ -1424,7 +1467,7 @@ def app_icon_png(d: int) -> bytes:
     return _png_bytes(d, infinity_rgba(d, (255, 255, 255), bg=APP_ICON_RGB,
                                        span=0.34, thickness=0.058))
 
-EMBLEM_VERSION = 2
+EMBLEM_VERSION = 3
 
 def _ensure_linux_emblems() -> bool:
     """Generate the per-agent + count emblems into the user icon theme once.
@@ -2564,6 +2607,7 @@ def cmd_reconcile(args):
             for p in rebadge:
                 apply_badge(p, desired_marks(p, True))
         maybe_auto_backup()
+        _spawn_mirror()
 
     if applied_moves or applied_copies or conflicts:
         acted_backends = sorted(
@@ -2678,7 +2722,9 @@ def cmd_hook(args):
             apply_badge(cwd, desired_marks(cwd, True))
     except Exception:
         pass
+    _hook_notes(cwd)
     _spawn_auto_backup()
+    _spawn_mirror()
     return 0
 
 # --------------------------------------------------------------------------- #
@@ -2789,6 +2835,7 @@ def cmd_status(args):
         "backends": backend_status(),
         "watcher": watcher_status(),
         "backups": backup_status(),
+        "handover": handover_status(),
         "log": {"path": str(log_path()),
                 "recent_problems": recent_log_problems()},
         "hook_installed": hook_installed(),
@@ -2816,6 +2863,11 @@ def cmd_status(args):
         print(f"  history backups  : {'on' if bk['enabled'] else 'OFF'}   "
               f"{bk['snapshots']} snapshot(s) of {bk['projects']} project(s), "
               f"last run {bk['last_run'] or 'never'}")
+        ho = st["handover"]
+        if ho["remotes"]:
+            print(f"  other machines   : {', '.join(sorted(ho['remotes']))}   "
+                  f"{len(ho['away'])} project(s) handed over, "
+                  f"{len(ho['mirrored'])} kept in sync")
         print(f"  watcher          : {w['kind']}  installed={w['installed']}  "
               f"running={w['running']}")
         print(f"  SessionStart hook: {'yes' if st['hook_installed'] else 'NO'} "
@@ -2833,7 +2885,11 @@ def cmd_projects(args):
                "exists": os.path.isdir(e["real_path"]),
                "stores": sorted((e.get("stores") or {})),
                "updated_at": e.get("updated_at"),
-               "is_git": is_git(e["real_path"]) if os.path.isdir(e["real_path"]) else False}
+               "is_git": is_git(e["real_path"]) if os.path.isdir(e["real_path"]) else False,
+               "away": (e.get("away") or {}).get("host"),
+               "away_remote": (e.get("away") or {}).get("remote"),
+               "mirror": (e.get("mirror") or {}).get("remote")
+               if (e.get("mirror") or {}).get("enabled") else None}
         row.update(_hist_stats(e))
         out.append(row)
     out.sort(key=lambda r: r["real_path"].lower())
@@ -2843,7 +2899,8 @@ def cmd_projects(args):
         print(f"{len(out)} tethered project(s):")
         for r in out:
             flag = " " if r["exists"] else "!"
-            print(f" {flag} {r['real_path']}")
+            print(f" {flag} {r['real_path']}"
+                  + (f"   → handed over to {r['away']}" if r["away"] else ""))
             print(f"     [{', '.join(r['stores']) or 'no stores yet'}]  "
                   f"{r['sessions']} session(s), {r['bytes']/1024:.0f} KiB, "
                   f"last {r['last_activity'] or '—'}")
@@ -3051,6 +3108,10 @@ def cmd_doctor(args):
                 except OSError:
                     pass
         ck("folder badge tool runs", ok, detail)
+    if handover_supported() and remotes_config():
+        rs = find_rsync()
+        ck("handover: rsync 3 on this machine", bool(rs),
+           rs.get("version") or "missing — on macOS:  brew install rsync")
     nprob = recent_log_problems()
     ck("no warnings/errors logged in the last 24h", nprob == 0,
        f"{nprob} — inspect with:  aht logs --errors")
@@ -3417,6 +3478,15 @@ COMMANDS:
   aht encode <path>               claude's dirname encoding for a path
   aht install | uninstall         set up / remove the watcher, hook and command
 
+HANDOVER (continue on another machine of yours, over ssh):
+  aht remote discover                   machines of your network that qualify
+  aht remote add <name> <user@host>     name a machine (as many as you like)
+  aht remote check [name|all]           what it lacks, with the fix
+  aht mirror <folder> --on              keep its copy there up to date
+  aht handover <folder> --apply         send it and resume the session there
+  aht attach <folder>                   open that session
+  aht reclaim <folder> --apply          bring files and history back
+
 Data:  ~/.aht/  (registry.json, config.json, backups/, aht.log)
 Docs:  README.md
 """
@@ -3510,6 +3580,2252 @@ def cmd_icons(args):
     else:
         print("(dry run — pass --refresh to apply the badges)")
     return 0
+
+# --------------------------------------------------------------------------- #
+# Handover: keep working on a project on another machine of yours, then take
+# it back.  Everything is driven from THIS machine over ssh + rsync; the other
+# machine needs python3, rsync, tmux (or byobu) and the agent CLI, nothing of
+# aht installed.  The same absolute path is used on both sides, because agent
+# CLIs key their history on it.
+#
+#   remote    a machine reachable over ssh, named in the config
+#   mirror    a background one-way sync that keeps a project's copy warm there,
+#             so a handover only has to send the last changes
+#   handover  final sync, then the session is resumed there inside tmux/byobu
+#   reclaim   files and history come back, three-way against what left
+#
+# SAFETY invariants:
+#   (1) nothing is transferred while an agent session or another process is
+#       running in the project on the side that gives it away;
+#   (2) a transcript only comes back as a CONTINUATION of what left: the copy
+#       that stayed behind must be an exact prefix of the returning one;
+#   (3) whatever a sync replaces or removes is moved into a backup dir first.
+# --------------------------------------------------------------------------- #
+
+HANDOVER_SKIP = (
+    # this machine's own metadata
+    "Icon\r", ".DS_Store", "._*", ".Spotlight-V100", ".Trashes", ".fseventsd",
+    ".aht-rsync-partial",
+    # rebuilt per machine: one OS's binaries are useless on the other
+    "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
+    ".pytest_cache", ".next", "DerivedData", ".gradle",
+)
+IDLE_SHELLS = {"zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh",
+               "login", "tmux", "tmux: server", "tmux: client", "byobu",
+               "screen", "sshd", "mosh-server"}
+AGENT_MARK = "@@AHT@@"
+SCRATCH_MAX_BYTES = 100 * 1024 * 1024
+
+class HandoverError(Exception):
+    pass
+
+def handover_supported() -> bool:
+    return os.name != "nt" and not getattr(sys, "frozen", False)
+
+def handover_skip() -> list:
+    extra = cfg_get("handover_excludes") or []
+    return list(HANDOVER_SKIP) + [str(x) for x in extra if x]
+
+def _skip_name(name: str, skip) -> bool:
+    return any(fnmatch.fnmatchcase(name, pat) for pat in skip)
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+def _inside(path: str, root: str) -> bool:
+    path, root = _nfc(str(path)).rstrip("/"), _nfc(str(root)).rstrip("/")
+    return path == root or path.startswith(root + "/")
+
+def handover_dir(uid: str) -> Path:
+    return aht_home() / "handover" / uid
+
+def _stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+def _human(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+# ---- what is running in a folder ------------------------------------------ #
+
+def claude_home() -> Path:
+    return claude_backend().root().parent
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+def _proc_started(pid: int):
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                           capture_output=True, text=True, timeout=10,
+                           cwd="/", env={**os.environ, "LC_ALL": "C"})
+        return time.mktime(time.strptime(" ".join(r.stdout.split()),
+                                         "%a %b %d %H:%M:%S %Y"))
+    except Exception:
+        return None
+
+def running_sessions(inside: str = None, home: Path = None) -> list:
+    """Claude Code sessions open right now, from the CLI's own per-process
+    records (<claude home>/sessions/<pid>.json).  A record counts unless its
+    process is provably gone: in doubt, the session is running."""
+    out = []
+    inside = os.path.realpath(inside) if inside else None
+    try:
+        files = sorted(((home or claude_home()) / "sessions").glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            rec = json.loads(f.read_text())
+            pid = int(rec.get("pid") or f.stem)
+        except Exception:
+            continue
+        if not _pid_alive(pid):
+            continue
+        try:                                # same pid, other process: stale
+            born = time.mktime(time.strptime(" ".join(str(rec["procStart"]).split()),
+                                             "%a %b %d %H:%M:%S %Y"))
+            seen = _proc_started(pid)
+            # the record's clock may be UTC and ours local: equal start times
+            # differ by a whole number of quarter hours
+            off = abs(seen - born) % 900 if seen is not None else 0
+            if min(off, 900 - off) > 5:
+                continue
+        except Exception:
+            pass
+        cwd = str(rec.get("cwd") or "")
+        if inside and not _inside(os.path.realpath(cwd), inside):
+            continue
+        out.append({"pid": pid, "cwd": cwd, "session": rec.get("sessionId"),
+                    "status": str(rec.get("status") or "unknown"),
+                    "kind": rec.get("kind"), "name": rec.get("name")})
+    return out
+
+def processes_inside(path: str) -> list:
+    """This user's processes whose working directory is inside `path`: a dev
+    server, a build, another agent CLI.  Shells that merely sit in the folder
+    are left out."""
+    me = {os.getpid(), os.getppid()}
+    path = os.path.realpath(path)
+    rows = []
+    uid = os.getuid()
+    if IS_LINUX:
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                if os.stat(f"/proc/{d}").st_uid != uid:
+                    continue
+                rows.append((int(d), Path(f"/proc/{d}/comm").read_text().strip(),
+                             os.readlink(f"/proc/{d}/cwd")))
+            except OSError:
+                continue
+    else:
+        lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof")
+                     if os.path.exists(c)), "lsof")
+        try:
+            # from "/": our own helper must not count as running in there
+            r = subprocess.run([lsof, "-a", "-u", str(uid), "-d", "cwd", "-Fpcn"],
+                               capture_output=True, text=True, timeout=60, cwd="/")
+        except Exception:
+            return []
+        pid, name = None, ""
+        for line in r.stdout.splitlines():
+            if line.startswith("p"):
+                pid, name = int(line[1:]), ""
+            elif line.startswith("c"):
+                name = line[1:]
+            elif line.startswith("n") and pid is not None:
+                rows.append((pid, name, line[1:]))
+    out = []
+    for pid, name, cwd in rows:
+        if pid in me or name.lstrip("-") in IDLE_SHELLS:
+            continue
+        if _inside(cwd, path):
+            out.append({"pid": pid, "name": name, "cwd": cwd})
+    return out
+
+def activity_in(path: str) -> dict:
+    """{sessions, processes}: everything that stands in the way of giving the
+    folder at `path` away."""
+    sess = running_sessions(inside=path)
+    own = {s["pid"] for s in sess}
+    return {"sessions": sess,
+            "processes": [p for p in processes_inside(path) if p["pid"] not in own]}
+
+def _activity_blockers(act: dict, where: str) -> list:
+    out = []
+    for s in act.get("sessions") or []:
+        busy = s.get("status") != "idle"
+        out.append(f"an agent session is {'WORKING' if busy else 'open'} in this "
+                   f"project {where} (pid {s['pid']}"
+                   + (f", “{s['name']}”" if s.get("name") else "") + ") — "
+                   + ("wait until it has finished, then exit it" if busy
+                      else "exit it first (/exit)"))
+    return out
+
+# ---- manifests -------------------------------------------------------------- #
+
+def tree_manifest(root: str, skip=None) -> dict:
+    """{files: {rel: [size, mtime] | ["l", target]}, raw: {rel: name on disk}}
+    — `rel` is NFC so a Mac's decomposed names compare equal to Linux's."""
+    skip = list(handover_skip() if skip is None else skip)
+    files, raw = {}, {}
+    root = str(root)
+    for dp, dns, fns in os.walk(root):
+        keep = []
+        for d in dns:
+            if _skip_name(d, skip):
+                continue
+            if os.path.islink(os.path.join(dp, d)):
+                fns.append(d)               # a linked folder travels as a link
+            else:
+                keep.append(d)
+        dns[:] = keep
+        for n in fns:
+            if _skip_name(n, skip):
+                continue
+            p = os.path.join(dp, n)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    val = ["l", os.readlink(p)]
+                except OSError:
+                    continue
+            elif stat.S_ISREG(st.st_mode):
+                val = [st.st_size, int(st.st_mtime)]
+            else:
+                continue
+            rel = os.path.relpath(p, root)
+            key = _nfc(rel)
+            files[key] = val
+            if key != rel:
+                raw[key] = rel
+    return {"files": files, "raw": raw}
+
+def file_sha256(path, limit: int = None) -> str:
+    h = hashlib.sha256()
+    left = limit
+    with open(path, "rb") as fh:
+        while left is None or left > 0:
+            chunk = fh.read(1 << 20 if left is None else min(1 << 20, left))
+            if not chunk:
+                break
+            h.update(chunk)
+            if left is not None:
+                left -= len(chunk)
+    return h.hexdigest()
+
+def three_way(left_here: dict, left_there: dict, here: dict, there: dict) -> dict:
+    """What happens to every path when a tree comes back.  `left_here` /
+    `left_there` are the two sides right after the handover, `here` / `there`
+    the two sides now."""
+    plan = {"take": [], "new": [], "delete": [], "conflict": [], "kept": []}
+    for k in sorted(set(left_here) | set(left_there) | set(here) | set(there)):
+        h, t = here.get(k), there.get(k)
+        if t == left_there.get(k):          # untouched over there
+            if h != left_here.get(k):
+                plan["kept"].append(k)      # changed only here
+            continue
+        if h == t:
+            continue                        # the same change on both sides
+        if h == left_here.get(k):           # untouched here
+            if t is None:
+                plan["delete"].append(k)
+            elif h is None:
+                plan["new"].append(k)
+            else:
+                plan["take"].append(k)
+        elif t is None:
+            plan["kept"].append(k)          # removed there, changed here: ours stays
+        elif h is None:
+            plan["take"].append(k)          # removed here, changed there
+        else:
+            plan["conflict"].append(k)
+    return plan
+
+# ---- rsync ------------------------------------------------------------------ #
+
+_RSYNC = {}
+
+def find_rsync() -> dict:
+    """{path, version, iconv} of the newest rsync on this machine.  macOS ships
+    an old-protocol openrsync without --iconv; Homebrew's is preferred."""
+    if _RSYNC:
+        return _RSYNC
+    best = None
+    for c in [cfg_get("rsync_path"), "/opt/homebrew/bin/rsync",
+              "/usr/local/bin/rsync", shutil.which("rsync"), "/usr/bin/rsync"]:
+        if not c or not os.path.exists(str(c)):
+            continue
+        try:
+            r = subprocess.run([str(c), "--version"], capture_output=True,
+                               text=True, timeout=15)
+        except Exception:
+            continue
+        m = re.search(r"rsync\s+version\s+(\d+)\.(\d+)(?:\.(\d+))?", r.stdout)
+        if not m:
+            continue                        # openrsync and friends
+        ver = tuple(int(x or 0) for x in m.groups())
+        caps = r.stdout.replace("\n", " ")
+        info = {"path": str(c), "version": ".".join(map(str, ver)), "ver": ver,
+                "iconv": bool(re.search(r"(?<!no )iconv", caps))}
+        if best is None or info["ver"] > best["ver"]:
+            best = info
+    _RSYNC.update(best or {})
+    return _RSYNC
+
+def _ssh_opts() -> list:
+    run = aht_home() / "run"
+    try:
+        run.mkdir(parents=True, exist_ok=True)
+        os.chmod(run, 0o700)
+    except OSError:
+        pass
+    return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+            "-o", "ControlMaster=auto", "-o", f"ControlPath={run}/ssh-%C",
+            "-o", "ControlPersist=60"]
+
+_STAT_RE = {
+    "files": re.compile(r"Number of regular files transferred:\s*([\d,.]+)"),
+    "bytes": re.compile(r"Total transferred file size:\s*([\d,.]+)"),
+    "sent": re.compile(r"Total bytes sent:\s*([\d,.]+)"),
+    "received": re.compile(r"Total bytes received:\s*([\d,.]+)"),
+    "deleted": re.compile(r"Number of deleted files:\s*([\d,.]+)"),
+}
+
+def _num(s: str) -> int:
+    return int(re.sub(r"[^\d]", "", s) or 0)
+
+# ---- a remote machine ------------------------------------------------------- #
+
+class Remote:
+    """One of the user's other machines.  `ssh` is the usual user@host; `root`
+    (tests) makes a local directory stand in for the machine instead."""
+
+    def __init__(self, name: str, spec: dict):
+        self.name = name
+        self.target = str(spec.get("ssh") or "")
+        self.root = str(spec.get("root") or "").rstrip("/")
+        self.claude = spec.get("claude")
+        self.info = {}
+
+    @property
+    def local(self) -> bool:
+        return bool(self.root) and not self.target
+
+    def path(self, p: str) -> str:
+        return self.root + p if self.local else p
+
+    def spec(self, remote_abs: str) -> str:
+        return remote_abs if self.local else f"{self.target}:{remote_abs}"
+
+    def _env(self) -> dict:
+        home = self.root + "/home"
+        e = {k: v for k, v in os.environ.items()
+             if not k.startswith("AHT_") or k == "AHT_CLAUDE"}
+        e.update(HOME=home, AHT_HOME=home + "/.aht",
+                 AHT_ROOT_CLAUDE=home + "/.claude/projects",
+                 AHT_NO_ICONS="1", AHT_NO_NOTIFY="1", AHT_NO_BACKUP="1",
+                 AHT_NO_MIRROR="1")
+        if os.environ.get("AHT_REMOTE_PATH"):
+            e["PATH"] = os.environ["AHT_REMOTE_PATH"] + os.pathsep + e.get("PATH", "")
+        if os.environ.get("AHT_REMOTE_CLAUDE"):     # tests: another version there
+            e["AHT_CLAUDE"] = os.environ["AHT_REMOTE_CLAUDE"]
+        return e
+
+    def sh(self, script: str, stdin: str = None, timeout: float = 120):
+        kw = {"input": stdin, "capture_output": True, "text": True,
+              "timeout": timeout, "cwd": "/"}
+        try:
+            if self.local:
+                Path(self.root + "/home").mkdir(parents=True, exist_ok=True)
+                return subprocess.run(["/bin/sh", "-c", script], env=self._env(), **kw)
+            r = subprocess.run(["ssh"] + _ssh_opts() + [self.target, script], **kw)
+        except subprocess.TimeoutExpired:
+            raise HandoverError(f"{self.name} did not answer within {timeout:.0f} s")
+        if r.returncode == 255:
+            raise HandoverError(f"cannot reach {self.name} ({self.target}): "
+                                + ((r.stderr or "").strip().splitlines() or ["no answer"])[-1])
+        return r
+
+    def push_agent(self) -> None:
+        """The other side runs this very file, so both ends always agree."""
+        r = self.sh('mkdir -p "$HOME/.aht/remote" && '
+                    'cat > "$HOME/.aht/remote/aht.py.new" && '
+                    'mv "$HOME/.aht/remote/aht.py.new" "$HOME/.aht/remote/aht.py"',
+                    stdin=Path(__file__).resolve().read_text(encoding="utf-8"))
+        if r.returncode != 0:
+            raise HandoverError(f"could not prepare {self.name}: "
+                                + (r.stderr or "").strip()[-200:])
+
+    def agent(self, op: str, timeout: float = 120, **req) -> dict:
+        req["op"] = op
+        py = shlex.quote(sys.executable) if self.local else "python3"
+        r = self.sh(f'exec {py} "$HOME/.aht/remote/aht.py" _agent',
+                    stdin=json.dumps(req), timeout=timeout)
+        i = (r.stdout or "").rfind(AGENT_MARK)
+        if i < 0:
+            raise HandoverError(f"{self.name} gave no usable answer to “{op}”: "
+                                + ((r.stderr or r.stdout or "").strip()[-300:]
+                                   or "python3 missing?"))
+        res = json.loads(r.stdout[i + len(AGENT_MARK):])
+        if not res.get("ok"):
+            raise HandoverError(f"{self.name}: {res.get('error') or op + ' failed'}")
+        return res
+
+    def connect(self, path: str = None) -> dict:
+        self.push_agent()
+        self.info = self.agent("probe", path=self.path(path) if path else None,
+                               claude=self.claude)
+        return self.info
+
+    def rsync(self, src: str, dst: str, *, delete: bool = False,
+              backup_dir: str = None, skip=(), files_from: list = None,
+              dry: bool = False, update: bool = False, include: list = None,
+              progress: bool = False) -> dict:
+        """One rsync run between this machine and the remote.  Paths ending in
+        a slash are directories whose CONTENT is synced."""
+        rs = find_rsync()
+        if not rs:
+            raise HandoverError("no usable rsync on this machine (version 3 or "
+                                "newer is needed) — on macOS:  brew install rsync")
+        cmd = [rs["path"], "-rlptD", "-s", "--timeout=120", "--stats",
+               "--partial-dir=.aht-rsync-partial"]
+        if cfg_get("handover_compress", True) and not self.local:
+            cmd.append("-z")
+        theirs = str(self.info.get("system") or "")
+        if not self.local and theirs and IS_MAC != (theirs == "Darwin"):
+            if not rs.get("iconv"):
+                raise HandoverError(f"{rs['path']} cannot convert file names "
+                                    "between macOS and Linux — brew install rsync")
+            cmd.append("--iconv=utf-8-mac,utf-8" if IS_MAC else "--iconv=utf-8,utf-8-mac")
+            if files_from is not None:
+                # a list of names is read in THIS machine's form; rsync then
+                # checks what arrives against it, after converting
+                form = "NFD" if IS_MAC else "NFC"
+                files_from = [unicodedata.normalize(form, f) for f in files_from]
+                if rs["ver"] >= (3, 2, 5):  # Apple's NFD differs for rare characters
+                    cmd.append("--trust-sender")
+        if not self.local:
+            cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts())]
+        if dry:
+            cmd.append("-n")
+        if update:
+            cmd.append("--update")
+        if delete:
+            cmd.append("--delete")
+        if backup_dir:
+            cmd += ["--backup", "--backup-dir=" + backup_dir]
+        for pat in include or []:
+            cmd.append("--include=" + pat)
+        if include:
+            cmd.append("--exclude=*")
+        for pat in skip:
+            cmd.append("--exclude=" + pat)
+        tmp = None
+        if files_from is not None:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix="aht-files-")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(b"\0".join(f.encode("utf-8") for f in files_from) + b"\0")
+            cmd += ["--from0", "--files-from=" + tmp]
+        if progress:
+            cmd.append("--info=progress2")
+        cmd += [src, dst]
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=None if progress else subprocess.PIPE,
+                                 cwd="/")
+            if progress:                    # show it as it comes, keep it for the numbers
+                got = []
+                while True:
+                    chunk = p.stdout.read1(4096)
+                    if not chunk:
+                        break
+                    got.append(chunk)
+                    if b"Number of files" not in b"".join(got[-3:]):
+                        sys.stderr.write(chunk.decode("utf-8", "replace"))
+                        sys.stderr.flush()
+                sys.stderr.write("\n")
+                text, err = b"".join(got), b""
+                p.wait()
+            else:
+                text, err = p.communicate()
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        text = text.decode("utf-8", "replace")
+        res = {k: _num(m.group(1)) if (m := rx.search(text)) else 0
+               for k, rx in _STAT_RE.items()}
+        res["rc"] = p.returncode
+        res["ok"] = p.returncode in (0, 24)     # 24: a file vanished meanwhile
+        res["error"] = "" if res["ok"] else (
+            (err or b"").decode("utf-8", "replace").strip()[-400:]
+            or f"rsync exit {p.returncode}")
+        return res
+
+def remotes_config() -> dict:
+    r = cfg_get("remotes") or {}
+    return r if isinstance(r, dict) else {}
+
+def get_remote(name: str = None) -> Remote:
+    rs = remotes_config()
+    if not rs:
+        raise HandoverError("no other machine is set up yet — add one with:  "
+                            "aht remote add <name> <user@host>")
+    name = name or cfg_get("default_remote") or (next(iter(rs)) if len(rs) == 1 else None)
+    if not name:
+        raise HandoverError("several machines are set up; name one with --to "
+                            f"({', '.join(sorted(rs))})")
+    if name not in rs:
+        raise HandoverError(f"unknown machine {name!r}; known: {', '.join(sorted(rs))}")
+    return Remote(name, rs[name])
+
+# ---- the agent side: operations the other machine runs for us --------------- #
+
+def find_claude(hint: str = None, prefer_user: bool = False):
+    if os.environ.get("AHT_CLAUDE"):            # tests: a stand-in CLI
+        return os.environ["AHT_CLAUDE"]
+    home = Path.home()
+    user = [home / ".local/bin/claude"]
+    rest = [shutil.which("claude"), "/opt/homebrew/bin/claude",
+            home / ".npm-global/bin/claude", "/usr/local/bin/claude"]
+    order = ([hint] if hint else []) + (user + rest if prefer_user else rest + user)
+    for c in order:
+        if c and os.path.exists(os.path.expanduser(str(c))):
+            return os.path.expanduser(str(c))
+    return None
+
+def claude_version(exe: str):
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                           timeout=30, cwd="/",
+                           env={**os.environ, "DISABLE_AUTOUPDATER": "1"})
+        m = re.search(r"(\d+\.\d+\.\d+)", r.stdout or "")
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def _tmux(*args, timeout: float = 15):
+    exe = shutil.which("tmux")
+    if not exe:
+        return None
+    try:
+        return subprocess.run([exe, *args], capture_output=True, text=True,
+                              timeout=timeout, cwd="/")
+    except Exception:
+        return None
+
+def _tmux_has(name: str) -> bool:
+    r = _tmux("has-session", "-t", "=" + name)
+    return bool(r) and r.returncode == 0
+
+def _tmux_screen(name: str, lines: int = 14) -> list:
+    r = _tmux("capture-pane", "-p", "-t", f"={name}:")      # a pane, not a session
+    if not r or r.returncode != 0:
+        return []
+    return [l.rstrip() for l in r.stdout.splitlines() if l.strip()][-lines:]
+
+def _agent_probe(req: dict) -> dict:
+    path = req.get("path")
+    exe = find_claude(req.get("claude"), prefer_user=True)
+    info = {"ok": True, "host": platform.node().split(".")[0],
+            "system": platform.system(), "home": str(Path.home()),
+            "python": platform.python_version(), "version": VERSION,
+            "claude_home": str(claude_home()), "claude": exe,
+            "claude_version": claude_version(exe) if exe else None,
+            "tools": {t: shutil.which(t) for t in
+                      ("rsync", "byobu", "tmux", "mosh-server", "curl")},
+            "packages": next((p for p in ("apt-get", "dnf", "pacman", "zypper", "brew")
+                              if find_tool(p)), None),
+            "firewall": "ufw" if find_tool("ufw") or os.path.exists("/usr/sbin/ufw")
+            else None,
+            "tailscale_if": os.path.exists("/sys/class/net/tailscale0"),
+            "logged_in": (claude_home() / ".credentials.json").is_file()
+            if not IS_MAC else None,     # macOS keeps the login in the keychain
+            "sessions_open": len(running_sessions())}
+    if path:
+        anc = Path(path)
+        while not anc.exists() and anc != anc.parent:
+            anc = anc.parent
+        info["path_exists"] = os.path.isdir(path)
+        info["path_base"] = str(anc)
+        info["path_writable"] = os.access(str(anc), os.W_OK | os.X_OK)
+        info["path_real"] = os.path.realpath(path)
+        try:
+            v = os.statvfs(str(anc))
+            info["free_bytes"] = v.f_bavail * v.f_frsize
+        except OSError:
+            pass
+        info.update(activity_in(info["path_real"]) if info["path_exists"]
+                    else {"sessions": [], "processes": []})
+    return info
+
+def _agent_manifest(req: dict) -> dict:
+    out = {}
+    for name, spec in (req.get("trees") or {}).items():
+        out[name] = tree_manifest(spec["path"], spec.get("skip") or []) \
+            if os.path.isdir(spec["path"]) else {"files": {}, "raw": {}}
+    return {"ok": True, "trees": out}
+
+def _agent_hash(req: dict) -> dict:
+    out = {}
+    for f in req.get("files") or []:
+        try:
+            out[f["key"]] = file_sha256(f["path"], f.get("limit"))
+        except OSError:
+            out[f["key"]] = None
+    return {"ok": True, "hashes": out}
+
+def _agent_written_by(req: dict) -> dict:
+    """The newest agent CLI version that wrote into each transcript, from
+    `offset` on — the part that was added on this machine."""
+    out = {}
+    for f in req.get("files") or []:
+        best = None
+        try:
+            with open(f["path"], "rb") as fh:
+                fh.seek(int(f.get("offset") or 0))
+                for line in fh:
+                    if b'"version"' not in line:
+                        continue
+                    try:
+                        v = json.loads(line).get("version")
+                        v = tuple(int(x) for x in str(v).split("."))
+                    except Exception:
+                        continue
+                    if len(v) == 3 and (best is None or v > best):
+                        best = v
+        except OSError:
+            pass
+        out[f["key"]] = ".".join(map(str, best)) if best else None
+    return {"ok": True, "versions": out}
+
+UDP_PROBE_PORTS = (60999, 60998)        # inside the range mosh uses
+
+def _agent_udp_echo(req: dict) -> dict:
+    """Answer one datagram: tells the caller whether mosh's UDP gets through."""
+    import socket
+    for port in UDP_PROBE_PORTS:
+        s = socket.socket(socket.AF_INET6 if req.get("v6") else socket.AF_INET,
+                          socket.SOCK_DGRAM)
+        try:
+            s.bind(("", port))
+        except OSError:
+            s.close()
+            continue
+        s.settimeout(float(req.get("wait") or 6))
+        try:
+            data, peer = s.recvfrom(64)
+            if data == b"aht-ping":
+                s.sendto(b"aht-pong", peer)
+                return {"ok": True, "heard": True, "port": port}
+        except OSError:
+            pass
+        finally:
+            s.close()
+        return {"ok": True, "heard": False, "port": port}
+    return {"ok": True, "heard": False, "port": None}
+
+def _agent_prepare(req: dict) -> dict:
+    """Folders the sync writes into; and, when the two homes differ, the other
+    machine's ~/.claude path made to resolve here, since the history names it."""
+    notes = []
+    for d in req.get("dirs") or []:
+        os.makedirs(d, exist_ok=True)
+    their = req.get("their_home")
+    mine = str(Path.home())
+    if their and os.path.realpath(their) != os.path.realpath(mine):
+        link = Path(their) / ".claude"
+        if Path(their).is_dir() and not link.exists() and not link.is_symlink() \
+                and os.access(their, os.W_OK):
+            try:
+                os.symlink(str(claude_home()), str(link))
+                notes.append(f"{link} now points at {claude_home()}")
+            except OSError as e:
+                notes.append(f"could not link {link}: {e}")
+    return {"ok": True, "notes": notes}
+
+def _claude_json() -> Path:
+    return claude_home().parent / ".claude.json"
+
+def _agent_trust(req: dict) -> dict:
+    """The user already trusted this very folder on the machine it comes
+    from; recorded here only while no agent CLI could overwrite the file."""
+    cj = _claude_json()
+    if not cj.is_file():
+        return {"ok": True, "trust": "not set: the agent CLI was never set up here"}
+    if running_sessions():
+        return {"ok": True, "trust": "not set: an agent session is open here"}
+    try:
+        data = json.loads(cj.read_text())
+        ent = data.setdefault("projects", {}).setdefault(req["path"], {})
+    except Exception as e:
+        return {"ok": True, "trust": f"not set: {cj.name} is unreadable ({e})"}
+    if ent.get("hasTrustDialogAccepted"):
+        return {"ok": True, "trust": "already trusted"}
+    ent["hasTrustDialogAccepted"] = True
+    shutil.copy2(cj, str(cj) + ".bak-aht")
+    tmp = cj.with_name(cj.name + ".aht-new")
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, cj)
+    return {"ok": True, "trust": "carried over"}
+
+def _agent_install_claude(req: dict) -> dict:
+    ver = str(req.get("version") or "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+        return {"ok": False, "error": f"not a version: {ver!r}"}
+    r = subprocess.run(["/bin/sh", "-c",
+                        f"curl -fsSL https://claude.ai/install.sh | bash -s {ver}"],
+                       capture_output=True, text=True, timeout=900)
+    exe = find_claude(None, prefer_user=True)
+    got = claude_version(exe) if exe else None
+    if got != ver:
+        return {"ok": False, "error": f"installing Claude Code {ver} failed "
+                f"(found {got}): {(r.stderr or r.stdout).strip()[-300:]}"}
+    return {"ok": True, "claude": exe, "claude_version": got}
+
+def _agent_start(req: dict) -> dict:
+    path, name = req["path"], req["name"]
+    mux = shutil.which("byobu") or shutil.which("tmux")
+    if not shutil.which("tmux"):
+        return {"ok": False, "error": "tmux is not installed (byobu needs it too)"}
+    if running_sessions(inside=path):
+        return {"ok": False, "error": "an agent session is already open there"}
+    if _tmux_has(name):
+        _tmux("kill-session", "-t", "=" + name)
+    run = aht_home() / "remote" / "run" / name
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "note.txt").write_text(req.get("note") or "")
+    (run / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "timeout": 5,
+                    "command": "cat " + shlex.quote(str(run / "note.txt"))}]}]}}))
+    argv = [req["claude"]]
+    if req.get("session"):
+        argv += ["--resume", req["session"]]
+    argv += ["--settings", str(run / "settings.json")]
+    argv += [str(a) for a in req.get("args") or []]
+    if req.get("remote_control"):
+        argv += ["--remote-control", req["remote_control"]]
+    line = ("cd %s && env DISABLE_AUTOUPDATER=1 %s; st=$?; cd /; "
+            "printf '\\n[aht] the agent exited (%%s); this window closes in a minute\\n' "
+            "\"$st\"; sleep 60"
+            % (shlex.quote(path), " ".join(shlex.quote(a) for a in argv)))
+    (run / "command.txt").write_text(line + "\n")
+    new = ["new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", path, line]
+    r = subprocess.run([mux] + new, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 and os.path.basename(mux) == "byobu":
+        mux = shutil.which("tmux")
+        r = subprocess.run([mux] + new, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return {"ok": False, "error": "could not start the terminal session: "
+                + (r.stderr or r.stdout).strip()[-200:]}
+    started, attention, screen = False, None, []
+    end = time.time() + float(req.get("wait") or 12)
+    while time.time() < end:
+        time.sleep(1.0)
+        screen = _tmux_screen(name)
+        text = " ".join(screen).lower()
+        if running_sessions(inside=path):
+            started = True
+        if "trust this folder" in text or "trust the files" in text:
+            attention = "it asks whether you trust the folder"
+            break
+        if "the agent exited" in text:
+            attention = "the agent exited right away"
+            break
+        if started:
+            break
+    return {"ok": True, "mux": os.path.basename(mux), "name": name,
+            "started": started, "attention": attention, "screen": screen}
+
+def _agent_stop(req: dict) -> dict:
+    """End an IDLE session the way its user would: Ctrl-C, never text typed
+    into the prompt — so a half-written message can not be sent by accident.
+    A working session is left alone."""
+    path, name = req["path"], req["name"]
+    end = time.time() + float(req.get("wait") or 30)
+    pressed = 0
+    while True:
+        sess = running_sessions(inside=path)
+        if not sess:
+            break
+        busy = [s for s in sess if s.get("status") != "idle"]
+        if busy:
+            return {"ok": True, "stopped": False, "reason": "working", "sessions": sess}
+        if not _tmux_has(name):
+            return {"ok": True, "stopped": False, "reason": "not-ours", "sessions": sess}
+        if time.time() >= end or pressed >= 4:
+            return {"ok": True, "stopped": False, "reason": "no-reaction", "sessions": sess}
+        # the CLI exits on a second Ctrl-C that follows the first at once
+        _tmux("send-keys", "-t", f"={name}:", "C-c")
+        time.sleep(0.4)
+        _tmux("send-keys", "-t", f"={name}:", "C-c")
+        pressed += 1
+        time.sleep(2.5)
+    if _tmux_has(name):
+        _tmux("kill-session", "-t", "=" + name)
+    return {"ok": True, "stopped": True}
+
+def _agent_close(req: dict) -> dict:
+    """Close the window a handover opened, once no session is left in it."""
+    if running_sessions(inside=req["path"]):
+        return {"ok": True, "closed": False}
+    had = _tmux_has(req["name"])
+    if had:
+        _tmux("kill-session", "-t", "=" + req["name"])
+        time.sleep(0.5)
+    return {"ok": True, "closed": had}
+
+def _agent_peek(req: dict) -> dict:
+    path, name = req["path"], req.get("name") or ""
+    act = activity_in(path) if os.path.isdir(path) else {"sessions": [], "processes": []}
+    return {"ok": True, "window": bool(name) and _tmux_has(name),
+            "screen": _tmux_screen(name) if name else [], **act}
+
+def _agent_prune(req: dict) -> dict:
+    """Drop what earlier syncs set aside, beyond the newest few."""
+    base, keep, n = Path(req["dir"]), int(req.get("keep") or 5), 0
+    if base.is_dir():
+        for d in sorted(p for p in base.iterdir() if p.is_dir())[:-keep]:
+            shutil.rmtree(d, ignore_errors=True)
+            n += 1
+    return {"ok": True, "pruned": n}
+
+AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
+             "hash": _agent_hash, "prepare": _agent_prepare,
+             "trust": _agent_trust, "install-claude": _agent_install_claude,
+             "start": _agent_start, "stop": _agent_stop, "peek": _agent_peek,
+             "close": _agent_close, "written-by": _agent_written_by,
+             "udp-echo": _agent_udp_echo,
+             "prune": _agent_prune}
+
+def cmd_agent(args):
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+        fn = AGENT_OPS.get(req.get("op"))
+        res = fn(req) if fn else {"ok": False,
+                                  "error": f"unknown operation {req.get('op')!r}"}
+    except Exception as e:
+        res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        error(f"AGENT {e}")
+    sys.stdout.write("\n" + AGENT_MARK + json.dumps(res) + "\n")
+    return 0
+
+# ---- what a session knew: carried in a readable form ------------------------ #
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text") or "" for b in content or []
+                     if isinstance(b, dict) and b.get("type") == "text")
+
+def _clip(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n].rstrip() + " […]"
+
+def session_digest(jsonl, project: str, turns: int = 8) -> dict:
+    """The state of one session, read from its transcript: title, the last
+    compaction summary, the latest exchanges, open to-dos, files it touched
+    and the paths OUTSIDE the project it used."""
+    d = {"title": None, "summary": None, "exchanges": [], "todos": [],
+         "touched": [], "outside": [], "version": None}
+    cur = None
+    home = str(Path.home())
+    noise = (home + "/.claude", home + "/.aht", "/tmp/", "/private/", "/var/",
+             "/dev/", "/proc/", "/usr/", "/opt/", "/System/", "/Library/", "/etc/",
+             "/bin/", "/sbin/")
+    try:
+        fh = open(jsonl, "r", errors="replace")
+    except OSError:
+        return d
+    with fh:
+        for line in fh:
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(e, dict):
+                continue
+            t = e.get("type")
+            if t in ("ai-title", "custom-title"):
+                d["title"] = e.get("aiTitle") or e.get("customTitle") or d["title"]
+            if e.get("version"):
+                d["version"] = e["version"]
+            m = e.get("message")
+            if e.get("isSidechain") or not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if t == "user":
+                if e.get("isCompactSummary"):
+                    d["summary"], d["exchanges"], cur = _text_of(c), [], None
+                    continue
+                if e.get("isMeta") or e.get("toolUseResult") is not None:
+                    continue
+                if isinstance(c, list) and any(isinstance(b, dict) and
+                                               b.get("type") == "tool_result" for b in c):
+                    continue
+                txt = _text_of(c).strip()
+                if not txt or txt.startswith("<"):      # reminders, notifications
+                    continue
+                cur = {"you": txt, "agent": ""}
+                d["exchanges"].append(cur)
+                del d["exchanges"][:-turns]
+            elif t == "assistant":
+                txt = _text_of(c).strip()
+                if txt and cur is not None:
+                    cur["agent"] = txt                  # a turn's last text wins
+                for b in c if isinstance(c, list) else []:
+                    if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                        continue
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    if b.get("name") == "TodoWrite" and isinstance(inp.get("todos"), list):
+                        d["todos"] = inp["todos"]
+                    fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+                    if not (isinstance(fp, str) and fp.startswith("/")):
+                        continue
+                    if _inside(fp, project):
+                        if b.get("name") in ("Write", "Edit", "NotebookEdit"):
+                            rel = os.path.relpath(fp, project)
+                            if rel in d["touched"]:
+                                d["touched"].remove(rel)
+                            d["touched"].append(rel)
+                    elif not fp.startswith(noise):
+                        if fp in d["outside"]:
+                            d["outside"].remove(fp)
+                        d["outside"].append(fp)
+    d["touched"] = d["touched"][-15:]
+    d["outside"] = d["outside"][-15:]
+    d["todos"] = [x for x in d["todos"] if isinstance(x, dict)
+                  and x.get("status") != "completed"]
+    return d
+
+def scratch_dir(real: str, sid: str):
+    """Where the agent CLI keeps a session's own scratch files."""
+    for tmp in ("/private/tmp", "/tmp"):
+        p = Path(tmp) / f"claude-{os.getuid()}" / _key_claude(real) / sid / "scratchpad"
+        if p.is_dir():
+            return p
+    return None
+
+def write_brief(real: str, sid, dig: dict, here: str, there: str,
+                there_system: str, carried: list, scratch: bool) -> tuple:
+    """The readable summary that travels inside the project, and the short
+    note the resumed session is told on arrival.  -> (file, note)"""
+    out = Path(real) / ".aht" / "handover"
+    out.mkdir(parents=True, exist_ok=True)
+    # excerpts of a conversation must never end up in the project's repository
+    (out / ".gitignore").write_text("*\n")
+    when = time.strftime("%Y-%m-%d %H:%M")
+    name = f"{time.strftime('%Y%m%d-%H%M')}-to-{there}.md"
+    system = {"Darwin": "macOS", "Linux": "Linux"}
+    mine = system.get(platform.system(), platform.system())
+    theirs = system.get(there_system, there_system or "?")
+    L = [f"# Handover: {os.path.basename(real)}", "",
+         f"- From **{here}** ({mine}) to **{there}** ({theirs}), {when}",
+         f"- Folder: `{real}` (the same path on both machines)"]
+    if sid:
+        L.append(f"- Session: {dig.get('title') or 'untitled'} — `{sid}`"
+                 + (f", Claude Code {dig['version']}" if dig.get("version") else ""))
+        L.append(f"- Continue it with: `claude --resume {sid}`")
+    if dig.get("summary"):
+        L += ["", "## Where things stood", "", _clip(dig["summary"], 8000)]
+    if dig.get("exchanges"):
+        L += ["", "## The latest exchanges"]
+        for x in dig["exchanges"]:
+            L += ["", "**You:** " + _clip(x["you"], 1500)]
+            if x.get("agent"):
+                L += ["", "**Agent:** " + _clip(x["agent"], 2500)]
+    if dig.get("todos"):
+        L += ["", "## Open to-do items", ""]
+        L += [f"- [ ] {_clip(str(x.get('content') or x.get('subject') or ''), 200)}"
+              + ("  *(in progress)*" if x.get("status") == "in_progress" else "")
+              for x in dig["todos"]]
+    if dig.get("touched"):
+        L += ["", "## Files changed most recently", ""]
+        L += [f"- `{p}`" for p in reversed(dig["touched"])]
+    missing = [p for p in dig.get("outside") or []
+               if not any(_inside(p, c) for c in carried)]
+    L += ["", "## What did not come along", "",
+          "- Running processes: servers, builds, background shells.",
+          "- Temporary files (`/tmp`, `/private/tmp`)."
+          + (f" This session's scratch folder was copied to "
+             f"`.aht/handover/scratch/{sid}/`." if scratch else ""),
+          "- Folders that are rebuilt per machine: `node_modules`, `.venv`, "
+          "`__pycache__` and the like."]
+    if missing:
+        L += ["- Files outside the project that this session used:"]
+        L += [f"  - `{p}`" for p in missing]
+    if carried:
+        L += ["", "## Carried along besides the project", ""]
+        L += [f"- `{p}`" for p in carried]
+    (out / name).write_text("\n".join(L) + "\n", encoding="utf-8")
+    for old in sorted(out.glob("*-to-*.md"))[:-5]:
+        old.unlink()
+    note = [f"[aht] This session was handed over from “{here}” ({mine}) to "
+            f"“{there}” ({theirs}) on {when}. The project folder and this "
+            f"conversation's history came along; the folder's path is unchanged.",
+            "Not carried: running processes, temporary files (/tmp, /private/tmp)"
+            + (f" — a copy of this session's scratch folder is at "
+               f".aht/handover/scratch/{sid}/" if scratch else "")
+            + ", and folders rebuilt per machine (node_modules, .venv, …)."]
+    if missing:
+        note.append("Files outside the project that were used here and are NOT "
+                    "on this machine: " + ", ".join(missing[:8])
+                    + (" …" if len(missing) > 8 else "") + ".")
+    if mine != theirs:
+        note.append(f"Tools that exist only on {mine} are not available here.")
+    note.append(f"A readable summary of where things stood: .aht/handover/{name}")
+    return out / name, "\n".join(note) + "\n"
+
+# ---- registry bookkeeping ---------------------------------------------------- #
+
+def _entry_for(reg: dict, real: str):
+    for uid, e in reg.get("projects", {}).items():
+        if os.path.realpath(e.get("real_path") or "") == real:
+            return uid, e
+    return None, None
+
+def _update_entry(uid: str, **fields) -> None:
+    """Set (or, with None, drop) keys of one registry entry."""
+    with Lock():
+        reg = load_registry()
+        e = reg["projects"].get(uid)
+        if e is None:
+            return
+        for k, v in fields.items():
+            if v is None:
+                e.pop(k, None)
+            else:
+                e[k] = v
+        save_registry(reg)
+
+class ProjectLock:
+    """One transfer per project at a time (a mirror run and a handover)."""
+    def __init__(self, uid: str):
+        self.p = handover_dir(uid) / ".lock"
+        self.fh = None
+    def __enter__(self):
+        self.p.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.p, "w")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.fh.close()
+            self.fh = None
+            raise HandoverError("another transfer of this project is running")
+        return self
+    def __exit__(self, *a):
+        if self.fh:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+                self.fh.close()
+            except Exception:
+                pass
+
+def _mux_name(real: str, uid: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", os.path.basename(real).lower()).strip("-")
+    return f"aht-{slug[:20].strip('-') or 'project'}-{uid[:6]}"
+
+def _here() -> str:
+    return platform.node().split(".")[0] or "this machine"
+
+def find_tool(name: str):
+    """A program by name — also where package managers put it, since a tray
+    or a LaunchAgent runs with the system's bare PATH."""
+    for c in (shutil.which(name), f"/opt/homebrew/bin/{name}",
+              f"/usr/local/bin/{name}", str(Path.home() / ".local/bin" / name)):
+        if c and os.path.exists(c):
+            return c
+    return None
+
+def udp_reaches(rem: Remote) -> bool:
+    """Does a datagram get to the machine and back?  mosh needs that; a
+    firewall there often says no."""
+    import socket, threading
+    if rem.local:
+        return False
+    host = rem.target.split("@")[-1]
+    got = {}
+    t = threading.Thread(target=lambda: got.update(
+        _quiet(lambda: rem.agent("udp-echo", timeout=30, wait=6))), daemon=True)
+    t.start()
+    ok = False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.4)
+        end = time.time() + 7
+        while time.time() < end and not ok:
+            for port in UDP_PROBE_PORTS:
+                try:
+                    s.sendto(b"aht-ping", (host, port))
+                except OSError:
+                    continue
+            try:
+                ok = s.recvfrom(64)[0] == b"aht-pong"
+            except OSError:
+                pass
+        s.close()
+    except OSError:
+        pass
+    t.join(timeout=10)
+    return ok
+
+def _quiet(fn) -> dict:
+    try:
+        return fn() or {}
+    except Exception:
+        return {}
+
+def mosh_usable(rem: Remote, test: bool = False) -> bool:
+    """mosh on both sides AND its UDP path open — tested once per machine and
+    remembered (`aht remote check` tests again)."""
+    if rem.local or not cfg_get("handover_mosh", True) or not find_tool("mosh") \
+            or not (rem.info.get("tools") or {}).get("mosh-server"):
+        return False
+    spec = remotes_config().get(rem.name) or {}
+    if test or "udp" not in spec:
+        ok = udp_reaches(rem)
+        with Lock():
+            cfg = load_config()
+            rs = dict(cfg.get("remotes") or {})
+            if rem.name in rs:
+                rs[rem.name] = dict(rs[rem.name], udp=ok)
+                cfg["remotes"] = rs
+                save_config(cfg)
+        return ok
+    return bool(spec.get("udp"))
+
+def attach_command(rem: Remote, mux: str, name: str) -> list:
+    inner = [mux or "tmux", "attach", "-t", name]
+    if rem.local:
+        return inner
+    if mosh_usable(rem):
+        return [find_tool("mosh"), rem.target, "--"] + inner    # survives a changing network
+    return ["ssh", "-t", rem.target] + inner
+
+# ---- pushing a project over -------------------------------------------------- #
+
+def _store_of(real: str):
+    hit = claude_backend().find(real)
+    return hit[1] if hit else None
+
+def _sessions_of(store) -> list:
+    """Session ids of a store, newest first."""
+    if not store:
+        return []
+    fs = [f for f in Path(store).glob("*.jsonl") if f.is_file()]
+    return [f.stem for f in sorted(fs, key=lambda f: f.stat().st_mtime, reverse=True)]
+
+_SLUG_RE = re.compile(rb'"slug"\s*:\s*"([A-Za-z0-9._-]{1,120})"')
+
+def _plans_of(store) -> list:
+    """rsync patterns for the plan files this project's sessions wrote."""
+    slugs = set()
+    for f in Path(store).glob("*.jsonl") if store else []:
+        try:
+            with open(f, "rb") as fh:
+                for line in fh:
+                    if b'"slug"' in line:
+                        slugs.update(m.decode() for m in _SLUG_RE.findall(line))
+        except OSError:
+            continue
+    return [f"/{s}.md" for s in sorted(slugs)]
+
+def _extras(entry: dict) -> list:
+    return [p for p in (entry.get("extras") or []) if os.path.exists(p)]
+
+def _check_extra(p: str) -> str:
+    """'' if `p` may travel next to a project, else why not."""
+    real = os.path.realpath(os.path.expanduser(p))
+    home = os.path.realpath(str(Path.home()))
+    if not os.path.exists(real):
+        return "does not exist"
+    if not _inside(real, home) or real == home:
+        return "only files and folders inside your home folder can travel"
+    for bad in (".claude", ".aht", ".ssh", ".gnupg", ".config", "Library"):
+        if _inside(real, os.path.join(home, bad)):
+            return f"~/{bad} holds this machine's own settings and keys"
+    return ""
+
+def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
+                 dry: bool = False) -> dict:
+    """Make the remote copy of a project and of its history equal to what is
+    here.  What the sync replaces or removes over there is set aside first."""
+    real = os.path.realpath(entry["real_path"])
+    rpath = rem.path(real)
+    rhome, rclaude = rem.info["home"], rem.info["claude_home"]
+    aside = f"{rhome}/.aht/remote/replaced/{uid}/{_stamp()}"
+    res = {"project": {}, "history": {}, "extras": [], "aside": aside}
+    store = _store_of(real)
+    sids = _sessions_of(store)
+    if not dry:
+        rem.agent("prepare", dirs=[rpath, f"{rclaude}/projects", f"{rclaude}/file-history",
+                                   f"{rclaude}/plans", os.path.dirname(aside)],
+                  their_home=str(Path.home()))
+    res["project"] = rem.rsync(real + "/", rem.spec(rpath + "/"), delete=True,
+                               backup_dir=aside + "/project", skip=handover_skip(),
+                               dry=dry, progress=progress)
+    if not res["project"]["ok"]:
+        raise HandoverError("sending the project failed: " + res["project"]["error"])
+    if store:
+        rkey = _key_claude(rpath)
+        res["history"] = rem.rsync(str(store) + "/",
+                                   rem.spec(f"{rclaude}/projects/{rkey}/"),
+                                   backup_dir=aside + "/history", dry=dry)
+        if not res["history"]["ok"]:
+            raise HandoverError("sending the history failed: " + res["history"]["error"])
+        side = [(claude_home() / "file-history", "file-history",
+                 [f"/{s}/***" for s in sids
+                  if (claude_home() / "file-history" / s).is_dir()]),
+                (claude_home() / "plans", "plans",
+                 _plans_of(store) if (claude_home() / "plans").is_dir() else [])]
+        for src, sub, inc in side:
+            if inc:
+                r = rem.rsync(str(src) + "/", rem.spec(f"{rclaude}/{sub}/"),
+                              include=inc, dry=dry)
+                res["history"]["bytes"] = res["history"].get("bytes", 0) + r.get("bytes", 0)
+    for p in _extras(entry):
+        isdir = os.path.isdir(p)
+        if not dry:
+            rem.agent("prepare", dirs=[rem.path(p) if isdir
+                                       else os.path.dirname(rem.path(p))])
+        r = rem.rsync(p + ("/" if isdir else ""), rem.spec(rem.path(p) + ("/" if isdir else "")),
+                      backup_dir=aside + "/extras", skip=handover_skip(),
+                      dry=dry, progress=progress)
+        res["extras"].append({"path": p, **r})
+    if not dry:
+        try:
+            rem.agent("prune", dir=os.path.dirname(aside), keep=5)
+        except HandoverError:
+            pass
+    return res
+
+# ---- mirror ------------------------------------------------------------------ #
+
+def mirror_due(entry: dict, now: float = None) -> bool:
+    m = entry.get("mirror") or {}
+    if not m.get("enabled") or entry.get("away"):
+        return False
+    try:
+        every = float(cfg_get("mirror_interval_minutes", 30)) * 60
+    except Exception:
+        every = 1800.0
+    last = max(float(m.get("synced_at") or 0), float(m.get("tried_at") or 0))
+    return (now or time.time()) - last >= every
+
+def mirror_project(uid: str, entry: dict, progress: bool = False) -> dict:
+    real = os.path.realpath(entry["real_path"])
+    m = dict(entry.get("mirror") or {})
+    row = {"project": real, "remote": m.get("remote")}
+    m["tried_at"] = time.time()
+    try:
+        if entry.get("away"):
+            raise HandoverError("handed over: the other machine holds the live copy")
+        if not os.path.isdir(real):
+            raise HandoverError("the folder is missing")
+        with ProjectLock(uid):
+            rem = get_remote(m.get("remote"))
+            rem.connect(real)
+            row["remote"] = rem.name
+            if rem.info.get("sessions") or rem.info.get("processes"):
+                raise HandoverError(f"something is running in it on {rem.name}")
+            if not rem.info.get("path_writable"):
+                raise HandoverError(f"{rem.info.get('path_base')} is not writable "
+                                    f"on {rem.name}")
+            r = push_project(rem, uid, entry, progress=progress)
+        sent = r["project"].get("bytes", 0) + r["history"].get("bytes", 0) \
+            + sum(x.get("bytes", 0) for x in r["extras"])
+        m.update(synced_at=time.time(), status="ok", bytes=sent, path=real)
+        row.update(status="synced", bytes=sent,
+                   files=r["project"].get("files", 0) + r["history"].get("files", 0))
+        log(f"MIRROR {real} -> {rem.name} ({row['files']} file(s), {_human(sent)})")
+    except HandoverError as e:
+        m["status"] = str(e)
+        row.update(status="skipped", reason=str(e))
+        warn(f"MIRROR {real}: {e}")
+    _update_entry(uid, mirror=m)
+    return row
+
+def mirror_pass(only_due: bool = False, only: str = None, progress: bool = False) -> list:
+    reg = load_registry()
+    rows = []
+    for uid, e in sorted(reg.get("projects", {}).items(),
+                         key=lambda kv: kv[1].get("real_path") or ""):
+        if not (e.get("mirror") or {}).get("enabled"):
+            continue
+        if only and os.path.realpath(e["real_path"]) != only:
+            continue
+        if only_due and not mirror_due(e):
+            continue
+        rows.append(mirror_project(uid, e, progress=progress))
+    return rows
+
+def _spawn_mirror() -> None:
+    """From the watcher and the hook: sync what is due, detached, one run at
+    a time."""
+    try:
+        if os.environ.get("AHT_NO_MIRROR") or not handover_supported():
+            return
+        reg = load_registry()
+        if not any(mirror_due(e) for e in reg.get("projects", {}).values()):
+            return
+        subprocess.Popen([sys.executable or "python3", str(Path(__file__).resolve()),
+                          "mirror", "--run", "--due", "--quiet"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         start_new_session=True, cwd="/")
+    except Exception:
+        pass
+
+def cmd_mirror(args):
+    if not handover_supported():
+        print("mirroring needs rsync and ssh; it is not available in this build")
+        return 2
+    real = os.path.realpath(args.path) if args.path else None
+    if args.on or args.off:
+        if not real or not os.path.isdir(real) \
+                or _inside(os.path.realpath(str(Path.home())), real):
+            print("name the project folder to switch mirroring on or off", file=sys.stderr)
+            return 2
+        try:
+            rem = get_remote(args.to) if args.on else None
+        except HandoverError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        with Lock():
+            reg = load_registry()
+            uid, entry = _entry_for(reg, real)
+            if entry is None:
+                uid = read_marker(real) or new_uuid()
+                write_marker(real, uid)
+                _register(reg, uid, real)
+                entry = reg["projects"][uid]
+            m = dict(entry.get("mirror") or {})
+            m["enabled"] = bool(args.on)
+            if rem:
+                m["remote"] = rem.name
+            entry["mirror"] = m
+            save_registry(reg)
+        log(f"MIRROR {'on' if args.on else 'off'} {real}")
+        if args.off or not args.run:
+            print(f"mirroring {'on' if args.on else 'off'}: {real}"
+                  + (f"  (to {rem.name}; the first sync runs in the background)"
+                     if rem else ""))
+            if args.on:
+                _spawn_mirror()
+            return 0
+    if args.run:
+        lock = aht_home() / "run"
+        lock.mkdir(parents=True, exist_ok=True)
+        fh = open(lock / "mirror.lock", "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if not args.quiet:
+                print("a mirror run is already in progress")
+            return 0
+        rows = mirror_pass(only_due=args.due, only=real,
+                           progress=sys.stderr.isatty() and not args.json and not args.quiet)
+        if args.json:
+            print(json.dumps({"mirrored": rows}, indent=2))
+        elif not args.quiet:
+            for r in rows:
+                print(f"  {'✓' if r['status'] == 'synced' else '·'} {r['project']}  → "
+                      f"{r.get('remote')}: "
+                      + (f"{r['files']} file(s), {_human(r['bytes'])} sent"
+                         if r["status"] == "synced" else r.get("reason", "")))
+            if not rows:
+                print("nothing to sync")
+        return 0
+    reg = load_registry()
+    rows = [{"project": e["real_path"], **(e.get("mirror") or {}),
+             "away": bool(e.get("away"))}
+            for e in reg.get("projects", {}).values()
+            if (e.get("mirror") or {}).get("enabled")
+            and (not real or os.path.realpath(e["real_path"]) == real)]
+    if args.json:
+        print(json.dumps({"mirrors": rows}, indent=2))
+    else:
+        print(f"{len(rows)} project(s) kept in sync:")
+        for r in sorted(rows, key=lambda r: r["project"].lower()):
+            at = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["synced_at"])) \
+                if r.get("synced_at") else "never"
+            print(f"   {r['project']}  → {r.get('remote')}   last sync {at}"
+                  + ("" if r.get("status") in (None, "ok") else f"   ({r['status']})")
+                  + ("   [handed over]" if r["away"] else ""))
+    return 0
+
+# ---- handover ----------------------------------------------------------------- #
+
+def _emit(args, out: dict, lines: list) -> int:
+    """Print one command's result: JSON for the front-ends, text for people."""
+    code = 3 if out.get("blockers") else (1 if out.get("error") else 0)
+    if getattr(args, "json", False):
+        print(json.dumps(out, indent=2, default=str))
+        return code
+    for l in lines:
+        print(l)
+    for w in out.get("warnings") or []:
+        print(f"  ! {w}")
+    for b in out.get("blockers") or []:
+        print(f"  ✗ {b}")
+    if out.get("error"):
+        print(f"  ✗ {out['error']}")
+    return code
+
+def cmd_handover(args):
+    out = {"command": "handover", "applied": False, "blockers": [], "warnings": []}
+    lines = []
+    if not handover_supported():
+        out["blockers"].append("handover needs rsync and ssh; it is not available "
+                               "in this build")
+        return _emit(args, out, lines)
+    real = os.path.realpath(args.path)
+    out["project"] = real
+    if not os.path.isdir(real):
+        out["blockers"].append(f"not a folder: {real}")
+        return _emit(args, out, lines)
+    if _inside(os.path.realpath(str(Path.home())), real):
+        out["blockers"].append("that is your home folder (or contains it), "
+                               "not a project")
+        return _emit(args, out, lines)
+    talk = not args.json
+    def say(msg):
+        if talk:
+            print(msg, flush=True)
+    try:
+        rem = get_remote(args.to)
+        out["remote"] = rem.name
+        with Lock():
+            reg = load_registry()
+            uid, entry = _entry_for(reg, real)
+            if entry is None and args.apply:
+                uid = read_marker(real) or new_uuid()
+                write_marker(real, uid)
+                _register(reg, uid, real)
+                entry = reg["projects"][uid]
+                save_registry(reg)
+        entry = dict(entry or {"real_path": real})
+        uid = uid or "untracked"
+        if entry.get("away"):
+            a = entry["away"]
+            out["blockers"].append(f"already handed over to {a.get('remote')} since "
+                                   f"{a.get('since')} — take it back first:  aht reclaim")
+            return _emit(args, out, lines)
+        for p in args.include or []:
+            why = _check_extra(p)
+            if why:
+                out["blockers"].append(f"{p}: {why}")
+        extras = list(dict.fromkeys(
+            list(entry.get("extras") or [])
+            + [os.path.realpath(os.path.expanduser(p)) for p in args.include or []]))
+        entry["extras"] = extras
+
+        # (1) nothing may be running in it here
+        act = activity_in(real)
+        out["here"] = act
+        out["blockers"] += _activity_blockers(act, "on this machine")
+        if act["processes"] and not args.allow_processes:
+            names = ", ".join(sorted({f"{p['name']} ({p['pid']})" for p in act["processes"]}))
+            out["blockers"].append(f"still running in this folder: {names} — stop "
+                                   "them, or pass --allow-processes to leave them behind")
+
+        # (2) the other machine
+        say(f"checking {rem.name} …")
+        info = rem.connect(real)
+        out["there"] = {k: info.get(k) for k in
+                        ("host", "system", "home", "claude", "claude_version",
+                         "path_exists", "path_writable", "free_bytes",
+                         "sessions", "processes")}
+        if info.get("path_real") and info["path_real"] != rem.path(real) \
+                and info.get("path_exists"):
+            out["blockers"].append(f"{real} is a link on {rem.name} (to "
+                                   f"{info['path_real']}); the histories are keyed "
+                                   "on the real path, so it must be a real folder")
+        if not info.get("path_writable"):
+            out["blockers"].append(
+                f"{rem.name} cannot hold {real}: {info.get('path_base')} is not "
+                f"writable there — create the folder once, e.g.  sudo mkdir -p "
+                f"{str(Path.home())} && sudo chown $USER {str(Path.home())}")
+        out["blockers"] += _activity_blockers(info, f"on {rem.name}")
+        if info.get("processes"):
+            out["blockers"].append(f"something is running in this folder on {rem.name}: "
+                                   + ", ".join(sorted({p["name"] for p in info["processes"]})))
+        tools = info.get("tools") or {}
+        for t in ("rsync", "tmux"):
+            if not tools.get(t) and not (t == "tmux" and args.no_start):
+                out["blockers"].append(f"{t} is missing on {rem.name}")
+        mine = find_claude()
+        here_ver = claude_version(mine) if mine else None
+        out["claude"] = {"here": here_ver, "there": info.get("claude_version")}
+        install = None
+        if not args.no_start:
+            if not here_ver:
+                out["warnings"].append("Claude Code was not found on this machine; "
+                                       "the other side keeps its own version")
+                if not info.get("claude"):
+                    out["blockers"].append(f"Claude Code is not installed on {rem.name}")
+            elif info.get("claude_version") != here_ver:
+                install = here_ver
+                if not tools.get("curl"):
+                    out["blockers"].append(f"Claude Code {here_ver} is needed on "
+                                           f"{rem.name} (it has "
+                                           f"{info.get('claude_version') or 'none'}) and "
+                                           "curl is missing there to install it")
+
+        # (3) what would travel
+        store = _store_of(real)
+        sids = _sessions_of(store)
+        sid = args.session or (sids[0] if sids else None)
+        if args.session and args.session not in sids:
+            out["blockers"].append(f"no session {args.session} in this project")
+        out["session"] = sid
+        dig = session_digest(Path(store) / f"{sid}.jsonl", real) if sid else \
+            session_digest(os.devnull, real)
+        out["title"] = dig.get("title")
+        carried = list(extras)
+        out["outside_not_carried"] = [p for p in dig["outside"]
+                                      if not any(_inside(p, c) for c in carried)]
+        if out["blockers"]:
+            return _emit(args, out, lines)
+        if not args.apply:
+            plan = push_project(rem, uid, entry, dry=True)
+            out["plan"] = {
+                "files": plan["project"].get("files", 0),
+                "bytes": plan["project"].get("bytes", 0),
+                "history_bytes": plan["history"].get("bytes", 0),
+                "extras": [{"path": x["path"], "bytes": x.get("bytes", 0)}
+                           for x in plan["extras"]],
+                "install_claude": install,
+                "free_bytes": info.get("free_bytes")}
+            need = out["plan"]["bytes"] + out["plan"]["history_bytes"]
+            if info.get("free_bytes") is not None and need > info["free_bytes"]:
+                out["blockers"].append(f"{rem.name} has {_human(info['free_bytes'])} "
+                                       f"free, {_human(need)} are needed")
+            lines += [f"would hand over:  {real}",
+                      f"   to             {rem.name} ({info.get('host')}, "
+                      f"{info.get('system')})",
+                      f"   files to send  {out['plan']['files']} "
+                      f"({_human(out['plan']['bytes'])}), history "
+                      f"{_human(out['plan']['history_bytes'])}",
+                      f"   session        {dig.get('title') or sid or 'none yet'}",
+                      f"   Claude Code    {here_ver or '?'} here, "
+                      f"{info.get('claude_version') or 'none'} there"
+                      + (f" → {install} gets installed" if install else "")]
+            if out["outside_not_carried"]:
+                lines.append("   stays here     " + ", ".join(out["outside_not_carried"][:5])
+                             + "   (carry with --include <path>)")
+            lines.append("(dry run — pass --apply to do it)")
+            return _emit(args, out, lines)
+
+        # (4) do it
+        with ProjectLock(uid):
+            try:
+                _snapshot_project(uid, entry)
+            except Exception as e:
+                out["warnings"].append(f"history backup failed: {e}")
+            scratch = False
+            if sid:
+                sdir = scratch_dir(real, sid)
+                keep = Path(real) / ".aht" / "handover" / "scratch"
+                shutil.rmtree(keep, ignore_errors=True)
+                keep.parent.mkdir(parents=True, exist_ok=True)
+                (keep.parent / ".gitignore").write_text("*\n")
+                if sdir and any(sdir.iterdir()) and sum(
+                        f.stat().st_size for f in sdir.rglob("*") if f.is_file()) \
+                        <= SCRATCH_MAX_BYTES:
+                    shutil.copytree(sdir, keep / sid, symlinks=True)
+                    scratch = True
+            brief, note = write_brief(real, sid, dig, _here(), info.get("host") or rem.name,
+                                      info.get("system"), carried, scratch)
+            out["brief"] = str(brief)
+            say(f"sending the project to {rem.name} …")
+            sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty())
+            out["sent"] = {"files": sent["project"].get("files", 0),
+                           "bytes": sent["project"].get("bytes", 0),
+                           "history_bytes": sent["history"].get("bytes", 0),
+                           "wire_bytes": sent["project"].get("sent", 0)
+                           + sent["history"].get("sent", 0)}
+
+            # what left, as seen on BOTH sides: the base of the way back
+            rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
+            theirs = rem.agent("manifest", timeout=900, trees={
+                "project": {"path": rem.path(real), "skip": handover_skip()},
+                "history": {"path": rstore, "skip": []}})["trees"]
+            ours = {"project": tree_manifest(real),
+                    "history": tree_manifest(str(store), []) if store
+                    else {"files": {}, "raw": {}}}
+            lost = sorted(set(ours["project"]["files"]) - set(theirs["project"]["files"]))
+            if lost:
+                out["warnings"].append(f"{len(lost)} file(s) did not arrive, e.g. {lost[0]}")
+            hashes = {k: [v[0], file_sha256(Path(store) / (ours["history"]["raw"].get(k) or k))]
+                      for k, v in ours["history"]["files"].items()
+                      if k.endswith(".jsonl") and isinstance(v[0], int)} if store else {}
+            hd = handover_dir(uid)
+            hd.mkdir(parents=True, exist_ok=True)
+            (hd / "manifest.json").write_text(json.dumps({
+                "uuid": uid, "project": real, "remote": rem.name, "at": _now(),
+                "here": {k: v["files"] for k, v in ours.items()},
+                "there": {k: v["files"] for k, v in theirs.items()},
+                "transcripts": hashes}))
+
+            away = {"remote": rem.name, "host": info.get("host"), "since": _now(),
+                    "path": real, "session": sid, "window": _mux_name(real, uid),
+                    "mux": "byobu" if tools.get("byobu") else "tmux",
+                    "claude": here_ver}
+            if install:
+                say(f"installing Claude Code {install} on {rem.name} …")
+                got = rem.agent("install-claude", timeout=1000, version=install)
+                info["claude"] = got["claude"]
+            if not args.no_start:
+                trusted = False
+                try:
+                    cj = json.loads(_claude_json().read_text())
+                    trusted = bool((cj.get("projects") or {}).get(real, {})
+                                   .get("hasTrustDialogAccepted"))
+                except Exception:
+                    pass
+                if trusted and cfg_get("handover_carry_trust", True):
+                    out["trust"] = rem.agent("trust", path=rem.path(real)).get("trust")
+                say(f"starting the session on {rem.name} …")
+                st = rem.agent("start", timeout=90, path=rem.path(real), session=sid,
+                               name=away["window"], claude=info["claude"], note=note,
+                               args=list(cfg_get("handover_claude_args") or []),
+                               remote_control=os.path.basename(real)
+                               if cfg_get("handover_remote_control", True) else None)
+                away["mux"] = st.get("mux") or away["mux"]
+                out["started"] = st.get("started")
+                out["screen"] = st.get("screen")
+                if st.get("attention"):
+                    out["warnings"].append(f"the session on {rem.name} needs you: "
+                                           f"{st['attention']} — open it to answer")
+            _update_entry(uid, away=away, extras=extras or None)
+        out["applied"] = True
+        out["away"] = away
+        out["attach"] = attach_command(rem, away["mux"], away["window"])
+        log(f"HANDOVER {real} -> {rem.name} (session {sid}, "
+            f"{_human(out['sent']['bytes'] + out['sent']['history_bytes'])})")
+        apply_badge(real, desired_marks(real, True))
+        notify_user("Handed over", f"{os.path.basename(real)} now runs on {rem.name}")
+        lines += [f"handed over:  {real}  →  {rem.name}",
+                  f"   sent      {out['sent']['files']} file(s), "
+                  f"{_human(out['sent']['bytes'])}; history "
+                  f"{_human(out['sent']['history_bytes'])}  "
+                  f"({_human(out['sent']['wire_bytes'])} on the wire)",
+                  f"   session   {dig.get('title') or sid or 'a new one'}",
+                  f"   summary   {brief}",
+                  "   open it   " + " ".join(shlex.quote(a) for a in out["attach"]),
+                  "   back      aht reclaim " + shlex.quote(real) + " --apply"]
+    except HandoverError as e:
+        out["error"] = str(e)
+        warn(f"HANDOVER {real}: {e}")
+    code = _emit(args, out, lines)
+    if out.get("applied") and args.attach and not args.json:
+        os.execvp(out["attach"][0], out["attach"])
+    return code
+
+# ---- reclaim ------------------------------------------------------------------ #
+
+def _conflict_name(rel: str, there: str, day: str) -> str:
+    head, tail = os.path.split(rel)
+    stem, ext = os.path.splitext(tail)
+    return os.path.join(head, f"{stem} (from {there} {day}){ext}")
+
+def _set_aside(path: Path, aside: Path, rel: str) -> None:
+    dst = aside / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(path, dst)
+
+def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
+               aside: Path, there: str, inert: bool, skip, progress: bool) -> dict:
+    """Carry out one three-way plan: fetch what changed there, set aside what
+    it replaces, and keep both versions of what changed on both sides."""
+    done = {"updated": 0, "new": 0, "deleted": 0, "conflicts": [], "kept": len(plan["kept"])}
+    name = lambda k: there_raw.get(k) or k
+    fetch = [name(k) for k in plan["take"] + plan["new"]]
+    if fetch:
+        aside.mkdir(parents=True, exist_ok=True)
+        r = rem.rsync(rem.spec(src + "/"), dst + "/", files_from=fetch,
+                      backup_dir=str(aside), skip=skip, progress=progress)
+        if not r["ok"]:
+            raise HandoverError("fetching the changes failed: " + r["error"])
+        done["updated"], done["new"] = len(plan["take"]), len(plan["new"])
+    for k in plan["delete"]:
+        p = Path(dst) / k
+        if p.exists() or p.is_symlink():
+            _set_aside(p, aside, k)
+            done["deleted"] += 1
+    if plan["conflict"]:
+        inc = aside.parent / (aside.name + "-incoming")
+        inc.mkdir(parents=True, exist_ok=True)
+        r = rem.rsync(rem.spec(src + "/"), str(inc) + "/",
+                      files_from=[name(k) for k in plan["conflict"]], skip=skip)
+        if not r["ok"]:
+            raise HandoverError("fetching the conflicting files failed: " + r["error"])
+        day = time.strftime("%Y-%m-%d")
+        for k in plan["conflict"]:
+            got = next((c for c in (inc / k, inc / name(k)) if c.exists()), None)
+            mine = Path(dst) / k
+            if got is None:
+                continue
+            if mine.is_file() and got.is_file() and \
+                    file_sha256(mine) == file_sha256(got):
+                continue                        # changed alike on both sides
+            rel = (k + f".aht-conflict-{there}-{_stamp()}") if inert \
+                else _conflict_name(k, there, day)
+            (Path(dst) / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(got), str(Path(dst) / rel))
+            done["conflicts"].append({"file": k, "their_version": rel})
+        shutil.rmtree(inc, ignore_errors=True)
+    return done
+
+def cmd_reclaim(args):
+    out = {"command": "reclaim", "applied": False, "blockers": [], "warnings": []}
+    lines = []
+    if not handover_supported():
+        out["blockers"].append("handover needs rsync and ssh; it is not available "
+                               "in this build")
+        return _emit(args, out, lines)
+    real = os.path.realpath(args.path)
+    out["project"] = real
+    talk = not args.json
+    def say(msg):
+        if talk:
+            print(msg, flush=True)
+    try:
+        reg = load_registry()
+        uid, entry = _entry_for(reg, real)
+        away = (entry or {}).get("away")
+        if not away:
+            out["blockers"].append("this project is not handed over")
+            return _emit(args, out, lines)
+        if os.path.realpath(away.get("path") or real) != real:
+            out["blockers"].append(f"the folder was at {away['path']} when it was "
+                                   "handed over; move it back there first")
+            return _emit(args, out, lines)
+        hd = handover_dir(uid)
+        try:
+            base = json.loads((hd / "manifest.json").read_text())
+        except Exception as e:
+            raise HandoverError(f"the record of what left is unreadable ({e})")
+        rem = get_remote(away.get("remote"))
+        out["remote"] = rem.name
+        there = away.get("host") or rem.name
+
+        act = activity_in(real)
+        out["here"] = act
+        out["blockers"] += _activity_blockers(act, "on this machine")
+
+        say(f"checking {rem.name} …")
+        info = rem.connect(real)
+        if not info["sessions"] and away.get("window") and \
+                rem.agent("close", path=rem.path(real), name=away["window"]).get("closed"):
+            info = rem.connect(real)        # the window it ran in is closed now
+        if info["sessions"] and args.stop and \
+                all(s.get("status") == "idle" for s in info["sessions"]):
+            if args.apply:
+                say(f"ending the idle session on {rem.name} …")
+                st = rem.agent("stop", timeout=90, path=rem.path(real),
+                               name=away.get("window") or "")
+                out["stopped"] = st.get("stopped")
+                if not st.get("stopped"):
+                    out["warnings"].append({
+                        "working": "the session started working again",
+                        "not-ours": "the session there was not started by aht; "
+                                    "exit it yourself",
+                        "no-reaction": "the session did not react; exit it yourself",
+                    }.get(st.get("reason"), "the session could not be ended"))
+                info = rem.connect(real)
+            else:
+                out["would_stop"] = True
+                info = dict(info, sessions=[])
+        out["there"] = {"sessions": info.get("sessions"),
+                        "processes": info.get("processes"),
+                        "claude_version": info.get("claude_version")}
+        blocked = _activity_blockers(info, f"on {rem.name}")
+        if blocked and not args.stop and \
+                all(s.get("status") == "idle" for s in info["sessions"]):
+            blocked = [b + ", or pass --stop to end it from here" for b in blocked]
+        out["blockers"] += blocked
+        if info.get("processes") and not args.allow_processes:
+            out["blockers"].append(
+                f"still running in this folder on {rem.name}: "
+                + ", ".join(sorted({f"{p['name']} ({p['pid']})" for p in info["processes"]}))
+                + " — stop them, or pass --allow-processes to leave them behind")
+        if out["blockers"]:
+            return _emit(args, out, lines)
+
+        # three-way, separately for the project and for the history
+        store = _store_of(real) or (claude_backend().root() / _key_claude(real))
+        rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
+        say("comparing both sides …")
+        theirs = rem.agent("manifest", timeout=900, trees={
+            "project": {"path": rem.path(real), "skip": handover_skip()},
+            "history": {"path": rstore, "skip": []}})["trees"]
+        ours = {"project": tree_manifest(real),
+                "history": tree_manifest(str(store), []) if Path(store).is_dir()
+                else {"files": {}, "raw": {}}}
+        plans = {t: three_way(base["here"].get(t) or {}, base["there"].get(t) or {},
+                              ours[t]["files"], theirs[t]["files"])
+                 for t in ("project", "history")}
+
+        # a transcript must come back as a continuation of what left
+        hp = plans["history"]
+        check = [k for k in hp["take"] if k in (base.get("transcripts") or {})]
+        if check:
+            got = rem.agent("hash", timeout=600, files=[
+                {"key": k, "path": f"{rstore}/{theirs['history']['raw'].get(k) or k}",
+                 "limit": base["transcripts"][k][0]} for k in check])["hashes"]
+            for k in check:
+                if got.get(k) != base["transcripts"][k][1]:
+                    hp["take"].remove(k)
+                    hp["conflict"].append(k)
+        # the history that returns must be readable here: neither the CLI over
+        # there nor anything that wrote into these transcripts may be newer
+        mine = find_claude()
+        here_ver = claude_version(mine) if mine else None
+        tv = lambda v: tuple(int(x) for x in str(v).split("."))
+        back = [k for k in hp["take"] + hp["new"] + hp["conflict"] if k.endswith(".jsonl")]
+        wrote = rem.agent("written-by", timeout=600, files=[
+            {"key": k, "path": f"{rstore}/{theirs['history']['raw'].get(k) or k}",
+             "offset": (base.get("transcripts") or {}).get(k, [0])[0]
+             if k in hp["take"] else 0} for k in back])["versions"] if back else {}
+        seen = [v for v in list(wrote.values()) + [info.get("claude_version")] if v]
+        newest = max(seen, key=tv) if seen else None
+        out["claude"] = {"here": here_ver, "there": info.get("claude_version"),
+                         "wrote_the_history": newest}
+        if here_ver and newest and tv(newest) > tv(here_ver):
+            msg = (f"Claude Code {newest} was used on {rem.name}, this machine has "
+                   f"{here_ver}: an older version may not read the newer history")
+            if args.ignore_version:
+                out["warnings"].append(msg)
+            else:
+                out["blockers"].append(msg + " — update Claude Code here first "
+                                       "(or pass --ignore-version)")
+                return _emit(args, out, lines)
+        out["conflicts"] = {t: list(p["conflict"]) for t, p in plans.items()
+                            if p["conflict"]}
+        if args.prefer == "there":          # theirs win; ours are set aside
+            for p in plans.values():
+                p["take"] += p["conflict"]
+                p["conflict"] = []
+        out["plan"] = {t: {k: len(v) for k, v in p.items()} for t, p in plans.items()}
+        changed = sum(len(p["take"]) + len(p["new"]) + len(p["delete"]) + len(p["conflict"])
+                      for p in plans.values())
+        pp = plans["project"]
+        lines += [f"{'taking back' if args.apply else 'would take back'}:  {real}"
+                  f"  ←  {rem.name}",
+                  f"   project   {len(pp['take'])} changed, {len(pp['new'])} new, "
+                  f"{len(pp['delete'])} removed there; {len(pp['kept'])} changed only here",
+                  f"   history   {len(hp['take'])} continued, {len(hp['new'])} new file(s)"]
+        for t, ks in out["conflicts"].items():
+            for k in ks[:6]:
+                lines.append(f"   ! changed on both sides ({t}): {k}   → "
+                             + (f"the version from {rem.name} is taken, ours is set aside"
+                                if args.prefer == "there"
+                                else "ours stays, theirs is kept next to it"))
+        if out["conflicts"] and not args.prefer:
+            lines.append(f"     (--prefer there takes the versions from {rem.name} instead)")
+        if not args.apply:
+            if out.get("would_stop"):
+                lines.append(f"   the idle session on {rem.name} would be ended first")
+            lines.append("(dry run — pass --apply to do it)")
+            return _emit(args, out, lines)
+
+        with ProjectLock(uid):
+            try:
+                _snapshot_project(uid, entry)
+            except Exception as e:
+                out["warnings"].append(f"history backup failed: {e}")
+            aside = hd / "replaced" / _stamp()
+            say(f"fetching the changes from {rem.name} …")
+            done = {"project": _pull_tree(rem, pp, rem.path(real), real,
+                                          theirs["project"]["raw"], aside / "project",
+                                          there, False, handover_skip(),
+                                          talk and sys.stderr.isatty())}
+            Path(store).mkdir(parents=True, exist_ok=True)
+            done["history"] = _pull_tree(rem, hp, rstore, str(store),
+                                         theirs["history"]["raw"], aside / "history",
+                                         there, True, [], False)
+            sids = _sessions_of(store)
+            for sub, inc in (("file-history", [f"/{s}/***" for s in sids]),
+                             ("plans", _plans_of(store))):
+                if inc:
+                    (claude_home() / sub).mkdir(parents=True, exist_ok=True)
+                    rem.rsync(rem.spec(f"{info['claude_home']}/{sub}/"),
+                              str(claude_home() / sub) + "/", include=inc, update=True,
+                              backup_dir=str(aside / sub))
+            for p in _extras(entry):
+                isdir = os.path.isdir(p)
+                r = rem.rsync(rem.spec(rem.path(p) + ("/" if isdir else "")),
+                              p + ("/" if isdir else ""), update=True,
+                              backup_dir=str(aside / "extras" / os.path.basename(p)),
+                              skip=handover_skip())
+                if not r["ok"]:
+                    out["warnings"].append(f"{p} did not come back: {r['error']}")
+            out["done"] = done
+            if aside.is_dir() and any(f.is_file() or f.is_symlink()
+                                      for f in aside.rglob("*")):
+                out["set_aside"] = str(aside)
+            else:
+                shutil.rmtree(aside, ignore_errors=True)
+            pd = done["project"]
+            back = {"from": there, "left": away.get("since"), "at": _now(),
+                    "session": away.get("session"), "updated": pd["updated"],
+                    "new": pd["new"], "deleted": pd["deleted"],
+                    "conflicts": [c["their_version"] for c in pd["conflicts"]]}
+            _update_entry(uid, away=None, returned=back)
+            try:
+                (hd / "manifest.json").replace(hd / f"manifest-{_stamp()}.json")
+                for old in sorted(hd.glob("manifest-*.json"))[:-5]:
+                    old.unlink()
+                for old in sorted(p for p in (hd / "replaced").iterdir()
+                                  if p.is_dir())[:-5]:
+                    shutil.rmtree(old, ignore_errors=True)
+            except OSError:
+                pass
+        out["applied"] = True
+        out["session"] = away.get("session")
+        log(f"RECLAIM {real} <- {rem.name} ({changed} change(s), "
+            f"{sum(len(d['conflicts']) for d in done.values())} conflict(s))")
+        apply_badge(real, desired_marks(real, True))
+        notify_user("Taken back", f"{os.path.basename(real)} is on this machine again")
+        for t, d in done.items():
+            for c in d["conflicts"]:
+                lines.append(f"   ! kept both ({t}): {c['file']}  +  {c['their_version']}")
+        if out.get("set_aside"):
+            lines.append(f"   replaced files are kept in {out['set_aside']}")
+        if away.get("session"):
+            lines.append(f"   continue with:  cd {shlex.quote(real)} && "
+                         f"claude --resume {away['session']}")
+    except HandoverError as e:
+        out["error"] = str(e)
+        warn(f"RECLAIM {real}: {e}")
+    return _emit(args, out, lines)
+
+# ---- remotes, attaching, status ---------------------------------------------- #
+
+def discover_machines() -> list:
+    """Machines that could be handed over to: the peers of this machine's
+    Tailscale network and the hosts named in ~/.ssh/config."""
+    rows = {}
+    ts = os.environ.get("AHT_TAILSCALE") or find_tool("tailscale") or next(
+        (c for c in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",)
+         if os.path.exists(c)), None)
+    if ts:
+        try:
+            r = subprocess.run([ts, "status", "--json"], capture_output=True,
+                               text=True, timeout=15, cwd="/")
+            for p in (json.loads(r.stdout).get("Peer") or {}).values():
+                system = str(p.get("OS") or "").lower()
+                host = str(p.get("DNSName") or "").split(".")[0] or p.get("HostName")
+                if host and system in ("linux", "macos", "freebsd"):
+                    rows[host] = {"name": host, "host": host, "system": system,
+                                  "online": bool(p.get("Online")), "via": "tailscale"}
+        except Exception as e:
+            warn(f"REMOTE discover: tailscale gave no list ({e})")
+    try:
+        for line in (Path.home() / ".ssh" / "config").read_text().splitlines():
+            m = re.match(r"\s*Host\s+(.+)", line, re.I)
+            for h in m.group(1).split() if m else []:
+                if not re.search(r"[*?!]", h) and h not in rows:
+                    rows[h] = {"name": h, "host": h, "system": None,
+                               "online": None, "via": "ssh config"}
+    except OSError:
+        pass
+    known = {str(s.get("ssh") or "").split("@")[-1]: n
+             for n, s in remotes_config().items()}
+    for r in rows.values():
+        r["added_as"] = known.get(r["host"])
+    return sorted(rows.values(), key=lambda r: (not r["online"], r["name"].lower()))
+
+_INSTALL = {"apt-get": "sudo apt install -y", "dnf": "sudo dnf install -y",
+            "pacman": "sudo pacman -S --needed", "zypper": "sudo zypper install -y",
+            "brew": "brew install"}
+
+def remote_checks(rem: Remote, info: dict) -> list:
+    """What a machine needs for a handover, each with the command that
+    fixes it — to be run ON that machine."""
+    tools = info.get("tools") or {}
+    rs = find_rsync()
+    mine = find_claude()
+    home = str(Path.home())
+    get = _INSTALL.get(info.get("packages") or "", "install")
+    rows = []
+    def ck(name, ok, detail, fix=None, needed=True):
+        rows.append({"check": name, "ok": bool(ok), "detail": str(detail),
+                     "needed": needed, **({"fix": fix} if fix and not ok else {})})
+    ck("reachable", True, f"{info.get('host')} ({info.get('system')})")
+    ck("rsync on this machine", rs, rs.get("version") or "missing",
+       "here:  brew install rsync" if IS_MAC else "here:  install rsync 3")
+    ck("rsync there", tools.get("rsync"), tools.get("rsync") or "missing",
+       f"{get} rsync")
+    ck("tmux there", tools.get("tmux"), tools.get("byobu") or tools.get("tmux")
+       or "missing", f"{get} tmux")
+    same = info.get("home") == home or bool(
+        rem.agent("probe", path=home).get("path_exists"))
+    ck(f"{home} exists there", same, "projects keep their path" if same else "missing",
+       f'sudo mkdir -p {shlex.quote(home)} && sudo chown "$USER" {shlex.quote(home)}')
+    ck("Claude Code there", info.get("claude"),
+       f"{info.get('claude_version') or 'missing'} "
+       f"(here: {claude_version(mine) if mine else 'missing'})",
+       "nothing to do: the first handover installs this machine's version"
+       if tools.get("curl") else f"{get} curl")
+    if info.get("logged_in") is not None:
+        ck("Claude Code is logged in there", info["logged_in"],
+           "yes" if info["logged_in"] else "no", "run once there:  claude")
+    both = tools.get("mosh-server") and find_tool("mosh")
+    ck("mosh (a connection that survives network changes)", both,
+       "on both" if both else
+       ("missing there" if not tools.get("mosh-server") else "missing here"),
+       f"{get} mosh" if not tools.get("mosh-server")
+       else ("here:  brew install mosh" if IS_MAC else "here:  install mosh"),
+       needed=False)
+    if both:
+        open_ = mosh_usable(rem, test=True)
+        where = "in on tailscale0 " if info.get("tailscale_if") else ""
+        ck("mosh gets through (UDP 60000–61000)", open_,
+           "yes" if open_ else "blocked on the way — ssh is used instead",
+           f"sudo ufw allow {where}to any port 60000:61000 proto udp"
+           if info.get("firewall") == "ufw"
+           else "open UDP ports 60000–61000 in that machine's firewall",
+           needed=False)
+    return rows
+
+def cmd_remote(args):
+    if not handover_supported():
+        print("handover needs rsync and ssh; it is not available in this build")
+        return 2
+    act = args.action or "list"
+    if act == "discover":
+        rows = discover_machines()
+        if args.json:
+            print(json.dumps({"machines": rows}, indent=2))
+        else:
+            for r in rows:
+                state = {True: "online", False: "offline", None: ""}[r["online"]]
+                print(f"   {r['name']:<22} {r['system'] or '':<7} {state:<8} "
+                      f"{r['via']}" + (f"   (added as {r['added_as']})"
+                                       if r["added_as"] else ""))
+            print("\nadd one with:  aht remote add <name> <user@host>"
+                  if rows else "nothing found — add one with:  "
+                  "aht remote add <name> <user@host>")
+        return 0
+    if act == "add":
+        if not (args.name and args.target) or not re.fullmatch(r"[A-Za-z0-9_.-]+", args.name):
+            print("usage: aht remote add <name> <user@host>", file=sys.stderr)
+            return 2
+        rem = Remote(args.name, {"ssh": args.target})
+        try:
+            info = rem.connect()
+        except HandoverError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            return 1
+        with Lock():
+            cfg = load_config()
+            rs = dict(cfg.get("remotes") or {})
+            rs[args.name] = {"ssh": args.target}
+            cfg["remotes"] = rs
+            cfg.setdefault("default_remote", args.name)
+            save_config(cfg)
+        print(f"✓ {args.name}: {info.get('host')} ({info.get('system')}), Claude Code "
+              f"{info.get('claude_version') or 'not installed'}")
+        return 0
+    if act in ("remove", "default"):
+        with Lock():
+            cfg = load_config()
+            rs = dict(cfg.get("remotes") or {})
+            if args.name not in rs:
+                print(f"unknown machine {args.name!r}", file=sys.stderr)
+                return 2
+            if act == "remove":
+                held = [e["real_path"] for e in load_registry()["projects"].values()
+                        if (e.get("away") or {}).get("remote") == args.name]
+                if held:
+                    print(f"{args.name} still holds {len(held)} handed-over project(s); "
+                          "take them back first:\n   " + "\n   ".join(held),
+                          file=sys.stderr)
+                    return 3
+                rs.pop(args.name)
+                cfg["remotes"] = rs
+                if cfg.get("default_remote") == args.name:
+                    cfg.pop("default_remote")
+            else:
+                cfg["default_remote"] = args.name
+            save_config(cfg)
+        print(f"{'removed' if act == 'remove' else 'default is now'}: {args.name}")
+        return 0
+    if act == "check":
+        names = sorted(remotes_config()) if args.name in (None, "all") and \
+            (args.name == "all" or not cfg_get("default_remote")) else [args.name]
+        results, code = [], 0
+        for n in names:
+            try:
+                rem = get_remote(n)
+                info = rem.connect()
+                rows = remote_checks(rem, info)
+                results.append({"remote": rem.name, "target": rem.target, "checks": rows,
+                                "ok": all(c["ok"] for c in rows if c["needed"])})
+            except HandoverError as e:
+                results.append({"remote": n, "ok": False, "error": str(e), "checks": []})
+                code = 1
+        if args.json:
+            print(json.dumps({"ok": all(r["ok"] for r in results),
+                              "machines": results}, indent=2))
+            return code
+        for r in results:
+            print(f"{r['remote']}" + (f"   {r['target']}" if r.get("target") else ""))
+            if r.get("error"):
+                print(f"  ✗ {r['error']}")
+            for c in r["checks"]:
+                mark = "✓" if c["ok"] else ("✗" if c["needed"] else "·")
+                print(f"  {mark} {c['check']}   — {c['detail']}")
+                if c.get("fix"):
+                    print(f"      → {c['fix']}")
+        return code
+    rs = remotes_config()
+    if args.json:
+        print(json.dumps({"remotes": rs, "default": cfg_get("default_remote")}, indent=2))
+    else:
+        for n, s in sorted(rs.items()):
+            print(f" {'*' if n == cfg_get('default_remote') else ' '} {n}   {s.get('ssh')}")
+        if not rs:
+            print("no other machine yet — add one with:  aht remote add <name> <user@host>")
+    return 0
+
+def cmd_attach(args):
+    """Open the handed-over session: in this terminal, or in a new window."""
+    real = os.path.realpath(args.path)
+    _uid, entry = _entry_for(load_registry(), real)
+    away = (entry or {}).get("away")
+    if not away:
+        print("this project is not handed over", file=sys.stderr)
+        return 2
+    try:
+        rem = get_remote(away.get("remote"))
+        if find_tool("mosh"):
+            rem.connect()
+    except HandoverError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    cmd = attach_command(rem, away.get("mux"), away.get("window"))
+    if args.print:
+        print(" ".join(shlex.quote(a) for a in cmd))
+        return 0
+    if args.window:
+        return open_terminal(" ".join(shlex.quote(a) for a in cmd),
+                             f"attach-{away.get('window')}")
+    os.execvp(cmd[0], cmd)
+
+def open_terminal(command: str, name: str) -> int:
+    """Run `command` in a new terminal window (the front-ends use this)."""
+    run = aht_home() / "run"
+    run.mkdir(parents=True, exist_ok=True)
+    if IS_MAC:
+        f = run / (re.sub(r"[^A-Za-z0-9_.-]+", "-", name) + ".command")
+        f.write_text("#!/bin/bash\n"
+                     'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\n'
+                     "clear\n" + command + "\n")
+        os.chmod(f, 0o755)
+        app = cfg_get("terminal_app") or (
+            "iTerm" if os.path.isdir("/Applications/iTerm.app") else None)
+        return subprocess.call(["open"] + (["-a", str(app)] if app else []) + [str(f)])
+    for term, flag in (("x-terminal-emulator", "-e"), ("gnome-terminal", "--"),
+                       ("konsole", "-e"), ("xterm", "-e")):
+        if _have(term):
+            subprocess.Popen([term, flag, "/bin/sh", "-c", command],
+                             start_new_session=True)
+            return 0
+    print(command)
+    return 1
+
+def cmd_resume_here(args):
+    """After a reclaim: continue the session in a new terminal window."""
+    real = os.path.realpath(args.path)
+    _uid, entry = _entry_for(load_registry(), real)
+    sid = ((entry or {}).get("returned") or {}).get("session") \
+        or next(iter(_sessions_of(_store_of(real))), None)
+    exe = find_claude() or "claude"
+    cmd = f"cd {shlex.quote(real)} && exec {shlex.quote(exe)}" \
+        + (f" --resume {sid}" if sid else "")
+    if args.print:
+        print(cmd)
+        return 0
+    return open_terminal(cmd, "resume-" + os.path.basename(real))
+
+def handover_status() -> dict:
+    reg = load_registry()
+    away, mirrored = [], []
+    for e in reg.get("projects", {}).values():
+        if e.get("away"):
+            away.append({"project": e["real_path"], **e["away"]})
+        m = e.get("mirror") or {}
+        if m.get("enabled"):
+            mirrored.append({"project": e["real_path"], "remote": m.get("remote"),
+                             "synced_at": m.get("synced_at"), "status": m.get("status")})
+    rs = find_rsync() if handover_supported() else {}
+    rs_cfg = remotes_config()
+    return {"supported": handover_supported(),
+            "remotes": rs_cfg,
+            "default_remote": cfg_get("default_remote") if cfg_get("default_remote")
+            in rs_cfg else (sorted(rs_cfg)[0] if rs_cfg else None),
+            "rsync": rs.get("version"), "away": away, "mirrored": mirrored}
+
+def _hook_notes(cwd: str) -> None:
+    """What a session that starts here must know about a handover; printed to
+    stdout, which Claude Code adds to the session's context."""
+    try:
+        reg = load_registry()
+        uid, entry = _entry_for(reg, cwd)
+        if not entry:
+            return
+        a, b = entry.get("away"), entry.get("returned")
+        if a:
+            print(f"[aht] WARNING: this project was handed over to “{a.get('host')}” on "
+                  f"{a.get('since')} and is being worked on there. Changes made here "
+                  "now can collide with that work. Tell the user before changing "
+                  "anything, and suggest taking the project back first (aht reclaim).")
+            notify_user("Project is handed over",
+                        f"{os.path.basename(cwd)} runs on {a.get('host')} — "
+                        "take it back before working here")
+        elif b and not b.get("told"):
+            msg = (f"[aht] This project is back on “{_here()}”. It ran on "
+                   f"“{b.get('from')}” from {b.get('left')} to {b.get('at')}; the "
+                   f"changes made there were brought back ({b.get('updated', 0)} "
+                   f"file(s) updated, {b.get('new', 0)} new, {b.get('deleted', 0)} "
+                   "removed).")
+            if b.get("conflicts"):
+                msg += (" Changed on BOTH machines, so both versions were kept: "
+                        + ", ".join(b["conflicts"][:8]) + ".")
+            print(msg)
+            _update_entry(uid, returned=dict(b, told=True))
+    except Exception as e:
+        warn(f"HOOK handover note: {e}")
 
 def build_parser():
     p = argparse.ArgumentParser(prog="aht")
@@ -3660,6 +5976,79 @@ def build_parser():
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_restore)
+
+    s = sub.add_parser("remote", help="the other machines a project can be "
+                       "handed over to")
+    s.add_argument("action", nargs="?",
+                   choices=("list", "add", "remove", "default", "check", "discover"))
+    s.add_argument("name", nargs="?")
+    s.add_argument("target", nargs="?", help="user@host, as ssh takes it")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_remote)
+
+    s = sub.add_parser("mirror", help="keep a project's copy on the other "
+                       "machine up to date in the background")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--to", metavar="NAME")
+    s.add_argument("--on", action="store_true")
+    s.add_argument("--off", action="store_true")
+    s.add_argument("--run", action="store_true", help="sync now")
+    s.add_argument("--due", action="store_true",
+                   help="with --run: only what the interval says is due")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_mirror)
+
+    s = sub.add_parser("handover", help="continue a project on the other "
+                       "machine: files, history and the session")
+    s.add_argument("path")
+    s.add_argument("--to", metavar="NAME")
+    s.add_argument("--session", help="the session to resume there "
+                   "(default: the most recent one)")
+    s.add_argument("--include", nargs="*", metavar="PATH",
+                   help="files or folders outside the project that travel along "
+                        "(remembered for this project)")
+    s.add_argument("--no-start", action="store_true", dest="no_start",
+                   help="transfer only; start the agent there yourself")
+    s.add_argument("--attach", action="store_true",
+                   help="open the session in this terminal afterwards")
+    s.add_argument("--allow-processes", action="store_true", dest="allow_processes",
+                   help="leave other programs running in the folder behind "
+                        "(an open agent session always blocks)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_handover)
+
+    s = sub.add_parser("reclaim", help="take a handed-over project back: "
+                       "files and history return, nothing is overwritten "
+                       "without a copy")
+    s.add_argument("path")
+    s.add_argument("--stop", action="store_true",
+                   help="end the session there first if it is idle")
+    s.add_argument("--prefer", choices=("here", "there"),
+                   help="what changed on BOTH machines: keep ours and put theirs "
+                        "next to it (here, the default), or take theirs and set "
+                        "ours aside (there)")
+    s.add_argument("--allow-processes", action="store_true", dest="allow_processes")
+    s.add_argument("--ignore-version", action="store_true", dest="ignore_version")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_reclaim)
+
+    s = sub.add_parser("attach", help="open a handed-over project's session")
+    s.add_argument("path")
+    s.add_argument("--print", action="store_true", help="only show the command")
+    s.add_argument("--window", action="store_true", help="in a new terminal window")
+    s.set_defaults(fn=cmd_attach)
+
+    s = sub.add_parser("resume-here", help="continue a project's session in a "
+                       "new terminal window")
+    s.add_argument("path")
+    s.add_argument("--print", action="store_true")
+    s.set_defaults(fn=cmd_resume_here)
+
+    s = sub.add_parser("_agent")           # the far end of a handover (stdin: JSON)
+    s.set_defaults(fn=cmd_agent)
 
     return p
 

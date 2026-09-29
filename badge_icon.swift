@@ -20,6 +20,8 @@ let AGENT_COLORS: [String: (CGFloat, CGFloat, CGFloat)] = [
     "codex":    ( 16/255.0, 163/255.0, 127/255.0),
     "copilot":  (110/255.0,  64/255.0, 201/255.0),
     "kimi":     (124/255.0,  58/255.0, 237/255.0),
+    // handed over to another machine: shown instead of the agents' marks
+    "away":     ( 37/255.0,  99/255.0, 235/255.0),
 ]
 let COUNT_COLOR: (CGFloat, CGFloat, CGFloat) = (51/255.0, 58/255.0, 66/255.0)
 // "agent:aht" = tethered, but no agent has history here yet.  Deliberately
@@ -48,6 +50,7 @@ func glyphFor(_ agent: String) -> String {
     case "copilot": return "bar"
     case "kimi": return "crescent"
     case "claude": return "asterisk"
+    case "away": return "arrow"
     default: return "infinity"          // the neutral mark
     }
 }
@@ -107,6 +110,16 @@ func drawDisc(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, d: CGFloat,
             if i == 0 { ctx.move(to: p) } else { ctx.addLine(to: p) }
         }
         ctx.closePath(); ctx.strokePath()
+    case "arrow":                       // points right: the work went out
+        ctx.setLineWidth(d * 0.13)
+        ctx.setLineCap(.butt)
+        ctx.move(to: CGPoint(x: cx - d * 0.26, y: cy))
+        ctx.addLine(to: CGPoint(x: cx + d * 0.04, y: cy))
+        ctx.strokePath()
+        ctx.move(to: CGPoint(x: cx + d * 0.28, y: cy))
+        ctx.addLine(to: CGPoint(x: cx + d * 0.02, y: cy + d * 0.22))
+        ctx.addLine(to: CGPoint(x: cx + d * 0.02, y: cy - d * 0.22))
+        ctx.closePath(); ctx.fillPath()
     case "crescent":
         ctx.fillEllipse(in: CGRect(x: cx - d * 0.24, y: cy - d * 0.24,
                                    width: d * 0.48, height: d * 0.48))

@@ -552,6 +552,340 @@ ck(sorted(stores_of(late)) == ["codex", "kimi-code"],
 r = run("logs", "-n", "400")
 ck("STORES " in r.stdout, "agent-list changes are logged")
 
+print("\n[16] handover: on to another machine, and back")
+sys.path.insert(0, str(HERE.parent))
+os.environ["AHT_HOME"] = str(sb / ".aht")
+import time, unicodedata
+import aht as core
+
+def handover_suite():
+    box = Path(os.path.realpath(sb)) / "box"    # a folder standing in for the machine
+    bhome = box / "home"
+    (bhome / ".claude").mkdir(parents=True)
+    (bhome / ".claude.json").write_text("{}")
+    stubs = sb / "stubs"
+    stubs.mkdir()
+    fake = f'#!/bin/sh\nexec "{PY}" "{HERE / "fake_tmux.py"}" "$@"\n'
+    (stubs / "tmux").write_text(fake)
+    (stubs / "byobu").write_text(fake)
+    (stubs / "claude").write_text('#!/bin/sh\necho "9.9.9 (Claude Code)"\n')
+    for s in stubs.iterdir():
+        s.chmod(0o755)
+    henv = {"AHT_REMOTE_PATH": str(stubs), "AHT_CLAUDE": str(stubs / "claude"),
+            "AHT_NO_MIRROR": "1"}
+    def hrun(*a):
+        return run(*a, extra_env=henv)
+    def J(r):
+        try:
+            return json.loads(r.stdout)
+        except Exception:
+            return {"unparsed": r.stdout[-400:] + r.stderr[-400:]}
+    def hook(path):
+        return subprocess.run([PY, CLI, "hook"], env=dict(env, **henv),
+                              capture_output=True, text=True,
+                              input=json.dumps({"cwd": path})).stdout
+    def project_row(path):
+        return next(p for p in J(hrun("projects", "--json"))["projects"]
+                    if p["real_path"] == path)
+    def open_there():
+        return core.running_sessions(home=bhome / ".claude")
+
+    r = hrun("config", "--set", "remotes=" + json.dumps({"box": {"root": str(box)}}))
+    ck(r.returncode == 0, "a machine can be named in the config")
+
+    projH = os.path.realpath(str(roots / "Hand Over"))
+    os.makedirs(projH + "/sub")
+    os.makedirs(projH + "/node_modules/pkg")
+    nfd = unicodedata.normalize("NFD", "Stürmer.txt")
+    for rel, body in (("a.txt", "a1\n"), ("sub/b.txt", "b1\n"), ("c.txt", "c1\n"),
+                      ("d.txt", "d1\n"), (nfd, "umlaut\n"), ("Icon\r", ""),
+                      ("node_modules/pkg/x.js", "x\n")):
+        Path(projH, rel).write_text(body)
+    hstore = tools / "claude" / enc(projH)
+    (hstore / "memory").mkdir(parents=True)
+    (hstore / "memory" / "MEMORY.md").write_text("- note\n")
+    outside = str(Path.home() / "elsewhere" / "notes.md")
+    T0 = "".join(json.dumps(e) + "\n" for e in (
+        {"type": "user", "cwd": projH, "version": "9.9.9",
+         "message": {"role": "user", "content": "first question"}},
+        {"type": "user", "isCompactSummary": True,
+         "message": {"role": "user", "content": "SUMMARY: the parser is half done"}},
+        {"type": "ai-title", "aiTitle": "Parser work"},
+        {"type": "user", "message": {"role": "user", "content": "now fix the lexer"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "The lexer is fixed."},
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": projH + "/a.txt"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": outside}},
+            {"type": "tool_use", "name": "TodoWrite", "input": {"todos": [
+                {"content": "write the tests", "status": "pending"},
+                {"content": "publish it", "status": "completed"}]}}]}}))
+    (hstore / "s1.jsonl").write_text(T0)
+    (sb / ".claude.json").write_text(json.dumps(
+        {"projects": {projH: {"hasTrustDialogAccepted": True}}}))
+    hrun("tag", projH, "--apply")
+    rproj = str(box) + projH
+    rstore = bhome / ".claude" / "projects" / enc(rproj)
+
+    d = J(hrun("handover", projH, "--json"))
+    ck(d.get("applied") is False and not d.get("blockers")
+       and d.get("plan", {}).get("files") == 6 and not os.path.exists(rproj),
+       f"dry run: what would travel is counted, nothing is sent ({d.get('plan') or d})")
+    ck(d.get("outside_not_carried") == [outside] and d.get("title") == "Parser work",
+       "dry run names the session and the outside files that stay behind")
+
+    # SAFETY (1): an open session blocks, working or idle
+    sess_dir = tools / "sessions"
+    sess_dir.mkdir(exist_ok=True)
+    sleeper = subprocess.Popen(["sleep", "600"], cwd="/")
+    rec = sess_dir / f"{sleeper.pid}.json"
+    rec.write_text(json.dumps({"pid": sleeper.pid, "cwd": projH, "status": "busy",
+                               "sessionId": "s1", "name": "parser"}))
+    r = hrun("handover", projH, "--apply", "--json")
+    d = J(r)
+    ck(r.returncode == 3 and not d.get("applied") and not os.path.exists(rproj)
+       and any("WORKING" in b for b in d.get("blockers", [])),
+       "a WORKING session blocks the handover; nothing leaves")
+    rec.write_text(json.dumps({"pid": sleeper.pid, "cwd": projH, "status": "idle",
+                               "sessionId": "s1"}))
+    d = J(hrun("handover", projH, "--apply", "--json", "--allow-processes"))
+    ck(not d.get("applied") and any("exit it first" in b for b in d.get("blockers", []))
+       and not os.path.exists(rproj),
+       "an open idle session blocks too, and no flag overrides that")
+    sleeper.kill(); sleeper.wait()
+    ck(core.running_sessions(inside=projH, home=tools) == [],
+       "the record a finished session left behind does not block")
+    worker = subprocess.Popen(["sleep", "600"], cwd=projH)
+    d = J(hrun("handover", projH, "--apply", "--json"))
+    ck(not d.get("applied") and any("still running in this folder" in b
+                                    for b in d.get("blockers", [])),
+       "a program running in the folder blocks")
+    worker.kill(); worker.wait()
+
+    r = hrun("handover", projH, "--apply", "--json")
+    d = J(r)
+    ck(r.returncode == 0 and d.get("applied") and d.get("started"),
+       "handover applied and the session started over there "
+       f"({d.get('error') or d.get('blockers') or d.get('unparsed') or 'ok'})")
+    got = sorted(str(p.relative_to(rproj)) for p in Path(rproj).rglob("*") if p.is_file())
+    ck("a.txt" in got and "sub/b.txt" in got and nfd in got
+       and not any("node_modules" in g or g.startswith("Icon") for g in got),
+       "the project arrived; per-machine folders and the icon file stayed")
+    ck((rstore / "s1.jsonl").is_file() and (rstore / "s1.jsonl").read_text() == T0
+       and (rstore / "memory" / "MEMORY.md").is_file(),
+       "the history arrived under the key of the path over there")
+    brief = sorted(Path(projH, ".aht", "handover").glob("*-to-*.md"))
+    btxt = brief[-1].read_text() if brief else ""
+    ck("SUMMARY: the parser is half done" in btxt and "now fix the lexer" in btxt
+       and "The lexer is fixed." in btxt and "write the tests" in btxt
+       and "publish it" not in btxt and outside in btxt
+       and "first question" not in btxt,
+       "readable summary: last compaction, latest exchange, open to-dos, "
+       "outside files")
+    ck(Path(projH, ".aht", "handover", ".gitignore").read_text().strip() == "*",
+       "git is told to ignore the summaries: they quote the conversation")
+    win = (d.get("away") or {}).get("window", "?")
+    rrun = bhome / ".aht" / "remote" / "run" / win
+    note = (rrun / "note.txt").read_text() if rrun.is_dir() else ""
+    sett = (rrun / "settings.json").read_text() if rrun.is_dir() else ""
+    ck("handed over" in note and outside in note and "note.txt" in sett
+       and "SessionStart" in sett,
+       "the resumed session is told on arrival what changed around it")
+    wfile = bhome / ".faketmux" / f"{win}.json"
+    line = json.loads(wfile.read_text())["command"] if wfile.is_file() else ""
+    ck("--resume s1" in line and "--settings" in line
+       and "--remote-control 'Hand Over'" in line,
+       "it resumes the newest session, reachable from the phone")
+    trust = json.loads((bhome / ".claude.json").read_text()).get("projects", {})
+    ck(trust.get(rproj, {}).get("hasTrustDialogAccepted") is True
+       and d.get("trust") == "carried over", "the folder's trust is carried over")
+    r = subprocess.run([PY, "-c", marks_probe, str(HERE.parent), projH], env=env,
+                       capture_output=True, text=True)
+    ck(project_row(projH)["away"] and "agent:away" in r.stdout
+       and "agent:claude" not in r.stdout, "the folder is marked as away")
+    d = J(hrun("handover", projH, "--apply", "--json"))
+    ck(any("already handed over" in b for b in d.get("blockers", [])),
+       "a project that is away cannot be handed over again")
+    warned = hook(projH)
+    ck("WARNING" in warned and "handed over" in warned and project_row(projH)["away"],
+       "a session started here meanwhile is warned; the record survives the hook")
+
+    # work over there, and some here
+    time.sleep(1.1)
+    Path(rproj, "a.txt").write_text("a2 from the box\n")
+    Path(rproj, "new.txt").write_text("born there\n")
+    Path(rproj, "sub/b.txt").unlink()
+    Path(rproj, "c.txt").write_text("c2 THERE\n")
+    Path(projH, "c.txt").write_text("c2 HERE\n")
+    Path(projH, "d.txt").write_text("d2 here only\n")
+    T1 = T0 + json.dumps({"type": "user", "message": {"content": "continued there"}}) + "\n"
+    (rstore / "s1.jsonl").write_text(T1)
+    (rstore / "s2.jsonl").write_text('{"type":"user"}\n')
+
+    live = open_there()
+    srec = bhome / ".claude" / "sessions" / f"{live[0]['pid']}.json" if live else None
+    ck(len(live) == 1, "one session is open over there")
+    state = json.loads(srec.read_text())
+    srec.write_text(json.dumps(dict(state, status="busy")))
+    r = hrun("reclaim", projH, "--apply", "--stop", "--json")
+    d = J(r)
+    ck(r.returncode == 3 and not d.get("applied") and len(open_there()) == 1
+       and any("WORKING" in b for b in d.get("blockers", []))
+       and Path(projH, "a.txt").read_text() == "a1\n",
+       "a session WORKING over there blocks the way back, --stop or not")
+    srec.write_text(json.dumps(dict(state, status="idle")))
+    d = J(hrun("reclaim", projH, "--apply", "--json"))
+    ck(not d.get("applied") and any("--stop" in b for b in d.get("blockers", [])),
+       "an idle session there blocks until it is ended")
+    d = J(hrun("reclaim", projH, "--stop", "--json"))
+    ck(not d.get("applied") and d.get("would_stop") and len(open_there()) == 1
+       and d.get("plan", {}).get("project") == {"take": 1, "new": 1, "delete": 1,
+                                                "conflict": 1, "kept": 1},
+       f"dry run: the plan; the session is left alone ({d.get('plan') or d})")
+    r = hrun("reclaim", projH, "--apply", "--stop", "--json")
+    d = J(r)
+    ck(r.returncode == 0 and d.get("applied") and d.get("stopped")
+       and open_there() == [],
+       "reclaim applied after ending the idle session "
+       f"({d.get('error') or d.get('blockers') or d.get('unparsed') or 'ok'})")
+    ck(Path(projH, "a.txt").read_text() == "a2 from the box\n"
+       and Path(projH, "new.txt").is_file()
+       and not Path(projH, "sub/b.txt").exists()
+       and Path(projH, "d.txt").read_text() == "d2 here only\n",
+       "changes made there arrived; what changed only here stayed")
+    both = [p.name for p in Path(projH).glob("c (from *).txt")]
+    ck(Path(projH, "c.txt").read_text() == "c2 HERE\n" and len(both) == 1
+       and Path(projH, both[0]).read_text() == "c2 THERE\n",
+       "changed on both sides: both versions are kept")
+    aside = Path(d.get("set_aside") or "/nonexistent")
+    ck((aside / "project" / "a.txt").is_file()
+       and (aside / "project" / "a.txt").read_text() == "a1\n"
+       and (aside / "project" / "sub" / "b.txt").is_file(),
+       "SAFETY (3): what was replaced or removed is set aside, not lost")
+    ck((hstore / "s1.jsonl").read_text() == T1 and (hstore / "s2.jsonl").is_file(),
+       "the transcript came back continued, new sessions with it")
+    ck(Path(projH, "Icon\r").exists() and Path(projH, "node_modules/pkg/x.js").exists(),
+       "what never travelled is untouched")
+    ck(project_row(projH)["away"] is None, "the project is no longer away")
+    told, again = hook(projH), hook(projH)
+    ck("is back on" in told and bool(both) and both[0] in told and again.strip() == "",
+       "the next session here is told once what came back")
+
+    # SAFETY (2): a transcript that is not a continuation never replaces ours
+    d = J(hrun("handover", projH, "--apply", "--no-start", "--json"))
+    ck(d.get("applied") and "started" not in d,
+       "a second handover, transfer only "
+       f"({d.get('error') or d.get('blockers') or d.get('unparsed') or 'ok'})")
+    time.sleep(1.1)
+    (rstore / "s1.jsonl").write_text("REWRITTEN" + T1[9:] + "more\n")
+    d = J(hrun("reclaim", projH, "--apply", "--json"))
+    odd = list(hstore.glob("s1.jsonl.aht-conflict-*"))
+    ck(d.get("applied") and (hstore / "s1.jsonl").read_text() == T1 and len(odd) == 1
+       and odd[0].read_text().startswith("REWRITTEN"),
+       "a rewritten transcript is kept aside; ours stays as it was "
+       f"({d.get('error') or d.get('blockers') or d.get('unparsed') or d.get('plan')}, "
+       f"{[p.name for p in hstore.iterdir()]})")
+
+    # mirror: the warm copy
+    projM = os.path.realpath(str(roots / "mirrored"))
+    os.makedirs(projM)
+    Path(projM, "keep.txt").write_text("k\n")
+    Path(projM, "gone.txt").write_text("g\n")
+    r = hrun("mirror", projM, "--on", "--run", "--json")
+    rm = str(box) + projM
+    ck(J(r).get("mirrored", [{}])[0].get("status") == "synced"
+       and Path(rm, "gone.txt").is_file(), "mirror: the copy over there is made")
+    Path(projM, "gone.txt").unlink()
+    Path(projM, "keep.txt").write_text("k2\n")
+    hrun("mirror", "--run", "--json")
+    kept = list((bhome / ".aht" / "remote" / "replaced").rglob("gone.txt"))
+    ck(Path(rm, "keep.txt").read_text() == "k2\n" and not Path(rm, "gone.txt").exists()
+       and len(kept) == 1,
+       "mirror: it follows changes; what it removes there is set aside")
+    ck(J(hrun("mirror", "--run", "--due", "--json")).get("mirrored") == [],
+       "mirror: nothing is due right after a sync")
+    os.makedirs(rm + "/busy")
+    other = subprocess.Popen(["sleep", "600"], cwd=rm + "/busy")
+    rows = J(hrun("mirror", "--run", "--json")).get("mirrored", [{}])
+    ck(rows[0].get("status") == "skipped",
+       "mirror: it stays out while something runs in the copy")
+    other.kill(); other.wait()
+    hook(projM)
+    ck(project_row(projM)["mirror"] == "box", "the mirror setting survives the hook")
+
+    # the history must stay readable where it returns to
+    newer = stubs / "claude-newer"
+    newer.write_text('#!/bin/sh\necho "9.9.10 (Claude Code)"\n')
+    newer.chmod(0o755)
+    J(hrun("handover", projH, "--apply", "--no-start", "--json"))
+    time.sleep(1.1)
+    Path(rproj, "a.txt").write_text("a3\n")
+    r = run("reclaim", projH, "--apply", "--json",
+            extra_env=dict(henv, AHT_REMOTE_CLAUDE=str(newer)))
+    d = J(r)
+    ck(r.returncode == 3 and not d.get("applied")
+       and any("9.9.10" in b and "update" in b for b in d.get("blockers", []))
+       and Path(projH, "a.txt").read_text() != "a3\n",
+       "a newer agent CLI over there blocks the way back")
+    now = (rstore / "s1.jsonl").read_text()
+    (rstore / "s1.jsonl").write_text(now + json.dumps(
+        {"type": "user", "version": "9.10.0", "message": {"content": "later"}}) + "\n")
+    d = J(hrun("reclaim", projH, "--apply", "--json"))
+    ck(not d.get("applied") and d.get("claude", {}).get("wrote_the_history") == "9.10.0"
+       and any("9.10.0" in b for b in d.get("blockers", [])),
+       "so does a history that a newer version wrote into")
+    d = J(hrun("reclaim", projH, "--apply", "--ignore-version", "--json"))
+    ck(d.get("applied") and any("9.10.0" in w for w in d.get("warnings", []))
+       and Path(projH, "a.txt").read_text() == "a3\n",
+       "--ignore-version takes it back anyway, with a warning")
+
+    # any number of machines
+    box2 = Path(os.path.realpath(sb)) / "box2"
+    (box2 / "home" / ".claude").mkdir(parents=True)
+    hrun("config", "--set", "remotes=" + json.dumps(
+        {"box": {"root": str(box)}, "box2": {"root": str(box2)}}))
+    ck(J(hrun("status", "--json"))["handover"]["default_remote"] == "box"
+       and sorted(J(hrun("remote", "list", "--json"))["remotes"]) == ["box", "box2"],
+       "several machines; the first one stays the default")
+    d = J(hrun("handover", projM, "--to", "box2", "--apply", "--no-start", "--json"))
+    ck(d.get("applied") and Path(str(box2) + projM, "keep.txt").is_file()
+       and project_row(projM)["away_remote"] == "box2",
+       "--to hands a project to the machine named")
+    r = hrun("remote", "remove", "box2")
+    ck(r.returncode == 3 and "box2" in J(hrun("remote", "list", "--json"))["remotes"],
+       "a machine that holds a project cannot be removed")
+    d = J(hrun("reclaim", projM, "--apply", "--json"))
+    r = hrun("remote", "remove", "box2")
+    ck(d.get("applied") and r.returncode == 0
+       and sorted(J(hrun("remote", "list", "--json"))["remotes"]) == ["box"],
+       "once the project is back it can")
+    ts = stubs / "tailscale"
+    ts.write_text("#!/bin/sh\ncat <<'JSON'\n" + json.dumps({"Peer": {
+        "a": {"HostName": "x", "DNSName": "homebox.net.ts.net.", "OS": "linux",
+              "Online": True},
+        "b": {"HostName": "phone", "DNSName": "phone.net.ts.net.", "OS": "iOS",
+              "Online": True},
+        "c": {"HostName": "old", "DNSName": "attic.net.ts.net.", "OS": "macOS",
+              "Online": False}}}) + "\nJSON\n")
+    ts.chmod(0o755)
+    found = J(run("remote", "discover", "--json",
+                  extra_env=dict(henv, AHT_TAILSCALE=str(ts)))).get("machines", [])
+    names = [m["name"] for m in found if m["via"] == "tailscale"]
+    ck(names == ["homebox", "attic"],
+       f"discover: computers of the network, reachable ones first, no phones ({names})")
+
+    for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
+        rec = json.loads(w.read_text())
+        if rec.get("alive"):
+            try:
+                os.kill(int(rec["pid"]), 15)
+            except OSError:
+                pass
+
+if os.name == "nt" or not core.find_rsync():
+    print("  SKIP needs rsync 3 (macOS: brew install rsync)")
+else:
+    handover_suite()
+
 shutil.rmtree(sb, ignore_errors=True)
 print("\nCORE RESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")
 for f in FAILS:

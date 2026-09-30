@@ -1240,7 +1240,11 @@ def is_git(path) -> bool:
 
 def _entry_for_path(path: str) -> dict:
     rp = os.path.realpath(path)
-    for e in load_registry().get("projects", {}).values():
+    projects = load_registry().get("projects", {})
+    mine = projects.get(read_marker(rp) or "")      # the folder's own entry first
+    if mine is not None and os.path.realpath(mine["real_path"]) == rp:
+        return mine
+    for e in projects.values():
         if os.path.realpath(e["real_path"]) == rp:
             return e
     return {}
@@ -2946,6 +2950,24 @@ def cmd_orphans(args):
             print()
     return 0
 
+def stale_doubles(reg: dict) -> list:
+    """Entries that list a folder ANOTHER entry owns — what is left when a
+    folder was removed and made anew at the same path.  The folder's own
+    marker names the owner; without that verdict nothing counts as stale."""
+    by = {}
+    for u, e in reg.get("projects", {}).items():
+        by.setdefault(os.path.realpath(e["real_path"]), []).append(u)
+    out = []
+    for path, ids in sorted(by.items()):
+        if len(ids) < 2 or not os.path.isdir(path):
+            continue
+        owner = read_marker(path)
+        if owner in ids:
+            out += [{"uuid": u, "real_path": path, "owner": owner,
+                     "stores": sorted(reg["projects"][u].get("stores") or {})}
+                    for u in ids if u != owner and not reg["projects"][u].get("away")]
+    return out
+
 def cmd_prune(args):
     with Lock():
         reg = load_registry()
@@ -2953,22 +2975,26 @@ def cmd_prune(args):
                  "stores": sorted(e.get("stores") or {})}
                 for u, e in reg.get("projects", {}).items()
                 if not os.path.isdir(e["real_path"])]
-        if args.apply and gone:
-            for g in gone:
+        twice = stale_doubles(reg)
+        if args.apply and (gone or twice):
+            for g in gone + twice:
                 reg["projects"].pop(g["uuid"], None)
                 reg.get("declined_moves", {}).pop(g["uuid"], None)
-                log(f"PRUNE {g['real_path']} (stores kept)")
+                log(f"PRUNE {g['real_path']} "
+                    + ("(listed twice)" if g in twice else "(stores kept)"))
             save_registry(reg)
-    result = {"applied": bool(args.apply), "pruned": gone,
+    result = {"applied": bool(args.apply), "pruned": gone, "doubles": twice,
               "remaining": len(load_registry().get("projects", {}))}
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"{'PRUNED' if args.apply else 'WOULD PRUNE'} {len(gone)} "
+        print(f"{'PRUNED' if args.apply else 'WOULD PRUNE'} {len(gone) + len(twice)} "
               f"registry entr(ies); history stores are never deleted.")
         for g in gone:
             print(f"  - {g['real_path']}   [{', '.join(g['stores'])}]")
-        if gone and not args.apply:
+        for g in twice:
+            print(f"  - {g['real_path']}   (listed twice; the folder's own entry stays)")
+        if (gone or twice) and not args.apply:
             print("\n  run with --apply to remove these mappings")
     return 0
 
@@ -3118,6 +3144,9 @@ def cmd_doctor(args):
     missing = [e["real_path"] for e in reg.get("projects", {}).values()
                if not os.path.isdir(e["real_path"])]
     ck("no missing project folders", not missing, f"{len(missing)} missing")
+    twice = stale_doubles(reg)
+    ck("no folder is listed twice", not twice,
+       f"{len(twice)} — remove with:  aht prune --apply")
     owned = registered_history_dirs(reg)
     orph = [d.name for d in _iter_history_dirs() if d.name not in owned]
     ck("no orphan claude stores", not orph, f"{len(orph)} orphan(s)")
@@ -4610,6 +4639,13 @@ def write_brief(real: str, sid, dig: dict, here: str, there: str,
 # ---- registry bookkeeping ---------------------------------------------------- #
 
 def _entry_for(reg: dict, real: str):
+    """The registry entry of the folder at `real`.  A path can be listed
+    twice (a folder that was removed and made anew): the entry the folder's
+    own marker names is the one that counts."""
+    mark = read_marker(real) if os.path.isdir(real) else None
+    e = reg.get("projects", {}).get(mark) if mark else None
+    if e is not None and os.path.realpath(e.get("real_path") or "") == real:
+        return mark, e
     for uid, e in reg.get("projects", {}).items():
         if os.path.realpath(e.get("real_path") or "") == real:
             return uid, e

@@ -2612,6 +2612,7 @@ def cmd_reconcile(args):
                 apply_badge(p, desired_marks(p, True))
         maybe_auto_backup()
         _spawn_mirror()
+        _spawn_search_update()
 
     if applied_moves or applied_copies or conflicts:
         acted_backends = sorted(
@@ -2729,6 +2730,7 @@ def cmd_hook(args):
     _hook_notes(cwd)
     _spawn_auto_backup()
     _spawn_mirror()
+    _spawn_search_update()
     return 0
 
 # --------------------------------------------------------------------------- #
@@ -2840,6 +2842,7 @@ def cmd_status(args):
         "watcher": watcher_status(),
         "backups": backup_status(),
         "handover": handover_status(),
+        "agent_clis": {n: agent_cli(n) for n in SWITCH_TARGETS},
         "log": {"path": str(log_path()),
                 "recent_problems": recent_log_problems()},
         "hook_installed": hook_installed(),
@@ -2904,8 +2907,9 @@ def cmd_projects(args):
                "agents": agents_of(e.get("stores") or {})}
         mine = [s["status"] for s in live
                 if _inside(os.path.realpath(s["cwd"]), os.path.realpath(e["real_path"]))]
-        # an open agent session: "working" or "idle" (it blocks a handover)
+        # an open agent session: "waiting" (for you), "working" or "idle"
         row["open"] = None if not mine else (
+            "waiting" if "waiting" in mine else
             "idle" if all(s == "idle" for s in mine) else "working")
         row.update(_hist_stats(e))
         out.append(row)
@@ -3520,6 +3524,14 @@ COMMANDS:
   aht encode <path>               claude's dirname encoding for a path
   aht install | uninstall         set up / remove the watcher, hook and command
 
+ACROSS AGENTS (Claude Code, Kimi Code, Codex):
+  aht search <words>                    every session, also deleted ones in backups
+  aht board                             open sessions here and on other machines
+  aht switch <folder> --to kimi         continue the work in another agent
+  aht journal <folder>                  a dated diary of the project
+  aht rules <folder> [--unify]          one set of project rules for every agent
+  aht secrets [folder]                  keys or passwords in the histories (masked)
+
 HANDOVER (continue on another machine of yours, over ssh):
   aht remote discover                   machines of your network that qualify
   aht remote add <name> <user@host>     name a machine (as many as you like)
@@ -3754,6 +3766,8 @@ def running_sessions(inside: str = None, home: Path = None) -> list:
             continue
         out.append({"pid": pid, "cwd": cwd, "session": rec.get("sessionId"),
                     "status": str(rec.get("status") or "unknown"),
+                    "waiting_for": rec.get("waitingFor"),
+                    "since": _when(rec.get("statusUpdatedAt")),
                     "kind": rec.get("kind"), "name": rec.get("name")})
     return out
 
@@ -3813,6 +3827,11 @@ def _activity_blockers(act: dict, where: str) -> list:
     out = []
     for s in act.get("sessions") or []:
         busy = s.get("status") != "idle"
+        if s.get("status") == "waiting":
+            out.append(f"an agent session in this project {where} is WAITING for you"
+                       + (f" ({s['waiting_for']})" if s.get("waiting_for") else "")
+                       + f" (pid {s['pid']}) — answer it, let it finish, then exit it")
+            continue
         out.append(f"an agent session is {'WORKING' if busy else 'open'} in this "
                    f"project {where} (pid {s['pid']}"
                    + (f", “{s['name']}”" if s.get("name") else "") + ") — "
@@ -4475,6 +4494,7 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "trust": _agent_trust, "install-claude": _agent_install_claude,
              "start": _agent_start, "stop": _agent_stop, "peek": _agent_peek,
              "close": _agent_close, "written-by": _agent_written_by,
+             "board": lambda req: _agent_board(req),
              "udp-echo": _agent_udp_echo,
              "prune": _agent_prune}
 
@@ -4606,22 +4626,9 @@ def write_brief(real: str, sid, dig: dict, here: str, there: str,
         L.append(f"- Session: {dig.get('title') or 'untitled'} — `{sid}`"
                  + (f", Claude Code {dig['version']}" if dig.get("version") else ""))
         L.append(f"- Continue it with: `claude --resume {sid}`")
-    if dig.get("summary"):
-        L += ["", "## Where things stood", "", _clip(dig["summary"], 8000)]
-    if dig.get("exchanges"):
-        L += ["", "## The latest exchanges"]
-        for x in dig["exchanges"]:
-            L += ["", "**You:** " + _clip(x["you"], 1500)]
-            if x.get("agent"):
-                L += ["", "**Agent:** " + _clip(x["agent"], 2500)]
-    if dig.get("todos"):
-        L += ["", "## Open to-do items", ""]
-        L += [f"- [ ] {_clip(str(x.get('content') or x.get('subject') or ''), 200)}"
-              + ("  *(in progress)*" if x.get("status") == "in_progress" else "")
-              for x in dig["todos"]]
-    if dig.get("touched"):
-        L += ["", "## Files changed most recently", ""]
-        L += [f"- `{p}`" for p in reversed(dig["touched"])]
+    if task:
+        L += ["", "## The task it was given on arrival", "", task.strip()]
+    L += _brief_sections(dig)
     missing = [p for p in dig.get("outside") or []
                if not any(_inside(p, c) for c in carried)]
     L += ["", "## What did not come along", "",
@@ -5909,6 +5916,10 @@ def open_terminal(command: str, name: str) -> int:
     """Run `command` in a new terminal window (the front-ends use this)."""
     run = aht_home() / "run"
     run.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("AHT_TERMINAL_LOG"):          # tests: note it, open nothing
+        with open(os.environ["AHT_TERMINAL_LOG"], "a") as fh:
+            fh.write(command + "\n")
+        return 0
     if IS_MAC:
         f = run / (re.sub(r"[^A-Za-z0-9_.-]+", "-", name) + ".command")
         f.write_text("#!/bin/bash\n"
@@ -5933,7 +5944,16 @@ def cmd_resume_here(args):
     real = os.path.realpath(args.path)
     _uid, entry = _entry_for(load_registry(), real)
     back = (entry or {}).get("returned") or {}
-    sid = latest_session(_store_of(real))
+    if args.agent and args.agent != "claude":
+        if not args.session:
+            print("name the session with --session", file=sys.stderr)
+            return 2
+        cmd = resume_command(args.agent, args.session, real)
+        if args.print:
+            print(cmd)
+            return 0
+        return open_terminal(cmd, f"resume-{os.path.basename(real)}")
+    sid = args.session or latest_session(_store_of(real))
     if args.handed_over:
         sid = back.get("handed_over") or back.get("session") or sid
     exe = find_claude() or "claude"
@@ -5992,6 +6012,1263 @@ def _hook_notes(cwd: str) -> None:
             _update_entry(uid, returned=dict(b, told=True))
     except Exception as e:
         warn(f"HOOK handover note: {e}")
+
+# --------------------------------------------------------------------------- #
+# Across agents: every agent's sessions, read one way.  Search, the secrets
+# check, the journal, switching agent and the session board build on it.
+# Readable: Claude Code, Kimi Code 2.x and Codex; the other agents keep
+# formats aht does not know yet.
+# --------------------------------------------------------------------------- #
+
+AGENT_NAMES = {"claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex"}
+
+def _when(v):
+    """Seconds since 1970 from an ISO text or a (milli)second number."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)) or (isinstance(v, str) and v.isdigit()):
+        x = float(v)
+        return x / 1000.0 if x > 1e11 else x
+    if isinstance(v, str) and len(v) >= 19 and v[4:5] == "-":
+        from datetime import datetime
+        s = v.replace("Z", "+00:00")
+        for cand in (s, re.sub(r"\.\d+", "", s)):
+            try:
+                return datetime.fromisoformat(cand).timestamp()
+            except ValueError:
+                continue
+    return None
+
+def _stat(p):
+    try:
+        return os.stat(p)
+    except OSError:
+        return None
+
+def _target(inp: dict) -> str:
+    for k in ("file_path", "notebook_path", "path", "command", "pattern", "url", "query"):
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:400]
+    return ""
+
+def _claude_events(e: dict):
+    typ, t = e.get("type"), _when(e.get("timestamp"))
+    if typ in ("ai-title", "custom-title"):
+        title = e.get("customTitle") or e.get("aiTitle")
+        if title:
+            yield {"t": t, "role": "title", "text": title}
+        return
+    m = e.get("message")
+    if e.get("isSidechain") or not isinstance(m, dict):
+        return
+    c = m.get("content")
+    if typ == "user":
+        if e.get("isCompactSummary"):
+            yield {"t": t, "role": "summary", "text": _text_of(c).strip()}
+            return
+        if e.get("isMeta") or e.get("toolUseResult") is not None:
+            return
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                       for b in c):
+            return
+        txt = _text_of(c).strip()
+        if txt and not txt.startswith("<"):         # reminders, command echoes
+            yield {"t": t, "role": "user", "text": txt}
+    elif typ == "assistant" and isinstance(c, list):
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and (b.get("text") or "").strip():
+                yield {"t": t, "role": "agent", "text": b["text"].strip()}
+            elif b.get("type") == "tool_use":
+                inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                yield {"t": t, "role": "tool", "tool": b.get("name") or "",
+                       "target": _target(inp), "input": inp}
+
+def _kimi_events(e: dict):
+    typ, t = e.get("type"), _when(e.get("time"))
+    if typ == "turn.prompt":
+        if ((e.get("origin") or {}).get("kind") or "user") != "user":
+            return
+        txt = "\n".join(b.get("text") or "" for b in e.get("input") or []
+                        if isinstance(b, dict) and b.get("type") == "text").strip()
+        if txt:
+            yield {"t": t, "role": "user", "text": txt}
+    elif typ == "context.append_loop_event":
+        ev = e.get("event") or {}
+        if ev.get("type") == "content.part":
+            part = ev.get("part") or {}
+            if part.get("type") == "text" and (part.get("text") or "").strip():
+                yield {"t": t, "role": "agent", "text": part["text"].strip()}
+        elif ev.get("type") == "tool.call":
+            args = ev.get("args") if isinstance(ev.get("args"), dict) else {}
+            yield {"t": t, "role": "tool", "tool": ev.get("name") or "",
+                   "target": _target(args), "input": args}
+
+def _codex_events(e: dict):
+    typ, t = e.get("type"), _when(e.get("timestamp"))
+    p = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+    if typ == "event_msg" and p.get("type") in ("user_message", "agent_message"):
+        txt = str(p.get("message") or "").strip()
+        if txt:
+            yield {"t": t, "role": "user" if p["type"] == "user_message" else "agent",
+                   "text": txt}
+    elif typ == "response_item" and p.get("type") in ("function_call", "custom_tool_call"):
+        args = p.get("arguments") if p.get("arguments") is not None else p.get("input")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"command": args}
+        args = args if isinstance(args, dict) else {}
+        cmd = args.get("command")
+        if isinstance(cmd, list):
+            args = dict(args, command=" ".join(map(str, cmd)))
+        yield {"t": t, "role": "tool", "tool": p.get("name") or "", "target": _target(args),
+               "input": args}
+
+_EVENTS = {"claude": _claude_events, "kimi": _kimi_events, "codex": _codex_events}
+
+def session_events(agent: str, src, start: int = 0):
+    """(end, event) for each message of one session from byte `start` on;
+    `src` is a path or an open binary file.  `end` is where the next read
+    starts, so an index can pick up what was appended since."""
+    parse = _EVENTS[agent]
+    fh = open(src, "rb") if isinstance(src, (str, Path)) else src
+    try:
+        if start:
+            fh.seek(start)
+        pos = start
+        for raw in fh:
+            end = pos + len(raw)
+            if not raw.endswith(b"\n"):
+                break                        # still being written: next time
+            pos = end
+            try:
+                e = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(e, dict):
+                for ev in parse(e):
+                    yield end, ev
+    finally:
+        if isinstance(src, (str, Path)):
+            fh.close()
+
+def _store_owners() -> dict:
+    owner = {}
+    for e in load_registry().get("projects", {}).values():
+        s = (e.get("stores") or {}).get("claude")
+        if s:
+            owner[s] = e["real_path"]
+    return owner
+
+def list_sessions(project: str = None, agents=None) -> list:
+    """Every session aht can read, newest first:
+    {agent, id, project, file, updated[, title]}.  `project` narrows it to one
+    folder."""
+    want = set(agents or AGENT_NAMES)
+    real = os.path.realpath(project) if project else None
+    out = []
+    if "claude" in want:
+        root = claude_backend().root()
+        if real:
+            hit = claude_backend().find(real)
+            stores = [(hit[1], real)] if hit else []
+        else:
+            owner = _store_owners()
+            stores = [(d, owner.get(d.name)) for d in (sorted(root.iterdir())
+                                                        if root.is_dir() else [])
+                      if d.is_dir() and not d.name.startswith(STAGING_PREFIX)]
+        for d, proj in stores:
+            files = [f for f in d.glob("*.jsonl") if f.is_file()]
+            if files and proj is None:
+                proj = transcript_cwd(d)
+            for f in files:
+                st = _stat(f)
+                if st:
+                    out.append({"agent": "claude", "id": f.stem, "project": proj,
+                                "file": str(f), "updated": st.st_mtime})
+    b = BY_NAME.get("kimi-code")
+    if "kimi" in want and b is not None and b.root().is_dir():
+        root = b.root()
+        buckets = [root / _key_kimicode(real)] if real else \
+            [p for p in root.iterdir() if p.name.startswith("wd_")]
+        for bk in buckets:
+            for sd in (sorted(bk.iterdir()) if bk.is_dir() else []):
+                wire = sd / "agents" / "main" / "wire.jsonl"
+                st = _stat(wire)
+                if not sd.name.startswith("session_") or st is None:
+                    continue
+                try:
+                    state = json.loads((sd / "state.json").read_text())
+                except Exception:
+                    state = {}
+                if real and os.path.realpath(state.get("cwd") or real) != real:
+                    continue
+                out.append({"agent": "kimi", "id": sd.name, "project": state.get("cwd"),
+                            "file": str(wire), "title": state.get("title"),
+                            "updated": _when(state.get("updatedAt")) or st.st_mtime})
+    b = BY_NAME.get("codex")
+    if "codex" in want and b is not None and b.available():
+        files = b.scan(real) if real else sorted(b.root().rglob("rollout-*.jsonl"))
+        for f in files:
+            st = _stat(f)
+            if st is None:
+                continue
+            meta = {}
+            try:
+                with open(f, "rb") as fh:
+                    first = json.loads(fh.readline() or b"{}")
+                if first.get("type") == "session_meta":
+                    meta = first.get("payload") or {}
+            except Exception:
+                pass
+            out.append({"agent": "codex", "id": meta.get("id") or Path(f).stem,
+                        "project": meta.get("cwd"), "file": str(f), "updated": st.st_mtime})
+    out.sort(key=lambda s: s["updated"] or 0, reverse=True)
+    return out
+
+def resume_command(agent: str, sid: str, project: str) -> str:
+    exe = agent_cli(agent) or agent
+    args = {"claude": ["--resume", sid], "kimi": ["-S", sid], "codex": ["resume", sid]}[agent]
+    return f"cd {shlex.quote(project)} && " + " ".join(shlex.quote(a) for a in [exe] + args)
+
+# ---- search -------------------------------------------------------------------- #
+
+def search_db() -> Path:
+    return aht_home() / "search.db"
+
+_SEARCH_SCHEMA = """
+create table if not exists files (path text primary key, size integer, mtime real,
+    pos integer, agent text, session text);
+create table if not exists sessions (key text primary key, agent text, session text,
+    project text, title text, started real, updated real, live integer, source text);
+create virtual table if not exists msgs using fts5(text, role unindexed,
+    agent unindexed, session unindexed, project unindexed, t unindexed,
+    file unindexed, tokenize = "unicode61 remove_diacritics 2");
+"""
+SEARCH_TEXT_MAX = 4000
+
+def _open_search_db():
+    import sqlite3
+    aht_home().mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(search_db()), timeout=60)
+    db.executescript(_SEARCH_SCHEMA)
+    return db
+
+def _index_events(db, agent, sid, project, file, events) -> tuple:
+    """Put a run of session events into the index -> (end, title, first, last)."""
+    end, title, first, last = None, None, None, None
+    rows = []
+    for end, ev in events:
+        if ev.get("t"):
+            first = first or ev["t"]
+            last = ev["t"]
+        if ev["role"] == "title":
+            title = ev["text"]
+            continue
+        if ev["role"] == "tool":
+            text = f"{ev.get('tool')}: {ev.get('target') or ''}".strip()
+        else:
+            text = ev.get("text") or ""
+        text = redact(text[:SEARCH_TEXT_MAX])           # the index holds no keys
+        if text:
+            rows.append((text[:SEARCH_TEXT_MAX], ev["role"], agent, sid, project or "",
+                         ev.get("t"), file))
+        if len(rows) >= 500:
+            db.executemany("insert into msgs values (?,?,?,?,?,?,?)", rows)
+            rows = []
+    if rows:
+        db.executemany("insert into msgs values (?,?,?,?,?,?,?)", rows)
+    return end, title, first, last
+
+def _note_session(db, agent, sid, project, title, first, last, live, source):
+    key = f"{agent}:{sid}"
+    old = db.execute("select title, started, updated from sessions where key = ?",
+                     (key,)).fetchone()
+    if old:
+        title = title or old[0]
+        first = min(x for x in (first, old[1]) if x) if (first or old[1]) else None
+        last = max(x for x in (last, old[2]) if x) if (last or old[2]) else None
+    db.execute("insert or replace into sessions values (?,?,?,?,?,?,?,?,?)",
+               (key, agent, sid, project or "", title or "", first, last, live, source))
+
+def update_search_index(progress=None) -> dict:
+    """Bring the index up to date: what live sessions appended since the last
+    run, sessions that are new, and sessions that now exist only in history
+    backups.  A session whose file is gone stays searchable."""
+    import zipfile
+    lock = open(str(search_db()) + ".lock", "w") if aht_home().is_dir() else None
+    if lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    db = _open_search_db()
+    stats = {"sessions": 0, "files_read": 0, "from_backups": 0}
+    try:
+        live = list_sessions()
+        live_keys = {f"{s['agent']}:{s['id']}" for s in live}
+        known = {r[0]: r[1:] for r in db.execute("select path, size, mtime, pos from files")}
+        todo = []
+        for s in live:
+            st = _stat(s["file"])
+            if st is None:
+                continue
+            k = known.get(s["file"])
+            if k and k[0] == st.st_size and abs(k[1] - st.st_mtime) < 1e-6:
+                continue
+            todo.append((s, st))
+        for i, (s, st) in enumerate(todo):
+            if progress:
+                progress(i, len(todo))
+            k = known.get(s["file"])
+            start = k[2] if k and st.st_size >= k[0] and k[2] <= st.st_size else 0
+            if start == 0 and k:
+                db.execute("delete from msgs where file = ?", (s["file"],))
+            end, title, first, last = _index_events(
+                db, s["agent"], s["id"], s.get("project"), s["file"],
+                session_events(s["agent"], s["file"], start))
+            _note_session(db, s["agent"], s["id"], s.get("project"),
+                          title or s.get("title"), first, last or s["updated"], 1, s["file"])
+            db.execute("insert or replace into files values (?,?,?,?,?,?)",
+                       (s["file"], st.st_size, st.st_mtime, end or start, s["agent"], s["id"]))
+            stats["files_read"] += 1
+            db.commit()
+        # sessions whose file is gone: still in the index, now marked so
+        db.execute("create temp table if not exists live_now (key text primary key)")
+        db.execute("delete from live_now")
+        db.executemany("insert or ignore into live_now values (?)",
+                       [(k,) for k in live_keys])
+        gone = {r[0] for r in db.execute("select key from sessions where live = 1 and key "
+                                         "not in (select key from live_now)")}
+        db.execute("update sessions set live = 0 where live = 1 and key not in "
+                   "(select key from live_now)")
+        unplaced = gone | {r[0] for r in db.execute(
+            "select key from sessions where live = 0 and source not like '%.zip'")}
+        # what only the backups still hold (newest snapshot first)
+        root = backups_root()
+        have = {r[0] for r in db.execute("select key from sessions")} - unplaced
+        owners = load_registry().get("projects", {})
+        member = re.compile(r"^(claude)/([^/]+)\.jsonl$|"
+                            r"^(kimi-code)/(session_[^/]+)/agents/main/wire\.jsonl$")
+        for zp in sorted(root.glob("*/*.zip"), reverse=True) if root.is_dir() else []:
+            st = _stat(zp)
+            k = known.get(str(zp))
+            if st is None or (k and abs(k[1] - st.st_mtime) < 1e-6 and not unplaced):
+                continue
+            uid = zp.parent.name
+            try:
+                meta = json.loads(zp.with_suffix(".meta.json").read_text())
+            except Exception:
+                meta = {}
+            project = (owners.get(uid) or {}).get("real_path") or meta.get("real_path")
+            try:
+                zf = zipfile.ZipFile(zp)
+            except Exception:
+                continue
+            with zf:
+                for name in zf.namelist():
+                    m = member.match(name)
+                    if not m:
+                        continue
+                    agent = "claude" if m.group(1) else "kimi"
+                    sid = m.group(2) or m.group(4)
+                    key = f"{agent}:{sid}"
+                    if key in have or key in live_keys:
+                        continue
+                    have.add(key)
+                    if key in unplaced:          # its text is indexed; it needs a home
+                        db.execute("update sessions set source = ? where key = ?",
+                                   (str(zp), key))
+                        unplaced.discard(key)
+                        stats["from_backups"] += 1
+                        continue
+                    with zf.open(name) as fh:
+                        _e, title, first, last = _index_events(
+                            db, agent, sid, project, str(zp), session_events(agent, fh))
+                    _note_session(db, agent, sid, project, title, first, last, 0, str(zp))
+                    stats["from_backups"] += 1
+            db.execute("insert or replace into files values (?,?,?,?,?,?)",
+                       (str(zp), st.st_size, st.st_mtime, 0, "backup", uid))
+            db.commit()
+        stats["sessions"] = db.execute("select count(*) from sessions").fetchone()[0]
+        db.execute("insert or replace into files values (?,?,?,?,?,?)",
+                   ("@updated", 0, time.time(), 0, "", ""))
+        db.commit()
+    finally:
+        db.close()
+        if lock:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+    return stats
+
+def _fts_query(q: str) -> str:
+    """Words as the user typed them -> an FTS5 query: every word must occur,
+    "quoted phrases" stay phrases, the last word may be the start of one."""
+    parts = re.findall(r'"([^"]+)"|(\S+)', q)
+    terms = []
+    for i, (phrase, word) in enumerate(parts):
+        w = (phrase or word).replace('"', '""')
+        if not w.strip():
+            continue
+        last = i == len(parts) - 1 and not phrase
+        terms.append(f'"{w}"' + ("*" if last and len(w) >= 2 else ""))
+    return " ".join(terms)
+
+HIT_OPEN, HIT_CLOSE = "\x02", "\x03"
+
+def search_history(q: str, project: str = None, agent: str = None,
+                   limit: int = 20) -> list:
+    """Sessions matching `q`, best first, with the best places in them."""
+    fq = _fts_query(q)
+    if not fq or not search_db().exists():
+        return []
+    db = _open_search_db()
+    try:
+        sql = ("select session, agent, project, role, t, snippet(msgs, 0, ?, ?, '…', 14), "
+               "bm25(msgs) from msgs where msgs match ?")
+        args = [HIT_OPEN, HIT_CLOSE, fq]
+        if project:
+            sql += " and project = ?"
+            args.append(os.path.realpath(project))
+        if agent:
+            sql += " and agent = ?"
+            args.append(agent)
+        sql += " order by bm25(msgs) limit 600"
+        try:
+            rows = db.execute(sql, args).fetchall()
+        except Exception as e:
+            raise ValueError(f"the search words could not be understood ({e})")
+        found, order = {}, []
+        for sid, ag, proj, role, t, snip, rank in rows:
+            key = f"{ag}:{sid}"
+            if key not in found:
+                if len(order) >= limit:
+                    continue
+                found[key] = {"agent": ag, "session": sid, "project": proj or None,
+                              "rank": rank, "hits": []}
+                order.append(key)
+            if len(found[key]["hits"]) < 3 and \
+                    snip not in [h["snippet"] for h in found[key]["hits"]]:
+                found[key]["hits"].append({"role": role, "t": t, "snippet": snip})
+        out = []
+        for key in order:
+            r = found[key]
+            meta = db.execute("select title, started, updated, live, source from sessions "
+                              "where key = ?", (key,)).fetchone() or ("", None, None, 1, "")
+            r.update(title=meta[0] or None, started=meta[1], updated=meta[2],
+                     live=bool(meta[3]), source=meta[4])
+            proj = r["project"]
+            if r["live"] and proj and os.path.isdir(proj):
+                r["resume"] = resume_command(r["agent"], r["session"], proj)
+            elif not r["live"] and str(r["source"]).endswith(".zip"):
+                zp = Path(r["source"])
+                r["restore"] = {"uuid": zp.parent.name, "stamp": zp.stem,
+                                "project": proj if proj and os.path.isdir(proj) else None}
+            out.append(r)
+        return out
+    finally:
+        db.close()
+
+def _search_age() -> float:
+    try:
+        import sqlite3
+        db = sqlite3.connect(str(search_db()))
+        row = db.execute("select mtime from files where path = '@updated'").fetchone()
+        db.close()
+        return time.time() - (row[0] if row else 0)
+    except Exception:
+        return float("inf")
+
+def _spawn_search_update() -> None:
+    """From the watcher and the hook: keep the index fresh, detached."""
+    try:
+        if os.environ.get("AHT_NO_SEARCH_INDEX") or _search_age() < 600:
+            return
+        me = [sys.executable] if getattr(sys, "frozen", False) else \
+            [sys.executable or "python3", str(Path(__file__).resolve())]
+        subprocess.Popen(me + ["search", "--update", "--quiet"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         start_new_session=True, cwd="/")
+    except Exception:
+        pass
+
+def _when_text(t) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "?"
+
+def cmd_search(args):
+    q = " ".join(args.words or []).strip()
+    if args.rebuild:
+        for p in (search_db(), Path(str(search_db()) + "-wal")):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    if args.update or args.rebuild or not args.no_update:
+        talk = sys.stderr.isatty() and not args.json and not args.quiet
+        def progress(i, n):
+            if talk and n > 20 and i % 10 == 0:
+                sys.stderr.write(f"\rindexing {i}/{n} session file(s)…")
+                sys.stderr.flush()
+        stats = update_search_index(progress)
+        if talk:
+            sys.stderr.write("\r" + " " * 50 + "\r")
+        if not q:
+            if args.json:
+                print(json.dumps({"index": stats}, indent=2))
+            elif not args.quiet:
+                print(f"index up to date: {stats['sessions']} session(s), "
+                      f"{stats['files_read']} file(s) read now, "
+                      f"{stats['from_backups']} only in backups")
+            return 0
+    if not q:
+        print("usage: aht search <words…>   (\"a phrase\" in quotes; --project, --agent)",
+              file=sys.stderr)
+        return 2
+    try:
+        rows = search_history(q, args.project, args.agent, args.limit)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"query": q, "results": rows}, indent=2))
+        return 0
+    bold = ("\033[1m", "\033[0m") if sys.stdout.isatty() else ("[", "]")
+    for r in rows:
+        where = r["project"] or "?"
+        print(f"{AGENT_NAMES.get(r['agent'], r['agent'])} · {_when_text(r['updated'])} · "
+              f"{r['title'] or r['session']}")
+        print(f"   {where}" + ("" if r["live"] else "   (deleted — it lives on in a backup)"))
+        for h in r["hits"]:
+            s = h["snippet"].replace("\n", " ").replace(HIT_OPEN, bold[0]).replace(HIT_CLOSE, bold[1])
+            print(f"   {h['role']:>5}: {s}")
+        if r.get("resume"):
+            print(f"   → {r['resume']}")
+        elif r.get("restore") and r["restore"]["project"]:
+            rs = r["restore"]
+            print(f"   → aht restore {shlex.quote(rs['project'])} --uuid {rs['uuid']} "
+                  f"--stamp {rs['stamp']} --apply")
+        print()
+    if not rows:
+        print("nothing found")
+    return 0
+
+# ---- secrets ------------------------------------------------------------------- #
+
+def _secret_patterns() -> list:
+    """(kind, needles, pattern, generic).  A pattern only runs around its
+    needles, so gigabytes of history take seconds; a generic one runs on the
+    lower-cased text.  Built from pieces, so this file does not itself look
+    like it holds a key."""
+    k = lambda *parts: "".join(parts).encode()
+    rx = lambda *parts: re.compile(k(*parts))
+    return [
+        ("Anthropic API key", [k("sk-", "ant-")], rx("sk-", "ant-", r"[A-Za-z0-9_\-]{20,}"), False),
+        ("OpenAI API key", [k("sk-")], rx(r"sk-(?!", "ant-", r")(?:proj-|svcacct-)?",
+                                          r"[A-Za-z0-9_\-]{32,}"), False),
+        ("Groq API key", [k("gs", "k_")], rx(r"\bgs", r"k_[A-Za-z0-9]{40,}"), False),
+        ("GitHub token", [k("gh", "p_"), k("gh", "o_"), k("gh", "u_"), k("gh", "s_"),
+                          k("gh", "r_"), k("github_", "pat_")],
+         rx(r"(?:gh", r"[pousr]_[A-Za-z0-9]{36,}|github_", r"pat_[A-Za-z0-9_]{50,})"), False),
+        ("AWS access key", [k("AK", "IA"), k("AS", "IA")],
+         rx(r"\b(?:AK", r"IA|AS", r"IA)[0-9A-Z]{16}\b"), False),
+        ("Google API key", [k("AI", "za")], rx("AI", r"za[0-9A-Za-z_\-]{35}"), False),
+        ("Slack token", [k("xo", "x")], rx("xo", r"x[abprs]-[0-9A-Za-z\-]{10,}"), False),
+        ("Stripe key", [k("_li", "ve_")], rx(r"(?:sk|rk)_", r"live_[0-9A-Za-z]{20,}"), False),
+        ("Hugging Face token", [k("hf", "_")], rx(r"\bhf_", r"[A-Za-z0-9]{30,}"), False),
+        ("npm token", [k("npm", "_")], rx(r"\bnpm_", r"[A-Za-z0-9]{36}\b"), False),
+        ("Tailscale key", [k("tsk", "ey-")], rx("tskey", r"-[A-Za-z0-9\-]{20,}"), False),
+        ("private key", [k("PRIV", "ATE KEY-----")],
+         rx(r"-----BEGIN (?:[A-Z]+ )?PRIV", r"ATE KEY-----"), False),
+        ("JSON web token", [k("ey", "J")], rx(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ",
+                                              r"[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), False),
+        ("password in a web address", [k(":/", "/")], rx(
+            r"\b[a-z][a-z0-9+.\-]{1,20}://[^\s:/@\"'\\]{1,64}:",
+            r"([^\s:/@\"'\\]{4,128})@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), True),
+        ("password or token", [k("pass", "word"), k("pass", "wd"), k("pw", "d"),
+                               k("sec", "ret"), k("api", "_key"), k("api", "-key"),
+                               k("api", "key"), k("access", "_token"), k("auth", "_token")],
+         rx(r"\b(?:password|passwd|pwd|secret|api[_-]?key|access_token|auth_token)",
+            r"\\?[\"']?\s*[:=]\s*\\?[\"']?([^\s\"'\\,;)}\]`]{8,64})"), True),
+    ]
+
+_PLACEHOLDER = re.compile(r"(?i)(?:x{4,}|\*{3,}|\.{3}|<|>|\$|\{|\(|%|your|example|changeme|"
+                          r"redacted|placeholder|dummy|sample|process\.env|os\.environ|getenv)")
+_CODE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$|^[A-Z][A-Z0-9_]+$"
+                        r"|^[/~.]|^[a-z]+(?:[-_][a-z0-9]+)+$")     # …, a path, joined words
+
+def _entropy(s: str) -> float:
+    import math
+    n = len(s)
+    return -sum(c / n * math.log2(c / n) for c in (s.count(x) for x in set(s)))
+
+def _plausible(kind: str, value: str) -> bool:
+    if kind not in ("password or token", "password in a web address"):
+        return True
+    if _PLACEHOLDER.search(value) or _CODE_NAME.match(value):
+        return False            # a placeholder, a variable, a constant's name
+    # what people and tools generate is random; words and dates are not
+    if kind == "password or token" and len(value) < 12:
+        classes = sum(bool(re.search(p, value)) for p in
+                      (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
+        return classes >= 3 and len(set(value)) >= 7
+    return _entropy(value) >= (3.5 if kind == "password or token" else 2.8)
+
+def _mask(value: str) -> str:
+    if value.startswith("-----BEGIN"):
+        return value.strip("-")                  # the header only: no key material
+    return (value[:4] + "…" + value[-2:]) if len(value) > 10 else value[:2] + "…"
+
+def _where_in(line: bytes, agent: str) -> tuple:
+    """(when, what kind of message) of the transcript line holding a find."""
+    try:
+        e = json.loads(line)
+    except Exception:
+        return None, "history"
+    if agent == "claude":
+        t = _when(e.get("timestamp"))
+        if e.get("toolUseResult") is not None:
+            return t, "tool output"
+        if e.get("type") == "user":
+            return t, "your message"
+        c = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_use" for b in c):
+            return t, "command or file the agent wrote"
+        return t, "agent reply"
+    if agent == "kimi":
+        ev = (e.get("event") or {}).get("type")
+        return _when(e.get("time")), {"tool.call": "command or file the agent wrote",
+                                      "tool.result": "tool output",
+                                      "content.part": "agent reply"}.get(
+            ev, "your message" if e.get("type") == "turn.prompt" else "history")
+    return _when(e.get("timestamp")), "history"
+
+def _scan_bytes(data: bytes, pats: list):
+    """(kind, start, end) of every plausible find in one history file."""
+    lower = None
+    seen = set()
+    for kind, needles, rx, generic in pats:
+        if generic and lower is None:
+            lower = data.lower()                  # same length: offsets carry over
+        hay = lower if generic else data
+        for nd in needles:
+            i = hay.find(nd)
+            while i >= 0:
+                for m in rx.finditer(hay, max(0, i - 160), i + 480):
+                    g = 1 if m.re.groups else 0
+                    span = (m.start(g), m.end(g))
+                    if span in seen:
+                        continue
+                    seen.add(span)
+                    value = data[span[0]:span[1]].decode("utf-8", "replace")
+                    if _plausible(kind, value):
+                        yield kind, span[0], span[1], value
+                i = hay.find(nd, i + len(nd))
+
+_PATS = []
+
+def redact(text: str) -> str:
+    """`text` with every key, token or password in it masked — for whatever
+    aht copies out of a history: the search index, the journal, summaries."""
+    if not text:
+        return text
+    if not _PATS:
+        _PATS.extend(_secret_patterns())
+    data = text.encode("utf-8", "replace")
+    spans = sorted((a0, b0, kind, value) for kind, a0, b0, value in _scan_bytes(data, _PATS))
+    if not spans:
+        return text
+    out, pos = [], 0
+    for a0, b0, kind, value in spans:
+        if a0 < pos:
+            continue                                # overlaps what is masked already
+        out += [data[pos:a0], f"[{kind}: {_mask(value)}]".encode()]
+        pos = b0
+    out.append(data[pos:])
+    return b"".join(out).decode("utf-8", "replace")
+
+def scan_secrets(project: str = None, sessions: list = None) -> list:
+    """Everything in the agents' histories that looks like a key, a token or
+    a password.  Values are only ever returned masked."""
+    pats = _secret_patterns()
+    finds = {}
+    for s in sessions if sessions is not None else list_sessions(project):
+        try:
+            data = Path(s["file"]).read_bytes()
+        except OSError:
+            continue
+        for kind, a0, b0, value in _scan_bytes(data, pats):
+            digest = hashlib.sha256(value.encode()).hexdigest()[:16]
+            key = (s["agent"], s["id"], digest)
+            if key in finds:
+                finds[key]["times"] += 1
+                continue
+            a = data.rfind(b"\n", 0, a0) + 1
+            b = data.find(b"\n", b0)
+            t, where = _where_in(data[a:b if b >= 0 else len(data)], s["agent"])
+            finds[key] = {"project": s.get("project"), "agent": s["agent"],
+                          "session": s["id"], "kind": kind, "masked": _mask(value),
+                          "fingerprint": digest, "where": where, "t": t, "times": 1}
+    out = list(finds.values())
+    out.sort(key=lambda f: (f["project"] or "", -(f["t"] or 0)))
+    return out
+
+def cmd_secrets(args):
+    real = os.path.realpath(args.path) if args.path else None
+    if real and not os.path.isdir(real):
+        print(f"not a folder: {real}", file=sys.stderr)
+        return 2
+    talk = sys.stderr.isatty() and not args.json
+    if talk:
+        sys.stderr.write("reading the histories…\r")
+    finds = scan_secrets(real)
+    if talk:
+        sys.stderr.write(" " * 30 + "\r")
+    if args.json:
+        print(json.dumps({"project": real, "finds": finds}, indent=2))
+        return 0
+    if not finds:
+        print("nothing that looks like a key, a token or a password"
+              + (" in this project's histories" if real else " in any history"))
+        return 0
+    last = None
+    for f in finds:
+        if f["project"] != last:
+            last = f["project"]
+            print(f"\n{last or '(folder unknown)'}")
+        print(f"   {f['kind']:<26} {f['masked']:<12} {f['where']}, "
+              f"{AGENT_NAMES.get(f['agent'], f['agent'])} {_when_text(f['t'])}"
+              + (f"  ({f['times']}×)" if f["times"] > 1 else ""))
+    print(f"\n{len(finds)} find(s).  They are in the agents' own history files; aht "
+          "never changes those.  Replace a key that was exposed at its source.")
+    return 0
+
+# ---- journal ------------------------------------------------------------------- #
+
+_CHANGE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "StrReplaceFile",
+                 "WriteFile", "apply_patch"}
+
+def build_journal(project: str, days: int = None) -> dict:
+    """A dated diary of a project from every agent's sessions: what was
+    asked, which files changed, and how each day's work ended."""
+    real = os.path.realpath(project)
+    since = time.time() - days * 86400 if days else None
+    per_day = {}
+    for s in list_sessions(real):
+        title = s.get("title")
+        for _end, ev in session_events(s["agent"], s["file"]):
+            if ev["role"] == "title":
+                title = ev["text"]
+                continue
+            t = ev.get("t")
+            if not t or (since and t < since):
+                continue
+            day = time.strftime("%Y-%m-%d", time.localtime(t))
+            d = per_day.setdefault(day, {}).setdefault(
+                (s["agent"], s["id"]), {"agent": s["agent"], "id": s["id"], "first": t,
+                                        "last": t, "asked": [], "changed": [],
+                                        "commands": 0, "outcome": ""})
+            d["first"], d["last"] = min(d["first"], t), max(d["last"], t)
+            if ev["role"] == "user":
+                line = redact(ev["text"].strip().splitlines()[0][:300])[:200]
+                if line and line not in d["asked"]:
+                    d["asked"].append(line)
+            elif ev["role"] == "agent":
+                d["outcome"] = ev["text"]
+            elif ev["role"] == "tool":
+                tgt = ev.get("target") or ""
+                if ev.get("tool") in _CHANGE_TOOLS and tgt.startswith("/") and _inside(tgt, real):
+                    rel = os.path.relpath(tgt, real)
+                    if rel not in d["changed"]:
+                        d["changed"].append(rel)
+                elif ev.get("tool") in ("Bash", "Shell", "shell", "exec_command"):
+                    d["commands"] += 1
+        for day in per_day.values():
+            if (s["agent"], s["id"]) in day:
+                day[(s["agent"], s["id"])]["title"] = title
+    name = os.path.basename(real)
+    L = [f"# Journal: {name}", "",
+         f"`{real}` — from the agents' own histories, {time.strftime('%Y-%m-%d %H:%M')}.",
+         "Newest day first."]
+    for day in sorted(per_day, reverse=True):
+        L += ["", f"## {time.strftime('%A, %d %B %Y', time.strptime(day, '%Y-%m-%d'))}"]
+        for d in sorted(per_day[day].values(), key=lambda d: d["first"]):
+            span = (time.strftime("%H:%M", time.localtime(d["first"])) + "–"
+                    + time.strftime("%H:%M", time.localtime(d["last"])))
+            L += ["", f"### {span} · {AGENT_NAMES.get(d['agent'], d['agent'])} · "
+                      f"{_clip(d.get('title') or d['id'], 90)}"]
+            if d["asked"]:
+                L += ["", "Asked:"] + [f"- {a}" for a in d["asked"][:12]]
+                if len(d["asked"]) > 12:
+                    L.append(f"- … and {len(d['asked']) - 12} more")
+            if d["changed"]:
+                L += ["", "Changed: " + ", ".join(f"`{c}`" for c in d["changed"][:20])
+                      + (f" and {len(d['changed']) - 20} more" if len(d["changed"]) > 20 else "")]
+            if d["commands"]:
+                L += ["", f"Ran {d['commands']} command(s)."]
+            if d["outcome"]:
+                L += ["", "Where it ended: " + redact(_clip(" ".join(d["outcome"].split()), 400))]
+    if not per_day:
+        L += ["", "No agent session of this project could be read."]
+    return {"project": real, "days": len(per_day), "markdown": "\n".join(L) + "\n"}
+
+def cmd_journal(args):
+    real = os.path.realpath(args.path)
+    if not os.path.isdir(real):
+        print(f"not a folder: {real}", file=sys.stderr)
+        return 2
+    j = build_journal(real, args.days)
+    if args.write:
+        out = Path(real) / ".aht" / "journal"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / ".gitignore").write_text("*\n")      # it quotes the conversations
+        (out / "journal.md").write_text(j["markdown"], encoding="utf-8")
+        j["file"] = str(out / "journal.md")
+    if args.json:
+        print(json.dumps(j, indent=2))
+    elif args.write:
+        print(f"written: {j['file']}  ({j['days']} day(s))")
+    else:
+        print(j["markdown"])
+    return 0
+
+# ---- one set of project rules -------------------------------------------------- #
+
+CLAUDE_RULE_FILES = ("CLAUDE.md", ".claude/CLAUDE.md")
+RULES_IMPORT = "@AGENTS.md"
+RULES_READERS = {        # which instruction file each agent reads in a project
+    "claude": "CLAUDE.md, .claude/CLAUDE.md or CLAUDE.local.md — AGENTS.md only when "
+              "none of those exists",
+    "kimi": "AGENTS.md", "codex": "AGENTS.md", "opencode": "AGENTS.md",
+    "cursor": "AGENTS.md", "copilot": "AGENTS.md", "gemini": "GEMINI.md"}
+
+def _imports_agents(text: str) -> bool:
+    return any(l.strip() in (RULES_IMPORT, "@./AGENTS.md") for l in text.splitlines())
+
+def rules_status(project: str) -> dict:
+    real = os.path.realpath(project)
+    files = {}
+    for name in ("AGENTS.md",) + CLAUDE_RULE_FILES + ("CLAUDE.local.md", "GEMINI.md"):
+        p = Path(real) / name
+        if p.is_file():
+            text = p.read_text(errors="replace")
+            files[name] = {"bytes": len(text.encode()), "imports_agents": _imports_agents(text),
+                           "sha": hashlib.sha256(text.strip().encode()).hexdigest()[:12]}
+    claude_file = next((n for n in CLAUDE_RULE_FILES if n in files), None)
+    agents = files.get("AGENTS.md")
+    if not files:
+        state, say = "none", "no instruction file: every agent starts without project rules"
+    elif claude_file and not agents:
+        state, say = "claude-only", (f"only {claude_file}: Claude follows it; Kimi, Codex and "
+                                     "the others see no project rules")
+    elif agents and not claude_file:
+        state, say = "one", ("AGENTS.md is the one set of rules; Claude reads it too "
+                             "(Claude Code 2.1.277 or later)")
+    elif files[claude_file]["imports_agents"]:
+        state, say = "one", (f"AGENTS.md is the one set of rules; {claude_file} brings it "
+                             f"in with {RULES_IMPORT}")
+    elif files[claude_file]["sha"] == agents["sha"]:
+        state, say = "twins", (f"{claude_file} and AGENTS.md are copies of each other — "
+                               "they drift apart as soon as one is edited")
+    else:
+        state, say = "split", (f"{claude_file} and AGENTS.md differ, and Claude reads only "
+                               f"{claude_file}: the agents follow different rules")
+    if "GEMINI.md" in files and not files["GEMINI.md"]["imports_agents"] and agents:
+        say += "; GEMINI.md is separate"
+    uid, entry = _entry_for(load_registry(), real)
+    used = agents_of((entry or {}).get("stores") or {})
+    return {"project": real, "files": files, "state": state, "summary": say,
+            "claude_file": claude_file, "agents_used": used,
+            "readers": {a: RULES_READERS[a] for a in RULES_READERS
+                        if a in used or a in ("claude", "kimi", "codex")}}
+
+def unify_rules(project: str, prefer: str = None, apply: bool = False) -> dict:
+    """Make AGENTS.md the one set of rules: Claude's file then only imports it.
+    What each file held before is kept in ~/.aht/rules-backups first."""
+    st = rules_status(project)
+    real, files = st["project"], st["files"]
+    cf = st["claude_file"]
+    res = {"project": real, "state": st["state"], "applied": False, "changes": []}
+    if st["state"] in ("none", "one"):
+        res["nothing_to_do"] = True
+        return res
+    agents_p = Path(real) / "AGENTS.md"
+    claude_p = Path(real) / cf
+    claude_text = claude_p.read_text(errors="replace")
+    agents_text = agents_p.read_text(errors="replace") if "AGENTS.md" in files else None
+    if st["state"] == "split" and prefer not in ("claude", "agents", "both"):
+        res["needs_choice"] = True
+        res["choices"] = {"claude": f"keep what {cf} says", "agents": "keep what AGENTS.md says",
+                          "both": f"keep both: {cf} is added to the end of AGENTS.md"}
+        return res
+    if agents_text is None or prefer == "claude":
+        new_agents = claude_text
+    elif prefer == "both":
+        new_agents = (agents_text.rstrip() + f"\n\n## More rules (moved here from {cf})\n\n"
+                      + claude_text.strip() + "\n")
+    else:
+        new_agents = agents_text
+    new_claude = RULES_IMPORT + "\n"
+    if new_agents != agents_text:
+        res["changes"].append({"file": "AGENTS.md", "now": "the shared rules"
+                               + (" (new)" if agents_text is None else "")})
+    res["changes"].append({"file": cf, "now": f"only the line {RULES_IMPORT}"})
+    if not apply:
+        return res
+    uid, _entry = _entry_for(load_registry(), real)
+    base = aht_home() / "rules-backups" / (uid or _key_claude(real))
+    keep, n = base / _stamp(), 2
+    while keep.exists():                        # never write over an earlier backup
+        keep, n = base / f"{_stamp()}-{n}", n + 1
+    keep.mkdir(parents=True)
+    for name in ("AGENTS.md", cf):
+        src = Path(real) / name
+        if src.is_file():
+            (keep / name.replace("/", "_")).write_bytes(src.read_bytes())
+    for p, text in ((agents_p, new_agents), (claude_p, new_claude)):
+        tmp = p.with_name(p.name + ".aht-new")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, p)
+    res.update(applied=True, backup=str(keep))
+    log(f"RULES {real}: AGENTS.md is the one set of rules ({st['state']}, prefer={prefer})")
+    return res
+
+def cmd_rules(args):
+    real = os.path.realpath(args.path)
+    if not os.path.isdir(real):
+        print(f"not a folder: {real}", file=sys.stderr)
+        return 2
+    if args.unify:
+        res = unify_rules(real, args.prefer, args.apply)
+        if args.json:
+            print(json.dumps(res, indent=2))
+            return 3 if res.get("needs_choice") else 0
+        if res.get("nothing_to_do"):
+            print("nothing to do: " + rules_status(real)["summary"])
+            return 0
+        if res.get("needs_choice"):
+            print("CLAUDE.md and AGENTS.md say different things. Choose what the one set "
+                  "of rules should hold:")
+            for k, v in res["choices"].items():
+                print(f"   --prefer {k:<7} {v}")
+            return 3
+        for c in res["changes"]:
+            print(f"   {c['file']:<18} → {c['now']}")
+        print("done; the old files are kept in " + res["backup"] if res["applied"]
+              else "(dry run — pass --apply to do it)")
+        return 0
+    st = rules_status(real)
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return 0
+    print(st["summary"])
+    for name, f in st["files"].items():
+        print(f"   {name:<18} {f['bytes']} bytes" + (f"  (imports {RULES_IMPORT})"
+                                                     if f["imports_agents"] else ""))
+    if st["state"] in ("claude-only", "twins", "split"):
+        print("\nmake AGENTS.md the one set of rules:  aht rules "
+              f"{shlex.quote(real)} --unify --apply")
+    return 0
+
+# ---- switch agent ---------------------------------------------------------------- #
+
+SWITCH_TARGETS = ("claude", "kimi", "codex")
+
+def agent_cli(agent: str):
+    if os.environ.get(f"AHT_CLI_{agent.upper()}"):     # tests: a stand-in CLI
+        return os.environ[f"AHT_CLI_{agent.upper()}"]
+    return {"claude": find_claude(), "kimi": find_tool("kimi") or (
+        str(Path.home() / ".kimi-code/bin/kimi")
+        if (Path.home() / ".kimi-code/bin/kimi").exists() else None),
+            "codex": find_tool("codex")}.get(agent)
+
+def events_digest(s: dict, project: str, turns: int = 8) -> dict:
+    """session_digest for any agent's session."""
+    if s["agent"] == "claude":
+        return session_digest(s["file"], project, turns)
+    d = {"title": s.get("title"), "summary": None, "exchanges": [], "todos": [],
+         "touched": [], "outside": [], "version": None}
+    cur = None
+    home = str(Path.home())
+    for _end, ev in session_events(s["agent"], s["file"]):
+        if ev["role"] == "user":
+            cur = {"you": ev["text"], "agent": ""}
+            d["exchanges"].append(cur)
+            del d["exchanges"][:-turns]
+        elif ev["role"] == "agent" and cur is not None:
+            cur["agent"] = ev["text"]
+        elif ev["role"] == "tool":
+            tgt = ev.get("target") or ""
+            if ev.get("tool") in ("TodoList", "TodoWrite"):
+                todos = (ev.get("input") or {}).get("todos")
+                if isinstance(todos, list):
+                    d["todos"] = [x for x in todos if isinstance(x, dict)
+                                  and x.get("status") not in ("completed", "done")]
+            elif tgt.startswith("/"):
+                if _inside(tgt, project):
+                    if ev.get("tool") in _CHANGE_TOOLS:
+                        rel = os.path.relpath(tgt, project)
+                        if rel in d["touched"]:
+                            d["touched"].remove(rel)
+                        d["touched"].append(rel)
+                elif tgt.startswith(home) and not tgt.startswith((home + "/.",)):
+                    if tgt in d["outside"]:
+                        d["outside"].remove(tgt)
+                    d["outside"].append(tgt)
+    d["touched"], d["outside"] = d["touched"][-15:], d["outside"][-15:]
+    return d
+
+def _brief_sections(dig: dict) -> list:
+    """The body of a handover or switch summary.  Whatever looks like a key
+    is masked: the summary is a new file, and a key must not spread."""
+    L = []
+    if dig.get("summary"):
+        L += ["", "## Where things stood", "", redact(_clip(dig["summary"], 8000))]
+    if dig.get("exchanges"):
+        L += ["", "## The latest exchanges"]
+        for x in dig["exchanges"]:
+            L += ["", "**You:** " + redact(_clip(x["you"], 1500))]
+            if x.get("agent"):
+                L += ["", "**Agent:** " + redact(_clip(x["agent"], 2500))]
+    if dig.get("todos"):
+        L += ["", "## Open to-do items", ""]
+        L += [f"- [ ] {redact(_clip(str(x.get('content') or x.get('subject') or x.get('title') or ''), 200))}"
+              + ("  *(in progress)*" if x.get("status") == "in_progress" else "")
+              for x in dig["todos"]]
+    if dig.get("touched"):
+        L += ["", "## Files changed most recently", ""]
+        L += [f"- `{p}`" for p in reversed(dig["touched"])]
+    return L
+
+def write_switch_brief(real: str, src: dict, dig: dict, target: str) -> Path:
+    out = Path(real) / ".aht" / "handover"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / ".gitignore").write_text("*\n")
+    frm = AGENT_NAMES.get(src["agent"], src["agent"])
+    L = [f"# Switch: {os.path.basename(real)}", "",
+         f"- From **{frm}** to **{AGENT_NAMES.get(target, target)}** on {_here()}, "
+         f"{time.strftime('%Y-%m-%d %H:%M')}",
+         f"- Folder: `{real}`",
+         f"- Session it continues: {dig.get('title') or 'untitled'} — `{src['id']}`",
+         f"- To go back to it: `{resume_command(src['agent'], src['id'], real)}`"]
+    L += _brief_sections(dig)
+    if dig.get("outside"):
+        L += ["", "## Files outside the project that session used", ""]
+        L += [f"- `{p}`" for p in dig["outside"]]
+    name = f"{time.strftime('%Y%m%d-%H%M')}-to-{target}.md"
+    (out / name).write_text("\n".join(L) + "\n", encoding="utf-8")
+    for old in sorted(out.glob("*-to-*.md"))[:-8]:
+        old.unlink()
+    return out / name
+
+def _kimi_session_after(real: str, since: float):
+    b = BY_NAME.get("kimi-code")
+    bucket = b.root() / _key_kimicode(real) if b else None
+    best = None
+    for sd in (bucket.iterdir() if bucket and bucket.is_dir() else []):
+        st = _stat(sd / "state.json")
+        if sd.name.startswith("session_") and st and st.st_mtime >= since - 1:
+            if best is None or st.st_mtime > best[0]:
+                best = (st.st_mtime, sd.name)
+    return best[1] if best else None
+
+def cmd_switch(args):
+    out = {"command": "switch", "applied": False, "blockers": [], "warnings": []}
+    lines = []
+    real = os.path.realpath(args.path)
+    out["project"] = real
+    target = args.to
+    if not os.path.isdir(real):
+        out["blockers"].append(f"not a folder: {real}")
+        return _emit(args, out, lines)
+    exe = agent_cli(target)
+    if not exe:
+        out["blockers"].append(f"{AGENT_NAMES[target]} is not installed on this machine")
+    sessions = [s for s in list_sessions(real) if s["agent"] != target]
+    if args.session:
+        src = next((s for s in sessions if s["id"] == args.session), None)
+    else:       # the latest one worked in; a scripted run only when nothing else is there
+        src = next((s for s in sessions if not (s["agent"] == "claude"
+                                               and _is_scripted(s["file"]))),
+                   sessions[0] if sessions else None)
+    if src is None:
+        out["blockers"].append("no session of another agent in this project to continue"
+                               + (f" (no session {args.session})" if args.session else ""))
+    act = activity_in(real)
+    for s in act["sessions"]:
+        if s.get("status") != "idle":
+            out["blockers"] += _activity_blockers({"sessions": [s]}, "on this machine")
+        else:
+            out["warnings"].append("a Claude session is still open in this project; do not "
+                                   "type into both agents at once")
+    if out["blockers"]:
+        return _emit(args, out, lines)
+    dig = events_digest(src, real)
+    out.update(source={"agent": src["agent"], "session": src["id"],
+                       "title": dig.get("title")}, target=target)
+    lines += [f"{'switching' if args.apply else 'would switch'}:  {real}",
+              f"   from   {AGENT_NAMES[src['agent']]} — {dig.get('title') or src['id']}",
+              f"   to     {AGENT_NAMES[target]} ({exe})"]
+    if not args.apply:
+        lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, out, lines)
+    brief = write_switch_brief(real, src, dig, target)
+    rel = os.path.relpath(brief, real)
+    frm = AGENT_NAMES[src["agent"]]
+    ask = (f"You are taking over this project from {frm}. Read {rel} first: it records "
+           "where the work stood, the latest exchanges and the open items. Then tell me "
+           "in two or three lines what you understood, and wait for my next instruction.")
+    out["brief"] = str(brief)
+    if target == "kimi":
+        # Kimi takes no first prompt in its interactive mode: it reads the brief
+        # in one run of its own, and that session is what opens
+        started = time.time()
+        inline = (f"You are taking over this project from {frm}. This is where the work "
+                  "stood:\n\n" + brief.read_text(encoding="utf-8")
+                  + "\nDo not start working yet. Reply in two or three lines with what you "
+                  "understood; the user continues in this session.")
+        try:
+            r = subprocess.run([exe, "-p", inline, "--output-format", "stream-json"],
+                               cwd=real, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            out["error"] = "Kimi did not finish reading the summary within 10 minutes"
+            return _emit(args, out, lines)
+        sid = next(iter(re.findall(r'"(session_[0-9a-f-]{36})"', r.stdout or "")), None) \
+            or _kimi_session_after(real, started)
+        if r.returncode != 0 or not sid:
+            out["error"] = ("Kimi could not read the summary: "
+                            + ((r.stderr or r.stdout or "").strip()[-300:] or "no session"))
+            return _emit(args, out, lines)
+        out["session"] = sid
+        cmd = resume_command("kimi", sid, real)
+    else:
+        cmd = f"cd {shlex.quote(real)} && {shlex.quote(exe)} {shlex.quote(ask)}"
+    out["command_line"] = cmd
+    if not args.no_window:
+        open_terminal(cmd, f"switch-{os.path.basename(real)}-{target}")
+    out["applied"] = True
+    log(f"SWITCH {real}: {src['agent']} {src['id']} -> {target}")
+    lines += [f"   summary {brief}", f"   opened  {cmd}"]
+    return _emit(args, out, lines)
+
+# ---- the session board ----------------------------------------------------------- #
+
+_AGENT_PROC = re.compile(r"(?:^|/)(kimi|codex|gemini|opencode|cursor-agent|copilot)(?:\s|$)")
+
+def agent_processes() -> list:
+    """Agent CLIs other than Claude Code that run right now, with their folder
+    (Claude Code sessions have records of their own)."""
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True,
+                           timeout=15, cwd="/")
+    except Exception:
+        return []
+    pids = {}
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        head = " ".join(parts[1].split()[:2])
+        m = _AGENT_PROC.search(head)
+        if m and " -p " not in f" {parts[1]} " and " --prompt " not in f" {parts[1]} ":
+            pids[int(parts[0])] = m.group(1)
+    if not pids:
+        return []
+    cwd = {}
+    if IS_LINUX:
+        for pid in pids:
+            try:
+                cwd[pid] = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                pass
+    else:
+        lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
+        try:
+            r = subprocess.run([lsof, "-a", "-p", ",".join(map(str, pids)), "-d", "cwd", "-Fpn"],
+                               capture_output=True, text=True, timeout=30, cwd="/")
+            pid = None
+            for line in r.stdout.splitlines():
+                if line.startswith("p"):
+                    pid = int(line[1:])
+                elif line.startswith("n") and pid:
+                    cwd[pid] = line[1:]
+        except Exception:
+            pass
+    # one row per agent and folder: a CLI often runs as several processes
+    rows = {}
+    for pid, agent in pids.items():
+        if pid in cwd and cwd[pid] != "/":
+            rows.setdefault((agent, cwd[pid]), {"agent": agent, "project": cwd[pid],
+                                                "pid": pid, "status": "running"})
+    return list(rows.values())
+
+_STATUS_WORDS = {"busy": "working", "shell": "working (a command runs)",
+                 "waiting": "waiting for you", "idle": "idle"}
+
+def open_sessions_here() -> list:
+    rows = []
+    for s in running_sessions():
+        rows.append({"agent": "claude", "project": s["cwd"], "pid": s["pid"],
+                     "session": s.get("session"), "name": s.get("name"),
+                     "status": _STATUS_WORDS.get(s["status"], s["status"]),
+                     "raw_status": s["status"], "waiting_for": s.get("waiting_for"),
+                     "since": s.get("since")})
+    rows += agent_processes()
+    return rows
+
+def _agent_board(req: dict) -> dict:
+    return {"ok": True, "host": _here(), "sessions": open_sessions_here()}
+
+def session_board(remotes: bool = True) -> list:
+    """Open agent sessions on this machine and on every machine set up for
+    handover (asked in parallel; one that does not answer is reported)."""
+    import threading
+    here = {"machine": _here(), "local": True, "reachable": True,
+            "sessions": open_sessions_here()}
+    boards = [here]
+    if remotes and handover_supported():
+        found = []
+        def ask(name):
+            row = {"machine": name, "local": False, "reachable": False, "sessions": []}
+            try:
+                rem = get_remote(name)
+                rem.push_agent()
+                ans = rem.agent("board", timeout=30)
+                row.update(reachable=True, host=ans.get("host"), sessions=ans["sessions"])
+            except HandoverError as e:
+                row["error"] = str(e)
+            found.append(row)
+        ts = [threading.Thread(target=ask, args=(n,), daemon=True)
+              for n in sorted(remotes_config())]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=45)
+        boards += sorted(found, key=lambda r: r["machine"])
+    away = {os.path.realpath(e["real_path"]): (e.get("away") or {})
+            for e in load_registry().get("projects", {}).values() if e.get("away")}
+    for b in boards:
+        for s in b["sessions"]:
+            a = away.get(os.path.realpath(s.get("project") or "/"))
+            if a and not b["local"] and a.get("remote") == b["machine"]:
+                s["handed_over"] = True
+    return boards
+
+def cmd_board(args):
+    boards = session_board(remotes=not args.local)
+    if args.json:
+        print(json.dumps({"machines": boards}, indent=2))
+        return 0
+    for b in boards:
+        print(f"{b['machine']}" + ("" if b["reachable"] else f"   — {b.get('error')}"))
+        if b["reachable"] and not b["sessions"]:
+            print("   no agent session open")
+        for s in sorted(b["sessions"], key=lambda s: s.get("project") or ""):
+            state = s["status"] + (f": {s['waiting_for']}" if s.get("waiting_for") else "")
+            print(f"   {AGENT_NAMES.get(s['agent'], s['agent']):<12} {state:<28} "
+                  f"{s.get('project')}" + ("   (handed over)" if s.get("handed_over") else ""))
+    return 0
 
 def build_parser():
     p = argparse.ArgumentParser(prog="aht")
@@ -6215,8 +7492,62 @@ def build_parser():
     s.add_argument("path")
     s.add_argument("--handed-over", action="store_true", dest="handed_over",
                    help="the session the last handover sent, not the one used last")
+    s.add_argument("--session", help="this session instead")
+    s.add_argument("--agent", choices=SWITCH_TARGETS, default="claude")
     s.add_argument("--print", action="store_true")
     s.set_defaults(fn=cmd_resume_here)
+
+    s = sub.add_parser("search", help="search every agent's sessions, also the "
+                       "ones only history backups still hold")
+    s.add_argument("words", nargs="*")
+    s.add_argument("--project", metavar="PATH")
+    s.add_argument("--agent", choices=sorted(AGENT_NAMES))
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--update", action="store_true", help="only bring the index up to date")
+    s.add_argument("--no-update", action="store_true", dest="no_update")
+    s.add_argument("--rebuild", action="store_true")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("secrets", help="what looks like a key, a token or a password "
+                       "in the agents' histories (shown masked)")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_secrets)
+
+    s = sub.add_parser("journal", help="a dated diary of a project from its sessions")
+    s.add_argument("path")
+    s.add_argument("--days", type=int)
+    s.add_argument("--write", action="store_true",
+                   help="save it as .aht/journal/journal.md (git ignores it)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_journal)
+
+    s = sub.add_parser("rules", help="which instruction file each agent follows; make "
+                       "AGENTS.md the one set of rules")
+    s.add_argument("path")
+    s.add_argument("--unify", action="store_true")
+    s.add_argument("--prefer", choices=("claude", "agents", "both"))
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_rules)
+
+    s = sub.add_parser("switch", help="continue a project's work in another agent")
+    s.add_argument("path")
+    s.add_argument("--to", required=True, choices=SWITCH_TARGETS)
+    s.add_argument("--session", help="the session to continue (default: the latest of "
+                   "another agent)")
+    s.add_argument("--no-window", action="store_true", dest="no_window")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_switch)
+
+    s = sub.add_parser("board", help="open agent sessions on this machine and the "
+                       "others: working, waiting for you, idle")
+    s.add_argument("--local", action="store_true", help="this machine only")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_board)
 
     s = sub.add_parser("_agent")           # the far end of a handover (stdin: JSON)
     s.set_defaults(fn=cmd_agent)

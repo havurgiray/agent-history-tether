@@ -558,6 +558,12 @@ os.environ["AHT_HOME"] = str(sb / ".aht")
 import time, unicodedata
 import aht as core
 
+def read_text_or_none(p):
+    try:
+        return Path(p).read_text().strip()
+    except OSError:
+        return None
+
 def handover_suite():
     box = Path(os.path.realpath(sb)) / "box"    # a folder standing in for the machine
     bhome = box / "home"
@@ -838,6 +844,93 @@ def handover_suite():
        and Path(projH, "a.txt").read_text() == "a3\n",
        "--ignore-version takes it back anyway, with a warning")
 
+    # which session goes on: the one used last, as `claude --continue` picks
+    projS = os.path.realpath(str(roots / "sessions"))
+    os.makedirs(projS)
+    Path(projS, "f.txt").write_text("f\n")
+    sstore = tools / "claude" / enc(projS)
+    sstore.mkdir()
+    def transcript(name, entry, *prompts, title=None, where=sstore, age=0):
+        rows = [{"type": "user", "entrypoint": entry, "cwd": projS,
+                 "message": {"role": "user", "content": p}} for p in prompts]
+        if title:
+            rows.append({"type": "ai-title", "aiTitle": title})
+        f = Path(where) / f"{name}.jsonl"
+        f.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        stamp = time.time() - age
+        os.utime(f, (stamp, stamp))
+    transcript("main", "cli", "the real work", title="Main thread", age=300)
+    transcript("cron", "sdk-cli", "a nightly scripted run", age=200)
+    transcript("loop", "cli", "/loop check the build", age=100)
+    ck(core._sessions_of(sstore)[0] == "loop" and core.latest_session(sstore) == "main",
+       "scripted runs and /loop sessions are passed over, however recent")
+    hrun("tag", projS, "--apply")
+    d = J(hrun("handover", projS, "--apply", "--no-start", "--json"))
+    ck(d.get("applied") and d.get("session") == "main" and d.get("sessions") == 3,
+       "handover goes on with the session last worked in")
+    rs = bhome / ".claude" / "projects" / enc(str(box) + projS)
+    time.sleep(1.1)
+    transcript("main", "cli", "the real work", "a bit more there", title="Main thread",
+               where=rs, age=50)
+    transcript("branch", "cli", "the real work", "a bit more there", "after the branch",
+               title="Main thread (branch)", where=rs)
+    d = J(hrun("reclaim", projS, "--apply", "--json"))
+    ck(d.get("applied") and d.get("session") == "branch"
+       and d.get("session_title") == "Main thread (branch)"
+       and d.get("handed_over_session") == "main"
+       and d.get("handed_over_title") == "Main thread",
+       "back from a branch made there: the branch goes on, the sent one is named")
+    r1 = hrun("resume-here", projS, "--print").stdout
+    r2 = hrun("resume-here", projS, "--handed-over", "--print").stdout
+    ck("--resume branch" in r1 and "--resume main" in r2,
+       "resume-here opens the latest; --handed-over the one that was sent")
+    sf = sb / "stage.json"
+    d = J(hrun("handover", projM, "--apply", "--no-start", "--json",
+               "--status-file", str(sf)))
+    stage = json.loads(sf.read_text()) if sf.is_file() else {}
+    ck(d.get("applied") and "sending" in stage.get("stage", "")
+       and "percent" in stage,
+       f"--status-file tells a front-end where the transfer stands ({stage})")
+    d = J(hrun("reclaim", projM, "--apply", "--json"))
+    ck(d.get("applied") and d.get("handed_over_session") is None,
+       "no second session is offered when the work stayed in the one sent")
+    row = project_row(projM)
+    ck(row["mirror"] == "box" and row["mirror_synced_at"] and row["away_since"] is None,
+       "the project list tells when a project was synced last")
+    sitter = subprocess.Popen(["sleep", "600"], cwd="/")
+    (tools / "sessions" / f"{sitter.pid}.json").write_text(json.dumps(
+        {"pid": sitter.pid, "cwd": projM, "status": "busy"}))
+    ck(project_row(projM)["open"] == "working" and project_row(projS)["open"] is None
+       and project_row(projH)["agents"] == ["claude"],
+       "the project list tells where an agent session is open")
+    sitter.kill(); sitter.wait()
+
+    # a path the registry lists twice: the folder's own marker decides
+    regf = sb / ".aht" / "registry.json"
+    reg = json.loads(regf.read_text())
+    mine = next(u for u, e in reg["projects"].items() if e["real_path"] == projS)
+    reg["projects"] = {"0" * 32: {"real_path": projS, "stores": {},
+                                  "updated_at": "2020-01-01T00:00:00"},
+                       **reg["projects"]}
+    regf.write_text(json.dumps(reg))
+    d = J(hrun("handover", projS, "--apply", "--no-start", "--json"))
+    reg = json.loads(regf.read_text())
+    ck(d.get("applied") and reg["projects"][mine].get("away")
+       and not reg["projects"]["0" * 32].get("away"),
+       "a path listed twice: the entry the folder's marker names is used")
+    J(hrun("reclaim", projS, "--apply", "--json"))
+    dr = J(hrun("doctor", "--json"))
+    twice = next(c for c in dr["checks"] if c["check"] == "no folder is listed twice")
+    d = J(hrun("prune", "--json"))
+    ck(not twice["ok"] and [x["uuid"] for x in d["doubles"]] == ["0" * 32]
+       and d["doubles"][0]["owner"] == mine,
+       "doctor and prune name the stale one of two entries for a folder")
+    d = J(hrun("prune", "--apply", "--json"))
+    reg = json.loads(regf.read_text())
+    ck("0" * 32 not in reg["projects"] and mine in reg["projects"]
+       and read_text_or_none(Path(projS) / ".aht" / ".project-id") == mine,
+       "prune drops it; the folder's own entry and its marker stay")
+
     # any number of machines
     box2 = Path(os.path.realpath(sb)) / "box2"
     (box2 / "home" / ".claude").mkdir(parents=True)
@@ -872,6 +965,16 @@ def handover_suite():
     names = [m["name"] for m in found if m["via"] == "tailscale"]
     ck(names == ["homebox", "attic"],
        f"discover: computers of the network, reachable ones first, no phones ({names})")
+    ts.write_text("#!/bin/sh\necho 'Tailscale is stopped.' >&2\nexit 1\n")
+    before = run("logs", "--errors", "-n", "400").stdout.count("discover")
+    for _ in range(3):
+        d = J(run("remote", "discover", "--json",
+                  extra_env=dict(henv, AHT_TAILSCALE=str(ts))))
+    after = run("logs", "--errors", "-n", "400").stdout.count("discover")
+    ck(not [m for m in d.get("machines", []) if m["via"] == "tailscale"]
+       and any("Tailscale is stopped" in n for n in d.get("notes", []))
+       and after == before,
+       "discover: a stopped Tailscale is told to the asker, not written to the log")
 
     for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
         rec = json.loads(w.read_text())

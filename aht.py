@@ -3538,6 +3538,7 @@ HANDOVER (continue on another machine of yours, over ssh):
   aht remote check [name|all]           what it lacks, with the fix
   aht mirror <folder> --on              keep its copy there up to date
   aht handover <folder> --apply         send it and resume the session there
+         [--task "…"]                   … and give it something to start on
   aht attach <folder>                   open that session
   aht reclaim <folder> --apply          bring files and history back
 
@@ -4404,6 +4405,8 @@ def _agent_start(req: dict) -> dict:
     argv += [str(a) for a in req.get("args") or []]
     if req.get("remote_control"):
         argv += ["--remote-control", req["remote_control"]]
+    if req.get("task"):
+        argv += ["--", req["task"]]           # the first prompt: work starts at once
     line = ("cd %s && env DISABLE_AUTOUPDATER=1 %s; st=$?; cd /; "
             "printf '\\n[aht] the agent exited (%%s); this window closes in a minute\\n' "
             "\"$st\"; sleep 60"
@@ -4607,7 +4610,7 @@ def scratch_dir(real: str, sid: str):
     return None
 
 def write_brief(real: str, sid, dig: dict, here: str, there: str,
-                there_system: str, carried: list, scratch: bool) -> tuple:
+                there_system: str, carried: list, scratch: bool, task: str = None) -> tuple:
     """The readable summary that travels inside the project, and the short
     note the resumed session is told on arrival.  -> (file, note)"""
     out = Path(real) / ".aht" / "handover"
@@ -4661,6 +4664,9 @@ def write_brief(real: str, sid, dig: dict, here: str, there: str,
     if mine != theirs:
         note.append(f"Tools that exist only on {mine} are not available here.")
     note.append(f"A readable summary of where things stood: .aht/handover/{name}")
+    if task:
+        note.append("The user's next message is the task to work on now; the user may "
+                    "be away and answers from the Claude app on the phone.")
     return out / name, "\n".join(note) + "\n"
 
 # ---- registry bookkeeping ---------------------------------------------------- #
@@ -5253,6 +5259,16 @@ def cmd_handover(args):
         carried = list(extras)
         out["outside_not_carried"] = [p for p in dig["outside"]
                                       if not any(_inside(p, c) for c in carried)]
+        out["task"] = args.task
+        try:
+            found = scan_secrets(real)
+        except Exception:
+            found = []
+        if found:
+            out["secrets"] = len(found)
+            out["warnings"].append(f"{len(found)} thing(s) that look like a key, token or "
+                                   "password are in this project's agent history and "
+                                   "travel with it (aht secrets shows where)")
         if out["blockers"]:
             return _emit(args, out, lines)
         if not args.apply:
@@ -5304,7 +5320,7 @@ def cmd_handover(args):
                     shutil.copytree(sdir, keep / sid, symlinks=True)
                     scratch = True
             brief, note = write_brief(real, sid, dig, _here(), info.get("host") or rem.name,
-                                      info.get("system"), carried, scratch)
+                                      info.get("system"), carried, scratch, args.task)
             out["brief"] = str(brief)
             say(f"sending the project to {rem.name} …")
             sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty())
@@ -5338,6 +5354,7 @@ def cmd_handover(args):
 
             away = {"remote": rem.name, "host": info.get("host"), "since": _now(),
                     "path": real, "session": sid, "window": _mux_name(real, uid),
+                    "task": args.task,
                     "mux": "byobu" if tools.get("byobu") else "tmux",
                     "claude": here_ver}
             if install:
@@ -5358,6 +5375,7 @@ def cmd_handover(args):
                 st = rem.agent("start", timeout=90, path=rem.path(real), session=sid,
                                name=away["window"], claude=info["claude"], note=note,
                                args=list(cfg_get("handover_claude_args") or []),
+                               task=args.task,
                                remote_control=os.path.basename(real)
                                if cfg_get("handover_remote_control", True) else None)
                 away["mux"] = st.get("mux") or away["mux"]
@@ -7455,6 +7473,8 @@ def build_parser():
                    help="transfer only; start the agent there yourself")
     s.add_argument("--attach", action="store_true",
                    help="open the session in this terminal afterwards")
+    s.add_argument("--task", metavar="TEXT",
+                   help="what the session should start working on over there")
     s.add_argument("--allow-processes", action="store_true", dest="allow_processes",
                    help="leave other programs running in the folder behind "
                         "(an open agent session always blocks)")

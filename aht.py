@@ -5535,10 +5535,13 @@ def cmd_reclaim(args):
 
 # ---- remotes, attaching, status ---------------------------------------------- #
 
-def discover_machines() -> list:
+def discover_machines(notes: list = None) -> list:
     """Machines that could be handed over to: the peers of this machine's
-    Tailscale network and the hosts named in ~/.ssh/config."""
+    Tailscale network and the hosts named in ~/.ssh/config.  What stood in
+    the way goes into `notes` for whoever asked — not into the log: the trays
+    ask every few seconds, and a stopped Tailscale is no fault of ours."""
     rows = {}
+    notes = [] if notes is None else notes
     ts = os.environ.get("AHT_TAILSCALE") or find_tool("tailscale") or next(
         (c for c in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",)
          if os.path.exists(c)), None)
@@ -5546,6 +5549,9 @@ def discover_machines() -> list:
         try:
             r = subprocess.run([ts, "status", "--json"], capture_output=True,
                                text=True, timeout=15, cwd="/")
+            if not (r.stdout or "").strip():
+                raise ValueError(((r.stderr or "").strip().splitlines()
+                                  or ["no answer"])[0])
             for p in (json.loads(r.stdout).get("Peer") or {}).values():
                 system = str(p.get("OS") or "").lower()
                 host = str(p.get("DNSName") or "").split(".")[0] or p.get("HostName")
@@ -5553,7 +5559,9 @@ def discover_machines() -> list:
                     rows[host] = {"name": host, "host": host, "system": system,
                                   "online": bool(p.get("Online")), "via": "tailscale"}
         except Exception as e:
-            warn(f"REMOTE discover: tailscale gave no list ({e})")
+            notes.append(f"Tailscale gave no list of machines ({str(e)[:120]}) — "
+                         "is it running?")
+            log(f"REMOTE discover: tailscale gave no list ({e})", "debug")
     try:
         for line in (Path.home() / ".ssh" / "config").read_text().splitlines():
             m = re.match(r"\s*Host\s+(.+)", line, re.I)
@@ -5633,10 +5641,13 @@ def cmd_remote(args):
         return 2
     act = args.action or "list"
     if act == "discover":
-        rows = discover_machines()
+        notes = []
+        rows = discover_machines(notes)
         if args.json:
-            print(json.dumps({"machines": rows}, indent=2))
+            print(json.dumps({"machines": rows, "notes": notes}, indent=2))
         else:
+            for n in notes:
+                print(f"  ! {n}")
             for r in rows:
                 state = {True: "online", False: "offline", None: ""}[r["online"]]
                 print(f"   {r['name']:<22} {r['system'] or '':<7} {state:<8} "

@@ -3966,6 +3966,42 @@ def _ssh_opts() -> list:
             "-o", "ControlMaster=auto", "-o", f"ControlPath={run}/ssh-%C",
             "-o", "ControlPersist=60"]
 
+def _tailscale_exe():
+    return os.environ.get("AHT_TAILSCALE") or find_tool("tailscale") or next(
+        (c for c in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",)
+         if os.path.exists(c)), None)
+
+def tailscale_address(host: str):
+    """The Tailscale address of a machine named `host`, from the network's own
+    list — for when the name does not resolve (MagicDNS on macOS can stop
+    answering after sleep or a network change while the tailnet works)."""
+    ts = _tailscale_exe()
+    if not ts:
+        return None
+    try:
+        r = subprocess.run([ts, "status", "--json"], capture_output=True, text=True,
+                           timeout=15, cwd="/")
+        peers = (json.loads(r.stdout).get("Peer") or {}).values()
+    except Exception:
+        return None
+    h = host.lower().rstrip(".")
+    for p in peers:
+        names = {str(p.get("HostName") or "").lower(),
+                 str(p.get("DNSName") or "").lower().rstrip(".")}
+        names.add(next(iter(names - {""}), "").split(".")[0])
+        if h in names or h == str(p.get("DNSName") or "").lower().split(".")[0]:
+            ips = p.get("TailscaleIPs") or []
+            return next((ip for ip in ips if ":" not in ip), ips[0] if ips else None)
+    return None
+
+def _resolves(host: str) -> bool:
+    import socket
+    try:
+        socket.getaddrinfo(host, 22)
+        return True
+    except (OSError, UnicodeError):
+        return False
+
 _STAT_RE = {
     "files": re.compile(r"Number of regular files transferred:\s*([\d,.]+)"),
     "bytes": re.compile(r"Total transferred file size:\s*([\d,.]+)"),
@@ -3990,6 +4026,37 @@ class Remote:
         self.claude = spec.get("claude")
         self.info = {}
         self.on_percent = None          # called with rsync's percentage
+        self._route = None              # (ssh target, host key alias) once known
+
+    def route(self) -> tuple:
+        """(user@address, alias): the name as given when it resolves; else the
+        machine's Tailscale address, with its host key still checked under
+        the name it is known by."""
+        if self._route is None:
+            self._route = (self.target, None)
+            user, at, host = self.target.rpartition("@")
+            try:
+                g = subprocess.run(["ssh", "-G", host], capture_output=True, text=True,
+                                   timeout=10, cwd="/").stdout
+                real = next((l.split(None, 1)[1] for l in g.splitlines()
+                             if l.startswith("hostname ")), host)
+            except Exception:
+                real = host
+            if host and not self.local and not _resolves(real):
+                ip = tailscale_address(real) or tailscale_address(host)
+                if ip:
+                    self._route = (f"{user}@{ip}" if at else ip, host)
+                    log(f"REMOTE {self.name}: {real} does not resolve; using its "
+                        f"Tailscale address {ip}")
+        return self._route
+
+    @property
+    def dest(self) -> str:
+        return self.route()[0]
+
+    def ssh_opts(self) -> list:
+        alias = self.route()[1]
+        return _ssh_opts() + (["-o", f"HostKeyAlias={alias}"] if alias else [])
 
     @property
     def local(self) -> bool:
@@ -3999,7 +4066,7 @@ class Remote:
         return self.root + p if self.local else p
 
     def spec(self, remote_abs: str) -> str:
-        return remote_abs if self.local else f"{self.target}:{remote_abs}"
+        return remote_abs if self.local else f"{self.dest}:{remote_abs}"
 
     def _env(self) -> dict:
         home = self.root + "/home"
@@ -4022,7 +4089,7 @@ class Remote:
             if self.local:
                 Path(self.root + "/home").mkdir(parents=True, exist_ok=True)
                 return subprocess.run(["/bin/sh", "-c", script], env=self._env(), **kw)
-            r = subprocess.run(["ssh"] + _ssh_opts() + [self.target, script], **kw)
+            r = subprocess.run(["ssh"] + self.ssh_opts() + [self.dest, script], **kw)
         except subprocess.TimeoutExpired:
             raise HandoverError(f"{self.name} did not answer within {timeout:.0f} s")
         if r.returncode == 255:
@@ -4089,7 +4156,7 @@ class Remote:
                 if rs["ver"] >= (3, 2, 5):  # Apple's NFD differs for rare characters
                     cmd.append("--trust-sender")
         if not self.local:
-            cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in _ssh_opts())]
+            cmd += ["-e", "ssh " + " ".join(shlex.quote(o) for o in self.ssh_opts())]
         if dry:
             cmd.append("-n")
         if update:
@@ -4770,7 +4837,7 @@ def udp_reaches(rem: Remote) -> bool:
     import socket, threading
     if rem.local:
         return False
-    host = rem.target.split("@")[-1]
+    host = rem.dest.split("@")[-1]
     got = {}
     t = threading.Thread(target=lambda: got.update(
         _quiet(lambda: rem.agent("udp-echo", timeout=30, wait=6))), daemon=True)
@@ -4826,8 +4893,11 @@ def attach_command(rem: Remote, mux: str, name: str) -> list:
     if rem.local:
         return inner
     if mosh_usable(rem):
-        return [find_tool("mosh"), rem.target, "--"] + inner    # survives a changing network
-    return ["ssh", "-t", rem.target] + inner
+        alias = rem.route()[1]
+        via = [f"--ssh=ssh -o HostKeyAlias={alias}"] if alias else []
+        return [find_tool("mosh")] + via + [rem.dest, "--"] + inner   # survives network changes
+    alias = rem.route()[1]
+    return ["ssh", "-t"] + (["-o", f"HostKeyAlias={alias}"] if alias else []) + [rem.dest] + inner
 
 # ---- pushing a project over -------------------------------------------------- #
 
@@ -5709,9 +5779,7 @@ def discover_machines(notes: list = None) -> list:
     ask every few seconds, and a stopped Tailscale is no fault of ours."""
     rows = {}
     notes = [] if notes is None else notes
-    ts = os.environ.get("AHT_TAILSCALE") or find_tool("tailscale") or next(
-        (c for c in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",)
-         if os.path.exists(c)), None)
+    ts = _tailscale_exe()
     if ts:
         try:
             r = subprocess.run([ts, "status", "--json"], capture_output=True,

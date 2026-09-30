@@ -56,7 +56,7 @@ import subprocess
 import unicodedata
 from pathlib import Path
 
-VERSION = "0.10.1"
+VERSION = "0.11.0"
 
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")

@@ -23,7 +23,7 @@ HOOK_CMD = f"{PY} {SCRIPT} hook"
 HOOK_TAIL = "aht.py hook"           # how uninstall/idempotency recognises our hook
 
 SOURCES = ("aht.py", "install.py", "uninstall.py", "badge_icon.swift",
-           "watcher.swift", "README.md", "LICENSE")
+           "watcher.swift", "README.md", "GUIDE.md", "LICENSE")
 BINARIES = {"badge_icon": "badge_icon.swift", "watcher": "watcher.swift",
             "aht-tray": "tray.swift"}
 COMMAND_DIRS = [HOME/".npm-global/bin", Path("/usr/local/bin"), HOME/".local/bin", HOME/"bin"]

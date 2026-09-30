@@ -16,6 +16,8 @@
 > histories, restores them wherever a folder ends up, and badges managed
 > folders.  History is never deleted or overwritten.
 
+**New to aht?** The [guide](GUIDE.md) walks through every feature with an example. It is also in the app (∞ → **Guide**) and in the terminal (`aht guide`).
+
 ## Supported agents
 
 | backend | agent CLI | storage model | relink | confidence |

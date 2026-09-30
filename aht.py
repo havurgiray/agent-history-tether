@@ -3508,6 +3508,7 @@ HOW:
   • every project's histories are auto-backed-up across all backends
 
 COMMANDS:
+  aht guide                       every feature, with an example (also in the app)
   aht status | doctor             what is installed / tracked / wrong
   aht adopt --apply               tether this machine's existing projects
   aht reconcile                   read-only: what moved / was copied
@@ -3545,6 +3546,20 @@ HANDOVER (continue on another machine of yours, over ssh):
 Data:  ~/.aht/  (registry.json, config.json, backups/, aht.log)
 Docs:  README.md
 """
+
+def cmd_guide(args):
+    """The guide that ships with aht, with an example for each feature."""
+    here = Path(__file__).resolve().parent
+    for c in (here / "GUIDE.md", here.parent / "GUIDE.md"):
+        if c.is_file():
+            if args.path:
+                print(c)
+            else:
+                print(c.read_text(encoding="utf-8"))
+            return 0
+    print("the guide was not found; it is GUIDE.md in "
+          "https://github.com/havurgiray/agent-history-tether", file=sys.stderr)
+    return 1
 
 def cmd_about(_args):
     print(ABOUT)
@@ -7461,6 +7476,10 @@ def build_parser():
     s.set_defaults(fn=cmd_backends)
 
     s = sub.add_parser("version"); s.set_defaults(fn=cmd_version)
+
+    s = sub.add_parser("guide", help="what aht does, feature by feature, with examples")
+    s.add_argument("--path", action="store_true", help="only where the guide is")
+    s.set_defaults(fn=cmd_guide)
 
     s = sub.add_parser("install", help="set up the watcher, the Claude hook and "
                        "the aht command on this machine (macOS/Linux)")

@@ -63,7 +63,7 @@ build "$REPO/badge_icon.swift" "$RES/badge_icon"
 
 echo "▸ bundling the core and the installers"
 # install.py can also rebuild from these sources should a binary ever go missing
-for f in aht.py install.py uninstall.py badge_icon.swift watcher.swift README.md LICENSE; do
+for f in aht.py install.py uninstall.py badge_icon.swift watcher.swift README.md GUIDE.md LICENSE; do
   cp "$REPO/$f" "$RES/$f"
 done
 cp tray.swift "$RES/tray.swift"

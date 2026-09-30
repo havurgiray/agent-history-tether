@@ -158,7 +158,7 @@ struct Project: Identifiable, Hashable {
     let sessions: Int
     let bytes: Int64
     let lastActivity: String
-    let open: String?               // "working" | "idle": an agent session is open
+    let open: String?               // "waiting" | "working" | "idle": a session is open
 
     var id: String { path }
     var name: String { (path as NSString).lastPathComponent }
@@ -168,7 +168,12 @@ struct Project: Identifiable, Hashable {
     var place: String {
         if let host = away { return "on " + host }
         if !exists { return "missing" }
-        return open.map { $0 == "idle" ? "here · session open" : "here · working" } ?? "here"
+        switch open {
+        case "idle": return "here · session open"
+        case "waiting": return "here · waiting for you"
+        case .some: return "here · working"
+        default: return "here"
+        }
     }
     var sync: String {
         guard mirror != nil else { return "–" }
@@ -223,6 +228,82 @@ struct Backend: Identifiable, Hashable {
     var id: String { name }
 }
 
+struct BoardRow: Identifiable, Hashable {
+    let id = UUID()
+    let machine: String
+    let local: Bool
+    let agent: String
+    let project: String
+    let status: String
+    let waitingFor: String?
+    let since: Double?
+    let handedOver: Bool
+    var name: String { (project as NSString).lastPathComponent }
+    var state: String { status + (waitingFor.map { ": " + $0 } ?? "") }
+}
+
+struct BoardMachine: Identifiable, Hashable {
+    let name: String
+    let reachable: Bool
+    let error: String?
+    let rows: [BoardRow]
+    var id: String { name }
+}
+
+struct SearchHit: Identifiable, Hashable {
+    let id = UUID()
+    let agent: String
+    let session: String
+    let project: String?
+    let title: String
+    let live: Bool
+    let updated: Double?
+    let snippets: [(role: String, text: String)]
+    let restoreUUID: String?
+    let restoreStamp: String?
+    let restoreProject: String?
+    static func == (a: SearchHit, b: SearchHit) -> Bool { a.id == b.id }
+    func hash(into h: inout Hasher) { h.combine(id) }
+}
+
+struct SecretFind: Identifiable, Hashable {
+    let id = UUID()
+    let project: String
+    let agent: String
+    let kind: String
+    let masked: String
+    let whereFound: String
+    let t: Double?
+    let times: Int
+}
+
+struct HandoverPlan: Identifiable {
+    let id = UUID()
+    let project: Project
+    let remote: String
+    let body: String
+    var task = ""
+}
+
+struct RulesView: Identifiable {
+    let id = UUID()
+    let project: Project
+    var status: [String: Any]
+    var result: String?
+}
+
+struct TextSheet: Identifiable {
+    let id = UUID()
+    let title: String
+    let text: String
+    let project: Project?
+    var wide = false
+}
+
+let AGENT_LABEL = ["claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex",
+                   "gemini": "Gemini", "opencode": "OpenCode", "cursor": "Cursor",
+                   "copilot": "Copilot"]
+
 struct NewMachine: Identifiable {
     let id = UUID()
     var name: String
@@ -230,7 +311,8 @@ struct NewMachine: Identifiable {
 }
 
 enum Tab: String, CaseIterable, Identifiable {
-    case projects = "Projects", machines = "Machines", settings = "Settings"
+    case projects = "Projects", sessions = "Sessions", search = "Search"
+    case machines = "Machines", settings = "Settings"
     var id: String { rawValue }
 }
 
@@ -252,6 +334,20 @@ final class AppModel: ObservableObject {
     @Published var checkError: [String: String] = [:]
     @Published var adding: NewMachine?
     @Published var loginItem = FileManager.default.fileExists(atPath: TRAY_PLIST)
+
+    @Published var board: [BoardMachine] = []
+    @Published var boardAt: Date?
+    @Published var boardLoading = false
+    @Published var query = ""
+    @Published var hits: [SearchHit] = []
+    @Published var searched: String?            // the query the hits belong to
+    @Published var searching = false
+    @Published var secrets: [SecretFind]?
+    @Published var secretsFor: String?          // a project, or nil for every history
+    @Published var showSecrets = false
+    @Published var handoverPlan: HandoverPlan?
+    @Published var rules: RulesView?
+    @Published var textSheet: TextSheet?
 
     private let q = DispatchQueue(label: "aht.tray.state")
 
@@ -327,6 +423,11 @@ final class AppModel: ObservableObject {
             .sorted { $0.lastActivity > $1.lastActivity }
     }
     var selected: Project? { projects.first { $0.path == selection } }
+    var agentCLIs: [String] {
+        let d = (status["agent_clis"] as? [String: Any]) ?? [:]
+        return ["claude", "kimi", "codex"].filter { d[$0] is String }
+    }
+    var waiting: Int { projects.filter { $0.open == "waiting" }.count }
     var summary: String {
         let tracked = status["tracked"] as? Int ?? 0
         let missing = status["missing"] as? Int ?? 0
@@ -431,14 +532,24 @@ final class AppModel: ObservableObject {
                     body += "\nFiles outside the project that stay here:\n"
                         + stay.prefix(6).map { "• " + $0 }.joined(separator: "\n") + "\n"
                 }
+                for w in (plan["warnings"] as? [String]) ?? [] { body += "\n⚠ " + w + "\n" }
                 body += "\nThe session is resumed there and this folder is marked as "
                     + "away until you take it back."
-                guard alert("Hand “\(p.name)” over to \(remote)?", body,
-                            confirm: "Hand Over") else { return }
-                let file = self.stageFile(p.path)
+                self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body)
+            }
+        }
+    }
+
+    func confirmHandover(_ plan: HandoverPlan) {
+        let p = plan.project, remote = plan.remote
+        let to = machine.map { ["--to", $0] } ?? []
+        let task = plan.task.trimmingCharacters(in: .whitespacesAndNewlines)
+        let file = self.stageFile(p.path)
+        do {
                 self.busy("handing \(p.name) over…", follow: file) {
                     let d = ahtJSON(["handover", p.path, "--apply", "--json",
-                                     "--status-file", file] + to) ?? [:]
+                                     "--status-file", file] + to
+                                    + (task.isEmpty ? [] : ["--task", task])) ?? [:]
                     if let why = self.problems(d) {
                         self.note(p.path, "The handover did not go through:\n\n" + why)
                         return
@@ -446,10 +557,10 @@ final class AppModel: ObservableObject {
                     let s = (d["sent"] as? [String: Any]) ?? [:]
                     var done = "Handed over to \(remote): \(s["files"] as? Int ?? 0) "
                         + "file(s) sent, \(byteText(s["wire_bytes"])) over the network."
+                    if !task.isEmpty { done += "\nIt started on: " + task }
                     for w in (d["warnings"] as? [String]) ?? [] { done += "\n⚠ " + w }
                     self.note(p.path, done)
                 }
-            }
         }
     }
 
@@ -510,6 +621,192 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    // ---- across agents ----
+
+    func refreshBoard() {
+        guard !boardLoading else { return }
+        boardLoading = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["board", "--json"]) ?? [:]
+            let machines = ((d["machines"] as? [[String: Any]]) ?? []).map { m -> BoardMachine in
+                let name = m["machine"] as? String ?? "?"
+                let local = m["local"] as? Bool ?? false
+                let rows = ((m["sessions"] as? [[String: Any]]) ?? []).map { r in
+                    BoardRow(machine: name, local: local, agent: r["agent"] as? String ?? "?",
+                             project: r["project"] as? String ?? "?",
+                             status: r["status"] as? String ?? "?",
+                             waitingFor: r["waiting_for"] as? String,
+                             since: (r["since"] as? NSNumber)?.doubleValue,
+                             handedOver: r["handed_over"] as? Bool ?? false)
+                }.sorted { ($0.status == "waiting for you" ? 0 : 1, $0.project)
+                           < ($1.status == "waiting for you" ? 0 : 1, $1.project) }
+                return BoardMachine(name: name, reachable: m["reachable"] as? Bool ?? false,
+                                    error: m["error"] as? String, rows: rows)
+            }
+            DispatchQueue.main.async {
+                self.board = machines
+                self.boardAt = Date()
+                self.boardLoading = false
+            }
+        }
+    }
+
+    func runSearch() {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty, !searching else { return }
+        searching = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["search", "--json", "--limit", "40"]
+                            + q.split(separator: " ").map(String.init)) ?? [:]
+            let rows = ((d["results"] as? [[String: Any]]) ?? []).map { r -> SearchHit in
+                let restore = r["restore"] as? [String: Any]
+                return SearchHit(
+                    agent: r["agent"] as? String ?? "?", session: r["session"] as? String ?? "",
+                    project: r["project"] as? String,
+                    title: (r["title"] as? String) ?? (r["session"] as? String ?? ""),
+                    live: r["live"] as? Bool ?? true,
+                    updated: (r["updated"] as? NSNumber)?.doubleValue,
+                    snippets: ((r["hits"] as? [[String: Any]]) ?? []).map {
+                        (role: $0["role"] as? String ?? "", text: $0["snippet"] as? String ?? "")
+                    },
+                    restoreUUID: restore?["uuid"] as? String,
+                    restoreStamp: restore?["stamp"] as? String,
+                    restoreProject: restore?["project"] as? String)
+            }
+            DispatchQueue.main.async {
+                self.hits = rows
+                self.searched = q
+                self.searching = false
+            }
+        }
+    }
+
+    func resume(_ h: SearchHit) {
+        guard let p = h.project else { return }
+        background { aht(["resume-here", p, "--session", h.session, "--agent", h.agent]) }
+    }
+
+    func restore(_ h: SearchHit) {
+        guard let p = h.restoreProject, let u = h.restoreUUID, let st = h.restoreStamp,
+              alert("Bring this session back?",
+                    "“\(h.title)” was deleted from \((p as NSString).lastPathComponent)'s "
+                    + "history; a backup still holds it. Restoring adds what is missing "
+                    + "and changes nothing that is there.", confirm: "Restore") else { return }
+        busy("restoring…") {
+            let r = aht(["restore", p, "--uuid", u, "--stamp", st, "--apply"])
+            DispatchQueue.main.async {
+                _ = alert(r.ok ? "Restored" : "Restoring did not work",
+                          r.ok ? "Continue it from the result list." : r.out)
+                if r.ok { self.runSearch() }
+            }
+        }
+    }
+
+    func show(_ path: String) {
+        selection = path
+        search = ""
+        tab = .projects
+    }
+
+    func checkSecrets(_ p: Project?) {
+        secretsFor = p?.path
+        secrets = nil
+        showSecrets = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["secrets", "--json"] + (p.map { [$0.path] } ?? [])) ?? [:]
+            let rows = ((d["finds"] as? [[String: Any]]) ?? []).map {
+                SecretFind(project: $0["project"] as? String ?? "?",
+                           agent: $0["agent"] as? String ?? "?",
+                           kind: $0["kind"] as? String ?? "?",
+                           masked: $0["masked"] as? String ?? "",
+                           whereFound: $0["where"] as? String ?? "",
+                           t: ($0["t"] as? NSNumber)?.doubleValue,
+                           times: $0["times"] as? Int ?? 1)
+            }
+            DispatchQueue.main.async { self.secrets = rows }
+        }
+    }
+
+    func journal(_ p: Project) {
+        busy("writing the journal…") {
+            let d = ahtJSON(["journal", p.path, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                self.textSheet = TextSheet(title: "Journal: \(p.name)",
+                                           text: d["markdown"] as? String
+                                               ?? "The journal could not be written.",
+                                           project: p)
+            }
+        }
+    }
+
+    func saveJournal(_ p: Project) {
+        background {
+            let d = ahtJSON(["journal", p.path, "--write", "--json"]) ?? [:]
+            if let f = d["file"] as? String { sh("/usr/bin/open", [f]) }
+        }
+    }
+
+    func openRules(_ p: Project) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["rules", p.path, "--json"]) ?? [:]
+            DispatchQueue.main.async { self.rules = RulesView(project: p, status: d) }
+        }
+    }
+
+    func unifyRules(_ p: Project, prefer: String?) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["rules", p.path, "--unify", "--apply", "--json"]
+                            + (prefer.map { ["--prefer", $0] } ?? [])) ?? [:]
+            let st = ahtJSON(["rules", p.path, "--json"]) ?? [:]
+            var said = "Nothing was changed."
+            if d["applied"] as? Bool ?? false {
+                said = "Done. AGENTS.md now holds the rules and CLAUDE.md brings them in. "
+                    + "The earlier files are kept in \(d["backup"] as? String ?? "~/.aht")."
+            }
+            DispatchQueue.main.async { self.rules = RulesView(project: p, status: st, result: said) }
+        }
+    }
+
+    func switchAgent(_ p: Project, to target: String) {
+        let label = AGENT_LABEL[target] ?? target
+        note(p.path, nil)
+        busy("checking \(p.name)…") {
+            let plan = ahtJSON(["switch", p.path, "--to", target, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    self.note(p.path, "Cannot switch now:\n\n" + why)
+                    return
+                }
+                let src = (plan["source"] as? [String: Any]) ?? [:]
+                let from = AGENT_LABEL[src["agent"] as? String ?? ""] ?? "the other agent"
+                var body = "\(label) continues the work of the latest \(from) session"
+                    + ((src["title"] as? String).map { " (“\($0)”)" } ?? "") + ". aht writes "
+                    + "a summary of where things stood into the project, and \(label) "
+                    + "reads it first. The \(from) session stays as it is."
+                if target == "kimi" {
+                    body += "\n\nKimi reads the summary in a first run of its own; this "
+                        + "takes a moment before the window opens."
+                }
+                for w in (plan["warnings"] as? [String]) ?? [] { body += "\n\n⚠ " + w }
+                guard alert("Continue “\(p.name)” in \(label)?", body,
+                            confirm: "Switch") else { return }
+                self.busy("\(label) is reading the summary…") {
+                    let d = ahtJSON(["switch", p.path, "--to", target, "--apply", "--json"]) ?? [:]
+                    if let why = self.problems(d) {
+                        self.note(p.path, "The switch did not go through:\n\n" + why)
+                    } else {
+                        self.note(p.path, "\(label) took over; its window is open. The summary "
+                                  + "it read: " + (d["brief"] as? String ?? ""))
+                    }
+                }
+            }
+        }
+    }
+
+    func showGuide() {
+        textSheet = TextSheet(title: "aht guide", text: guideText(), project: nil, wide: true)
     }
 
     func openSession(_ p: Project) {
@@ -820,12 +1117,21 @@ struct MainView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Picker("", selection: $m.tab) {
-                    ForEach(Tab.allCases) { Text($0.rawValue).tag($0) }
+                    ForEach(Tab.allCases) { t in
+                        Text(t == .sessions && m.waiting > 0 ? "Sessions (\(m.waiting))"
+                                                            : t.rawValue).tag(t)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 300)
+                .frame(width: 470)
                 Spacer()
+                Button {
+                    m.showGuide()
+                } label: {
+                    Label("Guide", systemImage: "questionmark.circle")
+                }
+                .help("What aht does, with examples")
                 Text(m.summary).foregroundColor(.secondary)
                 Circle().fill(m.running ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
@@ -836,6 +1142,8 @@ struct MainView: View {
             Group {
                 switch m.tab {
                 case .projects: ProjectsView()
+                case .sessions: SessionsView()
+                case .search: SearchView()
                 case .machines: MachinesView()
                 case .settings: SettingsView()
                 }
@@ -861,6 +1169,10 @@ struct MainView: View {
         }
         .frame(minWidth: 820, minHeight: 560)
         .sheet(item: $m.adding) { n in AddMachineView(draft: n) }
+        .sheet(item: $m.handoverPlan) { plan in HandoverSheet(plan: plan) }
+        .sheet(item: $m.rules) { r in RulesSheet(r: r) }
+        .sheet(item: $m.textSheet) { t in TextSheetView(t: t) }
+        .sheet(isPresented: $m.showSecrets) { SecretsSheet() }
     }
 }
 
@@ -947,9 +1259,27 @@ struct DetailView: View {
                             .disabled(m.machine == nil || !m.supported)
                         Button("Continue Session") { m.continueHere(p) }
                             .disabled(p.sessions == 0)
+                        Menu("Switch Agent") {
+                            ForEach(m.agentCLIs, id: \.self) { a in
+                                Button("Continue in \(AGENT_LABEL[a] ?? a)…") {
+                                    m.switchAgent(p, to: a)
+                                }
+                            }
+                        }
+                        .fixedSize()
+                        .disabled(p.sessions == 0 && p.agents.isEmpty)
                     }
                     Spacer()
-                    if p.exists { Button("Show in Finder") { m.reveal(p) } }
+                    if p.exists {
+                        Menu("More") {
+                            Button("Journal") { m.journal(p) }
+                            Button("Project Rules…") { m.openRules(p) }
+                            Button("Check for Secrets") { m.checkSecrets(p) }
+                            Divider()
+                            Button("Show in Finder") { m.reveal(p) }
+                        }
+                        .fixedSize()
+                    }
                 }
                 .disabled(m.working != nil)
                 if m.machine == nil && m.supported {
@@ -959,6 +1289,10 @@ struct DetailView: View {
                     Text(o == "idle"
                          ? "An agent session is open in this project. Exit it (/exit) "
                            + "before handing the project over."
+                         : o == "waiting"
+                         ? "An agent session in this project is waiting for you. Answer it "
+                           + "in its terminal; the project cannot be handed over until it "
+                           + "has finished and is closed."
                          : "An agent is working in this project. It can be handed over "
                            + "once that has finished and the session is closed.")
                         .font(.callout).foregroundColor(.orange)
@@ -988,6 +1322,479 @@ struct DetailView: View {
         }
         if !p.exists { return "the folder is gone; its histories are safe" }
         return "\(p.sessions) session(s), \(byteText(NSNumber(value: p.bytes))) of history"
+    }
+}
+
+struct SessionsView: View {
+    @EnvironmentObject var m: AppModel
+    let tick = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Agent sessions that are open now, here and on your other machines.")
+                    .foregroundColor(.secondary)
+                Spacer()
+                if m.boardLoading { ProgressView().controlSize(.small) }
+                if let at = m.boardAt {
+                    Text("updated " + ago(NSNumber(value: at.timeIntervalSince1970)))
+                        .foregroundColor(.secondary)
+                }
+                Button("Refresh") { m.refreshBoard() }.disabled(m.boardLoading)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if m.board.isEmpty {
+                        Text(m.boardLoading ? "Looking…" : "Nothing loaded yet.")
+                            .foregroundColor(.secondary)
+                    }
+                    ForEach(m.board) { mc in
+                        GroupBox(label: Text(mc.name).font(.headline)) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                if !mc.reachable {
+                                    Text("Not reachable right now — is it switched on, and is "
+                                         + "Tailscale connected on this Mac?")
+                                        .foregroundColor(.orange).help(mc.error ?? "")
+                                } else if mc.rows.isEmpty {
+                                    Text("No agent session open.").foregroundColor(.secondary)
+                                }
+                                ForEach(mc.rows) { r in BoardRowView(r: r) }
+                            }
+                            .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(16)
+            }
+        }
+        .onAppear { m.refreshBoard() }
+        .onReceive(tick) { _ in if m.tab == .sessions { m.refreshBoard() } }
+    }
+}
+
+struct BoardRowView: View {
+    @EnvironmentObject var m: AppModel
+    let r: BoardRow
+
+    var color: Color {
+        switch r.status {
+        case "waiting for you": return .orange
+        case "idle": return .secondary
+        default: return .blue
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(r.name).frame(width: 200, alignment: .leading).lineLimit(1).help(r.project)
+            Text(AGENT_LABEL[r.agent] ?? r.agent).foregroundColor(.secondary)
+                .frame(width: 100, alignment: .leading)
+            Text(r.state).foregroundColor(r.status == "waiting for you" ? .orange : .primary)
+                .fontWeight(r.status == "waiting for you" ? .semibold : .regular).lineLimit(1)
+            if let t = r.since {
+                Text(ago(NSNumber(value: t))).foregroundColor(.secondary)
+            }
+            Spacer()
+            if r.handedOver, let p = m.projects.first(where: { $0.away != nil
+                                                          && r.project.hasSuffix($0.path) }) {
+                Button("Open Session") { m.openSession(p) }.controlSize(.small)
+            } else if r.local, m.projects.contains(where: { $0.path == r.project }) {
+                Button("Show Project") { m.show(r.project) }.controlSize(.small)
+            }
+        }
+    }
+}
+
+struct SearchView: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                TextField("Search every agent's sessions — \"a phrase\" in quotes",
+                          text: $m.query)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { m.runSearch() }
+                Button("Search") { m.runSearch() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(m.query.trimmingCharacters(in: .whitespaces).isEmpty || m.searching)
+                if m.searching { ProgressView().controlSize(.small) }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if let q = m.searched, m.hits.isEmpty, !m.searching {
+                        Text("Nothing found for “\(q)”.").foregroundColor(.secondary)
+                    }
+                    if m.searched == nil {
+                        Text("Claude Code, Kimi Code and Codex sessions are searched, also "
+                             + "sessions that were deleted since and live on only in a "
+                             + "history backup. Keys and passwords are not in the index.")
+                            .foregroundColor(.secondary)
+                    }
+                    ForEach(m.hits) { h in SearchHitView(h: h) }
+                }
+                .padding(16)
+            }
+        }
+    }
+}
+
+func marked(_ s: String) -> Text {
+    // the core marks what matched with \u{02} … \u{03}
+    var out = Text("")
+    var bold = false
+    var cur = ""
+    for ch in s.replacingOccurrences(of: "\n", with: " ") {
+        if ch == "\u{02}" || ch == "\u{03}" {
+            out = out + (bold ? Text(cur).bold().foregroundColor(.primary) : Text(cur))
+            cur = ""
+            bold = ch == "\u{02}"
+        } else {
+            cur.append(ch)
+        }
+    }
+    return out + (bold ? Text(cur).bold() : Text(cur))
+}
+
+struct SearchHitView: View {
+    @EnvironmentObject var m: AppModel
+    let h: SearchHit
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(h.title).font(.headline).lineLimit(1)
+                Text(AGENT_LABEL[h.agent] ?? h.agent).foregroundColor(.secondary)
+                if let t = h.updated { Text(ago(NSNumber(value: t))).foregroundColor(.secondary) }
+                if !h.live {
+                    Text("deleted — in a backup").font(.caption).foregroundColor(.orange)
+                }
+                Spacer()
+                if h.live, let p = h.project, FileManager.default.fileExists(atPath: p) {
+                    Button("Resume") { m.resume(h) }.controlSize(.small)
+                    Button("Show Project") { m.show(p) }.controlSize(.small)
+                        .disabled(!m.projects.contains { $0.path == p })
+                } else if !h.live, h.restoreProject != nil {
+                    Button("Restore…") { m.restore(h) }.controlSize(.small)
+                }
+            }
+            if let p = h.project {
+                Text(p).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            ForEach(Array(h.snippets.enumerated()), id: \.offset) { _, sn in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(sn.role == "user" ? "you" : sn.role).font(.caption)
+                        .foregroundColor(.secondary).frame(width: 36, alignment: .trailing)
+                    marked(sn.text).foregroundColor(.secondary).lineLimit(2)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(6)
+    }
+}
+
+struct HandoverSheet: View {
+    @EnvironmentObject var m: AppModel
+    @State var plan: HandoverPlan
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Hand “\(plan.project.name)” over to \(plan.remote)?").font(.headline)
+            Text(plan.body).frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            Text("A task to start on over there (optional)").padding(.top, 6)
+            TextEditor(text: $plan.task)
+                .font(.body).frame(height: 70)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+            Text("With a task, the session begins working on it as soon as it has resumed; "
+                 + "you can follow it and answer its questions from the Claude app.")
+                .font(.caption).foregroundColor(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { m.handoverPlan = nil }.keyboardShortcut(.cancelAction)
+                Button("Hand Over") {
+                    let p = plan
+                    m.handoverPlan = nil
+                    m.confirmHandover(p)
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20).frame(width: 520)
+    }
+}
+
+struct RulesSheet: View {
+    @EnvironmentObject var m: AppModel
+    let r: RulesView
+
+    var body: some View {
+        let st = r.status
+        let state = st["state"] as? String ?? ""
+        let files = (st["files"] as? [String: [String: Any]]) ?? [:]
+        let readers = (st["readers"] as? [String: String]) ?? [:]
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Project rules: \(r.project.name)").font(.headline)
+            Text(st["summary"] as? String ?? "…")
+                .fixedSize(horizontal: false, vertical: true)
+            GroupBox(label: Text("Files")) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if files.isEmpty { Text("none").foregroundColor(.secondary) }
+                    ForEach(files.keys.sorted(), id: \.self) { f in
+                        HStack {
+                            Text(f).frame(width: 150, alignment: .leading)
+                            Text("\((files[f]?["bytes"] as? Int) ?? 0) bytes")
+                                .foregroundColor(.secondary)
+                            if files[f]?["imports_agents"] as? Bool ?? false {
+                                Text("brings in AGENTS.md").foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+                .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox(label: Text("Which file each agent reads")) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(readers.keys.sorted(), id: \.self) { a in
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(AGENT_LABEL[a] ?? a).frame(width: 110, alignment: .leading)
+                            Text(readers[a] ?? "").foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let said = r.result {
+                Text(said).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if state == "claude-only" || state == "twins" {
+                    Button("Make AGENTS.md the One Set of Rules") {
+                        m.unifyRules(r.project, prefer: nil)
+                    }
+                } else if state == "split" {
+                    Text("Keep:")
+                    Button("CLAUDE.md's") { m.unifyRules(r.project, prefer: "claude") }
+                    Button("AGENTS.md's") { m.unifyRules(r.project, prefer: "agents") }
+                    Button("Both") { m.unifyRules(r.project, prefer: "both") }
+                }
+                Spacer()
+                Button("Close") { m.rules = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 560)
+    }
+}
+
+struct TextSheetView: View {
+    @EnvironmentObject var m: AppModel
+    let t: TextSheet
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(t.title).font(.headline)
+            ScrollView {
+                // the sheet already carries the document's title
+                MarkdownView(text: t.text, skipTitle: true).padding(.trailing, 12)
+            }
+            HStack {
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(t.text, forType: .string)
+                }
+                if let p = t.project {
+                    Button("Save in the Project and Open") { m.saveJournal(p) }
+                }
+                Spacer()
+                Button("Close") { m.textSheet = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: t.wide ? 780 : 720, height: t.wide ? 680 : 560)
+    }
+}
+
+/// The Markdown aht writes and ships (the guide, journals), as blocks:
+/// headings, paragraphs, lists, quoted examples and code.  Source lines that
+/// were wrapped for the editor are joined again.
+struct MdBlock: Identifiable {
+    let id: Int
+    let kind: String            // h1 h2 h3 p li ol quote code
+    let text: String
+    var mark = ""
+}
+
+func mdBlocks(_ text: String) -> [MdBlock] {
+    var out: [MdBlock] = []
+    var kind = "", buf = "", mark = ""
+    var code: [String]? = nil
+    func flush() {
+        if !kind.isEmpty {
+            out.append(MdBlock(id: out.count, kind: kind,
+                               text: buf.trimmingCharacters(in: .whitespaces), mark: mark))
+        }
+        kind = ""; buf = ""; mark = ""
+    }
+    for raw in text.components(separatedBy: "\n") {
+        if code != nil {
+            if raw.hasPrefix("```") {
+                out.append(MdBlock(id: out.count, kind: "code", text: code!.joined(separator: "\n")))
+                code = nil
+            } else {
+                code!.append(raw)
+            }
+            continue
+        }
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if raw.hasPrefix("```") { flush(); code = []; continue }
+        if line.isEmpty { if kind != "quote" { flush() }; continue }
+        for (p, k) in [("### ", "h3"), ("## ", "h2"), ("# ", "h1")] where raw.hasPrefix(p) {
+            flush()
+            out.append(MdBlock(id: out.count, kind: k, text: String(raw.dropFirst(p.count))))
+            kind = "done"
+            break
+        }
+        if kind == "done" { kind = ""; continue }
+        if raw.hasPrefix(">") {
+            let t = raw.dropFirst().trimmingCharacters(in: .whitespaces)
+            if kind != "quote" { flush(); kind = "quote" }
+            buf += t.isEmpty ? "\n\n" : ((buf.isEmpty || buf.hasSuffix("\n\n")) ? t : " " + t)
+            continue
+        }
+        if kind == "quote" { flush() }
+        if raw.hasPrefix("- ") {
+            flush(); kind = "li"; buf = String(raw.dropFirst(2)); continue
+        }
+        if let r = raw.range(of: #"^\d+\. "#, options: .regularExpression) {
+            flush(); kind = "ol"; mark = String(raw[r]).trimmingCharacters(in: .whitespaces)
+            buf = String(raw[r.upperBound...]); continue
+        }
+        if raw.hasPrefix("  ") && (kind == "li" || kind == "ol") {
+            buf += " " + line; continue
+        }
+        if kind == "p" { buf += " " + line } else { flush(); kind = "p"; buf = line }
+    }
+    if let c = code { out.append(MdBlock(id: out.count, kind: "code", text: c.joined(separator: "\n"))) }
+    flush()
+    return out
+}
+
+func inlineMd(_ s: String) -> Text {
+    Text((try? AttributedString(markdown: s, options: .init(
+        interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s))
+}
+
+struct MarkdownView: View {
+    let text: String
+    var skipTitle = false
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 8) {
+            ForEach(mdBlocks(text).filter { !(skipTitle && $0.kind == "h1") }) { b in
+                block(b)
+            }
+        }
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder func block(_ b: MdBlock) -> some View {
+        switch b.kind {
+        case "h1": inlineMd(b.text).font(.title.bold()).padding(.bottom, 2)
+        case "h2": inlineMd(b.text).font(.title2.bold()).padding(.top, 14)
+        case "h3": inlineMd(b.text).font(.headline).padding(.top, 6)
+        case "li", "ol":
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(b.kind == "li" ? "•" : b.mark).frame(minWidth: 12, alignment: .trailing)
+                inlineMd(b.text).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.leading, 6)
+        case "quote":
+            HStack(alignment: .top, spacing: 10) {
+                Rectangle().fill(Color.accentColor.opacity(0.6)).frame(width: 3)
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(b.text.components(separatedBy: "\n\n").enumerated()),
+                            id: \.offset) { _, para in
+                        inlineMd(para).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(10)
+            .background(Color.accentColor.opacity(0.06))
+            .cornerRadius(6)
+        case "code":
+            Text(b.text).font(.system(.callout, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color.primary.opacity(0.05))
+                .cornerRadius(6)
+        default: inlineMd(b.text).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// The guide that ships with aht (GUIDE.md): from the app bundle, the
+/// installed core, or a checkout.
+func guideText() -> String {
+    var c: [String] = []
+    if let r = BUNDLE_RES { c.append(r + "/GUIDE.md") }
+    c.append(TOOLS + "/GUIDE.md")
+    let here = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+    c += [here.appendingPathComponent("GUIDE.md").path,
+          here.appendingPathComponent("../GUIDE.md").path]
+    for p in c {
+        if let t = try? String(contentsOfFile: p, encoding: .utf8) { return t }
+    }
+    return "# aht guide\n\nThe guide was not found. It is GUIDE.md next to aht.py, "
+        + "and at https://github.com/havurgiray/agent-history-tether."
+}
+
+struct SecretsSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(m.secretsFor.map { "Secrets in \(($0 as NSString).lastPathComponent)'s history" }
+                 ?? "Secrets in every agent history").font(.headline)
+            Text("What looks like a key, a token or a password in the agents' own history "
+                 + "files, shown masked. aht never changes those files; a key that ended up "
+                 + "there is best replaced where it was issued.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let rows = m.secrets {
+                if rows.isEmpty {
+                    Text("Nothing found.").padding(.vertical, 20)
+                }
+                Table(rows) {
+                    TableColumn("Project") { f in
+                        Text((f.project as NSString).lastPathComponent).help(f.project)
+                    }
+                    TableColumn("Looks like") { f in Text(f.kind) }
+                    TableColumn("Value") { f in Text(f.masked).font(.system(.body, design: .monospaced)) }
+                    TableColumn("Where") { f in
+                        Text(f.whereFound + (f.times > 1 ? " (\(f.times)×)" : ""))
+                    }
+                    TableColumn("When") { f in
+                        Text((AGENT_LABEL[f.agent] ?? f.agent) + (f.t.map { ", " + ago(NSNumber(value: $0)) } ?? ""))
+                    }
+                }
+            } else {
+                HStack { ProgressView().controlSize(.small); Text("Reading the histories…") }
+                    .padding(.vertical, 20)
+                Spacer()
+            }
+            HStack {
+                Spacer()
+                Button("Close") { m.showSecrets = false }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 820, height: 480)
     }
 }
 
@@ -1167,6 +1974,7 @@ struct SettingsView: View {
                         toggle("Notifications", "notifications")
                         toggle("Back up histories automatically", "backup_enabled")
                         Spacer()
+                        Button("Check All for Secrets…") { m.checkSecrets(nil) }
                         Button("Back Up Now") { m.backupNow() }
                     }
                     .padding(6)
@@ -1300,9 +2108,14 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
             let hosts = Set(away.compactMap { $0.away }).sorted()
             add(disabled: "\(away.count) handed over to " + hosts.joined(separator: ", "))
         }
+        if model.waiting > 0 {
+            add(disabled: "⚠ \(model.waiting) session\(model.waiting == 1 ? "" : "s") "
+                + "waiting for you")
+        }
         if let w = model.working { add(disabled: "⏳ " + w) }
         menu.addItem(.separator())
         add("Open aht…", #selector(openWindow), key: "o")
+        add("Guide", #selector(openGuide))
         menu.addItem(.separator())
         add("Find Moved Folders Now", #selector(reconcile), key: "r")
         add(model.running ? "Pause Watching" : "Resume Watching", #selector(toggleWatch))
@@ -1325,6 +2138,11 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     @objc func reconcile() { model.reconcile() }
     @objc func toggleWatch() { model.toggleWatch() }
     @objc func quit() { NSApp.terminate(nil) }
+
+    @objc func openGuide() {
+        openWindow()
+        model.showGuide()
+    }
 
     @objc func openWindow() {
         if window == nil {
@@ -1371,6 +2189,14 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
                      keyEquivalent: "a")
         editItem.submenu = edit
         bar.addItem(editItem)
+        let helpItem = NSMenuItem()
+        let help = NSMenu(title: "Help")
+        let g = NSMenuItem(title: "aht Guide", action: #selector(openGuide), keyEquivalent: "?")
+        g.target = self
+        help.addItem(g)
+        helpItem.submenu = help
+        bar.addItem(helpItem)
+        NSApp.helpMenu = help
         return bar
     }
 }
@@ -1382,34 +2208,67 @@ if CommandLine.arguments.contains("--selftest") {
     exit(r.ok ? 0 : 1)
 }
 
-// snapshot: the window's tabs as PNG files, to look at a layout without
-// clicking through it (needs a login session; nothing is changed)
+// snapshot: the window's tabs (and its dialogs) as PNG files, to look at a
+// layout without clicking through it (needs a login session; nothing changes)
+//   --snapshot DIR [--select-first] [--query WORDS]
+func snapshot(_ view: some View, _ file: String, _ size: NSSize) {
+    let host = NSHostingView(rootView: view)
+    let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                     styleMask: [.titled], backing: .buffered, defer: false)
+    w.contentView = host
+    w.layoutIfNeeded()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+    host.layoutSubtreeIfNeeded()
+    guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+    host.cacheDisplay(in: host.bounds, to: rep)
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: file))
+    print("wrote \(file)")
+}
+
 if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
    i + 1 < CommandLine.arguments.count {
-    let dir = CommandLine.arguments[i + 1]
+    let args = CommandLine.arguments
+    let dir = args[i + 1]
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let shot = NSApplication.shared
-    shot.setActivationPolicy(.accessory)
+    NSApplication.shared.setActivationPolicy(.accessory)
     let model = AppModel()
     model.take(AppModel.load())
-    if CommandLine.arguments.contains("--select-first") {
-        model.selection = model.shown.first?.path
+    if args.contains("--select-first") { model.selection = model.shown.first?.path }
+    if let q = args.firstIndex(of: "--query"), q + 1 < args.count {
+        model.query = args[q + 1]
+        model.runSearch()
+        let end = Date().addingTimeInterval(30)
+        while (model.searching || model.searched == nil) && Date() < end {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        }
     }
+    let size = NSSize(width: 900, height: 620)
     for tab in Tab.allCases {
         model.tab = tab
-        let host = NSHostingView(rootView: MainView().environmentObject(model))
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
-                         styleMask: [.titled], backing: .buffered, defer: false)
-        w.contentView = host
-        w.layoutIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
-        host.layoutSubtreeIfNeeded()
-        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
-        host.cacheDisplay(in: host.bounds, to: rep)
-        let file = dir + "/\(tab.rawValue.lowercased()).png"
-        try? rep.representation(using: .png, properties: [:])?
-            .write(to: URL(fileURLWithPath: file))
-        print("wrote \(file)")
+        snapshot(MainView().environmentObject(model), dir + "/\(tab.rawValue.lowercased()).png", size)
+    }
+    snapshot(TextSheetView(t: TextSheet(title: "aht guide", text: guideText(), project: nil, wide: true))
+                .environmentObject(model), dir + "/sheet-guide.png", NSSize(width: 780, height: 680))
+    if let p = model.selected {                  // the dialogs, for the selected project
+        let j = ahtJSON(["journal", p.path, "--json"]) ?? [:]
+        snapshot(TextSheetView(t: TextSheet(title: "Journal: \(p.name)",
+                                             text: j["markdown"] as? String ?? "", project: p))
+                    .environmentObject(model), dir + "/sheet-journal.png", NSSize(width: 720, height: 560))
+        snapshot(RulesSheet(r: RulesView(project: p, status: ahtJSON(["rules", p.path, "--json"]) ?? [:]))
+                    .environmentObject(model), dir + "/sheet-rules.png", NSSize(width: 560, height: 460))
+        snapshot(HandoverSheet(plan: HandoverPlan(project: p, remote: model.machine ?? "homebox",
+                                                  body: "12 file(s) to send (1.2 MB), history 3.4 MB.\nSession: the one used last\n\nThe session is resumed there and this folder is marked as away until you take it back."))
+                    .environmentObject(model), dir + "/sheet-handover.png", NSSize(width: 520, height: 470))
+        model.secretsFor = p.path
+        let d = ahtJSON(["secrets", p.path, "--json"]) ?? [:]
+        model.secrets = ((d["finds"] as? [[String: Any]]) ?? []).map {
+            SecretFind(project: $0["project"] as? String ?? "?", agent: $0["agent"] as? String ?? "?",
+                       kind: $0["kind"] as? String ?? "?", masked: $0["masked"] as? String ?? "",
+                       whereFound: $0["where"] as? String ?? "",
+                       t: ($0["t"] as? NSNumber)?.doubleValue, times: $0["times"] as? Int ?? 1)
+        }
+        snapshot(SecretsSheet().environmentObject(model), dir + "/sheet-secrets.png",
+                 NSSize(width: 820, height: 480))
     }
     exit(0)
 }

@@ -4827,7 +4827,53 @@ def _sessions_of(store) -> list:
     if not store:
         return []
     fs = [f for f in Path(store).glob("*.jsonl") if f.is_file()]
-    return [f.stem for f in sorted(fs, key=lambda f: f.stat().st_mtime, reverse=True)]
+    return [f.stem for f in sorted(fs, key=lambda f: (f.stat().st_mtime, f.name),
+                                   reverse=True)]
+
+_ENTRY_RE = re.compile(rb'"entrypoint"\s*:\s*"([^"\\]{1,40})"')
+
+def _is_scripted(jsonl) -> bool:
+    """A session only `claude -p` or the Agent SDK ever wrote (entrypoint
+    "sdk-…", never "cli"), or one that began with /loop — the ones Claude
+    Code's own --continue passes over."""
+    try:
+        size = os.path.getsize(jsonl)
+        with open(jsonl, "rb") as fh:
+            head = fh.read(1 << 18)
+            if size > (1 << 19):
+                fh.seek(size - (1 << 18))
+            tail = fh.read(1 << 18)
+    except OSError:
+        return False
+    for line in head.split(b"\n"):
+        if b'"type":"user"' not in line.replace(b" ", b""):
+            continue
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("isMeta") or not isinstance(e.get("message"), dict):
+            continue
+        if _text_of(e["message"].get("content")).lstrip().startswith("/loop"):
+            return True
+        break
+    kinds = {k.decode("utf-8", "replace") for k in _ENTRY_RE.findall(head + tail)}
+    return bool(kinds) and all(k.startswith("sdk") for k in kinds)
+
+def latest_session(store):
+    """The session to go on with: the one written to last, as `claude
+    --continue` would pick it.  Scripted runs only count when nothing else
+    is there."""
+    ids = _sessions_of(store)
+    for s in ids:
+        if not _is_scripted(Path(store) / f"{s}.jsonl"):
+            return s
+    return ids[0] if ids else None
+
+def session_title(store, sid) -> str:
+    if not (store and sid):
+        return ""
+    return session_digest(Path(store) / f"{sid}.jsonl", "/", turns=1).get("title") or ""
 
 _SLUG_RE = re.compile(rb'"slug"\s*:\s*"([A-Za-z0-9._-]{1,120})"')
 
@@ -5189,10 +5235,11 @@ def cmd_handover(args):
         # (3) what would travel
         store = _store_of(real)
         sids = _sessions_of(store)
-        sid = args.session or (sids[0] if sids else None)
+        sid = args.session or latest_session(store)
         if args.session and args.session not in sids:
             out["blockers"].append(f"no session {args.session} in this project")
         out["session"] = sid
+        out["sessions"] = len(sids)
         dig = session_digest(Path(store) / f"{sid}.jsonl", real) if sid else \
             session_digest(os.devnull, real)
         out["title"] = dig.get("title")
@@ -5583,8 +5630,13 @@ def cmd_reclaim(args):
             else:
                 shutil.rmtree(aside, ignore_errors=True)
             pd = done["project"]
+            # go on where the work stopped: that can be a branch, or a session
+            # begun over there, not the one that was sent
+            latest = latest_session(store) or away.get("session")
+            handed = away.get("session") if away.get("session") != latest else None
             back = {"from": there, "left": away.get("since"), "at": _now(),
-                    "session": away.get("session"), "updated": pd["updated"],
+                    "session": latest, "handed_over": handed,
+                    "updated": pd["updated"],
                     "new": pd["new"], "deleted": pd["deleted"],
                     "conflicts": [c["their_version"] for c in pd["conflicts"]]}
             _update_entry(uid, away=None, returned=back)
@@ -5598,7 +5650,10 @@ def cmd_reclaim(args):
             except OSError:
                 pass
         out["applied"] = True
-        out["session"] = away.get("session")
+        out["session"] = latest
+        out["session_title"] = session_title(store, latest)
+        out["handed_over_session"] = handed
+        out["handed_over_title"] = session_title(store, handed)
         log(f"RECLAIM {real} <- {rem.name} ({changed} change(s), "
             f"{sum(len(d['conflicts']) for d in done.values())} conflict(s))")
         apply_badge(real, desired_marks(real, True))
@@ -5608,9 +5663,13 @@ def cmd_reclaim(args):
                 lines.append(f"   ! kept both ({t}): {c['file']}  +  {c['their_version']}")
         if out.get("set_aside"):
             lines.append(f"   replaced files are kept in {out['set_aside']}")
-        if away.get("session"):
+        if latest:
             lines.append(f"   continue with:  cd {shlex.quote(real)} && "
-                         f"claude --resume {away['session']}")
+                         f"claude --resume {latest}")
+        if handed:
+            lines.append("      that is the session used last"
+                         + (f" (“{out['session_title']}”)" if out["session_title"] else "")
+                         + f"; the one you handed over:  claude --resume {handed}")
     except HandoverError as e:
         out["error"] = str(e)
         warn(f"RECLAIM {real}: {e}")
@@ -5869,11 +5928,14 @@ def open_terminal(command: str, name: str) -> int:
     return 1
 
 def cmd_resume_here(args):
-    """After a reclaim: continue the session in a new terminal window."""
+    """Continue a project's session in a new terminal window: the one used
+    last, or (--handed-over) the one the last handover sent away."""
     real = os.path.realpath(args.path)
     _uid, entry = _entry_for(load_registry(), real)
-    sid = ((entry or {}).get("returned") or {}).get("session") \
-        or next(iter(_sessions_of(_store_of(real))), None)
+    back = (entry or {}).get("returned") or {}
+    sid = latest_session(_store_of(real))
+    if args.handed_over:
+        sid = back.get("handed_over") or back.get("session") or sid
     exe = find_claude() or "claude"
     cmd = f"cd {shlex.quote(real)} && exec {shlex.quote(exe)}" \
         + (f" --resume {sid}" if sid else "")
@@ -6151,6 +6213,8 @@ def build_parser():
     s = sub.add_parser("resume-here", help="continue a project's session in a "
                        "new terminal window")
     s.add_argument("path")
+    s.add_argument("--handed-over", action="store_true", dest="handed_over",
+                   help="the session the last handover sent, not the one used last")
     s.add_argument("--print", action="store_true")
     s.set_defaults(fn=cmd_resume_here)
 

@@ -2884,6 +2884,10 @@ def cmd_status(args):
 def cmd_projects(args):
     reg = load_registry()
     out = []
+    try:
+        live = running_sessions() if handover_supported() else []
+    except Exception:
+        live = []
     for uid, e in reg.get("projects", {}).items():
         row = {"uuid": uid, "real_path": e["real_path"],
                "exists": os.path.isdir(e["real_path"]),
@@ -2892,8 +2896,17 @@ def cmd_projects(args):
                "is_git": is_git(e["real_path"]) if os.path.isdir(e["real_path"]) else False,
                "away": (e.get("away") or {}).get("host"),
                "away_remote": (e.get("away") or {}).get("remote"),
+               "away_since": (e.get("away") or {}).get("since"),
                "mirror": (e.get("mirror") or {}).get("remote")
-               if (e.get("mirror") or {}).get("enabled") else None}
+               if (e.get("mirror") or {}).get("enabled") else None,
+               "mirror_synced_at": (e.get("mirror") or {}).get("synced_at"),
+               "mirror_status": (e.get("mirror") or {}).get("status"),
+               "agents": agents_of(e.get("stores") or {})}
+        mine = [s["status"] for s in live
+                if _inside(os.path.realpath(s["cwd"]), os.path.realpath(e["real_path"]))]
+        # an open agent session: "working" or "idle" (it blocks a handover)
+        row["open"] = None if not mine else (
+            "idle" if all(s == "idle" for s in mine) else "working")
         row.update(_hist_stats(e))
         out.append(row)
     out.sort(key=lambda r: r["real_path"].lower())
@@ -3956,6 +3969,7 @@ class Remote:
         self.root = str(spec.get("root") or "").rstrip("/")
         self.claude = spec.get("claude")
         self.info = {}
+        self.on_percent = None          # called with rsync's percentage
 
     @property
     def local(self) -> bool:
@@ -4077,25 +4091,31 @@ class Remote:
             with os.fdopen(fd, "wb") as fh:
                 fh.write(b"\0".join(f.encode("utf-8") for f in files_from) + b"\0")
             cmd += ["--from0", "--files-from=" + tmp]
-        if progress:
+        watch = (progress or self.on_percent) and not dry
+        if watch:
             cmd.append("--info=progress2")
         cmd += [src, dst]
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                  stderr=None if progress else subprocess.PIPE,
                                  cwd="/")
-            if progress:                    # show it as it comes, keep it for the numbers
+            if watch:                       # follow it as it comes, keep it for the numbers
                 got = []
                 while True:
                     chunk = p.stdout.read1(4096)
                     if not chunk:
                         break
                     got.append(chunk)
-                    if b"Number of files" not in b"".join(got[-3:]):
+                    done = re.findall(rb"(\d{1,3})%", chunk)
+                    if done and self.on_percent:
+                        self.on_percent(min(100, int(done[-1])))
+                    if progress and b"Number of files" not in b"".join(got[-3:]):
                         sys.stderr.write(chunk.decode("utf-8", "replace"))
                         sys.stderr.flush()
-                sys.stderr.write("\n")
-                text, err = b"".join(got), b""
+                if progress:
+                    sys.stderr.write("\n")
+                text = b"".join(got)
+                err = b"" if progress else (p.stderr.read() or b"")
                 p.wait()
             else:
                 text, err = p.communicate()
@@ -4665,6 +4685,33 @@ def _update_entry(uid: str, **fields) -> None:
                 e[k] = v
         save_registry(reg)
 
+class Progress:
+    """Where a transfer stands, for a front-end that shows it: the stage in
+    words and the percentage rsync reports, rewritten into one small file."""
+    def __init__(self, path=None, talk=False):
+        self.path, self.talk = path, talk
+        self.stage, self.pct, self.at = "", None, 0.0
+    def say(self, msg: str) -> None:
+        self.stage, self.pct = msg, None
+        if self.talk:
+            print(msg, flush=True)
+        self._write(force=True)
+    def percent(self, n: int) -> None:
+        if n != self.pct:
+            self.pct = n
+            self._write()
+    def _write(self, force=False) -> None:
+        if not self.path or (not force and time.time() - self.at < 0.3):
+            return
+        self.at = time.time()
+        try:
+            tmp = str(self.path) + ".new"
+            with open(tmp, "w") as fh:
+                json.dump({"stage": self.stage, "percent": self.pct, "at": self.at}, fh)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
 class ProjectLock:
     """One transfer per project at a time (a mirror run and a handover)."""
     def __init__(self, uid: str):
@@ -5056,11 +5103,11 @@ def cmd_handover(args):
                                "not a project")
         return _emit(args, out, lines)
     talk = not args.json
-    def say(msg):
-        if talk:
-            print(msg, flush=True)
+    prog = Progress(args.status_file, talk)
+    say = prog.say
     try:
         rem = get_remote(args.to)
+        rem.on_percent = prog.percent
         out["remote"] = rem.name
         with Lock():
             reg = load_registry()
@@ -5355,9 +5402,8 @@ def cmd_reclaim(args):
     real = os.path.realpath(args.path)
     out["project"] = real
     talk = not args.json
-    def say(msg):
-        if talk:
-            print(msg, flush=True)
+    prog = Progress(args.status_file, talk)
+    say = prog.say
     try:
         reg = load_registry()
         uid, entry = _entry_for(reg, real)
@@ -5375,6 +5421,7 @@ def cmd_reclaim(args):
         except Exception as e:
             raise HandoverError(f"the record of what left is unreadable ({e})")
         rem = get_remote(away.get("remote"))
+        rem.on_percent = prog.percent
         out["remote"] = rem.name
         there = away.get("host") or rem.name
 
@@ -6072,6 +6119,8 @@ def build_parser():
     s.add_argument("--allow-processes", action="store_true", dest="allow_processes",
                    help="leave other programs running in the folder behind "
                         "(an open agent session always blocks)")
+    s.add_argument("--status-file", dest="status_file", metavar="FILE",
+                   help="keep the current stage and percentage in FILE (front-ends)")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_handover)
@@ -6088,6 +6137,7 @@ def build_parser():
                         "ours aside (there)")
     s.add_argument("--allow-processes", action="store_true", dest="allow_processes")
     s.add_argument("--ignore-version", action="store_true", dest="ignore_version")
+    s.add_argument("--status-file", dest="status_file", metavar="FILE")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_reclaim)

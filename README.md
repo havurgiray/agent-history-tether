@@ -233,6 +233,49 @@ session is open in it, and a transfer shows its progress.
   session there is reachable from the Claude app, including permission
   prompts.
 
+## Across agents
+
+aht reads the sessions of Claude Code, Kimi Code and Codex, so it can work
+across them.  On macOS all of this is in the app's window; the commands
+behave the same.
+
+- **Search everything** — `aht search <words>` (the window's *Search* tab)
+  looks through every session of every agent and project, including
+  sessions that were deleted since and live on only in a history backup; a
+  hit offers to resume it, or to restore it first.  The index
+  (`~/.aht/search.db`) keeps itself up to date and holds no keys: whatever
+  looks like one is masked before it is stored.
+- **Session board** — `aht board` (the *Sessions* tab) shows every open
+  agent session on this Mac and on each machine set up for handover:
+  working, waiting for you (and for what), or idle.  The menu bar counts
+  the sessions waiting for you.
+- **Switch agent** — `aht switch <folder> --to kimi|claude|codex --apply`
+  continues a project's work in another agent: aht writes a summary of the
+  latest session of the other agent into `.aht/handover/`, and the new agent
+  reads it first, in a window of its own.  The earlier session stays as it
+  was, so you can go back to it.
+- **Hand over with a task** — `aht handover <folder> --apply --task "…"`
+  (a field in the window's handover dialog): the session starts working on
+  it the moment it has resumed on the other machine.
+- **One set of project rules** — `aht rules <folder>` tells which
+  instruction file each agent follows; `--unify --apply` makes `AGENTS.md`
+  the one set of rules and reduces `CLAUDE.md` to `@AGENTS.md`, the import
+  Claude Code documents for exactly this.  Two different files are merged
+  only with `--prefer claude|agents|both`, and the earlier files are kept in
+  `~/.aht/rules-backups/`.
+- **Project journal** — `aht journal <folder>` builds a dated diary from all
+  agents' sessions: what was asked, which files changed, how each day ended.
+  `--write` keeps it as `.aht/journal/journal.md`.
+- **Secrets check** — `aht secrets [folder]` lists what looks like a key, a
+  token or a password in the agents' histories, masked, with where and when
+  it appeared.  A handover says how many travel with the project.  aht never
+  changes the histories themselves, and it masks such values in everything
+  it writes: the search index, journals, and handover and switch summaries
+  (those folders also carry a `.gitignore`).
+
+Development is macOS-first: the window and these features are built and
+tested on macOS; the core commands run wherever Python does.
+
 ## Settings
 
 One shared config (`~/.aht/config.json`) read by the CLI, the watchers, the
@@ -258,9 +301,9 @@ tray compiled by `install.sh`) on macOS, `aht-tray.exe` on Windows,
 confirmation, the policy / notification / backup switches, badge controls,
 diagnostics, autostart toggle).  On macOS the menu is kept short — status,
 *Open aht…*, *Find Moved Folders Now*, *Pause/Resume Watching*, *Quit* — and
-the rest lives in a window with three tabs, **Projects**, **Machines** and
-**Settings**, where nothing happens by a stray click: a row is selected
-first, a button pressed second.
+the rest lives in a window with five tabs, **Projects**, **Sessions**,
+**Search**, **Machines** and **Settings**, where nothing happens by a stray
+click: a row is selected first, a button pressed second.
 
 ## Safety invariants
 
@@ -286,7 +329,8 @@ first, a button pressed second.
 (leveled `[WARN]`/`[ERROR]` lines, size-rotated at `~/.aht/aht.log`) ·
 `tag` · `keys <path>`
 (each backend's store key for a path) · `encode` · `hook` · `version` ·
-`remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here`.
+`remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here` ·
+`search` · `board` · `switch` · `journal` · `rules` · `secrets`.
 Run `aht` with no arguments for the full help screen; every `--json` output is
 a stable machine interface (it's what the trays use).
 

@@ -169,8 +169,10 @@ aht attach ~/Desktop/paper               # open that session
 aht reclaim ~/Desktop/paper --apply      # bring files and history back
 ```
 
-The macOS tray has the same under **Handover**: *Machine*, *Hand Over*,
-*Take Back*, *Open Session*, *Keep in Sync*, *Sync Now*.
+On macOS the same is in the app's window (**∞ ▸ Open aht…**): pick a project
+in the list, then *Hand Over*, *Take Back*, *Open Session* or *Keep in sync*;
+the list shows where each project is, when it was synced and whether an agent
+session is open in it, and a transfer shows its progress.
 
 - **Any number of machines.**  `aht remote discover` lists the computers of
   your Tailscale network and the hosts in `~/.ssh/config`; add as many as you
@@ -209,6 +211,12 @@ The macOS tray has the same under **Handover**: *Machine*, *Hand Over*,
   (`--prefer there` takes the other machine's instead).  Whatever a transfer
   replaces or removes is set aside in `~/.aht/handover/<id>/replaced/` first.
   A transcript only comes back if it *continues* the one that left.
+- **Which session goes on.**  The one you worked in last, picked the way
+  `claude --continue` picks it (scripted `claude -p` runs and `/loop`
+  sessions do not count) — in both directions.  If that is not the session
+  you handed over, because you branched or began another one over there,
+  aht says so and offers both (`aht resume-here --handed-over`).
+  `handover --session <id>` names one yourself.
 - **Same agent version on both sides.**  The handover installs this
   machine's Claude Code version over there and keeps it from updating
   itself.  The way back is refused if the other machine — or anything that
@@ -241,11 +249,16 @@ for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
 `handover_mosh`, `rsync_path`, `terminal_app`.
 
-Every platform has a tray with the same menu (status, reconcile now,
-pause/resume watching, recent projects, adopt with confirmation, the policy /
-notification / backup switches, badge controls, diagnostics, autostart
-toggle), shown as an ∞ icon in the bar: `aht.app` (or the tray compiled by
-`install.sh`) on macOS, `aht-tray.exe` on Windows, `linux/tray.py` on Linux.
+Every platform has a tray, shown as an ∞ icon in the bar: `aht.app` (or the
+tray compiled by `install.sh`) on macOS, `aht-tray.exe` on Windows,
+`linux/tray.py` on Linux.  On Windows and Linux its menu holds everything
+(status, reconcile now, pause/resume watching, recent projects, adopt with
+confirmation, the policy / notification / backup switches, badge controls,
+diagnostics, autostart toggle).  On macOS the menu is kept short — status,
+*Open aht…*, *Find Moved Folders Now*, *Pause/Resume Watching*, *Quit* — and
+the rest lives in a window with three tabs, **Projects**, **Machines** and
+**Settings**, where nothing happens by a stray click: a row is selected
+first, a button pressed second.
 
 ## Safety invariants
 

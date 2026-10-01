@@ -8,6 +8,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# one run per tag at a time: two runs of one tag (GitHub delivered the push
+# twice for v0.12.0) otherwise race, and each uploads its own builds
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 

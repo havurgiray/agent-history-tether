@@ -128,6 +128,53 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>aht watches your project folders so each project's agent histories follow it when you move or rename the folder.</string>
     <key>NSDocumentsFolderUsageDescription</key>
     <string>aht watches your project folders so each project's agent histories follow it when you move or rename the folder.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>aht reads your iTerm2 tab titles to name your Claude Code sessions after them.</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>$BUNDLE_ID</string>
+            <key>CFBundleURLSchemes</key><array><string>aht</string></array>
+        </dict>
+    </array>
+    <key>NSServices</key>
+    <array>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>aht: Show in aht</string></dict>
+            <key>NSMessage</key><string>serviceShow</string>
+            <key>NSPortName</key><string>$APP_NAME</string>
+            <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+            <key>NSRequiredContext</key><dict/>
+        </dict>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>aht: What Changed</string></dict>
+            <key>NSMessage</key><string>serviceChanges</string>
+            <key>NSPortName</key><string>$APP_NAME</string>
+            <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+            <key>NSRequiredContext</key><dict/>
+        </dict>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>aht: Journal</string></dict>
+            <key>NSMessage</key><string>serviceJournal</string>
+            <key>NSPortName</key><string>$APP_NAME</string>
+            <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+            <key>NSRequiredContext</key><dict/>
+        </dict>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>aht: Search This Project</string></dict>
+            <key>NSMessage</key><string>serviceSearch</string>
+            <key>NSPortName</key><string>$APP_NAME</string>
+            <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+            <key>NSRequiredContext</key><dict/>
+        </dict>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>aht: Continue in Another Agent</string></dict>
+            <key>NSMessage</key><string>serviceSwitch</string>
+            <key>NSPortName</key><string>$APP_NAME</string>
+            <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+            <key>NSRequiredContext</key><dict/>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST

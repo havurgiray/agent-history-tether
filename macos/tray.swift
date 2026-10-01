@@ -16,9 +16,20 @@
 //   from aht.app:   offers to install the core, watcher and hook on first launch
 //   --selftest      headless check that the core answers (CI)
 //   --snapshot DIR  render every tab of the window into DIR as PNG files
+//   --spotlight-check WORD   are sessions with WORD in the title in Spotlight?
+//   aht://…         open parts of the window from Shortcuts, a link or a script:
+//                   aht://search?q=WORDS, aht://sessions, aht://loose-ends,
+//                   aht://report, aht://project?path=P, aht://changes?path=P,
+//                   aht://journal?path=P, aht://undo?path=P,
+//                   aht://switch?path=P&to=kimi, aht://resume?path=P&session=ID
+//                   (whatever starts an agent or changes files asks first)
 import AppKit
+import Carbon.HIToolbox
+import CoreSpotlight
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
+import UserNotifications
 
 let HOME = NSHomeDirectory()
 let TOOLS = HOME + "/.aht/tools/agent-history-tether"
@@ -80,11 +91,13 @@ func ahtJSON(_ args: [String]) -> [String: Any]? {
     return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
 }
 
+/// A notice from the app itself: a click on it opens aht, not Script Editor.
 func notifyUser(_ title: String, _ msg: String) {
-    let esc = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\")
-                               .replacingOccurrences(of: "\"", with: "\\\"") }
-    sh("/usr/bin/osascript",
-       ["-e", "display notification \"\(esc(msg))\" with title \"\(esc(title))\""])
+    let c = UNMutableNotificationContent()
+    c.title = title
+    c.body = msg
+    UNUserNotificationCenter.current().add(
+        UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { _ in }
 }
 
 func watcherRunning() -> Bool {
@@ -116,6 +129,14 @@ func ago(_ any: Any?) -> String {
     let r = RelativeDateTimeFormatter()
     r.unitsStyle = .full
     return r.localizedString(for: d, relativeTo: Date())
+}
+
+/// A file row of the core's JSON (undo, second opinion) as the diff views take it.
+func changedFile(_ d: [String: Any]) -> ChangedFile {
+    return ChangedFile(path: d["path"] as? String ?? d["name"] as? String ?? "",
+                       name: d["name"] as? String ?? "", state: d["state"] as? String ?? "",
+                       inside: true, added: d["added"] as? Int ?? 0,
+                       removed: d["removed"] as? Int ?? 0, diff: d["diff"] as? String ?? "")
 }
 
 func alert(_ title: String, _ body: String, confirm: String? = nil) -> Bool {
@@ -159,6 +180,8 @@ struct Project: Identifiable, Hashable {
     let bytes: Int64
     let lastActivity: String
     let open: String?               // "waiting" | "working" | "idle": a session is open
+    let limitSession: String?       // a Claude session stopped at its usage limit
+    let limitResets: String?
 
     var id: String { path }
     var name: String { (path as NSString).lastPathComponent }
@@ -193,6 +216,9 @@ struct Project: Identifiable, Hashable {
         syncStatus = d["mirror_status"] as? String
         agents = d["agents"] as? [String] ?? d["stores"] as? [String] ?? []
         open = d["open"] as? String
+        let lim = d["limit"] as? [String: Any]
+        limitSession = lim?["session"] as? String
+        limitResets = lim?["resets"] as? String
         sessions = d["sessions"] as? Int ?? 0
         bytes = (d["bytes"] as? NSNumber)?.int64Value ?? 0
         lastActivity = d["last_activity"] as? String ?? ""
@@ -238,6 +264,20 @@ struct BoardRow: Identifiable, Hashable {
     let waitingFor: String?
     let since: Double?
     let handedOver: Bool
+    var session: String? = nil
+    var title: String? = nil        // the session's name (what the Claude app shows)
+    var titleOrigin: String? = nil  // tab | aht | yours | automatic
+    var tab: String? = nil          // its iTerm2 tab's title
+    var pendingTitle: String? = nil // applied at the session's next prompt
+    var pid: Int? = nil
+    var inIterm = false             // in an iTerm2 tab: aht can bring it to the front
+    var background = false          // a background session (no terminal)
+    var issues: [String] = []       // twice | stuck | outside the app | older
+    var canRestart = false
+    var version: String? = nil
+    var installed: String? = nil
+    var limitResets: String? = nil  // stopped at Claude's usage limit
+    var limitAuto = false           // … and Claude Code goes on by itself then
     var name: String { (project as NSString).lastPathComponent }
     var state: String { status + (waitingFor.map { ": " + $0 } ?? "") }
 }
@@ -268,6 +308,7 @@ struct SearchHit: Identifiable, Hashable {
 
 struct SecretFind: Identifiable, Hashable {
     let id = UUID()
+    var fingerprint = ""
     let project: String
     let agent: String
     let kind: String
@@ -298,11 +339,142 @@ struct TextSheet: Identifiable {
     let text: String
     let project: Project?
     var wide = false
+    var topic: String? = nil        // the guide section its "?" opens
 }
 
 let AGENT_LABEL = ["claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex",
                    "gemini": "Gemini", "opencode": "OpenCode", "cursor": "Cursor",
                    "copilot": "Copilot"]
+
+struct TidyItem: Identifiable {
+    let id = UUID()
+    let kind: String            // missing | orphan | double
+    let key: String             // uuid or store name
+    let path: String            // where it was
+    let detail: String
+    let candidates: [(path: String, why: String)]
+    var sessions = 0
+    var bytes: Int64 = 0
+    var last: String? = nil     // when it was last used
+    var title: String? = nil    // the latest session's title
+    var history: String? = nil  // the history's own folder
+}
+
+struct ChangedFile: Identifiable {
+    let id = UUID()
+    let path: String
+    let name: String
+    let state: String
+    let inside: Bool
+    let added: Int
+    let removed: Int
+    let diff: String
+}
+
+struct ChangesView: Identifiable {
+    let id = UUID()
+    let project: Project
+    let session: String?
+    let title: String
+    let sessions: [String]
+    let files: [ChangedFile]
+}
+
+struct Checkpoint: Identifiable, Hashable {
+    let id: String
+    let at: Double
+    let agent: String
+    let title: String?
+    var label: String {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f.string(from: Date(timeIntervalSince1970: at)) + " — "
+            + (title ?? "a \(AGENT_LABEL[agent] ?? agent) session")
+    }
+}
+
+struct UndoView: Identifiable {
+    let id = UUID()
+    let project: Project
+    let checkpoints: [Checkpoint]
+    let chosen: String?
+    let files: [ChangedFile]
+    let blockers: [String]
+    let warnings: [String]
+}
+
+struct LooseItem {
+    let kind: String            // uncommitted | todos | question | offer
+    let text: String
+    let sub: [String]
+}
+
+struct LooseEnd: Identifiable {
+    let id = UUID()
+    let project: String
+    let agent: String
+    let session: String
+    let last: Double
+    let open: Bool
+    let items: [LooseItem]
+}
+
+struct OpinionResult: Identifiable {
+    let id: String              // the agent
+    let state: String
+    let answer: String
+    let seconds: Int?
+    let cost: Double?
+    let files: [ChangedFile]
+}
+
+struct OpinionView: Identifiable {
+    let id = UUID()
+    let project: Project
+    var runs: [(id: String, label: String)] = []
+    var current: String?
+    var task = ""
+    var results: [OpinionResult] = []
+    var changedMeanwhile: [String] = []
+    var taken: String?
+    var finished = true
+}
+
+struct NightJob: Identifiable {
+    let id: String
+    let state: String
+    let startAt: Double
+    let backAt: Double
+    let remote: String
+    let task: String
+    let log: [String]
+}
+
+struct NightShiftView: Identifiable {
+    let id = UUID()
+    let project: Project
+    let jobs: [NightJob]
+}
+
+/// What each option that makes an agent read or work costs: they stay off
+/// until the user turns them on, here or in Settings.
+let TOKEN_NOTES = [
+    "second_opinion": "Both agents work on the task you give them, each in its own copy "
+        + "of the project, so both use tokens: your Claude plan or API account and your "
+        + "Kimi account. aht starts one only when you press Start.",
+    "night_shift": "The agent on your other machine works on the task you give it while "
+        + "you are away, which uses the tokens of your Claude plan or API account. aht "
+        + "starts only the night shifts you plan.",
+]
+
+struct ReportRow: Identifiable {
+    let id = UUID()
+    let name: String
+    let hours: Double
+    let sessions: Int
+    let agents: String
+}
 
 struct NewMachine: Identifiable {
     let id = UUID()
@@ -348,6 +520,25 @@ final class AppModel: ObservableObject {
     @Published var handoverPlan: HandoverPlan?
     @Published var rules: RulesView?
     @Published var textSheet: TextSheet?
+    @Published var tidy: [TidyItem]?
+    @Published var showTidy = false
+    @Published var tidyCount = 0
+    @Published var changes: ChangesView?
+    @Published var showReport = false
+    @Published var report: [ReportRow] = []
+    @Published var reportTotal = ""
+    @Published var reportPeriod = "week"
+    @Published var reportBy = "project"
+    @Published var searchProject: String?       // Search limited to one project
+    @Published var focusSearch = 0              // bumped: the search field takes focus
+    @Published var limitSwitchTo: String?       // the agent offered at Claude's usage limit
+    @Published var undo: UndoView?
+    @Published var looseEnds: [LooseEnd]?
+    @Published var showLooseEnds = false
+    @Published var opinion: OpinionView?
+    @Published var night: NightShiftView?
+    @Published var coverageNote: String?        // which projects get no copy at a session start
+    var onChange: (() -> Void)?                 // the menu bar icon follows the state
 
     private let q = DispatchQueue(label: "aht.tray.state")
 
@@ -357,18 +548,23 @@ final class AppModel: ObservableObject {
         var status: [String: Any] = [:]
         var config: [String: Any] = [:]
         var projects: [[String: Any]] = []
+        var limitSwitchTo: String?
         var found: [[String: Any]] = []
         var running = false
+        var tidyCount = 0
     }
 
     static func load() -> Loaded {
         var l = Loaded()
         l.status = ahtJSON(["status", "--json"]) ?? [:]
         l.config = (ahtJSON(["config", "--json"])?["effective"] as? [String: Any]) ?? [:]
-        l.projects = (ahtJSON(["projects", "--json"])?["projects"] as? [[String: Any]]) ?? []
+        let pj = ahtJSON(["projects", "--json"]) ?? [:]
+        l.projects = (pj["projects"] as? [[String: Any]]) ?? []
+        l.limitSwitchTo = pj["limit_switch_to"] as? String
         l.found = (ahtJSON(["remote", "discover", "--json"])?["machines"]
                    as? [[String: Any]]) ?? []
         l.running = watcherRunning()
+        l.tidyCount = (l.status["missing"] as? Int ?? 0) + (l.status["orphan_claude_stores"] as? Int ?? 0)
         return l
     }
 
@@ -384,8 +580,11 @@ final class AppModel: ObservableObject {
                          note: bits.joined(separator: ", "))
         }
         running = l.running
+        tidyCount = l.tidyCount
+        limitSwitchTo = l.limitSwitchTo
         loginItem = FileManager.default.fileExists(atPath: TRAY_PLIST)
         loaded = true
+        onChange?()
     }
 
     func refresh(_ done: (() -> Void)? = nil) {
@@ -428,6 +627,7 @@ final class AppModel: ObservableObject {
         return ["claude", "kimi", "codex"].filter { d[$0] is String }
     }
     var waiting: Int { projects.filter { $0.open == "waiting" }.count }
+    var limited: [Project] { projects.filter { $0.limitSession != nil && $0.away == nil } }
     var summary: String {
         let tracked = status["tracked"] as? Int ?? 0
         let missing = status["missing"] as? Int ?? 0
@@ -549,7 +749,7 @@ final class AppModel: ObservableObject {
                 self.busy("handing \(p.name) over…", follow: file) {
                     let d = ahtJSON(["handover", p.path, "--apply", "--json",
                                      "--status-file", file] + to
-                                    + (task.isEmpty ? [] : ["--task", task])) ?? [:]
+                                    + (task.isEmpty ? [] : ["--task=" + task])) ?? [:]
                     if let why = self.problems(d) {
                         self.note(p.path, "The handover did not go through:\n\n" + why)
                         return
@@ -639,7 +839,17 @@ final class AppModel: ObservableObject {
                              status: r["status"] as? String ?? "?",
                              waitingFor: r["waiting_for"] as? String,
                              since: (r["since"] as? NSNumber)?.doubleValue,
-                             handedOver: r["handed_over"] as? Bool ?? false)
+                             handedOver: r["handed_over"] as? Bool ?? false,
+                             session: r["session"] as? String, title: r["title"] as? String,
+                             titleOrigin: r["title_origin"] as? String, tab: r["tab"] as? String,
+                             pendingTitle: r["pending_title"] as? String,
+                             pid: r["pid"] as? Int, inIterm: r["in_iterm"] as? Bool ?? false,
+                             background: r["background"] as? Bool ?? false,
+                             issues: (r["issues"] as? [String]) ?? [],
+                             canRestart: r["can_restart"] as? Bool ?? false,
+                             version: r["version"] as? String, installed: r["installed"] as? String,
+                             limitResets: (r["limit"] as? [String: Any])?["resets"] as? String,
+                             limitAuto: (r["limit"] as? [String: Any])?["auto"] as? Bool ?? false)
                 }.sorted { ($0.status == "waiting for you" ? 0 : 1, $0.project)
                            < ($1.status == "waiting for you" ? 0 : 1, $1.project) }
                 return BoardMachine(name: name, reachable: m["reachable"] as? Bool ?? false,
@@ -653,13 +863,252 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Claude Code takes a new name only from a hook, so it arrives with the
+    /// session's next prompt (typed here or in the Claude app).
+    func renameSession(_ r: BoardRow) {
+        guard let sid = r.session else { return }
+        let a = NSAlert()
+        a.messageText = "Name this session"
+        a.informativeText = "The name shows in the Claude app, in /resume and in the session's "
+            + "prompt bar. Claude Code takes it at the session's next prompt — when you next "
+            + "send it a message, here or in the app. A name set here stays, whatever the tab "
+            + "is called." + (r.tab.map { "\n\nIts iTerm2 tab is called “\($0)”." } ?? "")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        field.stringValue = r.pendingTitle ?? r.title ?? r.tab ?? ""
+        a.accessoryView = field
+        a.addButton(withTitle: "Rename")
+        a.addButton(withTitle: "Cancel")
+        if r.tab != nil { a.addButton(withTitle: "Follow the Tab Again") }
+        a.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        let pick = a.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard pick == 0 && !name.isEmpty || pick == 2 else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            aht(["tab-names", "--rename=" + sid, "--to=" + (pick == 2 ? "" : name)])
+            DispatchQueue.main.async { self.refreshBoard() }
+        }
+    }
+
+    func syncNamesToTabs() {
+        busy("reading iTerm2's tabs…") {
+            let d = ahtJSON(["tab-names", "--sync-all", "--json"]) ?? [:]
+            let plan = (d["plan"] as? [[String: Any]]) ?? []
+            DispatchQueue.main.async {
+                if plan.isEmpty {
+                    _ = alert("Nothing to change", "Every open session with a tab title already "
+                              + "carries it. (A tab counts once you gave it a title yourself.)")
+                    return
+                }
+                let lines = plan.prefix(14).map { x in
+                    "• " + ((x["from"] as? String) ?? "(no name)") + "  →  " + (x["to"] as? String ?? "")
+                }.joined(separator: "\n") + (plan.count > 14 ? "\n…" : "")
+                guard alert("Name \(plan.count) session\(plan.count == 1 ? "" : "s") after "
+                            + "\(plan.count == 1 ? "its tab" : "their tabs")?",
+                            lines + "\n\nNames you gave sessions yourself are replaced too. "
+                            + "Each session takes its new name at its next prompt; after that it "
+                            + "follows its tab.", confirm: "Rename") else { return }
+                self.busy("renaming…") {
+                    aht(["tab-names", "--sync-all", "--apply"])
+                    DispatchQueue.main.async { self.refreshBoard() }
+                }
+            }
+        }
+    }
+
+    func gotoTab(_ r: BoardRow) {
+        guard let pid = r.pid else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = sh(PY, [ahtScript(), "goto", String(pid)], mergeStderr: true)
+            if !res.ok {
+                DispatchQueue.main.async { _ = alert("Not in a tab", res.out) }
+            }
+        }
+    }
+
+    func restartSession(_ r: BoardRow) {
+        guard let pid = r.pid else { return }
+        busy("checking…") {
+            let plan = ahtJSON(["checkup", "--restart", String(pid), "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = alert("Not now", why)
+                    return
+                }
+                guard alert("Restart “\(r.title ?? r.name)” in its tab?",
+                            "aht ends the session and starts it again in the same iTerm2 tab, "
+                            + "where it left off, with the options it had:\n\n"
+                            + (plan["command"] as? String ?? "") + "\n\nIt then runs Claude Code "
+                            + (r.installed ?? "as installed") + " and, with Remote Control on for "
+                            + "every session, it shows in the Claude app. Anything typed into it "
+                            + "but not sent is lost.", confirm: "Restart") else { return }
+                self.busy("restarting…") {
+                    let d = ahtJSON(["checkup", "--restart", String(pid), "--apply", "--json"]) ?? [:]
+                    DispatchQueue.main.async {
+                        if let why = self.problems(d) { _ = alert("Not restarted", why) }
+                        self.refreshBoard()
+                    }
+                }
+            }
+        }
+    }
+
+    func closeSession(_ r: BoardRow) {
+        guard let pid = r.pid,
+              alert("End this Claude Code process?",
+                    "“\(r.title ?? r.name)” (process \(pid)) ends the way /exit ends it. Its "
+                    + "conversation stays, and claude --resume continues it.", confirm: "End It")
+        else { return }
+        busy("ending it…") {
+            let d = ahtJSON(["checkup", "--close", String(pid), "--apply", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(d) { _ = alert("Not ended", why) }
+                self.refreshBoard()
+            }
+        }
+    }
+
+    @Published var workspaces: [[String: Any]]?
+    @Published var showWorkspace = false
+    @Published var workspacePick: String?
+    @Published var workspacePlan: [String: Any] = [:]
+
+    func openWorkspaces() {
+        workspaces = nil
+        showWorkspace = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["workspace", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                self.workspaces = (d["workspaces"] as? [[String: Any]]) ?? []
+                self.pickWorkspace(d["default"] as? String)
+            }
+        }
+    }
+
+    func pickWorkspace(_ id: String?) {
+        workspacePick = id
+        workspacePlan = [:]
+        guard let id = id else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["workspace", "--restore", id, "--json"]) ?? [:]
+            DispatchQueue.main.async { if self.workspacePick == id { self.workspacePlan = d } }
+        }
+    }
+
+    func saveWorkspaceNow() {
+        busy("saving the workspace…") {
+            aht(["workspace", "--save"])
+            DispatchQueue.main.async { self.openWorkspaces() }
+        }
+    }
+
+    func restoreWorkspace() {
+        guard let id = workspacePick else { return }
+        busy("opening the tabs…") {
+            let d = ahtJSON(["workspace", "--restore", id, "--apply", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(d) {
+                    _ = alert("Not opened", why)
+                } else {
+                    self.showWorkspace = false
+                }
+                self.refreshBoard()
+            }
+        }
+    }
+
+    func syncAll(_ mc: Machine, on: Bool) {
+        busy(on ? "adding up what the first copy sends…" : "checking…") {
+            let plan = ahtJSON(["mirror", "--all", on ? "--on" : "--off", "--to", mc.name, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = alert("Nothing to do", why)
+                    return
+                }
+                let rows = (plan["projects"] as? [[String: Any]]) ?? []
+                let gb = ((plan["bytes"] as? NSNumber)?.doubleValue ?? 0) / 1e9
+                let top = rows.prefix(6).map { r -> String in
+                    let mb = ((r["bytes"] as? NSNumber)?.doubleValue ?? 0) / 1e6
+                    return "• " + ((r["project"] as? String ?? "") as NSString).lastPathComponent
+                        + (on ? String(format: " — %.0f MB", mb) : "")
+                }.joined(separator: "\n")
+                let body = on
+                    ? "\(rows.count) project\(rows.count == 1 ? "" : "s") get a copy on \(mc.name), "
+                      + String(format: "about %.1f GB the first time", gb) + " (it runs in the "
+                      + "background and can take a while); after that only changes travel, "
+                      + "every 30 minutes. The biggest:\n\n" + top + "\n\nProjects inside "
+                      + "another project travel with it. Rebuilt folders such as node_modules "
+                      + "stay behind."
+                    : "\(rows.count) project\(rows.count == 1 ? "" : "s") stop being kept in sync. "
+                      + "The copies on the other machine stay where they are."
+                guard alert(on ? "Keep every project in sync with \(mc.name)?"
+                               : "Stop keeping every project in sync?", body,
+                            confirm: on ? "Keep All in Sync" : "Stop") else { return }
+                self.busy(on ? "switching it on…" : "switching it off…") {
+                    aht(["mirror", "--all", on ? "--on" : "--off", "--to", mc.name, "--apply"])
+                }
+            }
+        }
+    }
+
+    var mirroredCount: Int { projects.filter { $0.mirror != nil }.count }
+
+    @Published var tidyReading: (title: String, text: String, item: TidyItem)?
+
+    func readHistory(_ t: TidyItem) {
+        busy("reading the history…") {
+            let d = ahtJSON(["tidy", "--show=" + t.key, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                self.tidyReading = (title: (t.path as NSString).lastPathComponent,
+                                    text: d["markdown"] as? String
+                                        ?? (d["error"] as? String ?? "It could not be read."),
+                                    item: t)
+            }
+        }
+    }
+
+    func removeHistory(_ t: TidyItem) {
+        busy("looking at it…") {
+            let plan = ahtJSON(["tidy", "--remove-history=" + t.key, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = alert("Not now", why)
+                    return
+                }
+                let n = plan["sessions"] as? Int ?? 0
+                guard alert("Move this history to the Trash?",
+                            "The history of \(t.path) — \(n) Claude Code session\(n == 1 ? "" : "s"), "
+                            + byteText(plan["bytes"]) + ". It goes to the Trash, where Put Back "
+                            + "brings it back, and aht's daily backups keep it too.",
+                            confirm: "Move to Trash") else { return }
+                self.busy("moving it to the Trash…") {
+                    let d = ahtJSON(["tidy", "--remove-history=" + t.key, "--apply", "--json"]) ?? [:]
+                    DispatchQueue.main.async {
+                        if let why = self.problems(d) { _ = alert("Not moved", why) }
+                        self.openTidy()
+                    }
+                }
+            }
+        }
+    }
+
+    func setAutoContinue(_ on: Bool) {
+        status["claude_auto_continue"] = on
+        background { aht(["limits", "--auto-continue", on ? "on" : "off"]) }
+    }
+
+    var itermInstalled: Bool {
+        (((status["terminals"] as? [String: Any])?["installed"] as? [String]) ?? []).contains("iTerm")
+    }
+
     func runSearch() {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty, !searching else { return }
         searching = true
         DispatchQueue.global(qos: .userInitiated).async {
             let d = ahtJSON(["search", "--json", "--limit", "40"]
-                            + q.split(separator: " ").map(String.init)) ?? [:]
+                            + (self.searchProject.map { ["--project", $0] } ?? [])
+                            + ["--"] + q.split(separator: " ").map(String.init)) ?? [:]
             let rows = ((d["results"] as? [[String: Any]]) ?? []).map { r -> SearchHit in
                 let restore = r["restore"] as? [String: Any]
                 return SearchHit(
@@ -717,7 +1166,8 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let d = ahtJSON(["secrets", "--json"] + (p.map { [$0.path] } ?? [])) ?? [:]
             let rows = ((d["finds"] as? [[String: Any]]) ?? []).map {
-                SecretFind(project: $0["project"] as? String ?? "?",
+                SecretFind(fingerprint: $0["fingerprint"] as? String ?? "",
+                           project: $0["project"] as? String ?? "?",
                            agent: $0["agent"] as? String ?? "?",
                            kind: $0["kind"] as? String ?? "?",
                            masked: $0["masked"] as? String ?? "",
@@ -736,7 +1186,7 @@ final class AppModel: ObservableObject {
                 self.textSheet = TextSheet(title: "Journal: \(p.name)",
                                            text: d["markdown"] as? String
                                                ?? "The journal could not be written.",
-                                           project: p)
+                                           project: p, topic: "Project journal")
             }
         }
     }
@@ -805,8 +1255,557 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func showGuide() {
-        textSheet = TextSheet(title: "aht guide", text: guideText(), project: nil, wide: true)
+    // ---- tidy up ----
+
+    func openTidy() {
+        tidy = nil
+        showTidy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["tidy", "--json"]) ?? [:]
+            var items: [TidyItem] = []
+            for m in (d["missing"] as? [[String: Any]]) ?? [] {
+                let agents = (m["agents"] as? [String]) ?? []
+                items.append(TidyItem(
+                    kind: "missing", key: m["uuid"] as? String ?? "", path: m["path"] as? String ?? "",
+                    detail: agents.isEmpty ? "no history" : "history of " + agents.map {
+                        AGENT_LABEL[$0] ?? $0 }.joined(separator: ", "),
+                    candidates: ((m["candidates"] as? [[String: Any]]) ?? []).map {
+                        (path: $0["path"] as? String ?? "",
+                         why: (($0["reasons"] as? [String]) ?? []).joined(separator: ", "))
+                    },
+                    sessions: m["sessions"] as? Int ?? 0,
+                    bytes: (m["bytes"] as? NSNumber)?.int64Value ?? 0,
+                    last: m["last"] as? String, title: m["title"] as? String,
+                    history: m["history"] as? String))
+            }
+            for o in (d["orphans"] as? [[String: Any]]) ?? [] {
+                let n = o["sessions"] as? Int ?? 0
+                items.append(TidyItem(
+                    kind: "orphan", key: o["store"] as? String ?? "",
+                    path: (o["was"] as? String) ?? (o["store"] as? String ?? ""),
+                    detail: "Claude Code",
+                    candidates: ((o["candidates"] as? [[String: Any]]) ?? []).map {
+                        (path: $0["path"] as? String ?? "",
+                         why: (($0["reasons"] as? [String]) ?? []).joined(separator: ", "))
+                    },
+                    sessions: n, bytes: (o["bytes"] as? NSNumber)?.int64Value ?? 0,
+                    last: o["last"] as? String, title: o["title"] as? String,
+                    history: o["history"] as? String))
+            }
+            for x in (d["doubles"] as? [[String: Any]]) ?? [] {
+                items.append(TidyItem(kind: "double", key: x["uuid"] as? String ?? "",
+                                      path: x["real_path"] as? String ?? "",
+                                      detail: "listed twice; the folder's own entry stays",
+                                      candidates: []))
+            }
+            DispatchQueue.main.async { self.tidy = items }
+        }
+    }
+
+    func chooseFolder(_ message: String) -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = message
+        return panel.runModal() == .OK ? panel.url?.path : nil
+    }
+
+    func tidyConnect(_ t: TidyItem, to path: String?) {
+        guard let dst = path ?? chooseFolder("Where is “\((t.path as NSString).lastPathComponent)” now?")
+        else { return }
+        let args = t.kind == "missing"
+            ? ["tidy", "--relink=" + t.key, "--to=" + dst, "--apply", "--json"]
+            : ["bind", "--store=" + t.key, "--to=" + dst, "--apply"]
+        busy("reconnecting…") {
+            let r = sh(PY, [ahtScript()] + args, mergeStderr: true)
+            DispatchQueue.main.async {
+                if !r.ok { _ = alert("That did not work", r.out) }
+                self.openTidy()
+            }
+        }
+    }
+
+    func tidyForget(_ t: TidyItem) {
+        guard alert("Forget “\((t.path as NSString).lastPathComponent)”?",
+                    "aht stops tracking this folder. Its agent history is kept, and a backup "
+                    + "can bring it back to any folder later.", confirm: "Forget") else { return }
+        busy("forgetting…") {
+            aht(["forget", "--uuid", t.key, "--apply"])
+            DispatchQueue.main.async { self.openTidy() }
+        }
+    }
+
+    // ---- what a session changed ----
+
+    func openChanges(_ p: Project, session: String? = nil) {
+        busy("reading the checkpoints…") {
+            let d = ahtJSON(["changes", p.path, "--json"] + (session.map { ["--session", $0] } ?? [])) ?? [:]
+            let files = ((d["files"] as? [[String: Any]]) ?? []).map {
+                ChangedFile(path: $0["path"] as? String ?? "", name: $0["name"] as? String ?? "",
+                            state: $0["state"] as? String ?? "", inside: $0["inside"] as? Bool ?? true,
+                            added: $0["added"] as? Int ?? 0, removed: $0["removed"] as? Int ?? 0,
+                            diff: $0["diff"] as? String ?? "")
+            }
+            DispatchQueue.main.async {
+                self.changes = ChangesView(project: p, session: d["session"] as? String,
+                                           title: (d["title"] as? String) ?? (d["session"] as? String ?? ""),
+                                           sessions: (d["sessions"] as? [String]) ?? [], files: files)
+            }
+        }
+    }
+
+    func putBack(_ c: ChangesView, _ f: ChangedFile) {
+        guard let sid = c.session,
+              alert("Put “\(f.name)” back as it was before the session?",
+                    f.state == "added" ? "The session created this file; it is removed. "
+                        + "A copy of it is kept in ~/.aht/changes-backups."
+                    : "What the file holds now is kept in ~/.aht/changes-backups first.",
+                    confirm: "Put Back") else { return }
+        busy("putting it back…") {
+            let r = sh(PY, [ahtScript(), "changes", c.project.path, "--session", sid,
+                            "--revert", f.path, "--apply"], mergeStderr: true)
+            DispatchQueue.main.async {
+                if !r.ok { _ = alert("That did not work", r.out) }
+                self.openChanges(c.project, session: sid)
+            }
+        }
+    }
+
+    // ---- report and AI-use statement ----
+
+    func loadReport() {
+        let since: String? = ["week": "week", "month": "month", "30": nil, "all": nil][reportPeriod] ?? nil
+        var args = ["report", "--json", "--by", reportBy]
+        if let s = since { args += ["--since", s] }
+        if reportPeriod == "30" {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd"
+            args += ["--since", f.string(from: Date().addingTimeInterval(-30 * 86400))]
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(args) ?? [:]
+            let rows = ((d["rows"] as? [[String: Any]]) ?? []).map { r -> ReportRow in
+                let key = r["key"] as? String ?? "?"
+                let agents = ((r["agents"] as? [String: Int]) ?? [:]).sorted { $0.value > $1.value }
+                    .map { "\(AGENT_LABEL[$0.key] ?? $0.key) \($0.value)" }.joined(separator: ", ")
+                return ReportRow(name: self.reportBy == "project" ? (key as NSString).lastPathComponent : key,
+                                 hours: (r["hours"] as? NSNumber)?.doubleValue ?? 0,
+                                 sessions: r["sessions"] as? Int ?? 0, agents: agents)
+            }
+            let total = "\(d["total_sessions"] as? Int ?? 0) sessions · about "
+                + "\((d["total_hours"] as? NSNumber)?.doubleValue ?? 0) h of session time"
+            DispatchQueue.main.async {
+                self.report = rows
+                self.reportTotal = total
+            }
+        }
+    }
+
+    func statement(_ p: Project) {
+        busy("writing the statement…") {
+            let d = ahtJSON(["report", "--project", p.path, "--statement", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                self.textSheet = TextSheet(title: "AI-use statement: \(p.name)",
+                                           text: (d["statement"] as? String ?? "") + "\n\n"
+                                           + "_A draft from the agents' histories: check the "
+                                           + "numbers and the tasks before you use it._",
+                                           project: nil, topic: "Reports and an AI-use statement")
+            }
+        }
+    }
+
+    // ---- share a session ----
+
+    func share(_ p: Project) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(p.name) session.html"
+        panel.message = "A page of the latest session, without keys, e-mail addresses or local paths"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        busy("writing the page…") {
+            let r = sh(PY, [ahtScript(), "share", p.path, "--format",
+                            url.pathExtension.lowercased() == "md" ? "md" : "html",
+                            "--out", url.path], mergeStderr: true)
+            DispatchQueue.main.async {
+                if r.ok { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                else { _ = alert("The page could not be written", r.out) }
+            }
+        }
+    }
+
+    // ---- a leaked key out of the histories ----
+
+    func removeSecret(_ f: SecretFind) {
+        busy("looking for it…") {
+            let d = ahtJSON(["secrets", "--redact", f.fingerprint, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                let blockers = (d["blockers"] as? [String]) ?? []
+                if !blockers.isEmpty {
+                    _ = alert("Not now", blockers.map { "• " + $0 }.joined(separator: "\n\n"))
+                    return
+                }
+                let places = d["places"] as? Int ?? 0, files = d["files"] as? Int ?? 0
+                guard alert("Remove \(f.masked) from the histories?",
+                            "It appears in \(places) place\(places == 1 ? "" : "s") in \(files) "
+                            + "history file\(files == 1 ? "" : "s"); each is replaced by "
+                            + "“[removed by aht]”. The files are copied to ~/.aht/redacted first. "
+                            + "Backups and copies on other machines still hold it, so replace the "
+                            + "key where it was issued as well.", confirm: "Remove") else { return }
+                self.busy("removing it…") {
+                    let r = sh(PY, [ahtScript(), "secrets", "--redact", f.fingerprint, "--apply"],
+                               mergeStderr: true)
+                    DispatchQueue.main.async {
+                        _ = alert(r.ok ? "Removed" : "That did not work", r.out)
+                        self.checkSecrets(self.projects.first { $0.path == self.secretsFor })
+                    }
+                }
+            }
+        }
+    }
+
+    func testNotice() {
+        background { aht(["notices", "--test"]) }
+    }
+
+    // ---- options that use tokens: asked for when first used ----
+
+    func tokensOK(_ key: String, _ what: String) -> Bool {
+        if flag(key, false) { return true }
+        guard alert("Turn on \(what)?", (TOKEN_NOTES[key] ?? "") + "\n\nYou can turn it "
+                    + "off again in Settings.", confirm: "Turn On") else { return false }
+        set(key, "true")
+        return true
+    }
+
+    // ---- undo a whole session ----
+
+    func openUndo(_ p: Project, checkpoint: String? = nil) {
+        busy("comparing with the copy…") {
+            let d = ahtJSON(["undo", p.path, "--diff", "--json"]
+                            + (checkpoint.map { ["--checkpoint", $0] } ?? [])) ?? [:]
+            let cps = ((d["checkpoints"] as? [[String: Any]]) ?? []).map {
+                Checkpoint(id: $0["id"] as? String ?? "", at: ($0["at"] as? NSNumber)?.doubleValue ?? 0,
+                           agent: $0["agent"] as? String ?? "claude", title: $0["title"] as? String)
+            }
+            let files = ((d["files"] as? [[String: Any]]) ?? []).map { changedFile($0) }
+            DispatchQueue.main.async {
+                self.undo = UndoView(project: p, checkpoints: cps,
+                                     chosen: (d["checkpoint"] as? [String: Any])?["id"] as? String,
+                                     files: files, blockers: (d["blockers"] as? [String]) ?? [],
+                                     warnings: (d["warnings"] as? [String]) ?? [])
+            }
+        }
+    }
+
+    func applyUndo(_ u: UndoView) {
+        guard let cid = u.chosen else { return }
+        let n = u.files.count
+        guard alert("Put “\(u.project.name)” back the way it was?",
+                    "\(n) file\(n == 1 ? "" : "s") go back to how they were when the session "
+                    + "started: changed files are restored, removed ones return, and files made "
+                    + "since are taken out. All of it is set aside in ~/.aht/undo first, so "
+                    + "nothing is lost.", confirm: "Put Back") else { return }
+        busy("putting the folder back…") {
+            let d = ahtJSON(["undo", u.project.path, "--checkpoint", cid, "--apply", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(d) {
+                    _ = alert("Not put back", why)
+                    return
+                }
+                self.undo = nil
+                self.note(u.project.path, "Put back as it was when the session started. What "
+                          + "the folder held is kept in " + (d["kept"] as? String ?? "~/.aht/undo"))
+            }
+        }
+    }
+
+    // ---- which projects are too big for a copy at each session start ----
+
+    func applyMaxFiles(_ text: String) {
+        guard let n = Int(text.filter { $0.isNumber }), n >= 100 else {
+            _ = alert("Not a number of files", "Enter how many files a project may have and "
+                      + "still get a copy, at least 100.")
+            return
+        }
+        set("checkpoint_max_files", String(n))
+        config["checkpoint_max_files"] = n
+        checkCoverage(n)
+    }
+
+    func saveExcludes(_ text: String) {
+        let names = text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        config["checkpoint_excludes"] = names
+        background {
+            aht(["config", "--set", "checkpoint_excludes=" + names.joined(separator: ","), "--no-reload"])
+            DispatchQueue.main.async { self.checkCoverage(nil) }
+        }
+    }
+
+    /// Counts the files of every project against the limit and says which
+    /// ones get no copy (and, for those, their biggest folders).
+    func checkCoverage(_ n: Int?, announce: Bool = true) {
+        busy("counting the files in each project…") {
+            let d = ahtJSON(["checkpoint", "--coverage", "--json"]
+                            + (n.map { ["--max", String($0)] } ?? [])) ?? [:]
+            let nf = NumberFormatter()
+            nf.numberStyle = .decimal
+            let num = { (x: Int) in nf.string(from: NSNumber(value: x)) ?? String(x) }
+            let limit = d["max"] as? Int ?? n ?? 20000
+            let rows = (d["projects"] as? [[String: Any]]) ?? []
+            let name = { (r: [String: Any]) in ((r["project"] as? String ?? "?") as NSString).lastPathComponent }
+            let over = rows.filter { $0["over"] as? Bool ?? false }
+            let big = rows.filter { !($0["over"] as? Bool ?? false) && ($0["files"] as? Int ?? 0) > 20000 }
+            let note = over.isEmpty ? "Every project is under \(num(limit)) files."
+                : "No copy for: " + over.map { "\(name($0)) (\(num($0["files"] as? Int ?? 0)) files)" }
+                    .joined(separator: ", ")
+            var body = over.isEmpty
+                ? "Every project has at most \(num(limit)) files, so each one gets a copy when a "
+                  + "session starts."
+                : "These projects have more than \(num(limit)) files. They get no copy when a "
+                  + "session starts, so Undo a Session does not work for them:\n\n"
+                  + over.map { r in
+                      let top = ((r["biggest"] as? [[String: Any]]) ?? []).prefix(2).map {
+                          "\($0["name"] as? String ?? "?")/ \(num($0["files"] as? Int ?? 0))" }
+                      return "• \(name(r)): \(num(r["files"] as? Int ?? 0)) files"
+                          + (top.isEmpty ? "" : " — most in " + top.joined(separator: ", "))
+                  }.joined(separator: "\n")
+                  + "\n\nTo cover one anyway, raise the limit, or leave its biggest folders "
+                  + "out of the copies (the field below the limit)."
+            if !big.isEmpty {
+                body += "\n\nCovered, but big: " + big.map { r in
+                    "\(name(r)) (\(num(r["files"] as? Int ?? 0)) files, about "
+                        + "\(Int(((r["seconds"] as? NSNumber)?.doubleValue ?? 0).rounded())) s)"
+                }.joined(separator: ", ") + ". Each session start there copies every file in the "
+                    + "background, and each kept copy adds file-system entries (roughly 100 MB "
+                    + "per 100,000 files), though no room for the data."
+            }
+            DispatchQueue.main.async {
+                self.coverageNote = note
+                if announce { _ = alert(over.isEmpty ? "Every project is covered"
+                                        : "\(over.count) project\(over.count == 1 ? "" : "s") get no copy",
+                                        body) }
+            }
+        }
+    }
+
+    // ---- loose ends ----
+
+    func openLooseEnds() {
+        looseEnds = nil
+        showLooseEnds = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["loose-ends", "--json"]) ?? [:]
+            let rows = ((d["loose_ends"] as? [[String: Any]]) ?? []).map { r in
+                LooseEnd(project: r["project"] as? String ?? "?", agent: r["agent"] as? String ?? "claude",
+                         session: r["session"] as? String ?? "",
+                         last: (r["last"] as? NSNumber)?.doubleValue ?? 0,
+                         open: r["open"] as? Bool ?? false,
+                         items: ((r["items"] as? [[String: Any]]) ?? []).map {
+                             LooseItem(kind: $0["kind"] as? String ?? "", text: $0["text"] as? String ?? "",
+                                       sub: ($0["items"] as? [String]) ?? [])
+                         })
+            }
+            DispatchQueue.main.async { self.looseEnds = rows }
+        }
+    }
+
+    func resumeSession(_ path: String, agent: String, session: String) {
+        background { aht(["resume-here", path, "--session", session, "--agent", agent]) }
+    }
+
+    // ---- a second opinion (uses tokens) ----
+
+    func openOpinion(_ p: Project) {
+        guard tokensOK("second_opinion", "second opinions") else { return }
+        loadOpinion(p, run: nil)
+    }
+
+    func loadOpinion(_ p: Project, run: String?) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let all = (ahtJSON(["second-opinion", "--list", "--json"])?["opinions"]
+                       as? [[String: Any]]) ?? []
+            var v = OpinionView(project: p)
+            let f = DateFormatter()
+            f.dateStyle = .short
+            f.timeStyle = .short
+            v.runs = all.filter { ($0["project"] as? String) == p.path }.map {
+                let t = ($0["started"] as? NSNumber)?.doubleValue ?? 0
+                return (id: $0["id"] as? String ?? "",
+                        label: f.string(from: Date(timeIntervalSince1970: t)) + " — "
+                            + String(($0["task"] as? String ?? "").prefix(40)))
+            }
+            v.current = run ?? v.runs.first?.id
+            if let rid = v.current, let d = ahtJSON(["second-opinion", "--show", rid, "--diff", "--json"]) {
+                v.task = d["task"] as? String ?? ""
+                v.taken = d["taken"] as? String
+                v.changedMeanwhile = (d["project_changed"] as? [String]) ?? []
+                let res = (d["results"] as? [String: Any]) ?? [:]
+                v.results = ((d["agents"] as? [String]) ?? []).map { a in
+                    let r = (res[a] as? [String: Any]) ?? [:]
+                    return OpinionResult(id: a, state: r["state"] as? String ?? "?",
+                                         answer: r["answer"] as? String ?? "",
+                                         seconds: r["seconds"] as? Int,
+                                         cost: (r["cost_usd"] as? NSNumber)?.doubleValue,
+                                         files: ((r["files"] as? [[String: Any]]) ?? []).map { changedFile($0) })
+                }
+                v.finished = !v.results.contains { ["working", "starting"].contains($0.state) }
+            }
+            DispatchQueue.main.async { self.opinion = v }
+        }
+    }
+
+    func startOpinion(_ p: Project, task: String) {
+        busy("copying the project twice…") {
+            let d = ahtJSON(["second-opinion", p.path, "--task=" + task, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(d) {
+                    _ = alert("Not started", why)
+                    return
+                }
+                self.loadOpinion(p, run: d["id"] as? String)
+            }
+        }
+    }
+
+    func takeOpinion(_ v: OpinionView, from agent: String) {
+        guard let rid = v.current else { return }
+        let label = AGENT_LABEL[agent] ?? agent
+        busy("checking…") {
+            let plan = ahtJSON(["second-opinion", "--take", rid, "--from", agent, "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = alert("Not now", why)
+                    return
+                }
+                let n = ((plan["files"] as? [[String: Any]]) ?? []).count
+                guard alert("Use \(label)'s changes in “\(v.project.name)”?",
+                            "\(n) file\(n == 1 ? "" : "s") of the project become \(label)'s "
+                            + "version. What they hold now is set aside in ~/.aht/undo first.",
+                            confirm: "Use Them") else { return }
+                self.busy("bringing them in…") {
+                    let d = ahtJSON(["second-opinion", "--take", rid, "--from", agent,
+                                     "--apply", "--json"]) ?? [:]
+                    DispatchQueue.main.async {
+                        if let why = self.problems(d) {
+                            _ = alert("Not done", why)
+                        } else {
+                            self.note(v.project.path, "\(label)'s changes are in the project; "
+                                      + "what was there is kept in " + (d["kept"] as? String ?? ""))
+                        }
+                        self.loadOpinion(v.project, run: rid)
+                    }
+                }
+            }
+        }
+    }
+
+    func discardOpinion(_ v: OpinionView) {
+        guard let rid = v.current,
+              alert("Remove the two copies?", "Their answers go with them. The project is "
+                    + "not touched.", confirm: "Remove") else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            aht(["second-opinion", "--discard", rid])
+            self.loadOpinion(v.project, run: nil)
+        }
+    }
+
+    // ---- the night shift (uses tokens) ----
+
+    func openNightShift(_ p: Project) {
+        guard tokensOK("night_shift", "the night shift") else { return }
+        loadNight(p)
+    }
+
+    func loadNight(_ p: Project) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let jobs = ((ahtJSON(["night-shift", "--list", "--json"])?["jobs"] as? [[String: Any]]) ?? [])
+                .filter { ($0["project"] as? String) == p.path }
+                .map { j in
+                    NightJob(id: j["id"] as? String ?? "", state: j["state"] as? String ?? "?",
+                             startAt: (j["start_at"] as? NSNumber)?.doubleValue ?? 0,
+                             backAt: (j["back_at"] as? NSNumber)?.doubleValue ?? 0,
+                             remote: j["remote"] as? String ?? "", task: j["task"] as? String ?? "",
+                             log: (j["log"] as? [String]) ?? [])
+                }
+            DispatchQueue.main.async { self.night = NightShiftView(project: p, jobs: jobs.reversed()) }
+        }
+    }
+
+    func planNight(_ p: Project, task: String, start: Date?, back: Date) {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        var args = ["night-shift", p.path, "--task=" + task, "--back", f.string(from: back),
+                    "--start", start.map { f.string(from: $0) } ?? "now", "--apply", "--json"]
+        if let name = machine { args += ["--to=" + name] }
+        busy("planning the night shift…") {
+            let d = ahtJSON(args) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(d) {
+                    _ = alert("Not planned", why)
+                    return
+                }
+                self.loadNight(p)
+            }
+        }
+    }
+
+    func cancelNight(_ p: Project, _ j: NightJob) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = sh(PY, [ahtScript(), "night-shift", "--cancel", j.id], mergeStderr: true)
+            DispatchQueue.main.async {
+                if !r.out.isEmpty { _ = alert("Night shift", r.out) }
+                self.loadNight(p)
+            }
+        }
+    }
+
+    // ---- Spotlight: every session's title, found from anywhere ----
+
+    func indexSpotlight() {
+        let on = flag("spotlight")
+        DispatchQueue.global(qos: .utility).async {
+            let idx = CSSearchableIndex.default()
+            guard on else {
+                idx.deleteSearchableItems(withDomainIdentifiers: ["sessions"]) { _ in }
+                return
+            }
+            let rows = (ahtJSON(["sessions", "--json", "--limit", "800"])?["sessions"]
+                        as? [[String: Any]]) ?? []
+            let f = DateFormatter()
+            f.dateStyle = .medium
+            f.timeStyle = .none
+            let items: [CSSearchableItem] = rows.compactMap { r in
+                guard let agent = r["agent"] as? String, let sid = r["session"] as? String,
+                      let proj = r["project"] as? String else { return nil }
+                let name = (proj as NSString).lastPathComponent
+                let a = CSSearchableItemAttributeSet(contentType: UTType.text)
+                a.title = (r["title"] as? String) ?? "Session in \(name)"
+                var desc = "\(AGENT_LABEL[agent] ?? agent) session in \(name)"
+                if let t = (r["updated"] as? NSNumber)?.doubleValue {
+                    desc += ", " + f.string(from: Date(timeIntervalSince1970: t))
+                }
+                a.contentDescription = desc
+                a.keywords = [name, AGENT_LABEL[agent] ?? agent, "aht", "session"]
+                return CSSearchableItem(uniqueIdentifier: [agent, sid, proj].joined(separator: "\t"),
+                                        domainIdentifier: "sessions", attributeSet: a)
+            }
+            idx.deleteSearchableItems(withDomainIdentifiers: ["sessions"]) { _ in
+                idx.indexSearchableItems(items) { err in
+                    if let e = err { NSLog("aht: Spotlight did not take the sessions: \(e)") }
+                }
+            }
+        }
+    }
+
+    func copyBackupsNow() {
+        busy("copying the backups…") {
+            let r = sh(PY, [ahtScript(), "backup", "--offsite"], mergeStderr: true)
+            DispatchQueue.main.async { _ = alert(r.ok ? "Backups copied" : "Not copied", r.out) }
+        }
+    }
+
+    func showGuide(_ topic: String? = nil) {
+        showGuideWindow(topic)
     }
 
     func openSession(_ p: Project) {
@@ -933,6 +1932,15 @@ final class AppModel: ObservableObject {
         config[key] = (value == "true" || value == "false") ? (value == "true") as Any
                                                              : value as Any
         background { aht(["config", "--set", "\(key)=\(value)", "--no-reload"]) }
+    }
+
+    /// "" = automatic: iTerm when installed, else Terminal.
+    func setTerminal(_ app: String) {
+        config["terminal_app"] = app.isEmpty ? nil : app
+        background {
+            aht(app.isEmpty ? ["config", "--unset", "terminal_app"]
+                            : ["config", "--set", "terminal_app=\(app)", "--no-reload"])
+        }
     }
 
     func backupNow() {
@@ -1129,10 +2137,12 @@ struct MainView: View {
                 Button {
                     m.showGuide()
                 } label: {
-                    Label("Guide", systemImage: "questionmark.circle")
+                    Image(systemName: "questionmark.circle").imageScale(.large)
                 }
-                .help("What aht does, with examples")
-                Text(m.summary).foregroundColor(.secondary)
+                .buttonStyle(.borderless)
+                .help("The whole guide: every feature, every setting, and what only the "
+                      + "terminal does")
+                Text(m.summary).foregroundColor(.secondary).lineLimit(1)
                 Circle().fill(m.running ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
                 Text(m.running ? "watching" : "paused").foregroundColor(.secondary)
@@ -1173,6 +2183,14 @@ struct MainView: View {
         .sheet(item: $m.rules) { r in RulesSheet(r: r) }
         .sheet(item: $m.textSheet) { t in TextSheetView(t: t) }
         .sheet(isPresented: $m.showSecrets) { SecretsSheet() }
+        .sheet(isPresented: $m.showTidy) { TidySheet() }
+        .sheet(isPresented: $m.showReport) { ReportSheet() }
+        .sheet(item: $m.changes) { c in ChangesSheet(c: c) }
+        .sheet(item: $m.undo) { u in UndoSheet(u: u) }
+        .sheet(isPresented: $m.showLooseEnds) { LooseEndsSheet() }
+        .sheet(item: $m.opinion) { v in OpinionSheet(v: v) }
+        .sheet(item: $m.night) { v in NightShiftSheet(v: v) }
+        .sheet(isPresented: $m.showWorkspace) { WorkspaceSheet() }
     }
 }
 
@@ -1193,12 +2211,21 @@ struct ProjectsView: View {
                     }
                     .frame(width: 220)
                 } else if let one = m.machine {
-                    Text("Machine: \(one)").foregroundColor(.secondary)
+                    Text("Machine: \(one)").foregroundColor(.secondary).lineLimit(1).fixedSize()
                 }
                 Button("Sync Now") { m.syncNow() }
                     .disabled(m.working != nil || m.machine == nil)
                 Button("Find Moved Folders") { m.reconcile() }
                     .disabled(m.working != nil)
+                HelpButton("Folders that move")
+                Menu("Look Back") {
+                    Button("Loose Ends…") { m.openLooseEnds() }
+                    Button("Report…") { m.showReport = true; m.loadReport() }
+                }
+                .fixedSize()
+                if m.tidyCount > 0 {
+                    Button("Tidy Up (\(m.tidyCount))…") { m.openTidy() }
+                }
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
 
@@ -1248,6 +2275,7 @@ struct DetailView: View {
                         Button("Take Back…") { m.takeBack(p) }
                             .keyboardShortcut(.defaultAction)
                         Button("Open Session") { m.openSession(p) }
+                        HelpButton("Hand a project over")
                     } else if p.exists {
                         Button(m.machine.map { "Hand Over to \($0)…" } ?? "Hand Over…") {
                             m.handOver(p)
@@ -1257,6 +2285,7 @@ struct DetailView: View {
                                isOn: Binding(get: { p.mirror != nil },
                                              set: { m.keepInSync(p, $0) }))
                             .disabled(m.machine == nil || !m.supported)
+                        HelpButton("Hand a project over")
                         Button("Continue Session") { m.continueHere(p) }
                             .disabled(p.sessions == 0)
                         Menu("Switch Agent") {
@@ -1268,17 +2297,28 @@ struct DetailView: View {
                         }
                         .fixedSize()
                         .disabled(p.sessions == 0 && p.agents.isEmpty)
+                        HelpButton("Continue in another agent")
                     }
                     Spacer()
                     if p.exists {
                         Menu("More") {
+                            Button("What Changed…") { m.openChanges(p) }
+                            Button("Undo a Session…") { m.openUndo(p) }
                             Button("Journal") { m.journal(p) }
+                            Button("AI-Use Statement") { m.statement(p) }
+                            Button("Share a Session…") { m.share(p) }
+                            Divider()
                             Button("Project Rules…") { m.openRules(p) }
                             Button("Check for Secrets") { m.checkSecrets(p) }
+                            Divider()
+                            Button("Second Opinion…") { m.openOpinion(p) }
+                            Button("Night Shift…") { m.openNightShift(p) }
+                                .disabled(m.machine == nil || !m.supported)
                             Divider()
                             Button("Show in Finder") { m.reveal(p) }
                         }
                         .fixedSize()
+                        HelpButton("The window at a glance")
                     }
                 }
                 .disabled(m.working != nil)
@@ -1296,6 +2336,20 @@ struct DetailView: View {
                          : "An agent is working in this project. It can be handed over "
                            + "once that has finished and the session is closed.")
                         .font(.callout).foregroundColor(.orange)
+                }
+                if p.limitSession != nil && p.away == nil {
+                    HStack(spacing: 10) {
+                        Text("Claude stopped at its usage limit"
+                             + (p.limitResets.map { "; it resets \($0)" } ?? "") + ".")
+                            .font(.callout).foregroundColor(.orange)
+                        if let t = m.limitSwitchTo {
+                            Button("Continue in \(AGENT_LABEL[t] ?? t)…") { m.switchAgent(p, to: t) }
+                                .controlSize(.small)
+                        } else {
+                            Text("Settings can offer another agent here.")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                    }
                 }
                 if let n = m.notes[p.path] {
                     ScrollView {
@@ -1340,7 +2394,15 @@ struct SessionsView: View {
                     Text("updated " + ago(NSNumber(value: at.timeIntervalSince1970)))
                         .foregroundColor(.secondary)
                 }
+                if m.itermInstalled {
+                    Button("Restore Workspace…") { m.openWorkspaces() }
+                        .help("Open the iTerm2 tabs and sessions of a saved workspace again")
+                    Button("Name Sessions After Their Tabs…") { m.syncNamesToTabs() }
+                        .disabled(m.working != nil)
+                        .help("Every open Claude session takes its iTerm2 tab's title")
+                }
                 Button("Refresh") { m.refreshBoard() }.disabled(m.boardLoading)
+                HelpButton("Sessions: what runs right now")
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
             ScrollView {
@@ -1385,7 +2447,91 @@ struct BoardRowView: View {
         }
     }
 
+    var origin: String {
+        switch r.titleOrigin {
+        case "tab": return r.tab == nil ? "an earlier tab's title" : "from its tab"
+        case "aht": return "named in aht"
+        case "yours": return "named by you"
+        case "automatic": return "Claude's own title"
+        default: return ""
+        }
+    }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            row
+            if r.agent == "claude" && (r.title != nil || r.pendingTitle != nil || r.local) {
+                HStack(spacing: 8) {
+                    Text("“\(r.title ?? "no name yet")”").fontWeight(.medium).lineLimit(1)
+                    if !origin.isEmpty {
+                        Text(origin).font(.caption).foregroundColor(.secondary)
+                    }
+                    if let p = r.pendingTitle {
+                        Text("→ “\(p)” at its next prompt").font(.caption).foregroundColor(.blue)
+                    }
+                    if let t = r.tab, t != r.title {
+                        Text("tab: \(t)").font(.caption).foregroundColor(.secondary)
+                    }
+                    if r.local && r.session != nil {
+                        Button("Rename…") { m.renameSession(r) }
+                            .controlSize(.small).buttonStyle(.borderless)
+                    }
+                    if r.inIterm {
+                        Button("Go to Tab") { m.gotoTab(r) }
+                            .controlSize(.small).buttonStyle(.borderless)
+                    }
+                }
+                .padding(.leading, 18)
+                if r.limitResets != nil || !r.issues.isEmpty {
+                    HStack(spacing: 8) {
+                        if let t = r.limitResets {
+                            Text("stopped at the usage limit · resets \(t)"
+                                 + (r.limitAuto ? " · continues by itself then" : ""))
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                        ForEach(r.issues, id: \.self) { i in
+                            Text(issueText(i)).font(.caption).foregroundColor(.orange)
+                                .help(issueHelp(i))
+                        }
+                        if r.canRestart && !r.issues.isEmpty {
+                            Button("Restart in Its Tab…") { m.restartSession(r) }
+                                .controlSize(.small).buttonStyle(.borderless)
+                        }
+                        if r.issues.contains("twice") || r.issues.contains("stuck") {
+                            Button("End It…") { m.closeSession(r) }
+                                .controlSize(.small).buttonStyle(.borderless)
+                        }
+                    }
+                    .padding(.leading, 18)
+                }
+            }
+        }
+    }
+
+    func issueText(_ i: String) -> String {
+        switch i {
+        case "twice": return "open twice"
+        case "stuck": return "working for hours, nothing written"
+        case "outside the app": return "not in the Claude app"
+        case "older": return "Claude Code \(r.version ?? "") (\(r.installed ?? "") installed)"
+        default: return i
+        }
+    }
+
+    func issueHelp(_ i: String) -> String {
+        switch i {
+        case "twice": return "The same conversation is open in two processes; both write to it."
+        case "stuck": return "It says it is working, but nothing was written for hours: "
+            + "probably a leftover."
+        case "outside the app": return "It started before Remote Control was on for every "
+            + "session. Restarting it in its tab brings it into the app."
+        case "older": return "It runs the Claude Code version it started with. Restarting it "
+            + "in its tab moves it to the installed one."
+        default: return ""
+        }
+    }
+
+    var row: some View {
         HStack(spacing: 10) {
             Circle().fill(color).frame(width: 8, height: 8)
             Text(r.name).frame(width: 200, alignment: .leading).lineLimit(1).help(r.project)
@@ -1409,17 +2555,28 @@ struct BoardRowView: View {
 
 struct SearchView: View {
     @EnvironmentObject var m: AppModel
+    @FocusState private var focused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
+                if let p = m.searchProject {
+                    Button {
+                        m.searchProject = nil
+                    } label: {
+                        Label((p as NSString).lastPathComponent, systemImage: "xmark.circle.fill")
+                    }
+                    .help("Searching this project only; click to search everything")
+                }
                 TextField("Search every agent's sessions — \"a phrase\" in quotes",
                           text: $m.query)
                     .textFieldStyle(.roundedBorder)
+                    .focused($focused)
                     .onSubmit { m.runSearch() }
                 Button("Search") { m.runSearch() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(m.query.trimmingCharacters(in: .whitespaces).isEmpty || m.searching)
+                HelpButton("Search every session")
                 if m.searching { ProgressView().controlSize(.small) }
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
@@ -1439,6 +2596,8 @@ struct SearchView: View {
                 .padding(16)
             }
         }
+        .onAppear { focused = true }
+        .onChange(of: m.focusSearch) { _ in focused = true }
     }
 }
 
@@ -1505,7 +2664,7 @@ struct HandoverSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Hand “\(plan.project.name)” over to \(plan.remote)?").font(.headline)
+            headed("Hand “\(plan.project.name)” over to \(plan.remote)?", "Hand a project over")
             Text(plan.body).frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
@@ -1541,7 +2700,7 @@ struct RulesSheet: View {
         let files = (st["files"] as? [String: [String: Any]]) ?? [:]
         let readers = (st["readers"] as? [String: String]) ?? [:]
         VStack(alignment: .leading, spacing: 12) {
-            Text("Project rules: \(r.project.name)").font(.headline)
+            headed("Project rules: \(r.project.name)", "One set of project rules")
             Text(st["summary"] as? String ?? "…")
                 .fixedSize(horizontal: false, vertical: true)
             GroupBox(label: Text("Files")) {
@@ -1600,7 +2759,10 @@ struct TextSheetView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(t.title).font(.headline)
+            HStack(spacing: 6) {
+                Text(t.title).font(.headline)
+                if let topic = t.topic { HelpButton(topic) }
+            }
             ScrollView {
                 // the sheet already carries the document's title
                 MarkdownView(text: t.text, skipTitle: true).padding(.trailing, 12)
@@ -1756,13 +2918,105 @@ func guideText() -> String {
         + "and at https://github.com/havurgiray/agent-history-tether."
 }
 
+/// The guide cut at its "## " headings: (title, text); the part before the
+/// first heading is the introduction.
+func guideTopics() -> [(title: String, text: String)] {
+    var out: [(title: String, text: String)] = []
+    var title = "Introduction", buf: [String] = []
+    for line in guideText().components(separatedBy: "\n") {
+        if line.hasPrefix("## ") {
+            out.append((title, buf.joined(separator: "\n")))
+            title = String(line.dropFirst(3))
+            buf = [line]
+        } else {
+            buf.append(line)
+        }
+    }
+    out.append((title, buf.joined(separator: "\n")))
+    return out
+}
+
+final class GuideModel: ObservableObject {
+    @Published var topic: String? = "Introduction"
+}
+let GUIDE = GuideModel()
+var GUIDE_WINDOW: NSWindow?
+
+/// Opens the guide in a window of its own (so a "?" works from a dialog
+/// too), at the section whose heading starts with `topic`; nil opens it at
+/// the beginning, with every section in the list on the left.
+func showGuideWindow(_ topic: String? = nil) {
+    let titles = guideTopics().map { $0.title }
+    if let t = topic?.lowercased() {
+        GUIDE.topic = titles.first { $0.lowercased().hasPrefix(t) } ?? "Introduction"
+    } else {
+        GUIDE.topic = "Introduction"
+    }
+    if GUIDE_WINDOW == nil {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 660),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                         backing: .buffered, defer: false)
+        w.title = "aht Guide"
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: GuideView().environmentObject(GUIDE))
+        w.setFrameAutosaveName("aht-guide")
+        w.center()
+        GUIDE_WINDOW = w
+    }
+    GUIDE_WINDOW?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+}
+
+struct GuideView: View {
+    @EnvironmentObject var g: GuideModel
+    let topics = guideTopics()
+
+    var body: some View {
+        let current = topics.first { $0.title == g.topic } ?? topics[0]
+        HSplitView {
+            List(selection: $g.topic) {
+                ForEach(topics, id: \.title) { t in
+                    Text(t.title).tag(Optional(t.title))
+                }
+            }
+            .frame(minWidth: 210, idealWidth: 250, maxWidth: 320)
+            ScrollView {
+                MarkdownView(text: current.text).padding(20)
+            }
+            .id(current.title)                  // a new topic starts at its top
+            .frame(minWidth: 420)
+        }
+    }
+}
+
+/// The "?" next to a feature: opens the guide at that feature's section.
+struct HelpButton: View {
+    let topic: String
+    init(_ topic: String) { self.topic = topic }
+
+    var body: some View {
+        Button { showGuideWindow(topic) } label: {
+            Image(systemName: "questionmark.circle")
+        }
+        .buttonStyle(.borderless)
+        .help("How this works (guide: \(topic))")
+    }
+}
+
+func headed(_ title: String, _ topic: String) -> some View {
+    HStack(spacing: 6) {
+        Text(title).font(.headline)
+        HelpButton(topic)
+    }
+}
+
 struct SecretsSheet: View {
     @EnvironmentObject var m: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(m.secretsFor.map { "Secrets in \(($0 as NSString).lastPathComponent)'s history" }
-                 ?? "Secrets in every agent history").font(.headline)
+            headed(m.secretsFor.map { "Secrets in \(($0 as NSString).lastPathComponent)'s history" }
+                   ?? "Secrets in every agent history", "Secrets check")
             Text("What looks like a key, a token or a password in the agents' own history "
                  + "files, shown masked. aht never changes those files; a key that ended up "
                  + "there is best replaced where it was issued.")
@@ -1783,6 +3037,11 @@ struct SecretsSheet: View {
                     TableColumn("When") { f in
                         Text((AGENT_LABEL[f.agent] ?? f.agent) + (f.t.map { ", " + ago(NSNumber(value: $0)) } ?? ""))
                     }
+                    TableColumn("") { f in
+                        Button("Remove…") { m.removeSecret(f) }.controlSize(.small)
+                            .disabled(m.working != nil)
+                    }
+                    .width(80)
                 }
             } else {
                 HStack { ProgressView().controlSize(.small); Text("Reading the histories…") }
@@ -1798,12 +3057,727 @@ struct SecretsSheet: View {
     }
 }
 
+struct TidySheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Tidy up", "Tidy up")
+            Text("Folders aht tracked that are gone, and histories no tracked folder owns. "
+                 + "Nothing here deletes history on its own: reconnect it, let aht forget "
+                 + "the folder, or move a history without a folder to the Trash (Remove…).")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let r = m.tidyReading {
+                HStack {
+                    Button("← Back") { m.tidyReading = nil }
+                    Text(r.title).font(.headline)
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(r.text, forType: .string)
+                    }
+                    if r.item.kind == "orphan" {
+                        Button("Remove…") { m.removeHistory(r.item); m.tidyReading = nil }
+                    }
+                }
+                ScrollView {
+                    MarkdownView(text: r.text, skipTitle: true).padding(.trailing, 12)
+                }
+            } else if let items = m.tidy {
+                if items.isEmpty { Text("Everything is in order.").padding(.vertical, 20) }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(items) { t in TidyRow(t: t) }
+                    }
+                }
+            } else {
+                HStack { ProgressView().controlSize(.small); Text("Looking…") }.padding(.vertical, 20)
+                Spacer()
+            }
+            HStack {
+                Spacer()
+                Button("Close") { m.showTidy = false; m.tidyReading = nil; m.refresh() }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 820, height: 620)
+    }
+}
+
+struct TidyRow: View {
+    @EnvironmentObject var m: AppModel
+    let t: TidyItem
+
+    var facts: String {
+        var bits = ["\(t.sessions) session\(t.sessions == 1 ? "" : "s")"]
+        if t.bytes > 0 { bits.append(byteText(NSNumber(value: t.bytes))) }
+        if let l = t.last, !ago(l).isEmpty { bits.append("last used " + ago(l)) }
+        if let title = t.title { bits.append("“\(title)”") }
+        return bits.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(t.kind == "missing" ? "Folder gone" : t.kind == "orphan"
+                     ? "History without a folder" : "Listed twice")
+                    .font(.caption).foregroundColor(.secondary).frame(width: 150, alignment: .leading)
+                Text((t.path as NSString).lastPathComponent).fontWeight(.semibold)
+                Text(t.detail).foregroundColor(.secondary)
+                Spacer()
+                if t.kind != "double" {
+                    Button("Choose Folder…") { m.tidyConnect(t, to: nil) }.controlSize(.small)
+                }
+                if t.kind != "orphan" {
+                    Button("Forget") { m.tidyForget(t) }.controlSize(.small)
+                } else {
+                    Button("Remove…") { m.removeHistory(t) }.controlSize(.small)
+                        .help("Move this history to the Trash")
+                }
+            }
+            Text(t.path).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                .truncationMode(.middle).padding(.leading, 158)
+            if t.kind != "double" && (t.sessions > 0 || t.title != nil) {
+                HStack(spacing: 8) {
+                    Text(facts).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    Spacer()
+                    Button("Read…") { m.readHistory(t) }.controlSize(.small)
+                        .help("The conversations of this history, as text")
+                    if let h = t.history {
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.selectFile(h, inFileViewerRootedAtPath: "")
+                        }
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.leading, 158)
+            }
+            ForEach(Array(t.candidates.enumerated()), id: \.offset) { _, c in
+                HStack {
+                    Text("maybe now:").font(.caption).foregroundColor(.secondary)
+                    Text(c.path).font(.caption).lineLimit(1).truncationMode(.middle)
+                    Text("(\(c.why))").font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Button("Reconnect") { m.tidyConnect(t, to: c.path) }.controlSize(.small)
+                }
+                .padding(.leading, 158)
+            }
+        }
+        .padding(8)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(6)
+        .disabled(m.working != nil)
+    }
+}
+
+struct ReportSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var text: String {
+        ([m.reportTotal] + m.report.map {
+            String(format: "%6.1f h  %3d sessions  %@  (%@)", $0.hours, $0.sessions, $0.name, $0.agents)
+        }).joined(separator: "\n")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                headed("Report", "Reports and an AI-use statement")
+                Spacer()
+                Picker("", selection: $m.reportPeriod) {
+                    Text("This week").tag("week")
+                    Text("This month").tag("month")
+                    Text("Last 30 days").tag("30")
+                    Text("Everything").tag("all")
+                }
+                .labelsHidden().fixedSize()
+                Picker("", selection: $m.reportBy) {
+                    Text("by project").tag("project")
+                    Text("by agent").tag("agent")
+                    Text("by area").tag("area")
+                }
+                .labelsHidden().fixedSize()
+            }
+            Text(m.reportTotal).foregroundColor(.secondary)
+            Table(m.report) {
+                TableColumn(m.reportBy == "agent" ? "Agent" : m.reportBy == "area" ? "Area" : "Project") { r in
+                    Text(r.name)
+                }
+                TableColumn("Hours") { r in Text(String(format: "%.1f", r.hours)).monospacedDigit() }
+                    .width(70)
+                TableColumn("Sessions") { r in Text("\(r.sessions)").monospacedDigit() }.width(70)
+                TableColumn("Agents") { r in Text(r.agents).foregroundColor(.secondary) }
+            }
+            Text("Session time counts the stretches in which a session was active; pauses over "
+                 + "15 minutes are left out, and sessions that ran side by side add up. Areas "
+                 + "come from report_areas in the config file.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Copy as Text") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+                Spacer()
+                Button("Close") { m.showReport = false }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 720, height: 520)
+        .onChange(of: m.reportPeriod) { _ in m.loadReport() }
+        .onChange(of: m.reportBy) { _ in m.loadReport() }
+    }
+}
+
+struct ChangesSheet: View {
+    @EnvironmentObject var m: AppModel
+    let c: ChangesView
+    @State private var pick: UUID?
+
+    var body: some View {
+        let shown = c.files.filter { $0.inside }
+        let current = shown.first { $0.id == pick } ?? shown.first { $0.state != "unchanged" }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                headed("What changed: \(c.project.name)", "What did a session change")
+                Spacer()
+                if c.sessions.count > 1 {
+                    Picker("Session", selection: Binding(get: { c.session ?? "" },
+                                                         set: { m.openChanges(c.project, session: $0) })) {
+                        ForEach(c.sessions, id: \.self) { Text(String($0.prefix(8))).tag($0) }
+                    }
+                    .frame(width: 180)
+                }
+            }
+            Text("Session “\(c.title)”: every file it edited, from before it touched it to now. "
+                 + "Files outside the project are left out.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            HSplitView {
+                List(shown, selection: $pick) { f in
+                    HStack {
+                        Text(f.state == "changed" ? "M" : f.state == "added" ? "A"
+                             : f.state == "removed" ? "D" : "·")
+                            .font(.system(.body, design: .monospaced)).foregroundColor(.secondary)
+                        Text(f.name).lineLimit(1).truncationMode(.head)
+                        Spacer()
+                        if f.added + f.removed > 0 {
+                            Text("+\(f.added) −\(f.removed)").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    .tag(f.id)
+                }
+                .frame(minWidth: 240, idealWidth: 280)
+                ScrollView([.vertical, .horizontal]) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array((current?.diff ?? "").components(separatedBy: "\n").enumerated()),
+                                id: \.offset) { _, line in
+                            Text(line.isEmpty ? " " : line)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(line.hasPrefix("+") ? .green
+                                                 : line.hasPrefix("-") ? .red
+                                                 : line.hasPrefix("@@") ? .blue : .primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .textSelection(.enabled)
+                    .padding(8)
+                }
+                .frame(minWidth: 360)
+            }
+            HStack {
+                if let f = current, ["changed", "added"].contains(f.state) {
+                    Button("Put Back “\(f.name)”…") { m.putBack(c, f) }
+                }
+                Spacer()
+                Button("Close") { m.changes = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 900, height: 600)
+    }
+}
+
+// ---- undo a session, loose ends, a second opinion, the night shift --------------
+
+/// Changed files on the left, the selected one's line diff on the right.
+struct FileDiffPane: View {
+    let files: [ChangedFile]
+    let empty: String
+    @State private var pick: UUID?
+
+    var body: some View {
+        let current = files.first { $0.id == pick } ?? files.first
+        if files.isEmpty {
+            VStack { Spacer(); Text(empty).foregroundColor(.secondary); Spacer() }
+                .frame(maxWidth: .infinity)
+        } else {
+            HSplitView {
+                List(files, selection: $pick) { f in
+                    HStack {
+                        Text(f.state == "changed" ? "M" : f.state == "added" ? "A" : "D")
+                            .font(.system(.body, design: .monospaced)).foregroundColor(.secondary)
+                        Text(f.name).lineLimit(1).truncationMode(.head)
+                        Spacer()
+                        if f.added + f.removed > 0 {
+                            Text("+\(f.added) −\(f.removed)").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    .tag(f.id)
+                }
+                .frame(minWidth: 220, idealWidth: 260)
+                DiffText(text: current?.diff ?? "")
+                    .frame(minWidth: 300)
+            }
+        }
+    }
+}
+
+struct DiffText: View {
+    let text: String
+
+    var body: some View {
+        ScrollView([.vertical, .horizontal]) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(text.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
+                    Text(line.isEmpty ? " " : line)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(line.hasPrefix("+") ? .green
+                                         : line.hasPrefix("-") ? .red
+                                         : line.hasPrefix("@@") || line.hasPrefix("==") ? .blue
+                                         : .primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .textSelection(.enabled)
+            .padding(8)
+        }
+    }
+}
+
+struct UndoSheet: View {
+    @EnvironmentObject var m: AppModel
+    let u: UndoView
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                headed("Undo a session: \(u.project.name)", "Undo a whole session")
+                Spacer()
+                if !u.checkpoints.isEmpty {
+                    Picker("Back to", selection: Binding(get: { u.chosen ?? "" },
+                                                         set: { m.openUndo(u.project, checkpoint: $0) })) {
+                        ForEach(u.checkpoints) { Text($0.label).tag($0.id) }
+                    }
+                    .frame(width: 420)
+                }
+            }
+            Text(u.checkpoints.isEmpty
+                 ? "aht has no copy of this folder yet. It makes one each time a Claude Code "
+                   + "session starts here, and before another agent takes over."
+                 : "How the folder differs from its copy at the start of that session. Putting "
+                   + "it back restores every file listed; what is there now is set aside in "
+                   + "~/.aht/undo. Rebuilt folders (node_modules, .venv …) and .git are left alone.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            FileDiffPane(files: u.files, empty: u.checkpoints.isEmpty ? "" : "Nothing changed since then.")
+            ForEach(u.checkpoints.isEmpty ? [] : u.blockers + u.warnings, id: \.self) {
+                Text("⚠ " + $0).font(.callout).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Close") { m.undo = nil }.keyboardShortcut(.cancelAction)
+                Button("Put Everything Back…") { m.applyUndo(u) }
+                    .disabled(u.files.isEmpty || !u.blockers.isEmpty || u.chosen == nil)
+            }
+        }
+        .padding(20).frame(width: 900, height: 600)
+    }
+}
+
+struct LooseEndsSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Loose ends", "Loose ends")
+            Text("Projects of the last 30 days with something left open: work not committed, "
+                 + "open to-do items, or a last session that asked you something or offered "
+                 + "a next step.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let rows = m.looseEnds {
+                if rows.isEmpty {
+                    Spacer()
+                    Text("Nothing left open.").foregroundColor(.secondary).frame(maxWidth: .infinity)
+                    Spacer()
+                } else {
+                    List(rows) { r in
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 8) {
+                                    Text((r.project as NSString).lastPathComponent).bold()
+                                    Text(ago(NSNumber(value: r.last))).font(.caption)
+                                        .foregroundColor(.secondary)
+                                    if r.open {
+                                        Text("session open").font(.caption).foregroundColor(.orange)
+                                    }
+                                }
+                                ForEach(Array(r.items.enumerated()), id: \.offset) { _, it in
+                                    Text((it.kind == "question" ? "? " : it.kind == "offer" ? "→ " : "• ")
+                                         + it.text)
+                                        .font(.callout).fixedSize(horizontal: false, vertical: true)
+                                    ForEach(it.sub, id: \.self) {
+                                        Text("    – " + $0).font(.caption).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 6) {
+                                Button("Continue") {
+                                    m.resumeSession(r.project, agent: r.agent, session: r.session)
+                                }
+                                .disabled(r.open || r.session.isEmpty)
+                                Button("Show") {
+                                    m.showLooseEnds = false
+                                    m.tab = .projects
+                                    m.selection = r.project
+                                }
+                            }
+                            .controlSize(.small)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            } else {
+                Spacer()
+                ProgressView("Looking through the projects…").frame(maxWidth: .infinity)
+                Spacer()
+            }
+            HStack {
+                Spacer()
+                Button("Close") { m.showLooseEnds = false }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 760, height: 540)
+    }
+}
+
+struct OpinionSheet: View {
+    @EnvironmentObject var m: AppModel
+    let v: OpinionView
+    @State private var task = ""
+    let tick = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                headed("Second opinion: \(v.project.name)", "A second opinion")
+                Spacer()
+                if v.runs.count > 1 {
+                    Picker("Run", selection: Binding(get: { v.current ?? "" },
+                                                     set: { m.loadOpinion(v.project, run: $0) })) {
+                        ForEach(v.runs, id: \.id) { Text($0.label).tag($0.id) }
+                    }
+                    .frame(width: 360)
+                }
+            }
+            HStack(alignment: .top) {
+                TextField("A task for both, e.g. make the parser accept empty lines",
+                          text: $task, axis: .vertical)
+                    .lineLimit(2...4).textFieldStyle(.roundedBorder)
+                Button("Start") {
+                    m.startOpinion(v.project, task: task)
+                    task = ""
+                }
+                .disabled(task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            Text("Claude Code and Kimi Code each get a copy of the project and the same task; "
+                 + "the project itself stays untouched until you pick one. This uses both "
+                 + "agents' tokens. Claude may edit files but not run commands; Kimi's "
+                 + "non-interactive mode may also run commands it decides on.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if v.current != nil {
+                Text("Task: " + v.task).font(.callout).lineLimit(2)
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(v.results) { r in column(r) }
+                }
+                if !v.changedMeanwhile.isEmpty {
+                    Text("⚠ Changed in the project since the copies were made: "
+                         + v.changedMeanwhile.prefix(6).joined(separator: ", "))
+                        .font(.callout).foregroundColor(.orange)
+                }
+            } else {
+                Spacer()
+            }
+            HStack {
+                if v.current != nil {
+                    Button("Remove the Copies…") { m.discardOpinion(v) }
+                }
+                Spacer()
+                Button("Close") { m.opinion = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 960, height: 660)
+        .onReceive(tick) { _ in
+            if !v.finished, let r = v.current { m.loadOpinion(v.project, run: r) }
+        }
+    }
+
+    func column(_ r: OpinionResult) -> some View {
+        let label = AGENT_LABEL[r.id] ?? r.id
+        var state = r.state == "done" ? "done" : r.state == "working" || r.state == "starting"
+            ? "working…" : r.state
+        if let s = r.seconds { state += " · \(s / 60) min \(s % 60) s" }
+        if let c = r.cost { state += String(format: " · $%.2f", c) }
+        let diff = r.files.map { "== \($0.name) (\($0.state)) ==\n" + $0.diff }.joined(separator: "\n")
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(label).bold()
+                Text(state).font(.caption).foregroundColor(.secondary)
+                Spacer()
+                if v.taken == r.id {
+                    Text("taken").font(.caption).foregroundColor(.green)
+                }
+            }
+            ScrollView {
+                Text(r.answer.isEmpty ? (state == "working…" ? "working on it…" : "–") : r.answer)
+                    .font(.callout).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 120)
+            Text(r.files.isEmpty ? "No files changed." : "\(r.files.count) file(s) changed")
+                .font(.caption).foregroundColor(.secondary)
+            DiffText(text: diff).background(Color(NSColor.textBackgroundColor))
+            Button("Use \(label)'s Changes…") { m.takeOpinion(v, from: r.id) }
+                .disabled(r.state != "done" || r.files.isEmpty || v.taken != nil)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+struct NightShiftSheet: View {
+    @EnvironmentObject var m: AppModel
+    let v: NightShiftView
+    @State private var task = ""
+    @State private var startNow = false
+    @State private var start = NightShiftSheet.at(22)
+    @State private var back = NightShiftSheet.at(7)
+
+    static func at(_ hour: Int) -> Date {
+        Calendar.current.date(bySettingHour: hour, minute: 0, second: 0, of: Date()) ?? Date()
+    }
+
+    func when(_ t: Double) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "EEE HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: t))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            headed("Night shift: \(v.project.name)", "The night shift")
+            Text("At the start time aht hands the project over to \(m.machine ?? "your other machine") "
+                 + "with the task below; at the end time it takes it back as soon as the session "
+                 + "there is done. The agent over there uses your tokens. This Mac has to be "
+                 + "awake at both times.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            TextField("The task, e.g. run the benchmarks and write the results into RESULTS.md",
+                      text: $task, axis: .vertical)
+                .lineLimit(3...6).textFieldStyle(.roundedBorder)
+            HStack(spacing: 16) {
+                Toggle("Start now", isOn: $startNow)
+                DatePicker("Start", selection: $start, displayedComponents: .hourAndMinute)
+                    .disabled(startNow).fixedSize()
+                DatePicker("Take back", selection: $back, displayedComponents: .hourAndMinute)
+                    .fixedSize()
+                Spacer()
+                Button("Plan It") {
+                    m.planNight(v.project, task: task, start: startNow ? nil : start, back: back)
+                    task = ""
+                }
+                .disabled(task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || m.machine == nil)
+            }
+            Divider()
+            Text("Planned and past").font(.subheadline.bold())
+            if v.jobs.isEmpty {
+                Text("None yet.").foregroundColor(.secondary)
+                Spacer()
+            } else {
+                List(v.jobs) { j in
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(j.state) · \(when(j.startAt)) → \(when(j.backAt)) on \(j.remote)")
+                                .font(.callout)
+                            Text(j.task).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                            if let l = j.log.last {
+                                Text(l).font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if ["planned", "started"].contains(j.state) {
+                            Button("Cancel") { m.cancelNight(v.project, j) }.controlSize(.small)
+                        }
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Close") { m.night = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 660, height: 540)
+    }
+}
+
+struct WorkspaceSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    func title(_ e: [String: Any]) -> String {
+        let t = e["title"] as? String ?? ""
+        return t.isEmpty ? "(no title)" : t
+    }
+
+    func openLine(_ e: [String: Any]) -> String {
+        let what = (e["name"] as? String) ?? (e["agent"] as? String) ?? ""
+        let folder = ((e["cwd"] as? String) ?? "") as NSString
+        return "↻ " + title(e) + "  " + what + "  " + folder.lastPathComponent
+    }
+
+    func skipLine(_ e: [String: Any]) -> String {
+        return "– " + title(e) + ": " + (e["why"] as? String ?? "")
+    }
+
+    func when(_ any: Any?) -> String {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f.string(from: Date(timeIntervalSince1970: (any as? NSNumber)?.doubleValue ?? 0))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Restore the workspace", "Restore my workspace")
+            Text("aht keeps your iTerm2 windows and tabs, their titles and the sessions in them, "
+                 + "while you work. Opening one again resumes each session where it was, in a "
+                 + "tab with its title. Sessions and titled tabs that are open now are skipped.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let ws = m.workspaces {
+                if ws.isEmpty {
+                    Text("No workspace saved yet. aht saves one while you work with Claude Code in "
+                         + "iTerm2, or now with Save Now.").foregroundColor(.secondary)
+                } else {
+                    HSplitView {
+                        List(selection: Binding(get: { m.workspacePick },
+                                                set: { m.pickWorkspace($0) })) {
+                            ForEach(ws.indices, id: \.self) { i in
+                                let w = ws[i]
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("last seen " + when(w["seen"]))
+                                    Text("\(w["tabs"] as? Int ?? 0) tabs, \(w["sessions"] as? Int ?? 0) sessions")
+                                        .font(.caption).foregroundColor(.secondary)
+                                }
+                                .tag(Optional(w["id"] as? String ?? ""))
+                            }
+                        }
+                        .frame(minWidth: 210, idealWidth: 230)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                let plan = (m.workspacePlan["plan"] as? [String: Any]) ?? [:]
+                                let wins = (plan["windows"] as? [[[[String: Any]]]]) ?? []
+                                ForEach(Array(wins.enumerated()), id: \.offset) { wi, win in
+                                    Text("Window \(wi + 1)").font(.subheadline.bold()).padding(.top, 4)
+                                    ForEach(Array(win.joined().enumerated()), id: \.offset) { _, e in
+                                        Text(openLine(e)).lineLimit(1)
+                                    }
+                                }
+                                let skipped = (plan["skipped"] as? [[String: Any]]) ?? []
+                                if !skipped.isEmpty {
+                                    Text("Skipped").font(.subheadline.bold()).padding(.top, 8)
+                                    ForEach(Array(skipped.enumerated()), id: \.offset) { _, e in
+                                        Text(skipLine(e))
+                                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                                    }
+                                }
+                                if let why = (m.workspacePlan["blockers"] as? [String])?.first {
+                                    Text(why).foregroundColor(.orange).padding(.top, 8)
+                                }
+                            }
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity)
+            }
+            HStack {
+                Button("Save Now") { m.saveWorkspaceNow() }
+                Spacer()
+                Button("Close") { m.showWorkspace = false }.keyboardShortcut(.cancelAction)
+                Button("Open Them") { m.restoreWorkspace() }
+                    .disabled(((m.workspacePlan["plan"] as? [String: Any])?["opens"] as? Int ?? 0) == 0)
+            }
+        }
+        .padding(20).frame(width: 820, height: 560)
+    }
+}
+
+// ---- the shortcut that opens the search from anywhere ----------------------------
+
+var HOTKEY_ACTION: (() -> Void)?
+var HOTKEY_REF: EventHotKeyRef?
+
+let KEY_CODES: [String: Int] = [
+    "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E,
+    "f": kVK_ANSI_F, "g": kVK_ANSI_G, "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J,
+    "k": kVK_ANSI_K, "l": kVK_ANSI_L, "m": kVK_ANSI_M, "n": kVK_ANSI_N, "o": kVK_ANSI_O,
+    "p": kVK_ANSI_P, "q": kVK_ANSI_Q, "r": kVK_ANSI_R, "s": kVK_ANSI_S, "t": kVK_ANSI_T,
+    "u": kVK_ANSI_U, "v": kVK_ANSI_V, "w": kVK_ANSI_W, "x": kVK_ANSI_X, "y": kVK_ANSI_Y,
+    "z": kVK_ANSI_Z, "space": kVK_Space, "/": kVK_ANSI_Slash, ".": kVK_ANSI_Period,
+]
+
+func hotkeyLabel(_ spec: String) -> String {
+    let p = spec.lowercased().split(separator: "+").map(String.init)
+    var out = ""
+    if p.contains("ctrl") || p.contains("control") { out += "⌃" }
+    if p.contains("opt") || p.contains("alt") || p.contains("option") { out += "⌥" }
+    if p.contains("shift") { out += "⇧" }
+    if p.contains("cmd") || p.contains("command") { out += "⌘" }
+    return out + (p.last.map { $0 == "space" ? "Space" : $0.uppercased() } ?? "")
+}
+
+func registerHotKey(_ spec: String, _ action: @escaping () -> Void) {
+    if let r = HOTKEY_REF { UnregisterEventHotKey(r); HOTKEY_REF = nil }
+    let p = spec.lowercased().split(separator: "+").map(String.init)
+    guard let key = p.last, let code = KEY_CODES[key] else { return }
+    var mods = 0
+    if p.contains("ctrl") || p.contains("control") { mods |= controlKey }
+    if p.contains("opt") || p.contains("alt") || p.contains("option") { mods |= optionKey }
+    if p.contains("shift") { mods |= shiftKey }
+    if p.contains("cmd") || p.contains("command") { mods |= cmdKey }
+    guard mods != 0 else { return }                  // a bare key would steal typing
+    HOTKEY_ACTION = action
+    if HOTKEY_ACTION != nil && HOTKEY_REF == nil {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { HOTKEY_ACTION?() }
+            return noErr
+        }, 1, &spec, nil, nil)
+    }
+    let id = EventHotKeyID(signature: OSType(0x41485431), id: 1)     // "AHT1"
+    RegisterEventHotKey(UInt32(code), UInt32(mods), id, GetApplicationEventTarget(), 0, &HOTKEY_REF)
+}
+
 struct MachinesView: View {
     @EnvironmentObject var m: AppModel
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("The machines a project can be handed over to, and kept in sync with.")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    HelpButton("Hand a project over")
+                }
                 if !m.supported {
                     Text("Handover is not available in this build.")
                         .foregroundColor(.secondary)
@@ -1829,6 +3803,12 @@ struct MachinesView: View {
                                 if mc.name != m.machine {
                                     Button("Use for Handover") { m.use(mc) }
                                 }
+                                Menu("Sync") {
+                                    Button("Keep All Projects in Sync…") { m.syncAll(mc, on: true) }
+                                    Button("Stop Keeping All in Sync…") { m.syncAll(mc, on: false) }
+                                        .disabled(m.mirroredCount == 0)
+                                }
+                                .fixedSize()
                                 Button("Check") { m.check(mc) }
                                 Button("Remove…") { m.remove(mc) }
                             }
@@ -1908,7 +3888,7 @@ struct AddMachineView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Add a machine").font(.headline)
+            headed("Add a machine", "Hand a project over")
             Text("A machine you reach over ssh without a password prompt. aht checks "
                  + "it and tells you what it still needs.")
                 .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -1933,6 +3913,8 @@ struct AddMachineView: View {
 
 struct SettingsView: View {
     @EnvironmentObject var m: AppModel
+    @State private var maxFiles = ""
+    @State private var excludes = ""
 
     func choice(_ title: String, _ key: String, _ options: [(String, String)]) -> some View {
         HStack {
@@ -1951,10 +3933,26 @@ struct SettingsView: View {
                                     set: { m.set(key, $0 ? "true" : "false") }))
     }
 
+    func tokenToggle(_ title: String, _ key: String, _ cost: String?) -> some View {
+        HStack(spacing: 8) {
+            Toggle(title, isOn: Binding(get: { m.flag(key, false) },
+                                        set: { m.set(key, $0 ? "true" : "false") }))
+            if let c = cost {
+                Text(c).font(.caption).foregroundColor(.secondary)
+            }
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                GroupBox(label: Text("When folders change")) {
+                HStack(spacing: 6) {
+                    Text("Every setting, also those without a switch here, is in the guide:")
+                        .foregroundColor(.secondary)
+                    HelpButton("All settings")
+                    Spacer()
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("When folders change"); HelpButton("Folders that move") }) {
                     VStack(alignment: .leading, spacing: 8) {
                         choice("A folder moves", "move_policy",
                                [("ask", "Ask me"), ("apply", "Relink automatically"),
@@ -1969,7 +3967,7 @@ struct SettingsView: View {
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
-                GroupBox(label: Text("Histories")) {
+                GroupBox(label: HStack(spacing: 6) { Text("Histories"); HelpButton("Backups") }) {
                     HStack(spacing: 16) {
                         toggle("Notifications", "notifications")
                         toggle("Back up histories automatically", "backup_enabled")
@@ -1979,7 +3977,133 @@ struct SettingsView: View {
                     }
                     .padding(6)
                 }
-                GroupBox(label: Text("Folder badges")) {
+                GroupBox(label: HStack(spacing: 6) { Text("Notices"); HelpButton("Know when a session needs you") }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 16) {
+                            toggle("When a session waits for you", "notify_waiting")
+                            toggle("When a long piece of work is done", "notify_finished")
+                        }
+                        HStack {
+                            Text("Also send them to my phone:")
+                            TextField("imessage:+43… or ntfy:my-topic",
+                                      text: Binding(get: { m.text("notify_phone", "") },
+                                                    set: { m.config["notify_phone"] = $0 }))
+                                .textFieldStyle(.roundedBorder).frame(width: 260)
+                            Button("Save") { m.set("notify_phone", m.text("notify_phone", "")) }
+                            Button("Send a Test") { m.testNotice() }
+                        }
+                        Text("Sessions here and on your other machines are checked every 30 "
+                             + "seconds. iMessage goes to your own number or Apple ID; ntfy "
+                             + "to a topic you follow in the ntfy app.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Safety nets (no tokens)"); HelpButton("Undo a whole session") }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        toggle("Copy the folder when a session starts, to undo a whole session",
+                               "checkpoints")
+                        toggle("Tell me when Claude stops at its usage limit", "notify_limit")
+                        toggle("Show sessions in Spotlight", "spotlight")
+                        HStack {
+                            Text("A project with more than")
+                            TextField("20000", text: $maxFiles)
+                                .textFieldStyle(.roundedBorder).frame(width: 90)
+                            Text("files gets no copy")
+                            Button("Apply") { m.applyMaxFiles(maxFiles) }
+                            Button("Which Are Cut Off?") { m.checkCoverage(nil) }
+                            Spacer()
+                        }
+                        .padding(.leading, 20)
+                        HStack {
+                            Text("Leave these folders out of the copies:")
+                            TextField("e.g. results, datasets", text: $excludes)
+                                .textFieldStyle(.roundedBorder).frame(width: 240)
+                            Button("Save") { m.saveExcludes(excludes) }
+                            Spacer()
+                        }
+                        .padding(.leading, 20)
+                        if let c = m.coverageNote {
+                            Text(c).font(.caption).foregroundColor(.orange).padding(.leading, 20)
+                        }
+                        Text("The copies are copy-on-write: they take no room until a file "
+                             + "changes, and the last \(m.config["checkpoint_keep"] as? Int ?? 10) "
+                             + "per project are kept. Time Machine leaves them out.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("The Claude app on your phone"); HelpButton("Session names from your iTerm2 tabs") }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        toggle("Name each Claude session after its iTerm2 tab", "tab_names")
+                        Text("The name shows in the Claude app, in /resume and in the "
+                             + "session's prompt bar. It is set when a session starts, and "
+                             + "at the next prompt after you rename the tab. A second open "
+                             + "session under the same tab title becomes “· 2” (a branch "
+                             + "“⑂ 2”). A name you give a session yourself (/rename, or in "
+                             + "the app) stays. No tokens.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text((m.status["claude_remote_control"] as? Bool ?? false)
+                             ? "Remote Control is on for every session, so each one is in the app."
+                             : "Remote Control is off: in Claude Code, /config → Enable Remote "
+                               + "Control for all sessions puts every session into the app.")
+                            .font(.caption)
+                            .foregroundColor((m.status["claude_remote_control"] as? Bool ?? false)
+                                             ? .secondary : .orange)
+                    }
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Uses tokens — off until you turn it on"); HelpButton("What uses tokens") }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        tokenToggle("A new Claude session learns where the last one in its "
+                                    + "folder stopped", "informed_sessions",
+                                    "a few hundred tokens per new session")
+                        HStack {
+                            tokenToggle("When Claude stops at its limit, offer to go on in",
+                                        "limit_switch", nil)
+                            Picker("", selection: Binding(get: { m.text("limit_switch_to", "kimi") },
+                                                          set: { m.set("limit_switch_to", $0) })) {
+                                Text("Kimi Code").tag("kimi")
+                                Text("Codex").tag("codex")
+                            }
+                            .labelsHidden().fixedSize()
+                            Text("that agent reads a summary").font(.caption).foregroundColor(.secondary)
+                        }
+                        HStack(spacing: 8) {
+                            Toggle("When Claude's usage limit resets, the session continues by itself",
+                                   isOn: Binding(get: { m.status["claude_auto_continue"] as? Bool ?? false },
+                                                 set: { m.setAutoContinue($0) }))
+                            Text("Claude Code's own setting").font(.caption).foregroundColor(.secondary)
+                        }
+                        tokenToggle("Second opinion: one task, two agents, compared",
+                                    "second_opinion", "both agents work")
+                        tokenToggle("Night shift: hand a project over with a task, on a timer",
+                                    "night_shift", "the agent works while you are away")
+                        Text("Each of these makes an agent read or work, which counts against "
+                             + "your plan or API bill. aht's own work — watching, search, "
+                             + "backups, reports, loose ends — never uses tokens.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Backups on another machine"); HelpButton("Backups") }) {
+                    HStack {
+                        Picker("Keep a copy of the history backups on", selection: Binding(
+                            get: { m.text("offsite_backup", "") },
+                            set: { m.set("offsite_backup", $0) })) {
+                            Text("no other machine").tag("")
+                            ForEach(m.machines) { Text($0.name).tag($0.name) }
+                        }
+                        .frame(maxWidth: 460)
+                        Spacer()
+                        Button("Copy Now") { m.copyBackupsNow() }
+                            .disabled(m.text("offsite_backup", "").isEmpty)
+                    }
+                    .padding(6)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Folder badges"); HelpButton("Folder badges") }) {
                     HStack(spacing: 16) {
                         toggle("Badge folders", "icons_enabled")
                         toggle("Agent symbols", "icons_agent")
@@ -1990,7 +4114,7 @@ struct SettingsView: View {
                     }
                     .padding(6)
                 }
-                GroupBox(label: Text("Handover")) {
+                GroupBox(label: HStack(spacing: 6) { Text("Handover"); HelpButton("Hand a project over") }) {
                     VStack(alignment: .leading, spacing: 8) {
                         toggle("Reachable from the Claude app (Remote Control)",
                                "handover_remote_control")
@@ -2002,7 +4126,7 @@ struct SettingsView: View {
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
-                GroupBox(label: Text("Where each agent keeps its history")) {
+                GroupBox(label: HStack(spacing: 6) { Text("Where each agent keeps its history"); HelpButton("All settings") }) {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(m.backends) { b in
                             HStack {
@@ -2026,11 +4150,28 @@ struct SettingsView: View {
                     }
                     .padding(6)
                 }
-                GroupBox(label: Text("This Mac")) {
+                GroupBox(label: HStack(spacing: 6) { Text("This Mac"); HelpButton("Settings") }) {
                     VStack(alignment: .leading, spacing: 10) {
                         Toggle("Start aht in the menu bar at login",
                                isOn: Binding(get: { m.loginItem },
                                              set: { m.setLoginItem($0) }))
+                        HStack {
+                            Text("Open session windows in")
+                            Picker("", selection: Binding(
+                                get: { m.config["terminal_app"] as? String ?? "" },
+                                set: { m.setTerminal($0) })) {
+                                Text("Automatic (iTerm when installed)").tag("")
+                                ForEach(((m.status["terminals"] as? [String: Any])?["installed"]
+                                         as? [String]) ?? ["Terminal"], id: \.self) {
+                                    Text($0).tag($0)
+                                }
+                            }
+                            .labelsHidden().fixedSize()
+                            Spacer()
+                        }
+                        Text("Search from anywhere: " + hotkeyLabel(m.text("hotkey", "ctrl+opt+cmd+a"))
+                             + " — and in Finder, right-click a project folder for aht's actions.")
+                            .foregroundColor(.secondary)
                         HStack(spacing: 10) {
                             Button("Adopt This Mac's Projects…") { m.adopt() }
                             if let res = BUNDLE_RES {
@@ -2058,12 +4199,19 @@ struct SettingsView: View {
             .padding(16)
             .disabled(m.working != nil)
         }
+        .onAppear {
+            maxFiles = String(m.config["checkpoint_max_files"] as? Int ?? 20000)
+            excludes = ((m.config["checkpoint_excludes"] as? [String]) ?? []).joined(separator: ", ")
+        }
     }
 }
 
 // ---- the app -------------------------------------------------------------------
 
-final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
+let NOTICE_QUEUE = HOME + "/.aht/run/app-notices.jsonl"
+
+final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate,
+                     UNUserNotificationCenterDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
     let model = AppModel()
@@ -2079,12 +4227,270 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         item.button?.toolTip = "agent-history-tether"
         menu.delegate = self
         item.menu = menu
+        model.onChange = { [weak self] in self?.updateIcon() }
         model.refresh()
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
             self.model.refresh()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             self.model.offerInstallIfNeeded()
+            self.hotkey = self.model.text("hotkey", "ctrl+opt+cmd+a")
+            registerHotKey(self.hotkey) { self.quickSearch() }
+        }
+        // Finder: right-click a folder → Quick Actions / Services → aht: …
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
+        // notices: while the app runs it shows them itself, so a click on one
+        // goes to the session (the core hands them over through a file)
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        noticeOffset = (try? FileManager.default.attributesOfItem(atPath: NOTICE_QUEUE)[.size]
+                        as? NSNumber)?.uint64Value ?? 0
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in self.pumpNotices() }
+        pumpNotices()
+        // Spotlight: session titles, refreshed every half hour
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { self.model.indexSpotlight() }
+        Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in
+            self.model.indexSpotlight()
+        }
+    }
+
+    // aht://… links (Shortcuts, scripts, a note): registered before launch
+    // finishes, so the link that started the app is not missed
+    func applicationWillFinishLaunching(_ n: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleURL(_:reply:)),
+            forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc func handleURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        guard let s = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let u = URLComponents(string: s) else { return }
+        var q: [String: String] = [:]
+        for i in u.queryItems ?? [] { q[i.name] = i.value ?? "" }
+        route(((u.host ?? "") + u.path).trimmingCharacters(in: CharacterSet(charactersIn: "/")), q)
+    }
+
+    /// Opens a part of the window; whatever starts an agent or changes files
+    /// asks first, so a link can never do that on its own.
+    func route(_ what: String, _ q: [String: String]) {
+        func withProject(_ then: @escaping (Project) -> Void) {
+            openWindow()
+            model.tab = .projects
+            guard let raw = q["path"], !raw.isEmpty else { return }
+            let real = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+                .resolvingSymlinksInPath().path
+            model.refresh {
+                guard let p = self.model.projects.first(where: { $0.path == real }) else {
+                    _ = alert("aht does not track this folder", real)
+                    return
+                }
+                self.model.selection = p.path
+                then(p)
+            }
+        }
+        switch what {
+        case "search":
+            openWindow()
+            model.tab = .search
+            if let w = q["q"], !w.isEmpty {
+                model.query = w
+                model.runSearch()
+            } else {
+                model.focusSearch += 1
+            }
+        case "sessions", "board":
+            openWindow()
+            model.tab = .sessions
+        case "loose-ends":
+            openWindow()
+            model.openLooseEnds()
+        case "report":
+            openWindow()
+            model.showReport = true
+            model.loadReport()
+        case "project": withProject { _ in }
+        case "changes": withProject { self.model.openChanges($0) }
+        case "journal": withProject { self.model.journal($0) }
+        case "undo": withProject { self.model.openUndo($0) }
+        case "switch":
+            withProject { p in
+                if let to = q["to"], ["claude", "kimi", "codex"].contains(to) {
+                    self.model.switchAgent(p, to: to)
+                }
+            }
+        case "resume":
+            if let path = q["path"], let sid = q["session"], !sid.isEmpty {
+                continueFromOutside(agent: q["agent"] ?? "claude", session: sid,
+                                    project: (path as NSString).expandingTildeInPath)
+            }
+        default:
+            openWindow()
+        }
+    }
+
+    /// A session picked in Spotlight or by a link: offer to continue it.
+    func continueFromOutside(agent: String, session: String, project: String) {
+        openWindow()
+        model.tab = .projects
+        model.selection = project
+        let label = AGENT_LABEL[agent] ?? agent
+        if alert("Continue this \(label) session?",
+                 "It opens in a new terminal window, in “\((project as NSString).lastPathComponent)”.",
+                 confirm: "Continue") {
+            model.resumeSession(project, agent: agent, session: session)
+        }
+    }
+
+    func application(_ application: NSApplication, continue userActivity: NSUserActivity,
+                     restorationHandler: @escaping ([NSUserActivityRestoring]) -> Void) -> Bool {
+        guard userActivity.activityType == CSSearchableItemActionType,
+              let key = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String
+        else { return false }
+        let parts = key.components(separatedBy: "\t")
+        guard parts.count == 3 else { return false }
+        continueFromOutside(agent: parts[0], session: parts[1], project: parts[2])
+        return true
+    }
+
+    /// The ∞ carries the number of sessions that wait for you.
+    func updateIcon() {
+        let n = model.waiting
+        item.button?.imagePosition = .imageLeft
+        item.button?.title = n > 0 ? " \(n)" : ""
+        var tip = ["agent-history-tether"]
+        if n > 0 { tip.append("\(n) session\(n == 1 ? "" : "s") waiting for you") }
+        for p in model.limited { tip.append("\(p.name): Claude's usage limit") }
+        item.button?.toolTip = tip.joined(separator: "\n")
+    }
+
+    var hotkey = ""
+    var noticeOffset: UInt64 = 0
+
+    /// Marks the app alive for the core, and shows the notices it queued.
+    func pumpNotices() {
+        let run = HOME + "/.aht/run"
+        try? FileManager.default.createDirectory(atPath: run, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: run + "/app-alive", contents: Data())
+        guard let fh = FileHandle(forReadingAtPath: NOTICE_QUEUE) else { return }
+        defer { try? fh.close() }
+        let size = fh.seekToEndOfFile()
+        if size < noticeOffset { noticeOffset = 0 }          // the file was started anew
+        guard size > noticeOffset else { return }
+        fh.seek(toFileOffset: noticeOffset)
+        let data = fh.readDataToEndOfFile()
+        noticeOffset = size
+        for line in (String(data: data, encoding: .utf8) ?? "").split(separator: "\n") {
+            guard let d = line.data(using: .utf8),
+                  let n = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { continue }
+            let c = UNMutableNotificationContent()
+            c.title = n["title"] as? String ?? "aht"
+            c.body = n["message"] as? String ?? ""
+            c.sound = .default
+            c.userInfo = (n["info"] as? [String: Any] ?? [:]).compactMapValues {
+                $0 is NSNull ? nil : $0 }
+            let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
+            UNUserNotificationCenter.current().add(req) { err in
+                if err != nil { notifyUser(c.title, c.body) }   // not allowed: the plain kind
+            }
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent n: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .sound])
+    }
+
+    /// A click on a notice: to the session's tab when it is here, else to the
+    /// Sessions tab (another machine) or the project (the usage limit).
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        let info = r.notification.request.content.userInfo
+        let kind = info["kind"] as? String ?? ""
+        DispatchQueue.main.async {
+            if (kind == "waiting" || kind == "finished"), info["local"] as? Bool ?? false,
+               let pid = info["pid"] as? Int {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let res = sh(PY, [ahtScript(), "goto", String(pid)])
+                    if !res.ok {
+                        DispatchQueue.main.async {
+                            self.openWindow()
+                            self.model.tab = .sessions
+                        }
+                    }
+                }
+            } else if kind == "limit", let p = info["project"] as? String {
+                self.openWindow()
+                self.model.tab = .projects
+                self.model.selection = p
+            } else {
+                self.openWindow()
+                self.model.tab = .sessions
+            }
+        }
+        done()
+    }
+
+    func quickSearch() {
+        openWindow()
+        model.tab = .search
+        model.focusSearch += 1
+    }
+
+    /// A folder handed over by a Finder service: select its project (tracking
+    /// it first if aht does not know it yet), then do what was asked.
+    func fromFinder(_ pboard: NSPasteboard, _ then: @escaping (Project) -> Void) {
+        let urls = (pboard.readObjects(forClasses: [NSURL.self],
+                                       options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        guard let url = urls.first else { return }
+        let path = url.resolvingSymlinksInPath().path
+        openWindow()
+        model.tab = .projects
+        let go = {
+            guard let p = self.model.projects.first(where: { $0.path == path }) else { return }
+            self.model.selection = p.path
+            then(p)
+        }
+        if model.projects.contains(where: { $0.path == path }) {
+            go()
+            return
+        }
+        guard alert("aht does not track “\(url.lastPathComponent)” yet",
+                    "Track it, so aht keeps its agents' history with it?", confirm: "Track It")
+        else { return }
+        model.background { aht(["tag", path, "--apply"]) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.model.refresh { go() } }
+    }
+
+    @objc func serviceShow(_ pboard: NSPasteboard, userData: String?,
+                           error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        fromFinder(pboard) { _ in }
+    }
+    @objc func serviceChanges(_ pboard: NSPasteboard, userData: String?,
+                              error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        fromFinder(pboard) { self.model.openChanges($0) }
+    }
+    @objc func serviceJournal(_ pboard: NSPasteboard, userData: String?,
+                              error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        fromFinder(pboard) { self.model.journal($0) }
+    }
+    @objc func serviceSearch(_ pboard: NSPasteboard, userData: String?,
+                             error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        fromFinder(pboard) { p in
+            self.model.searchProject = p.path
+            self.model.tab = .search
+            self.model.focusSearch += 1
+        }
+    }
+    @objc func serviceSwitch(_ pboard: NSPasteboard, userData: String?,
+                             error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        fromFinder(pboard) { p in
+            let agents = self.model.agentCLIs
+            let pick = choose("Continue “\(p.name)” in another agent?",
+                              "The agent reads a summary of where the work stood first.",
+                              agents.map { AGENT_LABEL[$0] ?? $0 } + ["Cancel"])
+            if pick >= 0 && pick < agents.count { self.model.switchAgent(p, to: agents[pick]) }
         }
     }
 
@@ -2108,9 +4514,14 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
             let hosts = Set(away.compactMap { $0.away }).sorted()
             add(disabled: "\(away.count) handed over to " + hosts.joined(separator: ", "))
         }
+        add("Search Sessions…", #selector(searchFromMenu))
         if model.waiting > 0 {
             add(disabled: "⚠ \(model.waiting) session\(model.waiting == 1 ? "" : "s") "
                 + "waiting for you")
+        }
+        for p in model.limited.prefix(3) {
+            add(disabled: "⏸ \(p.name): Claude's usage limit"
+                + (p.limitResets.map { ", resets " + $0 } ?? ""))
         }
         if let w = model.working { add(disabled: "⏳ " + w) }
         menu.addItem(.separator())
@@ -2139,9 +4550,10 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     @objc func toggleWatch() { model.toggleWatch() }
     @objc func quit() { NSApp.terminate(nil) }
 
+    @objc func searchFromMenu() { quickSearch() }
+
     @objc func openGuide() {
-        openWindow()
-        model.showGuide()
+        showGuideWindow(nil)
     }
 
     @objc func openWindow() {
@@ -2208,6 +4620,56 @@ if CommandLine.arguments.contains("--selftest") {
     exit(r.ok ? 0 : 1)
 }
 
+// notify: post one notice as aht and leave (the core uses this while the
+// menu bar app is not running, so a click on the notice still opens aht)
+//   --notify TITLE MESSAGE [INFO-JSON]
+if let i = CommandLine.arguments.firstIndex(of: "--notify"), i + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let c = UNMutableNotificationContent()
+    c.title = args[i + 1]
+    c.body = args[i + 2]
+    c.sound = .default
+    if i + 3 < args.count, let d = args[i + 3].data(using: .utf8),
+       let info = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+        c.userInfo = info.compactMapValues { $0 is NSNull ? nil : $0 }
+    }
+    let center = UNUserNotificationCenter.current()
+    let done = DispatchSemaphore(value: 0)
+    var ok = false
+    center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+        guard granted else { done.signal(); return }
+        center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { err in
+            ok = err == nil
+            done.signal()
+        }
+    }
+    _ = done.wait(timeout: .now() + 8)
+    exit(ok ? 0 : 1)
+}
+
+// spotlight check: are the sessions in Spotlight?  Asks the index the way
+// Spotlight does, for this app's own items only
+//   --spotlight-check WORD
+if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
+   i + 1 < CommandLine.arguments.count {
+    let word = CommandLine.arguments[i + 1].replacingOccurrences(of: "\"", with: "")
+    let ctx = CSSearchQueryContext()
+    ctx.fetchAttributes = ["title"]
+    let q = CSSearchQuery(queryString: "title == \"*\(word)*\"cd", queryContext: ctx)
+    var n = 0
+    q.foundItemsHandler = { items in
+        for it in items where n < 5 { print("  " + (it.attributeSet.title ?? "?")); n += 1 }
+    }
+    q.completionHandler = { err in
+        print("SPOTLIGHT \(n > 0 ? "OK" : "NOTHING") — \(n) shown" + (err.map { " (\($0))" } ?? ""))
+        exit(n > 0 ? 0 : 1)
+    }
+    q.start()
+    RunLoop.main.run(until: Date().addingTimeInterval(20))
+    print("SPOTLIGHT no answer")
+    exit(1)
+}
+
 // snapshot: the window's tabs (and its dialogs) as PNG files, to look at a
 // layout without clicking through it (needs a login session; nothing changes)
 //   --snapshot DIR [--select-first] [--query WORDS]
@@ -2243,12 +4705,19 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         }
     }
     let size = NSSize(width: 900, height: 620)
+    model.refreshBoard()                        // the Sessions tab shows real rows
+    let boardEnd = Date().addingTimeInterval(60)
+    while model.boardAt == nil && Date() < boardEnd {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+    }
     for tab in Tab.allCases {
         model.tab = tab
         snapshot(MainView().environmentObject(model), dir + "/\(tab.rawValue.lowercased()).png", size)
     }
-    snapshot(TextSheetView(t: TextSheet(title: "aht guide", text: guideText(), project: nil, wide: true))
-                .environmentObject(model), dir + "/sheet-guide.png", NSSize(width: 780, height: 680))
+    snapshot(SettingsView().environmentObject(model), dir + "/settings-all.png",
+             NSSize(width: 900, height: 2000))
+    GUIDE.topic = guideTopics().first { $0.title.hasPrefix("Undo a whole session") }?.title
+    snapshot(GuideView().environmentObject(GUIDE), dir + "/guide.png", NSSize(width: 900, height: 660))
     if let p = model.selected {                  // the dialogs, for the selected project
         let j = ahtJSON(["journal", p.path, "--json"]) ?? [:]
         snapshot(TextSheetView(t: TextSheet(title: "Journal: \(p.name)",
@@ -2269,7 +4738,64 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         }
         snapshot(SecretsSheet().environmentObject(model), dir + "/sheet-secrets.png",
                  NSSize(width: 820, height: 480))
+        func wait(_ done: () -> Bool) {
+            let end = Date().addingTimeInterval(40)
+            while !done() && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
+        }
+        model.openChanges(p)
+        wait { model.changes != nil }
+        if let c = model.changes {
+            snapshot(ChangesSheet(c: c).environmentObject(model), dir + "/sheet-changes.png",
+                     NSSize(width: 900, height: 600))
+        }
+        model.openUndo(p)
+        wait { model.undo != nil }
+        if let u = model.undo {
+            snapshot(UndoSheet(u: u).environmentObject(model), dir + "/sheet-undo.png",
+                     NSSize(width: 900, height: 600))
+        }
+        model.loadOpinion(p, run: nil)
+        wait { model.opinion != nil }
+        if let v = model.opinion {
+            snapshot(OpinionSheet(v: v).environmentObject(model), dir + "/sheet-opinion.png",
+                     NSSize(width: 960, height: 660))
+        }
+        model.loadNight(p)
+        wait { model.night != nil }
+        if let v = model.night {
+            snapshot(NightShiftSheet(v: v).environmentObject(model), dir + "/sheet-night.png",
+                     NSSize(width: 660, height: 540))
+        }
     }
+    model.openLooseEnds()
+    let looseEnd = Date().addingTimeInterval(60)
+    while model.looseEnds == nil && Date() < looseEnd {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+    }
+    snapshot(LooseEndsSheet().environmentObject(model), dir + "/sheet-loose-ends.png",
+             NSSize(width: 760, height: 540))
+    model.openTidy()
+    func waitFor(_ done: () -> Bool) {
+        let end = Date().addingTimeInterval(60)
+        while !done() && Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.2)) }
+    }
+    waitFor { model.tidy != nil }
+    snapshot(TidySheet().environmentObject(model), dir + "/sheet-tidy.png", NSSize(width: 820, height: 620))
+    if let t = model.tidy?.first(where: { $0.sessions > 0 }) {
+        model.readHistory(t)
+        waitFor { model.tidyReading != nil }
+        snapshot(TidySheet().environmentObject(model), dir + "/sheet-tidy-read.png",
+                 NSSize(width: 820, height: 620))
+        model.tidyReading = nil
+    }
+    model.openWorkspaces()
+    waitFor { model.workspaces != nil && (model.workspacePick == nil || !model.workspacePlan.isEmpty) }
+    snapshot(WorkspaceSheet().environmentObject(model), dir + "/sheet-workspace.png",
+             NSSize(width: 820, height: 560))
+    model.reportPeriod = "month"
+    model.loadReport()
+    waitFor { !model.reportTotal.isEmpty }
+    snapshot(ReportSheet().environmentObject(model), dir + "/sheet-report.png", NSSize(width: 720, height: 520))
     exit(0)
 }
 

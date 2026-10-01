@@ -22,7 +22,10 @@ else
   RUN="wine"; WT='Z:\tmp\aht-features-smoke'; SEP='\'
 fi
 J() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }           # a path as JSON text
-P() { printf '%s' "$WT$SEP$1" | sed "s#/#$SEP#g"; }      # a path under the sandbox
+P() {                                                     # a path under the sandbox
+  if [ "$SEP" = "/" ]; then printf '%s/%s' "$WT" "$1"
+  else printf '%s\\%s' "$WT" "$(printf '%s' "$1" | tr '/' '\\')"; fi
+}
 W() { $RUN "$EXE" "$@" | tr -d '\r'; }
 fail() { echo "FEATURES SMOKE FAIL: $*"; exit 1; }
 has() { printf '%s\n' "$1" | grep -q -E -- "$2" || fail "$3 (got: $(printf '%s' "$1" | head -c 400))"; }

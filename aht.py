@@ -3861,6 +3861,20 @@ def claude_home() -> Path:
     return claude_backend().root().parent
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # on Windows signal 0 is CTRL_C_EVENT: ask the process table instead
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            k.CloseHandle(h)
+            return bool(ok) and code.value == 259          # STILL_ACTIVE
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True

@@ -237,7 +237,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 """
 
 
-def notify_user(title, message):
+def notify_user(title, message, info=None):
     try:
         if os.environ.get("AHT_NO_NOTIFY") or not aht.cfg_get("notifications", True):
             return
@@ -353,11 +353,11 @@ def _reload_watcher():
     print("✓ watcher restarted with the current roots")
 
 
-def hook_installed() -> bool:
+def hook_installed(event: str = "SessionStart") -> bool:
     s = Path.home() / ".claude" / "settings.json"
     try:
         data = json.loads(s.read_text(encoding="utf-8"))
-        for group in data.get("hooks", {}).get("SessionStart", []):
+        for group in data.get("hooks", {}).get(event, []):
             for h in group.get("hooks", []):
                 if _is_our_hook(h.get("command", "")):
                     return True

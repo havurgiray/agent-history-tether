@@ -17,6 +17,8 @@ LABEL = "com.aht.watcher"
 TRAY_LABEL = "com.aht.tray"
 PLIST = LA_DIR / f"{LABEL}.plist"
 TRAY_PLIST = LA_DIR / f"{TRAY_LABEL}.plist"
+NOTICES_LABEL = "com.aht.notices"        # "waiting for you" / "finished" notices
+NOTICES_PLIST = LA_DIR / f"{NOTICES_LABEL}.plist"
 PY = "/usr/bin/python3"
 SCRIPT = TOOLS / "aht.py"
 HOOK_CMD = f"{PY} {SCRIPT} hook"
@@ -89,7 +91,8 @@ def unquarantine():
     when aht.app sets itself up — and then refuses to run our own ad-hoc
     signed helpers.  The user approved the app these files came out of, so
     the copies we just wrote into OUR directory lose the inherited flag."""
-    targets = [p for p in TOOLS.iterdir() if p.is_file()] + [PLIST, TRAY_PLIST]
+    targets = [p for p in TOOLS.iterdir() if p.is_file()] + [PLIST, TRAY_PLIST,
+                                                              NOTICES_PLIST]
     targets += [d / "aht" for d in COMMAND_DIRS]
     for p in targets:
         if p.is_file() and not p.is_symlink():
@@ -138,6 +141,38 @@ def write_plist():
 </plist>
 ''')
 
+def write_notices_plist():
+    """Every half minute: did a session start waiting for you, or finish a
+    long piece of work?  Runs whether or not the menu bar app does."""
+    NOTICES_PLIST.write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{NOTICES_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{PY}</string>
+        <string>{SCRIPT}</string>
+        <string>notices</string>
+        <string>--quiet</string>
+    </array>
+    <key>StartInterval</key><integer>30</integer>
+    <key>RunAtLoad</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityIO</key><true/>
+    <key>StandardErrorPath</key><string>{HOME}/.aht/aht-notices.err</string>
+</dict>
+</plist>
+''')
+
+def load_notices():
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{NOTICES_LABEL}"], capture_output=True)
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(NOTICES_PLIST)],
+                       capture_output=True, text=True)
+    print("✓ notices every 30 s (waiting for you / finished)" if r.returncode == 0
+          else f"⚠ notices agent not loaded: {r.stderr.strip()[-120:]}")
+
 def _on_path(d):
     return str(d) in os.environ.get("PATH", "").split(os.pathsep)
 
@@ -168,16 +203,23 @@ def install_hook():
     if SETTINGS.exists():
         shutil.copy2(SETTINGS, str(SETTINGS) + ".bak-aht")
     hooks = s.setdefault("hooks", {})
-    groups = [g for g in hooks.get("SessionStart", [])
-              if not any(h.get("command", "").endswith(HOOK_TAIL) for h in g.get("hooks", []))]
-    for matcher in ("startup", "resume"):
+    def ours_out(event):
+        return [g for g in hooks.get(event, [])
+                if not any(h.get("command", "").endswith(HOOK_TAIL) for h in g.get("hooks", []))]
+    groups = ours_out("SessionStart")
+    for matcher in ("startup", "resume", "fork"):   # fork: /branch, --fork-session
         groups.append({"matcher": matcher,
                        "hooks": [{"type": "command", "command": HOOK_CMD, "timeout": 10}]})
     hooks["SessionStart"] = groups
+    # every prompt: a session is named after its iTerm2 tab (quick; adds nothing
+    # to the conversation)
+    hooks["UserPromptSubmit"] = ours_out("UserPromptSubmit") + [
+        {"hooks": [{"type": "command", "command": HOOK_CMD, "timeout": 10}]}]
     SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS, "w") as fh:
         json.dump(s, fh, indent=2)
-    print("✓ SessionStart hook registered (backup: settings.json.bak-aht)")
+    print("✓ SessionStart and UserPromptSubmit hooks registered "
+          "(backup: settings.json.bak-aht)")
 
 def load_agent():
     uid = os.getuid()
@@ -220,10 +262,12 @@ if __name__ == "__main__":
     compile_binaries(prebuilt)
     aht.ensure_config()          # create ~/.aht/config.json with defaults
     write_plist()
+    write_notices_plist()
     install_command()
     install_hook()
     unquarantine()               # before launchd (or anyone) runs the helpers
     load_agent()
+    load_notices()
     if FROM_APP:
         stop_other_trays()
         retarget_tray_autostart()

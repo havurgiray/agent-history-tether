@@ -14,6 +14,8 @@ LABEL = "com.aht.watcher"
 TRAY_LABEL = "com.aht.tray"
 PLIST = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
 TRAY_PLIST = HOME / "Library/LaunchAgents" / f"{TRAY_LABEL}.plist"
+NOTICES_LABEL = "com.aht.notices"
+NOTICES_PLIST = HOME / "Library/LaunchAgents" / f"{NOTICES_LABEL}.plist"
 REG = HOME / ".aht/registry.json"
 CONFIG = HOME / ".aht/config.json"
 HOOK_TAIL = "aht.py hook"
@@ -30,23 +32,24 @@ def remove_hook():
         print("⚠ settings.json is not valid JSON — left untouched, hook NOT removed")
         return
     shutil.copy2(SETTINGS, str(SETTINGS) + ".bak-aht-uninstall")
-    kept = []
-    for g in s.get("hooks", {}).get("SessionStart", []):
-        survivors = [h for h in g.get("hooks", [])
-                     if not h.get("command", "").endswith(HOOK_TAIL)]
-        if survivors:
-            g["hooks"] = survivors
-            kept.append(g)
-    if "hooks" in s and "SessionStart" in s["hooks"]:
-        if kept:
-            s["hooks"]["SessionStart"] = kept
-        else:
-            del s["hooks"]["SessionStart"]
-            if not s["hooks"]:
-                del s["hooks"]
+    for event in ("SessionStart", "UserPromptSubmit"):
+        kept = []
+        for g in s.get("hooks", {}).get(event, []):
+            survivors = [h for h in g.get("hooks", [])
+                         if not h.get("command", "").endswith(HOOK_TAIL)]
+            if survivors:
+                g["hooks"] = survivors
+                kept.append(g)
+        if "hooks" in s and event in s["hooks"]:
+            if kept:
+                s["hooks"][event] = kept
+            else:
+                del s["hooks"][event]
+    if "hooks" in s and not s["hooks"]:
+        del s["hooks"]
     with open(SETTINGS, "w") as fh:
         json.dump(s, fh, indent=2)
-    print("✓ SessionStart hook removed (backup: settings.json.bak-aht-uninstall)")
+    print("✓ aht's Claude Code hooks removed (backup: settings.json.bak-aht-uninstall)")
 
 def quit_app():
     """Stop the tray so it cannot re-create state we are about to remove."""
@@ -62,6 +65,9 @@ def remove_agent():
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{TRAY_LABEL}"], capture_output=True)
     if TRAY_PLIST.exists():
         TRAY_PLIST.unlink()
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{NOTICES_LABEL}"], capture_output=True)
+    if NOTICES_PLIST.exists():
+        NOTICES_PLIST.unlink()
         print("✓ tray autostart removed")
 
 def remove_command():

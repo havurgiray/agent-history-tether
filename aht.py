@@ -3938,6 +3938,8 @@ def processes_inside(path: str) -> list:
     """This user's processes whose working directory is inside `path`: a dev
     server, a build, another agent CLI.  Shells that merely sit in the folder
     are left out."""
+    if os.name == "nt":                 # no lsof and no /proc: nothing known
+        return []
     me = {os.getpid(), os.getppid()}
     path = os.path.realpath(path)
     rows = []
@@ -4851,7 +4853,7 @@ def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dic
 def scratch_dir(real: str, sid: str):
     """Where the agent CLI keeps a session's own scratch files."""
     for tmp in ("/private/tmp", "/tmp"):
-        p = Path(tmp) / f"claude-{os.getuid()}" / _key_claude(real) / sid / "scratchpad"
+        p = Path(tmp) / f"claude-{getattr(os, 'getuid', lambda: 0)()}" / _key_claude(real) / sid / "scratchpad"
         if p.is_dir():
             return p
     return None

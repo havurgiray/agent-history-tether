@@ -39,4 +39,7 @@ if [ "$1" != "--no-test" ]; then
   echo "== watcher smoke test (wine) =="
   docker run --rm --platform linux/amd64 -v "$REPO":/repo -w /repo/windows "$IMAGE" \
     sh tests/wine_watch_smoke.sh /repo/windows/aht.exe
+  echo "== features smoke test (wine) =="
+  docker run --rm --platform linux/amd64 -v "$REPO":/repo -w /repo/windows "$IMAGE" \
+    sh tests/features_smoke.sh /repo/windows/aht.exe
 fi

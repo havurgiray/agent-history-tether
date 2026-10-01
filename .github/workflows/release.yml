@@ -45,6 +45,7 @@ jobs:
         run: |
           sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht.exe"
           sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht.exe"
+          sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht.exe"
       - name: package
         shell: pwsh
         run: |

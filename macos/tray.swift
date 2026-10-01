@@ -131,6 +131,12 @@ func ago(_ any: Any?) -> String {
     return r.localizedString(for: d, relativeTo: Date())
 }
 
+/// A path under the home folder as ~/…, shorter and the way Finder thinks of it.
+func tilde(_ path: String) -> String {
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    return path == home ? "~" : path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
+}
+
 /// A file row of the core's JSON (undo, second opinion) as the diff views take it.
 func changedFile(_ d: [String: Any]) -> ChangedFile {
     return ChangedFile(path: d["path"] as? String ?? d["name"] as? String ?? "",
@@ -2268,7 +2274,7 @@ struct DetailView: View {
                     Text(state(p)).foregroundColor(.secondary)
                     Spacer()
                 }
-                Text(p.path).font(.caption).foregroundColor(.secondary)
+                Text(tilde(p.path)).font(.caption).foregroundColor(.secondary)
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 HStack(spacing: 10) {
                     if p.away != nil {

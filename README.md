@@ -16,7 +16,7 @@
 > histories, restores them wherever a folder ends up, and badges managed
 > folders.  History is never deleted or overwritten.
 
-**New to aht?** The [guide](GUIDE.md) walks through every feature with an example. It is also in the app (∞ → **Guide**) and in the terminal (`aht guide`).
+**New to aht?** The [guide](GUIDE.md) walks through every feature with an example, and lists every setting and every command, with what each does in plain words. It is also in the app (∞ → **Guide**, and a **?** next to each feature opens its section) and in the terminal (`aht guide`).
 
 ## Supported agents
 
@@ -45,6 +45,34 @@ CLI finds sessions), re-points the `cwd` a resumed session would run in,
 renames the workspace's catalog entry, and appends to the CLI's session log
 instead of rewriting it.  Transcripts are never edited, and workspace
 *trust* is deliberately not carried to the new location — Kimi asks again.
+
+## Platforms
+
+aht runs on macOS, Linux and Windows.  The core — keeping every agent's
+history with its folder through moves and copies, backups, restore, badges,
+the tray — works on all three.  Since 0.11, new features are built and
+tested on macOS first: they reach Linux and Windows when they need nothing
+that only macOS has (the window, iTerm2, APFS copy-on-write, a LaunchAgent)
+and have been tested there.  Until then, many of them already work from the
+terminal.
+
+| feature | macOS | Linux | Windows |
+|---|---|---|---|
+| Moves, copies and relinks; backups and restore; badges; the tray | ✓ | ✓ | ✓ |
+| The Claude Code hook (relinks when a session starts) | ✓ | ✓ | ✓ |
+| Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, switch agent | window and terminal | terminal | terminal, untested |
+| Handover, keep in sync, backups on another machine | ✓ | terminal; also as the machine projects go to | — |
+| Notices (waiting for you, done, usage limit) | every 30 s; a click goes to the session | `aht notices` from your own timer | — |
+| Night shift | ✓ | needs `aht notices` on a timer | — |
+| Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux, untested |
+| Second opinion, informed sessions (use tokens; off by default) | window and terminal | terminal | untested |
+| Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab, checkup | ✓ (iTerm2) | — | — |
+| The window, Spotlight, `aht://` links, Finder Quick Actions, search shortcut, in-app guide | ✓ | — | — |
+
+"terminal" means the `aht` command does it; the guide gives each one.  CI
+runs the whole test suite on Linux and macOS for every push and smoke-tests
+the Windows exe; the features marked "untested" are in the Windows build
+but have not been tried on Windows.
 
 ## Install
 
@@ -273,8 +301,110 @@ behave the same.
   it writes: the search index, journals, and handover and switch summaries
   (those folders also carry a `.gitignore`).
 
+- **Notices** — `aht notices` (run every 30 seconds by a LaunchAgent) tells
+  you when a session, here or on another machine, starts waiting for you or
+  finishes a long piece of work; optionally also on the phone
+  (`notify_phone = imessage:<you>` or `ntfy:<topic>`).
+- **What changed** — `aht changes <folder> [--diff]`: every file a Claude
+  Code session edited, before and now, from Claude's own checkpoints;
+  `--revert <file> --apply` puts one back (the current one is kept aside).
+- **Report and AI-use statement** — `aht report --since week --by
+  project|agent|area` (areas: `report_areas` in the config); `--project …
+  --statement` drafts a disclosure of AI use for a paper or a course.
+- **Share** — `aht share <folder> --format html`: a session as a page without
+  keys, e-mail addresses or local paths.
+- **Tidy up** — `aht tidy`: gone folders and histories without a folder,
+  with suggestions; `--relink <id> --to <folder> --apply`.
+- **Backups elsewhere** — `offsite_backup = <machine>` copies the history
+  backups there after each daily pass; `aht backup --fetch-offsite` brings
+  them back on a new Mac.
+- **Taking a key out** — `aht secrets --redact <fingerprint> --apply`
+  replaces one found secret in every history file (copies kept first; not
+  while a session is open there).
+- **Finder and a shortcut** — right-click a project folder for aht's
+  Quick Actions; ⌃⌥⌘A (`hotkey`) opens the search from anywhere.
+
+## Before and after a session
+
+- **Undo a whole session** — when a Claude Code session starts (and before
+  another agent takes over), aht makes a copy-on-write copy of the project
+  folder in `~/.aht/checkpoints/` (APFS clones: no room taken until a file
+  changes; the last 10 per project; rebuilt folders and `.git` left out).
+  `aht undo <folder>` shows what differs; `--apply` puts the folder back,
+  including what the session's commands changed; what was there goes to
+  `~/.aht/undo/` first.  `checkpoints = false` turns it off.  A project
+  over `checkpoint_max_files` (20,000) gets no copy: a copy of 98,000 files
+  measured 17 s of disk work per session start and ~100 MB of file-system
+  entries per kept copy.  `aht checkpoint --coverage [--max N]` lists who is
+  cut off and their biggest folders; `checkpoint_excludes` leaves folders
+  out.  Time Machine is told to skip the copies (it would store them in
+  full).
+- **Claude's usage limit** — aht spots a session that stopped at the limit
+  in its transcript (no tokens), says so in a notice with the reset time
+  (`notify_limit`), and marks the project.  `aht limits` lists them.  With
+  `limit_switch = true` it also offers to go on in `limit_switch_to` (Kimi
+  Code by default) — that agent's tokens are used when you accept.
+- **Informed sessions** — with `informed_sessions = true`, a new Claude Code
+  session learns in a few lines where the last session in its folder
+  stopped, whichever agent ran it (last request and answer, open to-dos,
+  files changed; keys masked).
+- **Loose ends** — `aht loose-ends`: projects of the last 30 days with work
+  not committed, open to-do items, or a last session that ended on a
+  question or an offer.
+- **Second opinion** — `aht second-opinion <folder> --task "…"` runs Claude
+  Code and Kimi Code on the same task, each in its own copy; `--show <id>`
+  compares answers and changes, `--take <id> --from kimi --apply` brings one
+  into the project (refused for files changed there meanwhile).  Needs
+  `second_opinion = true`.
+- **Night shift** — `aht night-shift <folder> --task "…" --start 22:00
+  --back 07:00 --apply`: a handover with a task at the start time, taken
+  back when the session is done after the end time (the notices agent keeps
+  the clock; the Mac has to be awake).  Needs `night_shift = true`.
+- **Session names from iTerm2 tabs** — `tab_names` (on): a Claude Code
+  session is named after its iTerm2 tab's own title, which is what the
+  Claude app (Remote Control), `/resume` and the prompt bar show.  Set by
+  the SessionStart hook and, after a tab is renamed, at the next prompt
+  (a UserPromptSubmit hook that answers from a cache; asking iTerm2 takes a
+  second, so that runs in the background).  Clashes among open sessions
+  become `Paper · 2`, branches `Paper ⑂ 2`; a name the user set stays; a
+  handed-over session is `Paper @ <machine>`.  `aht tab-names` lists them.
+- **Workspace** — `aht workspace`: iTerm2's windows, tabs, titles and the
+  sessions in them are saved while you work (on the prompt hook's
+  background refresh); `--restore [--apply]` opens the layout from before
+  iTerm2 last started again, each session resumed by id with its options.
+- **Go to a tab, and a checkup** — `aht goto <project|session|pid>` brings a
+  session's iTerm2 tab to the front; `aht checkup` marks sessions open
+  twice, stuck, outside the Claude app or on an older Claude Code, and
+  `--restart <pid> --apply` starts one again in its tab (`--close` ends it).
+  A click on an aht notice goes to the session's tab (the app posts the
+  notices; macOS used to attribute them to Script Editor).
+- **Spotlight and links** — the app puts session titles into Spotlight
+  (`spotlight`), and `aht://search?q=…`, `aht://loose-ends`,
+  `aht://undo?path=…` and more open the window from the Shortcuts app or a
+  script (see the guide); whatever starts an agent or changes files asks
+  first.  `aht sessions --json` lists every session with its title.
+
+### What uses tokens
+
+aht's own work runs locally and never asks a model.  These are the only
+features that make an agent read or work:
+
+| Feature | What spends tokens | Default |
+|---|---|---|
+| Informed sessions (`informed_sessions`) | a few hundred tokens of context per new Claude Code session | off |
+| Another agent at the usage limit (`limit_switch`) | the other agent reads a summary, when you accept | off |
+| Second opinion (`second_opinion`) | both agents work on the task | off, and only when you press Start |
+| Night shift (`night_shift`) | the agent on the other machine works on the task | off, and only the shifts you plan |
+| Switch agent | the new agent reads a summary | only when you ask |
+| Hand over with a task | the resumed session starts on the task | only when you give a task |
+| Handover note | one sentence in a new Claude session while its project is away or just came back | part of handover |
+
+Everything else — watching, relinking, badges, backups, search, the
+session board, notices, loose ends, reports, journals, the secrets check,
+what changed, undo, Spotlight — uses none.
+
 Development is macOS-first: the window and these features are built and
-tested on macOS; the core commands run wherever Python does.
+tested on macOS; what reaches Linux and Windows is in *Platforms* above.
 
 ## Settings
 
@@ -292,7 +422,13 @@ Locations* page), `move_policy`, `copy_policy`, `new_policy`,
 for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `mirror_interval_minutes`, `handover_excludes`, `handover_compress`,
 `handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
-`handover_mosh`, `rsync_path`, `terminal_app`.
+`handover_mosh`, `rsync_path`, `terminal_app`; notices and reports:
+`notify_waiting`, `notify_finished`, `notify_finished_minutes`,
+`notify_phone`, `notify_limit`, `offsite_backup`, `report_areas`, `hotkey`;
+before and after a session: `checkpoints`, `checkpoint_keep`,
+`checkpoint_max_files`, `checkpoint_excludes`, `spotlight`, `tab_names`, and — off by default because they use
+tokens — `informed_sessions`, `limit_switch` / `limit_switch_to`,
+`second_opinion`, `night_shift`.
 
 Every platform has a tray, shown as an ∞ icon in the bar: `aht.app` (or the
 tray compiled by `install.sh`) on macOS, `aht-tray.exe` on Windows,
@@ -307,7 +443,8 @@ click: a row is selected first, a button pressed second.
 
 ## Safety invariants
 
-1. History is **never deleted or overwritten** — dir renames refuse occupied
+1. History is **never deleted or overwritten** on aht's own initiative (a
+   history without a folder goes to the Trash only when you ask) — dir renames refuse occupied
    targets (surfaced as conflicts, never merged; an *empty* directory left
    behind by a tool holds no history and does not count as occupied); metadata rewrites are
    preceded by a mandatory backup copy; restores only add missing files.
@@ -319,6 +456,9 @@ click: a row is selected first, a button pressed second.
 5. A project is **never transferred while something runs in it**, a
    transcript only returns as a continuation of what left, and a transfer
    sets aside what it replaces.
+6. **Nothing spends an agent's tokens unless you turned it on or asked for
+   it**, and nothing that starts an agent or changes files runs from a link
+   or a notice without a question first.
 
 ## Commands
 
@@ -330,7 +470,10 @@ click: a row is selected first, a button pressed second.
 `tag` · `keys <path>`
 (each backend's store key for a path) · `encode` · `hook` · `version` ·
 `remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here` ·
-`search` · `board` · `switch` · `journal` · `rules` · `secrets`.
+`search` · `board` · `switch` · `journal` · `rules` · `secrets` · `notices` ·
+`changes` · `report` · `share` · `tidy` · `limits` · `checkpoint` · `undo` ·
+`loose-ends` · `second-opinion` · `night-shift` · `sessions` · `tab-names` ·
+`workspace` · `goto` · `checkup` · `guide`.
 Run `aht` with no arguments for the full help screen; every `--json` output is
 a stable machine interface (it's what the trays use).
 

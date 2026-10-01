@@ -18,7 +18,7 @@ COMMON = dict(
     hookspath=[],
     runtime_hooks=[],
     excludes=['tkinter', 'unittest', 'pydoc', 'doctest', 'test',
-              'xmlrpc', 'sqlite3', 'lzma', 'bz2', 'curses'],
+              'xmlrpc', 'lzma', 'bz2', 'curses'],   # sqlite3 stays: search needs it
     noarchive=False,
 )
 

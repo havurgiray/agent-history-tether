@@ -18,6 +18,37 @@
 
 **New to aht?** The [guide](GUIDE.md) walks through every feature with an example, and lists every setting and every command, with what each does in plain words. It is also in the app (∞ → **Guide**, and a **?** next to each feature opens its section) and in the terminal (`aht guide`).
 
+## The Mac app
+
+On macOS, aht is an app: an ∞ in the menu bar and a window.  On Linux and
+Windows it is a tray and the `aht` command (see *Platforms*).
+
+<p>
+<img src="docs/screenshots/mac-projects.png" width="49%" alt="The Projects tab: every tracked folder, where it is, when it was last used, and the actions for the selected one">
+<img src="docs/screenshots/mac-sessions.png" width="49%" alt="The Sessions tab: open sessions with their names, Go to Tab, and Restart in Its Tab for one outside the Claude app">
+</p>
+
+- **Projects** — every tracked folder: here or handed over, a session
+  working or waiting for you, last used, which agents have history there.
+  Select one to hand it over, keep it in sync, continue its session or
+  switch agent; **More** has What Changed, Undo a Session, Journal,
+  AI-Use Statement, Share, Project Rules, Secrets, Second Opinion and Night
+  Shift.  **Look Back** has Loose Ends and the Report; **Tidy Up** appears
+  when something needs a decision.
+- **Sessions** — the open sessions here and on your other machines, each
+  with the name the Claude app shows (taken from its iTerm2 tab), **Go to
+  Tab**, and **Restart in Its Tab** for one that is outside the Claude app
+  or on an older Claude Code; **Restore Workspace** brings the iTerm2 tabs
+  and their sessions back after a restart.
+- **Search**, **Machines** and **Settings** tabs; Finder Quick Actions,
+  ⌃⌥⌘A, Spotlight, `aht://` links and notices you can click.
+- A **?** next to every feature opens the [guide](GUIDE.md) at its section:
+
+<p><img src="docs/screenshots/mac-guide.png" width="70%" alt="The guide window: every topic on the left, the selected one on the right"></p>
+
+*The screenshots show made-up projects; `docs/make_screenshots.py` renders
+them again.*
+
 ## Supported agents
 
 | backend | agent CLI | storage model | relink | confidence |

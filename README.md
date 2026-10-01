@@ -60,19 +60,22 @@ terminal.
 |---|---|---|---|
 | Moves, copies and relinks; backups and restore; badges; the tray | ✓ | ✓ | ✓ |
 | The Claude Code hook (relinks when a session starts) | ✓ | ✓ | ✓ |
-| Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, switch agent | window and terminal | terminal | terminal, untested |
+| Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy | window and terminal | terminal | terminal |
+| Switch agent | window and terminal | terminal | terminal, untested |
 | Handover, keep in sync, backups on another machine | ✓ | terminal; also as the machine projects go to | — |
 | Notices (waiting for you, done, usage limit) | every 30 s; a click goes to the session | `aht notices` from your own timer | — |
 | Night shift | ✓ | needs `aht notices` on a timer | — |
-| Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux, untested |
+| Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
 | Second opinion, informed sessions (use tokens; off by default) | window and terminal | terminal | untested |
 | Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab, checkup | ✓ (iTerm2) | — | — |
 | The window, Spotlight, `aht://` links, Finder Quick Actions, search shortcut, in-app guide | ✓ | — | — |
 
 "terminal" means the `aht` command does it; the guide gives each one.  CI
-runs the whole test suite on Linux and macOS for every push and smoke-tests
-the Windows exe; the features marked "untested" are in the Windows build
-but have not been tried on Windows.
+runs the whole test suite on Linux and macOS for every push, and on real
+Windows it smoke-tests the exe: moves and relinks, the watcher, backups,
+and search, journal, report, share, secrets, rules, loose ends, undo and
+tidy.  "untested" means the feature is in the Windows build but no test
+has run it on Windows yet.
 
 ## Install
 

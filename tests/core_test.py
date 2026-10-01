@@ -41,6 +41,7 @@ env.update({
     "AHT_ROOT_KIMI": str(tools / "kimi" / "sessions"),
     "AHT_ROOT_KIMI_CODE": str(tools / "kimi-code" / "sessions"),
     "AHT_NO_ICONS": "1", "AHT_NO_NOTIFY": "1", "AHT_NO_BACKUP": "1",
+    "AHT_NO_CHECKPOINT": "1",       # the checkpoint test turns it back on
 })
 env.pop("AHT_ASSUME", None)
 
@@ -976,6 +977,21 @@ def handover_suite():
        and after == before,
        "discover: a stopped Tailscale is told to the asker, not written to the log")
 
+    # the history backups kept on the other machine too
+    hrun("config", "--set", "offsite_backup=box")
+    bdir = sb / ".aht" / "backups" / "u1"
+    bdir.mkdir(parents=True, exist_ok=True)
+    (bdir / "20260101-000000.zip").write_bytes(b"zip")
+    d = J(hrun("backup", "--offsite", "--json"))
+    copies = list((bhome / ".aht" / "offsite").rglob("20260101-000000.zip"))
+    ck(d.get("machine") == "box" and len(copies) == 1,
+       f"backups are copied to the other machine ({d})")
+    (bdir / "20260101-000000.zip").unlink()
+    d = J(hrun("backup", "--fetch-offsite", "--json"))
+    ck((bdir / "20260101-000000.zip").read_bytes() == b"zip",
+       "…and fetched back from it on a new Mac")
+    hrun("config", "--unset", "offsite_backup")
+
     # hand over with a task: the session starts on it at once
     d = J(hrun("handover", projM, "--apply", "--json",
                "--task", "-- run the benchmark overnight"))
@@ -993,6 +1009,47 @@ def handover_suite():
     ck(there.get("reachable") and row.get("status") == "idle",
        f"board: the other machine's open sessions are listed ({there.get('error') or row})")
     J(hrun("reclaim", projM, "--apply", "--stop", "--json"))
+
+    # the night shift: a handover with a task on a timer, and back again
+    jobs_file = sb / ".aht" / "night-shift.json"
+    r = hrun("night-shift", projM, "--task", "tidy the logs", "--to", "box", "--apply")
+    ck(r.returncode == 3 and "tokens" in r.stdout and not jobs_file.exists(),
+       "night shift: off until turned on, because it uses tokens")
+    hrun("config", "--set", "night_shift=true")
+    def job_state(want, secs=90):
+        for _ in range(secs * 4):
+            j = json.loads(jobs_file.read_text())[-1]
+            if j["state"] == want:
+                break
+            time.sleep(0.25)
+        return j
+    d = J(hrun("night-shift", projM, "--task", "tidy the logs", "--to", "box",
+               "--back", "07:00", "--apply", "--json"))
+    j = job_state("started")
+    ck(d.get("applied") and j["state"] == "started" and project_row(projM)["away"],
+       f"night shift: handed over with the task when it starts ({j.get('log')})")
+    jobs = json.loads(jobs_file.read_text())
+    jobs[-1]["back_at"] = time.time() - 1
+    jobs_file.write_text(json.dumps(jobs))
+    hrun("notices")
+    j = job_state("back")
+    ck(j["state"] == "back" and not project_row(projM)["away"],
+       f"night shift: taken back when it ends ({j.get('log')})")
+    hrun("config", "--unset", "night_shift")
+
+    # every project in sync with one machine at once
+    d = J(hrun("mirror", "--all", "--on", "--to", "box", "--json"))
+    names = [r["project"] for r in d.get("projects", [])]
+    ck(names and d.get("bytes", 0) > 0 and not d.get("applied")
+       and not any(n != m and n.startswith(m + "/") for n in names for m in names),
+       f"mirror --all: every project, sizes added up, nested ones carried by their parent ({len(names)})")
+    J(hrun("mirror", "--all", "--on", "--to", "box", "--apply", "--json"))
+    rows = J(hrun("projects", "--json"))["projects"]
+    ck(all(r["mirror"] == "box" for r in rows if r["real_path"] in names),
+       "mirror --all --apply: each of them is kept in sync")
+    J(hrun("mirror", "--all", "--off", "--apply", "--json"))
+    rows = J(hrun("projects", "--json"))["projects"]
+    ck(not [r for r in rows if r["mirror"]], "mirror --all --off: none any more")
 
     for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
         rec = json.loads(w.read_text())
@@ -1197,6 +1254,552 @@ ck(d.get("applied") and str(fk / "claude") in opened and os.path.basename(brief)
    and d["source"]["agent"] == "kimi" and Path(brief).is_file()
    and Path(projX, ".aht", "handover", ".gitignore").is_file(),
    "switch back to Claude: it opens with the summary to read")
+
+print("\n[18] notices, tidy, changes, report, share, taking a key out")
+nlog = sb / "notices.log"
+nenv = {"AHT_NOTIFY_LOG": str(nlog), "AHT_NO_SEARCH_INDEX": "1"}
+rec = tools / "sessions"
+rec.mkdir(exist_ok=True)
+worker = subprocess.Popen(["sleep", "600"], cwd="/")
+wrec = rec / f"{worker.pid}.json"
+def say(status, waiting=None):
+    wrec.write_text(json.dumps({"pid": worker.pid, "cwd": projX, "sessionId": "c1",
+                                "status": status, **({"waitingFor": waiting} if waiting else {})}))
+say("busy")
+run("config", "--set", "notify_finished_minutes=0")
+run("notices", extra_env=nenv)
+say("waiting", "approve Bash")
+run("notices", extra_env=nenv)
+say("busy"); run("notices", extra_env=nenv)
+say("idle"); run("notices", extra_env=nenv)
+got = [json.loads(l) for l in nlog.read_text().splitlines()] if nlog.is_file() else []
+ck([g["title"] for g in got] == ["Across waits for you", "Across is done"]
+   and got[0]["message"] == "approve Bash",
+   f"notices: waiting for you, then done — once each ({[g['title'] for g in got]})")
+run("notices", extra_env=nenv)
+ck(len(nlog.read_text().splitlines()) == 2, "notices: nothing new, nothing said")
+worker.kill(); worker.wait()
+wrec.unlink()
+
+# tidy: a tracked folder that is gone turns up under another name elsewhere
+projG = os.path.realpath(str(roots / "Gone Away"))
+os.makedirs(projG)
+mkstores(projG)
+run("tag", projG, "--apply")
+uidG = Path(projG, ".aht", ".project-id").read_text().strip()
+shutil.rmtree(projG)                         # gone, marker and all
+found_again = os.path.realpath(str(roots / "elsewhere" / "Gone Away"))
+os.makedirs(found_again)
+d = JS("tidy", "--json")
+gone = next((m for m in d.get("missing", []) if m["uuid"] == uidG), {})
+ck([c["path"] for c in gone.get("candidates", [])] == [found_again],
+   f"tidy: a gone folder, and where a folder of that name is now ({gone})")
+r = JS("tidy", "--relink", uidG, "--to", found_again, "--apply", "--json")
+reg = json.loads((sb / ".aht" / "registry.json").read_text())
+ck(r.get("relinked") and reg["projects"][uidG]["real_path"] == found_again
+   and (tools / "claude" / enc(found_again)).is_dir(),
+   "tidy --relink: the project and its history follow to the folder found "
+   f"({r}, {reg['projects'][uidG]['real_path']}, "
+   f"{sorted(p.name for p in (tools / 'claude').iterdir() if 'Gone' in p.name)})")
+
+# what a session changed, and putting one file back
+projC = os.path.realpath(str(roots / "Changes"))
+os.makedirs(projC)
+Path(projC, "a.py").write_text("x = 2\n")
+Path(projC, "new.py").write_text("made by the session\n")
+cst = tools / "claude" / enc(projC)
+cst.mkdir()
+fh = tools / "file-history" / "s9"
+fh.mkdir(parents=True)
+(fh / "aaaa@v1").write_text("x = 1\n")
+(cst / "s9.jsonl").write_text(
+    json.dumps({"type": "user", "cwd": projC, "entrypoint": "cli",
+                "message": {"role": "user", "content": "change a.py"}}) + "\n"
+    + json.dumps({"type": "file-history-snapshot", "snapshot": {"trackedFileBackups": {
+        "a.py": {"backupFileName": "aaaa@v1", "version": 1},
+        "new.py": {"backupFileName": None, "version": 1}}}}) + "\n")
+d = JS("changes", projC, "--json")
+states = {f["name"]: f["state"] for f in d.get("files", [])}
+diff = next((f["diff"] for f in d.get("files", []) if f["name"] == "a.py"), "")
+ck(states == {"a.py": "changed", "new.py": "added"} and "-x = 1" in diff and "+x = 2" in diff,
+   f"changes: before the session and now, per file ({states})")
+r = JS("changes", projC, "--session", "s9", "--revert", projC + "/a.py", "--apply", "--json")
+ck(Path(projC, "a.py").read_text() == "x = 1\n" and r.get("kept")
+   and Path(r["kept"]).read_text() == "x = 2\n",
+   "changes --revert: the file is back, what it held is kept aside")
+
+# the report and a statement of AI use
+d = JS("report", "--json", "--by", "agent")
+agents = sorted(r["key"] for r in d.get("rows", []))
+ck("Claude Code" in agents and "Kimi Code" in agents
+   and all(r["seconds"] >= 0 for r in d.get("rows", [])),
+   f"report: time and sessions per agent ({agents})")
+d = JS("report", "--project", projX, "--statement", "--json")
+ck("Claude Code" in d.get("statement", "") and "Kimi Code" in d.get("statement", ""),
+   "report --statement: a draft naming the agents used")
+
+# share a session: no key, no e-mail address, no home folder
+home = str(Path.home())
+(cstore / "c3.jsonl").write_text(cline(type="user", timestamp=iso(T + 500), message={
+    "role": "user", "content": f"mail me at someone@example.org, file {home}/notes.txt, "
+                               f"key {KEY}"}))
+d = JS("share", projX, "--session", "c3", "--format", "html", "--json")
+page = d.get("text", "")
+ck(d.get("turns") == 1 and KEY not in page and "someone@example.org" not in page
+   and home not in page and "~/notes.txt" in page and "<!doctype html>" in page,
+   "share: a clean page — no key, no e-mail address, no home folder")
+
+# taking a found key out of the histories
+fp = next(f["fingerprint"] for f in JS("secrets", projX, "--json")["finds"]
+          if f["kind"] == "Anthropic API key")
+blocker = subprocess.Popen(["sleep", "600"], cwd="/")
+(rec / f"{blocker.pid}.json").write_text(json.dumps({"pid": blocker.pid, "cwd": projX,
+                                                     "status": "idle"}))
+r = run("secrets", "--redact", fp, "--apply")
+ck(r.returncode == 3 and KEY in (cstore / "c1.jsonl").read_text(),
+   "a key is not taken out while a session is open in that project")
+blocker.kill(); blocker.wait()
+(rec / f"{blocker.pid}.json").unlink()
+d = JS("secrets", "--redact", fp, "--apply", "--json")
+kept = list(Path(d.get("kept", "/nonexistent")).rglob("c1.jsonl"))
+ck(d.get("applied") and KEY not in (cstore / "c1.jsonl").read_text()
+   and "[removed by aht]" in (cstore / "c1.jsonl").read_text()
+   and all(json.loads(l) for l in (cstore / "c1.jsonl").read_text().splitlines())
+   and kept and KEY in kept[0].read_text(),
+   "secrets --redact: gone from the history, which stays valid; the original is kept")
+
+print("\n[19] before and after a session: informed, usage limit, undo, loose ends, "
+      "second opinion")
+import time
+# every session starts informed: only when turned on, since it costs tokens
+def hook_out(payload, **extra):
+    return subprocess.run([PY, CLI, "hook"], env=dict(env, **extra), capture_output=True,
+                          text=True, input=json.dumps(payload)).stdout
+out = hook_out({"cwd": projX, "session_id": "new1", "source": "startup"})
+ck("[aht] The latest" not in out, "informed sessions: off by default (the note costs tokens)")
+run("config", "--set", "informed_sessions=true")
+out = hook_out({"cwd": projX, "session_id": "new1", "source": "startup"})
+ck("[aht] The latest earlier session" in out and "mail me at" in out and KEY not in out
+   and "someone@example.org" in out and len(out) < 2000,
+   f"informed sessions: where the last session stopped, short, no key ({out[:160]!r})")
+out = hook_out({"cwd": projX, "session_id": "c1", "source": "resume"})
+ck("[aht] The latest" not in out, "informed sessions: nothing added when a session is resumed")
+run("config", "--unset", "informed_sessions")
+
+# Claude's usage limit: seen in the transcript, said once, the other agent offered
+projL = os.path.realpath(str(roots / "Limited"))
+os.makedirs(projL)
+lstore = tools / "claude" / enc(projL)
+lstore.mkdir()
+soon = time.localtime(time.time() + 7200)
+resets = f"{soon.tm_hour % 12 or 12}:{soon.tm_min:02d}{'pm' if soon.tm_hour >= 12 else 'am'}"
+(lstore / "l1.jsonl").write_text(
+    json.dumps({"type": "user", "cwd": projL, "timestamp": iso(time.time() - 300),
+                "message": {"role": "user", "content": "go on"}}) + "\n"
+    + json.dumps({"type": "assistant", "cwd": projL, "timestamp": iso(time.time() - 290),
+                  "isApiErrorMessage": True, "error": "rate_limit", "apiErrorStatus": 429,
+                  "message": {"role": "assistant", "model": "<synthetic>", "content": [
+                      {"type": "text", "text": f"You've hit your session limit · resets "
+                                               f"{resets} (Europe/Lisbon)"}]}}) + "\n")
+run("tag", projL, "--apply")
+d = JS("limits", "--json")
+hit = next((h for h in d.get("limits", []) if h.get("session") == "l1"), {})
+ck(hit.get("resets", "").startswith(resets) and hit.get("over") is False
+   and d.get("switch_to") is None,
+   f"usage limit: found at the end of the transcript, with its reset time ({hit or d})")
+kenv = {"AHT_CLI_KIMI": sys.executable, "AHT_NOTIFY_LOG": str(nlog),
+        "AHT_NO_SEARCH_INDEX": "1"}
+run("config", "--set", "limit_switch=true")
+nlog.write_text("")
+run("notices", extra_env=kenv)
+run("notices", extra_env=kenv)
+got = [json.loads(l) for l in nlog.read_text().splitlines()]
+ck([g["title"] for g in got] == ["Limited: Claude's usage limit"]
+   and "go on in Kimi Code" in got[0]["message"],
+   f"usage limit: said once, with the agent to go on in ({got})")
+row = next(p for p in JS("projects", "--json", extra_env=kenv)["projects"]
+           if p["real_path"] == projL)
+ck((row.get("limit") or {}).get("session") == "l1", "usage limit: shown on the project")
+run("config", "--unset", "limit_switch")
+with open(lstore / "l1.jsonl", "a") as fh:
+    fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "go on"}}) + "\n")
+ck(not [h for h in JS("limits", "--json").get("limits", []) if h["session"] == "l1"],
+   "usage limit: gone once the session goes on")
+
+# a copy of the folder when a session starts, and the whole session undone
+projK = os.path.realpath(str(roots / "Checkpointed"))
+os.makedirs(projK + "/src")
+os.makedirs(projK + "/node_modules/big")
+Path(projK, "src", "a.py").write_text("a = 1\n")
+Path(projK, "b.txt").write_text("keep me\n")
+Path(projK, "node_modules", "big", "x.js").write_text("x\n")
+run("tag", projK, "--apply")
+uidK = Path(projK, ".aht", ".project-id").read_text().strip()
+run("config", "--set", "checkpoints=true")     # on by itself only on macOS
+hook_out({"cwd": projK, "session_id": "k1", "source": "startup"}, AHT_NO_CHECKPOINT="")
+cpdir = sb / ".aht" / "checkpoints" / uidK
+for _ in range(80):
+    if list(cpdir.glob("*/meta.json")):
+        break
+    time.sleep(0.25)
+cp = next(iter(cpdir.glob("*")), None)
+ck(cp is not None and (cp / "files" / "src" / "a.py").read_text() == "a = 1\n"
+   and not (cp / "files" / "node_modules").exists(),
+   "checkpoint: the folder is copied when a session starts (not what is rebuilt)")
+Path(projK, "src", "a.py").write_text("a = 2  # the session changed it\n")
+Path(projK, "b.txt").unlink()
+Path(projK, "made.txt").write_text("the session made it\n")
+d = JS("undo", projK, "--json")
+ck((d.get("changed"), d.get("added"), d.get("removed")) == (1, 1, 1) and not d.get("applied"),
+   f"undo: what changed since the session started ({d.get('files')})")
+blocker = subprocess.Popen(["sleep", "600"], cwd="/")
+(rec / f"{blocker.pid}.json").write_text(json.dumps({"pid": blocker.pid, "cwd": projK,
+                                                     "status": "busy"}))
+r = run("undo", projK, "--apply")
+ck(r.returncode == 3 and Path(projK, "made.txt").exists(),
+   "undo: refused while a session works in the folder")
+blocker.kill(); blocker.wait()
+(rec / f"{blocker.pid}.json").unlink()
+d = JS("undo", projK, "--apply", "--json")
+kept = Path(d.get("kept", "/nonexistent"))
+ck(d.get("applied") and Path(projK, "src", "a.py").read_text() == "a = 1\n"
+   and Path(projK, "b.txt").read_text() == "keep me\n" and not Path(projK, "made.txt").exists()
+   and (kept / "made.txt").is_file() and "changed it" in (kept / "src" / "a.py").read_text(),
+   "undo: the folder is as it was; what it held is set aside")
+
+# which projects are too big for a copy, and folders left out of the copies
+os.makedirs(projK + "/results")
+for i in range(30):
+    Path(projK, "results", f"r{i}.csv").write_text("1\n")
+cov = JS("checkpoint", "--coverage", "--max", "20", "--json")
+rowK = next((r for r in cov.get("projects", []) if r["project"] == projK), {})
+ck(rowK.get("over") and rowK["biggest"][0] == {"name": "results", "files": 30}
+   and projK in [r["project"] for r in cov.get("over", [])],
+   f"coverage: a project over the limit, with its biggest folder ({rowK})")
+run("config", "--set", "checkpoint_excludes=results")
+cov = JS("checkpoint", "--coverage", "--max", "20", "--json")
+rowK = next((r for r in cov.get("projects", []) if r["project"] == projK), {})
+d = JS("checkpoint", projK, "--json")
+ck(rowK.get("over") is False and d.get("files") == 2 and d.get("skip", [])[-1] == "results",
+   f"checkpoint_excludes: the folder stays out, the project is covered again ({rowK}, {d.get('files')})")
+run("config", "--unset", "checkpoint_excludes")
+dd = JS("undo", projK, "--json")
+ck(dd.get("added") == 0 and dd.get("changed") == 0,
+   "undo compares with the names left out when the copy was made, not today's")
+shutil.rmtree(projK + "/results")
+
+# loose ends: work not committed, and a session that ended on a question
+kst = tools / "claude" / enc(projK)
+kst.mkdir(exist_ok=True)
+(kst / "k1.jsonl").write_text(
+    json.dumps({"type": "user", "cwd": projK, "message": {"role": "user", "content": "fix it"}})
+    + "\n" + json.dumps({"type": "assistant", "cwd": projK, "message": {"role": "assistant",
+          "content": [{"type": "text", "text": "Fixed the parser.\n\nShall I also update "
+                                               "the docs for the new option?"}]}}) + "\n")
+has_git = shutil.which("git") is not None
+if has_git:
+    subprocess.run(["git", "init", "-q", projK], capture_output=True)
+row = next((r for r in JS("loose-ends", "--json").get("loose_ends", [])
+            if r["project"] == projK), {})
+kinds = sorted(i["kind"] for i in row.get("items", []))
+ck(kinds == (["question", "uncommitted"] if has_git else ["question"])
+   and any("update the docs" in i["text"] for i in row["items"]),
+   f"loose ends: files not committed and the question left open ({row})")
+
+# a second opinion: the same task by two agents, each in its own copy
+projO = os.path.realpath(str(roots / "Opinion"))
+os.makedirs(projO)
+Path(projO, "a.py").write_text("a = 1\n")
+wrap = {}
+for who in ("claude", "kimi"):
+    w = sb / f"agent-{who}"
+    w.write_text(f'#!/bin/sh\nexec "{PY}" "{HERE / "fake_agent.py"}" {who} "$@"\n')
+    w.chmod(0o755)
+    wrap[f"AHT_CLI_{who.upper()}"] = str(w)
+r = run("second-opinion", projO, "--task", "add a line", extra_env=wrap)
+ck(r.returncode == 3 and "tokens" in r.stdout,
+   "second opinion: off until turned on, because it uses both agents' tokens")
+run("config", "--set", "second_opinion=true")
+d = JS("second-opinion", projO, "--task", "add a line", "--json", extra_env=wrap)
+rid = d.get("id", "?")
+for _ in range(120):
+    sh_ = JS("second-opinion", "--show", rid, "--json", extra_env=wrap)
+    if all(r.get("state") in ("done", "failed") for r in sh_.get("results", {}).values()):
+        break
+    time.sleep(0.25)
+res = sh_.get("results", {})
+files = {a: sorted((f["state"], f["name"]) for f in r.get("files", [])) for a, r in res.items()}
+ck(d.get("applied") and files == {"claude": [("changed", "a.py")],
+                                  "kimi": [("added", "notes.txt"), ("changed", "a.py")]}
+   and "Claude: added a line." in res.get("claude", {}).get("answer", "")
+   and Path(projO, "a.py").read_text() == "a = 1\n",
+   f"second opinion: both worked in copies; the project is untouched ({files})")
+Path(projO, "a.py").write_text("a = 1  # changed meanwhile\n")
+r = run("second-opinion", "--take", rid, "--from", "kimi", "--apply", extra_env=wrap)
+ck(r.returncode == 3 and "since the copies were made" in r.stdout,
+   "second opinion: not taken over a file changed in the project meanwhile")
+Path(projO, "a.py").write_text("a = 1\n")
+d = JS("second-opinion", "--take", rid, "--from", "kimi", "--apply", "--json", extra_env=wrap)
+ck(d.get("applied") and "kimi did" in Path(projO, "a.py").read_text()
+   and Path(projO, "notes.txt").is_file() and Path(d["kept"], "a.py").is_file(),
+   "second opinion: one agent's changes brought in; the old files set aside")
+run("second-opinion", "--discard", rid)
+ck(not (sb / ".aht" / "opinions" / rid).exists(), "second opinion: the copies can be removed")
+run("config", "--unset", "second_opinion")
+
+d = JS("sessions", "--json")
+ck(any(s.get("title") == "Pelican deploy" for s in d.get("sessions", [])),
+   "sessions: every session with its title, for Spotlight")
+
+print("\n[20] a session carries its iTerm2 tab's title (what the Claude app shows)")
+tabs_file = sb / "iterm-tabs.json"
+tabs_file.write_text(json.dumps({"/dev/ttysT1": {"title": "Paper", "pane": 1, "panes": 1},
+                                 "/dev/ttysT2": {"title": "Paper", "pane": 1, "panes": 1}}))
+tstore = tools / "claude" / enc(projX)
+def title_line(t, sid):
+    return json.dumps({"type": "custom-title", "customTitle": t, "sessionId": sid}) + "\n"
+def fake_claude(sid, title=None):
+    """A stand-in Claude process: a live pid with a session record and a transcript."""
+    proc = subprocess.Popen(["sleep", "600"], cwd="/", stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    (rec / f"{proc.pid}.json").write_text(json.dumps({"pid": proc.pid, "cwd": projX,
+                                                      "sessionId": sid, "status": "idle"}))
+    (tstore / f"{sid}.jsonl").write_text(title_line(title, sid) if title else "")
+    return proc
+def tab_hook(event, sid, tty, pid, **extra):
+    payload = {"hook_event_name": event, "session_id": sid, "cwd": projX,
+               "transcript_path": str(tstore / f"{sid}.jsonl"), "source": "startup"}
+    out = hook_out(payload, AHT_ITERM_TABS=str(tabs_file), AHT_TTY=tty,
+                   AHT_CLAUDE_PID=str(pid), **extra).strip()
+    try:
+        return json.loads(out)["hookSpecificOutput"].get("sessionTitle")
+    except Exception:
+        return out or None
+a = fake_claude("t1")
+ck(tab_hook("SessionStart", "t1", "/dev/ttysT1", a.pid) == "Paper",
+   "tab names: a new session takes its tab's title")
+with open(tstore / "t1.jsonl", "a") as fh:
+    fh.write(title_line("Paper", "t1"))
+ck(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid) is None,
+   "tab names: nothing said while the name is right")
+tabs_file.write_text(json.dumps({"/dev/ttysT1": {"title": "Paper v2", "pane": 1, "panes": 1},
+                                 "/dev/ttysT2": {"title": "Paper v2", "pane": 1, "panes": 1}}))
+ck(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid) == "Paper v2",
+   "tab names: a renamed tab renames the session at the next prompt")
+with open(tstore / "t1.jsonl", "a") as fh:
+    fh.write(title_line("Paper v2", "t1"))
+b = fake_claude("t2")
+ck(tab_hook("SessionStart", "t2", "/dev/ttysT2", b.pid) == "Paper v2 · 2",
+   "tab names: a second open session with that title gets “· 2”")
+c = fake_claude("t3")
+(tstore / "t3.jsonl").write_text(json.dumps({"type": "user", "forkedFrom": {"sessionId": "t1"},
+                                             "message": {"role": "user", "content": "x"}})
+                                 + "\n" + title_line("Paper v2", "t3"))
+ck(tab_hook("UserPromptSubmit", "t3", "/dev/ttysT2", c.pid) == "Paper v2 ⑂ 2",
+   "tab names: a branch that inherited the name becomes “⑂ 2”")
+d_ = fake_claude("t4", title="My own name")
+ck(tab_hook("UserPromptSubmit", "t4", "/dev/ttysT1", d_.pid) is None,
+   "tab names: a name the user gave the session stays")
+run("config", "--set", "tab_names=false")
+e_ = fake_claude("t5")
+ck(tab_hook("SessionStart", "t5", "/dev/ttysT1", e_.pid) is None,
+   "tab names: off in the settings, nothing happens")
+run("config", "--unset", "tab_names")
+run("config", "--set", "informed_sessions=true")
+f_ = fake_claude("t6")
+raw = hook_out({"hook_event_name": "SessionStart", "session_id": "t6", "cwd": projX,
+                "transcript_path": str(tstore / "t6.jsonl"), "source": "startup"},
+               AHT_ITERM_TABS=str(tabs_file), AHT_TTY="/dev/ttysT1", AHT_CLAUDE_PID=str(f_.pid))
+try:
+    hso = json.loads(raw)["hookSpecificOutput"]
+except Exception:
+    hso = {}
+ck(hso.get("sessionTitle", "").startswith("Paper v2")
+   and "[aht] The latest earlier session" in hso.get("additionalContext", ""),
+   f"tab names: the start notes travel with the name, as JSON ({raw[:120]!r})")
+run("config", "--unset", "informed_sessions")
+probe = ("import sys, json; sys.path.insert(0, sys.argv[1]); import aht; "
+         "print(aht.handover_session_name('t1', '/x/Paper', 'homebox')); "
+         "print(aht.handover_session_name('nobody', '/x/Paper', 'homebox'))")
+r = subprocess.run([PY, "-c", probe, str(HERE.parent)], env=env, capture_output=True, text=True)
+ck(r.stdout.split() == ["Paper", "v2", "@", "homebox", "Paper"],
+   f"handover: the session there is “<tab title> @ <machine>” ({r.stdout.strip() or r.stderr[-200:]})")
+# a name set in aht's window: at the next prompt, and it stays until handed back
+run("tab-names", "--rename", "t1", "--to", "Budget work")
+ck(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid) == "Budget work",
+   "rename: the name set in aht arrives at the session's next prompt")
+with open(tstore / "t1.jsonl", "a") as fh:
+    fh.write(title_line("Budget work", "t1"))
+ck(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid) is None,
+   "rename: it stays, whatever the tab is called")
+run("tab-names", "--rename", "t1", "--to", "")
+ck(str(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid)).startswith("Paper v2"),
+   "rename: following the tab again brings the tab's title back")
+for pr in (a, b, c, d_, e_, f_):
+    pr.kill(); pr.wait()
+    (rec / f"{pr.pid}.json").unlink()
+
+# name every open session after its tab, also one named otherwise
+tabs_file.write_text(json.dumps({"/dev/ttysT1": {"title": "Alpha", "pane": 1, "panes": 1},
+                                 "/dev/ttysT2": {"title": "Alpha", "pane": 1, "panes": 1}}))
+g = fake_claude("t7", title="Draft")
+h = fake_claude("t8")
+tenv = {"AHT_ITERM_TABS": str(tabs_file),
+        "AHT_TTYS": json.dumps({str(g.pid): "/dev/ttysT1", str(h.pid): "/dev/ttysT2"})}
+d = JS("tab-names", "--sync-all", "--json", extra_env=tenv)
+plan = sorted((x["from"] or "", x["to"]) for x in d.get("plan", []))
+ck(plan == [("", "Alpha · 2"), ("Draft", "Alpha")] and not d.get("applied"),
+   f"sync all: every session with a tab title takes it, a clash gets “· 2” ({plan})")
+rows = {r["session"]: r for r in JS("tab-names", "--json", extra_env=tenv).get("sessions", [])}
+ck(rows.get("t7", {}).get("origin") == "yours" and rows["t7"].get("tab") == "Alpha",
+   f"tab names: the list says where each name came from ({rows.get('t7')})")
+JS("tab-names", "--sync-all", "--apply", "--json", extra_env=tenv)
+ck(tab_hook("UserPromptSubmit", "t7", "/dev/ttysT1", g.pid) == "Alpha",
+   "sync all: applied at the next prompt, also over a name the user gave")
+for pr in (g, h):
+    pr.kill(); pr.wait()
+    (rec / f"{pr.pid}.json").unlink()
+
+print("\n[22] workspace, go to a tab, a checkup of open sessions, tidy, the usage limit")
+ilog = sb / "iterm.log"
+def ilines():
+    return [json.loads(l) for l in ilog.read_text().splitlines()] if ilog.is_file() else []
+tabs_file.write_text(json.dumps({
+    "/dev/ttysW1": {"title": "Paper", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 1},
+    "/dev/ttysW2": {"title": "Notes", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 2},
+    "/dev/ttysW3": {"title": "", "override": False, "pane": 1, "panes": 1, "window": 1, "tab": 3}}))
+p1 = fake_claude("w1", title="Paper")
+shell = subprocess.Popen(["sleep", "600"], cwd="/", stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+started = "claude --dangerously-skip-permissions --model opus --resume old1 fix-it"
+wenv = {"AHT_ITERM_LOG": str(ilog), "AHT_ITERM_TABS": str(tabs_file),
+        "AHT_TTYS": json.dumps({str(p1.pid): "/dev/ttysW1"}),
+        "AHT_TTY_PROCS": json.dumps({"/dev/ttysW1": [[p1.pid, started]],
+                                     "/dev/ttysW2": [[shell.pid, "-zsh"]], "/dev/ttysW3": []}),
+        "AHT_CWDS": json.dumps({str(shell.pid): projX}),
+        "AHT_CMDLINES": json.dumps({str(p1.pid): started}), "AHT_CLAUDE_VERSION": "9.9.9"}
+JS("workspace", "--save", "--json", extra_env=wenv)
+JS("workspace", "--save", "--json", extra_env=wenv)
+ws = JS("workspace", "--json", extra_env=wenv).get("workspaces", [])
+snap = json.loads(next((sb / ".aht" / "workspaces").glob("*.json")).read_text())
+e1 = next((e for e in snap["tabs"] if e["title"] == "Paper"), {})
+e2 = next((e for e in snap["tabs"] if e["title"] == "Notes"), {})
+ck(len(ws) == 1 and ws[0]["tabs"] == 3 and ws[0]["sessions"] == 1
+   and e1.get("session") == "w1" and e1.get("args") == ["--dangerously-skip-permissions",
+                                                        "--model", "opus"]
+   and e2.get("cwd") == projX and e2.get("agent") is None,
+   f"workspace: tabs, titles, folders and sessions kept; the same layout once ({ws}, {e1})")
+r = run("workspace", "--restore", extra_env=wenv)
+ck(r.returncode == 3 and "its session is open" in r.stdout and "that title is open" in r.stdout,
+   "workspace: what is open now is skipped")
+p1.kill(); p1.wait()
+(rec / f"{p1.pid}.json").unlink()
+tabs_file.write_text(json.dumps({"/dev/ttysW3": {"title": "", "override": False, "pane": 1,
+                                                 "panes": 1, "window": 1, "tab": 1}}))
+d = JS("workspace", "--restore", "--apply", "--json", extra_env=wenv)
+script = next((x["script"] for x in ilines() if x.get("what") == "restore"), "")
+ck(d.get("applied") and d["plan"]["opens"] == 2 and "--resume w1" in script
+   and "--model opus" in script and "fix-it" not in script and "old1" not in script
+   and "user.ahtTitle" in script and "Notes" in script
+   and "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1" in script,
+   f"workspace: opened again, each session resumed with its options, tabs titled ({d.get('plan')})")
+
+# go to a session's tab; a background session has none
+p2 = fake_claude("w2")
+genv = dict(wenv, AHT_TTYS=json.dumps({str(p2.pid): "/dev/ttysW3"}))
+r = run("goto", str(p2.pid), extra_env=genv)
+ck(r.returncode == 0 and {"tty": "/dev/ttysW3", "what": "goto", "text": ""} in ilines(),
+   "goto: the session's tab is brought to the front")
+r = run("goto", "w2", extra_env=dict(wenv, AHT_TTYS="{}"))
+ck(r.returncode == 1 and "background" in r.stderr, "goto: a background session has no tab")
+
+# the checkup: open twice, stuck, outside the app, older Claude Code
+(tools / "settings.json").write_text(json.dumps({"remoteControlAtStartup": True}))
+old = int((time.time() - 5 * 3600) * 1000)
+p3 = fake_claude("w3")
+p4 = subprocess.Popen(["sleep", "600"], cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+(rec / f"{p3.pid}.json").write_text(json.dumps({"pid": p3.pid, "cwd": projX, "sessionId": "w3",
+    "status": "busy", "statusUpdatedAt": old, "version": "1.0.0", "kind": "interactive"}))
+(rec / f"{p4.pid}.json").write_text(json.dumps({"pid": p4.pid, "cwd": projX, "sessionId": "w3",
+    "status": "idle", "version": "9.9.9", "kind": "interactive", "bridgeSessionId": "b1"}))
+os.utime(tstore / "w3.jsonl", (time.time() - 5 * 3600, time.time() - 5 * 3600))
+cenv = dict(wenv, AHT_TTYS=json.dumps({str(p3.pid): "/dev/ttysW3", str(p2.pid): "/dev/ttysW3"}),
+            AHT_CMDLINES=json.dumps({str(p3.pid): "claude --model sonnet --resume w3"}))
+rows = {r["pid"]: r for r in JS("checkup", "--json", extra_env=cenv).get("sessions", [])}
+i3, i4 = rows.get(p3.pid, {}).get("issues", []), rows.get(p4.pid, {}).get("issues", [])
+ck(sorted(i3) == ["older", "outside the app", "stuck", "twice"] and i4 == ["twice"]
+   and rows[p3.pid]["can_restart"],
+   f"checkup: open twice, stuck, outside the app, older ({i3}, {i4})")
+d = JS("checkup", "--restart", str(p3.pid), "--apply", "--json", extra_env=cenv)
+typed = [x for x in ilines() if x.get("what") == "write"]
+ck(d.get("applied") and p3.wait(timeout=5) is not None and typed
+   and typed[-1]["tty"] == "/dev/ttysW3" and "--model sonnet --resume w3" in typed[-1]["text"],
+   f"checkup --restart: ended, then started again in its tab with its options ({d})")
+d = JS("checkup", "--close", str(p4.pid), "--apply", "--json", extra_env=cenv)
+ck(d.get("applied") and p4.wait(timeout=5) is not None,
+   "checkup --close: the process ends; its conversation stays")
+for pr in (p2, shell):
+    pr.kill(); pr.wait()
+for f in rec.glob("*.json"):
+    f.unlink()
+
+# tidy: a history without a folder goes to the Trash, only when asked
+orphan = tools / "claude" / "-gone-forever"
+orphan.mkdir()
+(orphan / "o1.jsonl").write_text(json.dumps({"type": "user", "cwd": "/gone/forever",
+                                             "message": {"role": "user", "content": "x"}}) + "\n")
+trash = sb / "trash"
+d = JS("tidy", "--show=-gone-forever", "--json")
+row = next((o for o in JS("tidy", "--json").get("orphans", []) if o["store"] == "-gone-forever"), {})
+ck("# History of /gone/forever" in d.get("markdown", "") and "**You:** x" in d["markdown"]
+   and row.get("sessions") == 1 and row.get("bytes", 0) > 0 and row.get("last"),
+   f"tidy --show: a history to read before deciding, with its size and last use ({row})")
+r = run("tidy", "--remove-history=-gone-forever", extra_env={"AHT_TRASH": str(trash)})
+ck(r.returncode == 0 and orphan.is_dir(), "tidy --remove-history: a dry run first")
+d = JS("tidy", "--remove-history=-gone-forever", "--apply", "--json",
+       extra_env={"AHT_TRASH": str(trash)})
+ck(d.get("applied") and not orphan.exists() and (trash / "-gone-forever" / "o1.jsonl").is_file(),
+   "tidy --remove-history: moved to the Trash")
+r = run("tidy", "--remove-history=" + enc(projX), "--apply", extra_env={"AHT_TRASH": str(trash)})
+ck(r.returncode == 3 and (tools / "claude" / enc(projX)).is_dir(),
+   "tidy --remove-history: never a history a tracked project owns")
+
+# Claude Code's own continue-after-the-limit, switched from aht
+run("limits", "--auto-continue", "on")
+st = json.loads((tools / "settings.json").read_text())
+ck(st.get("autoContinueAtUsageLimit") is True and st.get("remoteControlAtStartup") is True
+   and JS("limits", "--json").get("auto_continue") is True,
+   "limits --auto-continue: Claude Code's setting, the others left as they were")
+
+print("\n[21] the documentation covers everything")
+import re as _re
+guide = (HERE.parent / "GUIDE.md").read_text()
+heads = [l[3:].strip().lower() for l in guide.splitlines() if l.startswith("## ")]
+swift = (HERE.parent / "macos" / "tray.swift").read_text()
+topics = set(_re.findall(r'HelpButton\("([^"]+)"\)', swift)) \
+    | set(_re.findall(r'headed\([^\n]*?, "([^"]+)"\)', swift)) \
+    | set(_re.findall(r'topic: "([^"]+)"', swift))
+lost = sorted(t for t in topics if not any(h.startswith(t.lower()) for h in heads))
+ck(topics and not lost, f"every ? in the window opens a section of the guide ({lost})")
+sys.path.insert(0, str(HERE.parent))
+import aht as _core
+subs = [a for a in _core.build_parser()._actions
+        if a.__class__.__name__ == "_SubParsersAction"][0].choices
+ck(not [n for n in subs if not n.startswith("_") and f"aht {n}" not in guide],
+   "every command is in the guide")
+loose = _re.findall(r'"--(store|task|rename|relink|remove-history|show|to)", '
+                   r'(?:t\.key|task|sid|dst|j\[|name)', swift)
+ck(not loose, f"the window glues values to their options, so a value may begin with a dash ({loose})")
+r = run("bind", "--store=-Users-nobody-gone", "--to=/nonexistent")
+ck("expected one argument" not in r.stderr, "bind --store=<name beginning with a dash> is read right")
+ck(not [k for k in _core.CONFIG_DEFAULTS if f"`{k}`" not in guide],
+   f"every setting is in the guide ({[k for k in _core.CONFIG_DEFAULTS if f'`{k}`' not in guide]})")
+
+run("config", "--set", "terminal_app=Terminal")
+probe = "import sys; sys.path.insert(0, sys.argv[1]); import aht; print(aht.terminal_choice())"
+r = subprocess.run([PY, "-c", probe, str(HERE.parent)], env=env, capture_output=True, text=True)
+ck(r.stdout.strip() == "Terminal", f"terminal_app: the chosen terminal is used ({r.stdout.strip()})")
+run("config", "--unset", "terminal_app")
 
 shutil.rmtree(sb, ignore_errors=True)
 print("\nCORE RESULT:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")

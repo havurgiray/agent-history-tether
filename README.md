@@ -24,8 +24,8 @@ On macOS, aht is an app: an ∞ in the menu bar and a window.  On Linux and
 Windows it is a tray and the `aht` command (see *Platforms*).
 
 <p>
-<img src="docs/screenshots/mac-projects.png" width="49%" alt="The Projects tab: every tracked folder, where it is, when it was last used, and the actions for the selected one">
-<img src="docs/screenshots/mac-sessions.png" width="49%" alt="The Sessions tab: open sessions with their names, Go to Tab, and Restart in Its Tab for one outside the Claude app">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/mac-projects-dark.png"><img src="docs/screenshots/mac-projects.png" width="49%" alt="The Projects tab: every tracked folder, where it is, when it was last used, and the actions for the selected one"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/mac-sessions-dark.png"><img src="docs/screenshots/mac-sessions.png" width="49%" alt="The Sessions tab: open sessions with their names, Go to Tab, and Restart in Its Tab for one outside the Claude app"></picture>
 </p>
 
 - **Projects** — every tracked folder: here or handed over, a session
@@ -44,10 +44,10 @@ Windows it is a tray and the `aht` command (see *Platforms*).
   ⌃⌥⌘A, Spotlight, `aht://` links and notices you can click.
 - A **?** next to every feature opens the [guide](GUIDE.md) at its section:
 
-<p><img src="docs/screenshots/mac-guide.png" width="70%" alt="The guide window: every topic on the left, the selected one on the right"></p>
+<p><picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/mac-guide-dark.png"><img src="docs/screenshots/mac-guide.png" width="70%" alt="The guide window: every topic on the left, the selected one on the right"></picture></p>
 
-*The screenshots show made-up projects; `docs/make_screenshots.py` renders
-them again.*
+*The screenshots show made-up projects, in your page's light or dark look;
+`docs/make_screenshots.py` renders them again.*
 
 ## Supported agents
 

@@ -4679,17 +4679,39 @@ if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
 // snapshot: the window's tabs (and its dialogs) as PNG files, to look at a
 // layout without clicking through it (needs a login session; nothing changes)
 //   --snapshot DIR [--select-first] [--query WORDS]
+/// --dark renders in the dark appearance; the window's own background is
+/// drawn under every snapshot, so the PNG is opaque (a transparent one is
+/// unreadable on a page of the other colour)
+let SNAP_LOOK = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)!
+
 func snapshot(_ view: some View, _ file: String, _ size: NSSize) {
     let host = NSHostingView(rootView: view)
+    host.appearance = SNAP_LOOK
     let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                      styleMask: [.titled], backing: .buffered, defer: false)
+    w.appearance = SNAP_LOOK
     w.contentView = host
     w.layoutIfNeeded()
     RunLoop.main.run(until: Date().addingTimeInterval(0.8))
     host.layoutSubtreeIfNeeded()
     guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
     host.cacheDisplay(in: host.bounds, to: rep)
-    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: file))
+    guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: rep.pixelsWide,
+                                     pixelsHigh: rep.pixelsHigh, bitsPerSample: 8,
+                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+    else { return }
+    out.size = rep.size
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+    let all = NSRect(origin: .zero, size: rep.size)
+    SNAP_LOOK.performAsCurrentDrawingAppearance {
+        NSColor.windowBackgroundColor.setFill()
+        all.fill()
+    }
+    rep.draw(in: all, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    NSGraphicsContext.restoreGraphicsState()
+    try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: file))
     print("wrote \(file)")
 }
 
@@ -4699,6 +4721,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     let dir = args[i + 1]
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     NSApplication.shared.setActivationPolicy(.accessory)
+    NSApplication.shared.appearance = SNAP_LOOK
     let model = AppModel()
     model.take(AppModel.load())
     if args.contains("--select-first") { model.selection = model.shown.first?.path }

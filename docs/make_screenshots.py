@@ -2,9 +2,11 @@
 """Render the aht window from a made-up demo setup, for the README's
 screenshots: no real project, session, machine, path or user name appears.
 
-  docs/make_screenshots.py OUT_DIR [SANDBOX_DIR] [--app PATH/TO/aht-tray]
+  docs/make_screenshots.py OUT_DIR [SANDBOX_DIR] [--app PATH/TO/aht-tray] [--dark]
 
-Then: sips -Z 1400 OUT_DIR/{projects,sessions,guide}.png --out docs/screenshots/mac-….png
+--app: the aht-tray inside an aht.app (it carries the core); --dark renders
+the dark appearance.  Then, for light and dark:
+  sips -Z 1400 OUT_DIR/{projects,sessions,guide}.png --out docs/screenshots/mac-…[-dark].png
 """
 import json, os, shutil, subprocess, sys, time
 from datetime import datetime, timezone
@@ -14,7 +16,7 @@ import tempfile
 REPO = Path(__file__).resolve().parent.parent
 APP = (sys.argv[sys.argv.index("--app") + 1] if "--app" in sys.argv
        else "/Applications/aht.app/Contents/MacOS/aht-tray")
-args = [a for a in sys.argv[1:] if a != "--app" and a != APP]
+args = [a for a in sys.argv[1:] if a not in ("--app", APP, "--dark")]
 OUT = Path(args[0])
 D = Path(os.path.realpath(args[1] if len(args) > 1 else tempfile.mkdtemp(prefix="aht-demo-")))
 shutil.rmtree(D, ignore_errors=True)
@@ -123,7 +125,8 @@ aht("search", "--update")
 
 try:
     shutil.rmtree(OUT, ignore_errors=True)
-    r = subprocess.run([APP, "--snapshot", str(OUT), "--select-first"], env=env,
+    r = subprocess.run([APP, "--snapshot", str(OUT), "--select-first"]
+                       + (["--dark"] if "--dark" in sys.argv else []), env=env,
                        capture_output=True, text=True, timeout=400)
     print(r.stdout[-400:], r.stderr[-400:])
 finally:

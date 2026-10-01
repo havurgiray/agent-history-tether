@@ -56,7 +56,7 @@ import subprocess
 import unicodedata
 from pathlib import Path
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
@@ -128,7 +128,31 @@ CONFIG_DEFAULTS = {
     "handover_claude_args": [],      # extra arguments for the resumed session
     "handover_mosh":    True,        # attach with mosh when both sides have it
     "rsync_path":       None,        # None -> the newest rsync found
+    # notices: a session that waits for you, or finished a long piece of work
+    "notify_waiting":   True,
+    "notify_finished":  True,
+    "notify_finished_minutes": 3,
+    "notify_phone":     None,        # "imessage:<phone or Apple ID>" | "ntfy:<topic>"
+    "offsite_backup":   None,        # a machine that keeps a copy of the backups
+    "report_areas":     None,        # {"Work": "~/Desktop/Workspace/Work", …}
+    "hotkey":           "ctrl+opt+cmd+a",   # opens the search from anywhere
     "terminal_app":     None,        # macOS: app that opens a session window
+    # before and after a session.  USES TOKENS = off until turned on
+    "informed_sessions": False,      # USES TOKENS: a new session learns where the
+                                     #   last one in its folder stopped
+    "notify_limit":     True,        # say so when Claude hits its usage limit
+    "limit_switch":     False,       # USES TOKENS: offer to go on in another agent
+    "limit_switch_to":  "kimi",      #   … this one
+    "checkpoints":      True,        # a copy of the folder when a session starts
+    "checkpoint_keep":  10,          #   per project
+    "checkpoint_max_files": 20000,   #   bigger folders get none (see `aht
+                                     #   checkpoint --coverage`)
+    "checkpoint_excludes": [],       #   extra names left out of the copies
+    "second_opinion":   False,       # USES TOKENS: one task, two agents, compared
+    "night_shift":      False,       # USES TOKENS: a handover with a task, on a timer
+    "spotlight":        True,        # session titles in Spotlight (the app)
+    "tab_names":        True,        # a Claude session is named after its iTerm2
+                                     #   tab (what the Claude app shows)
 }
 
 POLICY_CHOICES = {
@@ -163,6 +187,20 @@ def _coerce(key: str, raw: str):
         if v not in LOG_LEVELS:
             raise ValueError(f"log_level expects one of {sorted(LOG_LEVELS)}")
         return v
+    if key == "limit_switch_to":
+        v = raw.strip().lower()
+        if v not in SWITCH_TARGETS or v == "claude":
+            raise ValueError("limit_switch_to expects one of "
+                             f"{[t for t in SWITCH_TARGETS if t != 'claude']}")
+        return v
+    if key == "report_areas":
+        try:
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                raise ValueError("expects a JSON object")
+        except Exception as e:
+            raise ValueError(f'{key}: {e} — e.g. {{"Work": "~/Desktop/Work"}}')
+        return {str(k): _expand(str(v)) for k, v in obj.items()}
     if key == "remotes":
         try:
             obj = json.loads(raw)
@@ -989,10 +1027,31 @@ def ask_dialog(message: str, buttons: list, default: str,
         return _ask_linux(message, buttons, default, title, timeout)
     return _ask_terminal(message, buttons, default, title)
 
-def notify_user(title: str, message: str) -> None:
+def _app_binary():
+    """The aht app's own executable: a notice it posts is aht's, so a click
+    on it opens aht (one posted through AppleScript opens Script Editor)."""
+    for d in ("/Applications", str(Path.home() / "Applications")):
+        exe = Path(d) / "aht.app" / "Contents" / "MacOS" / "aht-tray"
+        if exe.is_file():
+            return exe
+    return None
+
+def notify_user(title: str, message: str, info: dict = None) -> None:
     try:
         if os.environ.get("AHT_NO_NOTIFY") or not cfg_get("notifications", True):
             return
+        if IS_MAC and app_running():            # the app shows it, and handles a click
+            q = aht_home() / "run" / "app-notices.jsonl"
+            with open(q, "a") as fh:
+                fh.write(json.dumps({"title": title, "message": message, "info": info or {},
+                                     "at": time.time()}) + "\n")
+            return
+        exe = _app_binary() if IS_MAC else None
+        if exe:
+            r = subprocess.run([str(exe), "--notify", title, message, json.dumps(info or {})],
+                               capture_output=True, timeout=15, cwd="/")
+            if r.returncode == 0:
+                return
         if IS_MAC and _have("osascript"):
             subprocess.run(["osascript", "-e",
                             "display notification %s with title %s"
@@ -1779,6 +1838,7 @@ def maybe_auto_backup() -> None:
         done = sum(1 for r in backup_pass() if r["status"] == "backed-up")
         if done:
             log(f"BACKUP auto pass: {done} project(s) snapshotted")
+            _spawn_offsite()
     except Exception as e:
         error(f"BACKUP auto pass failed: {e}")
 
@@ -2656,6 +2716,10 @@ def cmd_hook(args):
     except Exception:
         data = {}
     cwd = os.path.realpath(data.get("cwd") or os.getcwd())
+    if _inside(cwd, os.path.realpath(str(aht_home()))):
+        return 0                    # a copy aht made (second opinion): not a project
+    if data.get("hook_event_name") == "UserPromptSubmit":
+        return _prompt_hook(data)   # every prompt: only the tab's name, and quickly
     tpath = data.get("transcript_path") or ""
     new_name = os.path.basename(os.path.dirname(tpath)) if tpath else ""
     if not new_name:
@@ -2727,7 +2791,29 @@ def cmd_hook(args):
             apply_badge(cwd, desired_marks(cwd, True))
     except Exception:
         pass
-    _hook_notes(cwd)
+    notes = [_hook_notes(cwd)]
+    source = str(data.get("source") or "startup")
+    sid = data.get("session_id")
+    if source != "compact" and cwd != home:
+        _spawn_checkpoint(cwd, sid, "claude")
+    if source in ("startup", "clear") and cfg_get("informed_sessions", False):
+        try:                        # USES TOKENS: only when the user turned it on
+            notes.append(informed_note(cwd, current=sid))
+        except Exception as e:
+            warn(f"HOOK informed note: {e}")
+    notes = "\n\n".join(n for n in notes if n)
+    try:
+        title = tab_session_name(data, "SessionStart")
+    except Exception as e:
+        title = None
+        warn(f"HOOK tab name: {e}")
+    if title:                       # JSON, so Claude Code takes the name too
+        out = {"hookEventName": "SessionStart", "sessionTitle": title}
+        if notes:
+            out["additionalContext"] = notes
+        print(json.dumps({"hookSpecificOutput": out}))
+    elif notes:
+        print(notes)
     _spawn_auto_backup()
     _spawn_mirror()
     _spawn_search_update()
@@ -2778,11 +2864,20 @@ def watcher_status() -> dict:
         st["detail"] = str(e)
     return st
 
-def hook_installed() -> bool:
+def claude_remote_control() -> bool:
+    """Whether Claude Code puts every session into the Claude app (/config →
+    "Enable Remote Control for all sessions")."""
+    try:
+        return bool(json.loads((claude_home() / "settings.json").read_text())
+                    .get("remoteControlAtStartup"))
+    except Exception:
+        return False
+
+def hook_installed(event: str = "SessionStart") -> bool:
     s = Path.home() / ".claude/settings.json"
     try:
         data = json.loads(s.read_text())
-        for group in data.get("hooks", {}).get("SessionStart", []):
+        for group in data.get("hooks", {}).get(event, []):
             for h in group.get("hooks", []):
                 c = h.get("command", "")
                 if "aht.py" in c or "aht.exe" in c.lower():
@@ -2846,6 +2941,12 @@ def cmd_status(args):
         "log": {"path": str(log_path()),
                 "recent_problems": recent_log_problems()},
         "hook_installed": hook_installed(),
+        "prompt_hook_installed": hook_installed("UserPromptSubmit"),
+        "claude_remote_control": claude_remote_control(),
+        "claude_auto_continue": claude_auto_continue(),
+        "terminals": {"installed": [t for t in TERMINALS if app_installed(t)],
+                      "chosen": cfg_get("terminal_app"), "used": terminal_choice()}
+        if IS_MAC else {},
         "gui_dialogs": gui_dialogs_available(),
         "policies": {"moves": cfg_get("move_policy"),
                      "copies": cfg_get("copy_policy"),
@@ -2891,6 +2992,10 @@ def cmd_projects(args):
         live = running_sessions() if handover_supported() else []
     except Exception:
         live = []
+    try:
+        stops = [h for h in limit_stops(12) if not h["over"] and h.get("project")]
+    except Exception:
+        stops = []
     for uid, e in reg.get("projects", {}).items():
         row = {"uuid": uid, "real_path": e["real_path"],
                "exists": os.path.isdir(e["real_path"]),
@@ -2911,11 +3016,16 @@ def cmd_projects(args):
         row["open"] = None if not mine else (
             "waiting" if "waiting" in mine else
             "idle" if all(s == "idle" for s in mine) else "working")
+        hit = next((h for h in stops if os.path.realpath(h["project"])
+                    == os.path.realpath(e["real_path"])), None)
+        row["limit"] = {k: hit.get(k) for k in ("session", "resets", "at", "until")} \
+            if hit else None
         row.update(_hist_stats(e))
         out.append(row)
     out.sort(key=lambda r: r["real_path"].lower())
     if args.json:
-        print(json.dumps({"projects": out}, indent=2))
+        print(json.dumps({"projects": out, "limit_switch_to": limit_switch_target()},
+                         indent=2))
     else:
         print(f"{len(out)} tethered project(s):")
         for r in out:
@@ -3105,6 +3215,10 @@ def cmd_doctor(args):
     except Exception as e:
         ck("lock acquirable", False, e)
     ck("SessionStart hook registered (claude)", hook_installed())
+    if IS_MAC and cfg_get("tab_names", True):
+        ok = hook_installed("UserPromptSubmit")
+        ck("UserPromptSubmit hook registered (sessions named after their tab)", ok,
+           "" if ok else "run: aht install")
     w = watcher_status()
     if w["owner"] == "none":
         ck("a watcher is configured", False,
@@ -3179,6 +3293,20 @@ def cmd_doctor(args):
     return 0
 
 def cmd_backup(args):
+    if args.offsite or args.fetch_offsite:
+        try:
+            st = offsite_backup(pull=args.fetch_offsite)
+        except HandoverError as e:
+            if not args.quiet:
+                print(str(e), file=sys.stderr)
+            warn(f"OFFSITE {e}")
+            return 1
+        if args.json:
+            print(json.dumps(st, indent=2))
+        elif not args.quiet:
+            print(f"{'fetched from' if st['pulled'] else 'copied to'} {st['machine']}: "
+                  f"{st['files']} file(s), {_human(st['bytes'])}")
+        return 0
     if args.list:
         reg = load_registry()
         rows = []
@@ -3532,6 +3660,11 @@ ACROSS AGENTS (Claude Code, Kimi Code, Codex):
   aht journal <folder>                  a dated diary of the project
   aht rules <folder> [--unify]          one set of project rules for every agent
   aht secrets [folder]                  keys or passwords in the histories (masked)
+  aht changes <folder> [--diff]         what the latest session changed in the files
+  aht report [--since week] [--by agent]   time and sessions; --statement: AI-use text
+  aht share <folder> --format html      a session as a clean page to pass on
+  aht tidy                              gone folders, histories without a folder
+  aht notices --test                    how "waiting for you" notices arrive
 
 HANDOVER (continue on another machine of yours, over ssh):
   aht remote discover                   machines of your network that qualify
@@ -4607,22 +4740,29 @@ def _clip(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n].rstrip() + " […]"
 
-def session_digest(jsonl, project: str, turns: int = 8) -> dict:
+def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dict:
     """The state of one session, read from its transcript: title, the last
     compaction summary, the latest exchanges, open to-dos, files it touched
-    and the paths OUTSIDE the project it used."""
+    and the paths OUTSIDE the project it used.  `tail`: read only the last
+    that many bytes (quick, for a glance at where it stopped)."""
     d = {"title": None, "summary": None, "exchanges": [], "todos": [],
          "touched": [], "outside": [], "version": None}
     cur = None
+    tasks = {}                  # the task list tools (TaskCreate / TaskUpdate)
     home = str(Path.home())
     noise = (home + "/.claude", home + "/.aht", "/tmp/", "/private/", "/var/",
              "/dev/", "/proc/", "/usr/", "/opt/", "/System/", "/Library/", "/etc/",
              "/bin/", "/sbin/")
     try:
-        fh = open(jsonl, "r", errors="replace")
+        fh = open(jsonl, "rb")
     except OSError:
         return d
     with fh:
+        if tail:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - tail))
+            if size > tail:
+                fh.readline()                   # a line cut in half
         for line in fh:
             try:
                 e = json.loads(line)
@@ -4643,7 +4783,12 @@ def session_digest(jsonl, project: str, turns: int = 8) -> dict:
                 if e.get("isCompactSummary"):
                     d["summary"], d["exchanges"], cur = _text_of(c), [], None
                     continue
-                if e.get("isMeta") or e.get("toolUseResult") is not None:
+                tur = e.get("toolUseResult")
+                if isinstance(tur, dict) and isinstance(tur.get("task"), dict) \
+                        and tur["task"].get("id") and tur["task"].get("subject"):
+                    tasks[str(tur["task"]["id"])] = {"content": tur["task"]["subject"],
+                                                     "status": "pending"}
+                if e.get("isMeta") or tur is not None:
                     continue
                 if isinstance(c, list) and any(isinstance(b, dict) and
                                                b.get("type") == "tool_result" for b in c):
@@ -4656,6 +4801,9 @@ def session_digest(jsonl, project: str, turns: int = 8) -> dict:
                 del d["exchanges"][:-turns]
             elif t == "assistant":
                 txt = _text_of(c).strip()
+                if txt and cur is None and tail:        # its prompt lies before the tail
+                    cur = {"you": "", "agent": ""}
+                    d["exchanges"].append(cur)
                 if txt and cur is not None:
                     cur["agent"] = txt                  # a turn's last text wins
                 for b in c if isinstance(c, list) else []:
@@ -4664,6 +4812,9 @@ def session_digest(jsonl, project: str, turns: int = 8) -> dict:
                     inp = b.get("input") if isinstance(b.get("input"), dict) else {}
                     if b.get("name") == "TodoWrite" and isinstance(inp.get("todos"), list):
                         d["todos"] = inp["todos"]
+                    elif b.get("name") == "TaskUpdate" and str(inp.get("taskId")) in tasks:
+                        if inp.get("status"):
+                            tasks[str(inp["taskId"])]["status"] = inp["status"]
                     fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
                     if not (isinstance(fp, str) and fp.startswith("/")):
                         continue
@@ -4679,8 +4830,8 @@ def session_digest(jsonl, project: str, turns: int = 8) -> dict:
                         d["outside"].append(fp)
     d["touched"] = d["touched"][-15:]
     d["outside"] = d["outside"][-15:]
-    d["todos"] = [x for x in d["todos"] if isinstance(x, dict)
-                  and x.get("status") != "completed"]
+    d["todos"] = [x for x in d["todos"] + list(tasks.values()) if isinstance(x, dict)
+                  and x.get("status") not in ("completed", "deleted")]
     return d
 
 def scratch_dir(real: str, sid: str):
@@ -5134,10 +5285,89 @@ def _spawn_mirror() -> None:
     except Exception:
         pass
 
+def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
+    """Switch "keep in sync" on (or off) for every tracked project at once.
+    The plan says how much the first copy sends: everything that travels in
+    a handover (rebuilt folders such as node_modules stay behind)."""
+    res = {"on": on, "applied": False, "blockers": [], "projects": [], "bytes": 0}
+    rem = None
+    if on:
+        try:
+            rem = get_remote(to)
+        except HandoverError as e:
+            res["blockers"].append(str(e))
+            return res
+        res["remote"] = rem.name
+    home = os.path.realpath(str(Path.home()))
+    projects = load_registry().get("projects", {})
+    tops = [e["real_path"] for e in projects.values() if os.path.isdir(e["real_path"])
+            and os.path.realpath(e["real_path"]) != home]
+    for uid, e in projects.items():
+        real, m = e["real_path"], e.get("mirror") or {}
+        if not os.path.isdir(real) or e.get("away") or os.path.realpath(real) == home:
+            continue
+        if on and any(t != real and _inside(real, t) for t in tops):
+            continue            # inside another project: that one's copy carries it
+        if on and m.get("enabled") and m.get("remote") == rem.name:
+            continue
+        if not on and not m.get("enabled"):
+            continue
+        row = {"uuid": uid, "project": real}
+        if on:
+            files = tree_manifest(real)["files"]
+            row.update(files=len(files),
+                       bytes=sum(v[0] for v in files.values() if isinstance(v[0], int)))
+            res["bytes"] += row["bytes"]
+        res["projects"].append(row)
+    res["projects"].sort(key=lambda r: -r.get("bytes", 0))
+    if not res["projects"]:
+        res["blockers"].append("every project is in sync already" if on
+                               else "no project is kept in sync")
+    if not apply or res["blockers"]:
+        return res
+    with Lock():
+        reg = load_registry()
+        for r in res["projects"]:
+            e = reg["projects"].get(r["uuid"])
+            if e is None:
+                continue
+            m = dict(e.get("mirror") or {})
+            m["enabled"] = on
+            if rem:
+                m["remote"] = rem.name
+            e["mirror"] = m
+        save_registry(reg)
+    log(f"MIRROR all {'on' if on else 'off'}: {len(res['projects'])} project(s)"
+        + (f" to {rem.name}" if rem else ""))
+    if on:
+        _spawn_mirror()
+    res["applied"] = True
+    return res
+
 def cmd_mirror(args):
     if not handover_supported():
         print("mirroring needs rsync and ssh; it is not available in this build")
         return 2
+    if args.all:
+        if not (args.on or args.off):
+            print("with --all, say --on or --off", file=sys.stderr)
+            return 2
+        res = mirror_all(bool(args.on), args.to, args.apply)
+        lines = []
+        if res["projects"]:
+            word = ("keeping in sync" if res["applied"] else "would keep in sync") if args.on \
+                else ("stopped" if res["applied"] else "would stop")
+            lines.append(f"{word}: {len(res['projects'])} project(s)"
+                         + (f" with {res['remote']}, about {res['bytes'] / 1e9:.1f} GB "
+                            "to send the first time" if args.on else ""))
+            for r in res["projects"][:12]:
+                lines.append(f"   {r.get('bytes', 0) / 1e6:>9,.0f} MB  {r['project']}"
+                             if args.on else f"   {r['project']}")
+            if len(res["projects"]) > 12:
+                lines.append(f"   … and {len(res['projects']) - 12} more")
+            if not args.apply:
+                lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
     real = os.path.realpath(args.path) if args.path else None
     if args.on or args.off:
         if not real or not os.path.isdir(real) \
@@ -5461,7 +5691,7 @@ def cmd_handover(args):
                                name=away["window"], claude=info["claude"], note=note,
                                args=list(cfg_get("handover_claude_args") or []),
                                task=args.task,
-                               remote_control=os.path.basename(real)
+                               remote_control=handover_session_name(sid, real, rem.name)
                                if cfg_get("handover_remote_control", True) else None)
                 away["mux"] = st.get("mux") or away["mux"]
                 out["started"] = st.get("started")
@@ -6013,6 +6243,24 @@ def cmd_attach(args):
                              f"attach-{away.get('window')}")
     os.execvp(cmd[0], cmd)
 
+TERMINALS = ("iTerm", "Terminal")         # apps that run a .command file they open
+
+def app_installed(name: str) -> bool:
+    """Whether macOS knows an app of that name, wherever it is installed
+    (/Applications, ~/Applications, an external disk): asks LaunchServices."""
+    if not IS_MAC:
+        return False
+    try:
+        return subprocess.run(["open", "-Ra", name], capture_output=True, timeout=10,
+                              cwd="/").returncode == 0
+    except Exception:
+        return False
+
+def terminal_choice() -> str:
+    """The app session windows open in: the one set in terminal_app, else
+    iTerm when installed, else Terminal."""
+    return cfg_get("terminal_app") or ("iTerm" if app_installed("iTerm") else "Terminal")
+
 def open_terminal(command: str, name: str) -> int:
     """Run `command` in a new terminal window (the front-ends use this)."""
     run = aht_home() / "run"
@@ -6027,9 +6275,7 @@ def open_terminal(command: str, name: str) -> int:
                      'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\n'
                      "clear\n" + command + "\n")
         os.chmod(f, 0o755)
-        app = cfg_get("terminal_app") or (
-            "iTerm" if os.path.isdir("/Applications/iTerm.app") else None)
-        return subprocess.call(["open"] + (["-a", str(app)] if app else []) + [str(f)])
+        return subprocess.call(["open", "-a", terminal_choice(), str(f)])
     for term, flag in (("x-terminal-emulator", "-e"), ("gnome-terminal", "--"),
                        ("konsole", "-e"), ("xterm", "-e")):
         if _have(term):
@@ -6083,24 +6329,24 @@ def handover_status() -> dict:
             in rs_cfg else (sorted(rs_cfg)[0] if rs_cfg else None),
             "rsync": rs.get("version"), "away": away, "mirrored": mirrored}
 
-def _hook_notes(cwd: str) -> None:
-    """What a session that starts here must know about a handover; printed to
-    stdout, which Claude Code adds to the session's context."""
+def _hook_notes(cwd: str) -> str:
+    """What a session that starts here must know about a handover; the hook
+    hands it to Claude Code, which adds it to the session's context."""
     try:
         reg = load_registry()
         uid, entry = _entry_for(reg, cwd)
         if not entry:
-            return
+            return ""
         a, b = entry.get("away"), entry.get("returned")
         if a:
-            print(f"[aht] WARNING: this project was handed over to “{a.get('host')}” on "
-                  f"{a.get('since')} and is being worked on there. Changes made here "
-                  "now can collide with that work. Tell the user before changing "
-                  "anything, and suggest taking the project back first (aht reclaim).")
             notify_user("Project is handed over",
                         f"{os.path.basename(cwd)} runs on {a.get('host')} — "
                         "take it back before working here")
-        elif b and not b.get("told"):
+            return (f"[aht] WARNING: this project was handed over to “{a.get('host')}” on "
+                    f"{a.get('since')} and is being worked on there. Changes made here "
+                    "now can collide with that work. Tell the user before changing "
+                    "anything, and suggest taking the project back first (aht reclaim).")
+        if b and not b.get("told"):
             msg = (f"[aht] This project is back on “{_here()}”. It ran on "
                    f"“{b.get('from')}” from {b.get('left')} to {b.get('at')}; the "
                    f"changes made there were brought back ({b.get('updated', 0)} "
@@ -6109,10 +6355,11 @@ def _hook_notes(cwd: str) -> None:
             if b.get("conflicts"):
                 msg += (" Changed on BOTH machines, so both versions were kept: "
                         + ", ".join(b["conflicts"][:8]) + ".")
-            print(msg)
             _update_entry(uid, returned=dict(b, told=True))
+            return msg
     except Exception as e:
         warn(f"HOOK handover note: {e}")
+    return ""
 
 # --------------------------------------------------------------------------- #
 # Across agents: every agent's sessions, read one way.  Search, the secrets
@@ -6820,6 +7067,22 @@ def cmd_secrets(args):
     if real and not os.path.isdir(real):
         print(f"not a folder: {real}", file=sys.stderr)
         return 2
+    if args.redact:
+        res = redact_in_histories(args.redact, real, args.apply)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            for b in res["blockers"]:
+                print(f"  ✗ {b}")
+            print(f"{'removed from' if res['applied'] else 'would remove from'} "
+                  f"{res['places']} place(s) in {res['files']} history file(s)"
+                  + (f"; the originals are kept in {res['kept']}" if res.get("kept") else "")
+                  + ("" if res["applied"] or res["blockers"] else
+                     " (dry run — pass --apply to do it)"))
+            if res["applied"]:
+                print("history backups and copies on other machines still hold it; "
+                      "replace the key where it was issued")
+        return 3 if res["blockers"] else 0
     talk = sys.stderr.isatty() and not args.json
     if talk:
         sys.stderr.write("reading the histories…\r")
@@ -7084,15 +7347,19 @@ def agent_cli(agent: str):
         if (Path.home() / ".kimi-code/bin/kimi").exists() else None),
             "codex": find_tool("codex")}.get(agent)
 
-def events_digest(s: dict, project: str, turns: int = 8) -> dict:
+def events_digest(s: dict, project: str, turns: int = 8, tail: int = None) -> dict:
     """session_digest for any agent's session."""
     if s["agent"] == "claude":
-        return session_digest(s["file"], project, turns)
+        return session_digest(s["file"], project, turns, tail)
     d = {"title": s.get("title"), "summary": None, "exchanges": [], "todos": [],
          "touched": [], "outside": [], "version": None}
     cur = None
     home = str(Path.home())
-    for _end, ev in session_events(s["agent"], s["file"]):
+    start = 0
+    if tail:
+        st = _stat(s["file"])
+        start = max(0, st.st_size - tail) if st else 0
+    for _end, ev in session_events(s["agent"], s["file"], start):
         if ev["role"] == "user":
             cur = {"you": ev["text"], "agent": ""}
             d["exchanges"].append(cur)
@@ -7215,6 +7482,8 @@ def cmd_switch(args):
         lines.append("(dry run — pass --apply to do it)")
         return _emit(args, out, lines)
     brief = write_switch_brief(real, src, dig, target)
+    if checkpoints_on():
+        take_checkpoint(real, None, target)
     rel = os.path.relpath(brief, real)
     frm = AGENT_NAMES[src["agent"]]
     ask = (f"You are taking over this project from {frm}. Read {rel} first: it records "
@@ -7307,11 +7576,30 @@ def agent_processes() -> list:
 _STATUS_WORDS = {"busy": "working", "shell": "working (a command runs)",
                  "waiting": "waiting for you", "idle": "idle"}
 
-def open_sessions_here() -> list:
+def open_sessions_here(names: bool = False) -> list:
     rows = []
+    named, check, stops = {}, {}, {}
+    if names:
+        try:
+            named = {r["pid"]: r for r in session_names()}
+            check = {r["pid"]: r for r in session_checkup()}
+            auto = claude_auto_continue()
+            stops = {h["session"]: dict(h, auto=auto) for h in limit_stops(12) if not h["over"]}
+        except Exception as e:
+            warn(f"BOARD names: {e}")
     for s in running_sessions():
+        n = named.get(s["pid"]) or {}
+        c = check.get(s["pid"]) or {}
+        stop = stops.get(s.get("session") or "")
         rows.append({"agent": "claude", "project": s["cwd"], "pid": s["pid"],
                      "session": s.get("session"), "name": s.get("name"),
+                     "title": n.get("name"), "title_origin": n.get("origin"),
+                     "tab": n.get("tab"), "pending_title": n.get("pending"),
+                     "in_iterm": c.get("in_iterm"), "background": c.get("background"),
+                     "issues": c.get("issues") or [], "can_restart": c.get("can_restart"),
+                     "version": c.get("version"), "installed": c.get("installed"),
+                     "limit": {k: stop.get(k) for k in ("resets", "until", "auto")}
+                     if stop else None,
                      "status": _STATUS_WORDS.get(s["status"], s["status"]),
                      "raw_status": s["status"], "waiting_for": s.get("waiting_for"),
                      "since": s.get("since")})
@@ -7319,14 +7607,15 @@ def open_sessions_here() -> list:
     return rows
 
 def _agent_board(req: dict) -> dict:
-    return {"ok": True, "host": _here(), "sessions": open_sessions_here()}
+    return {"ok": True, "host": _here(),
+            "sessions": open_sessions_here(names=bool(req.get("names")))}
 
-def session_board(remotes: bool = True) -> list:
+def session_board(remotes: bool = True, names: bool = False) -> list:
     """Open agent sessions on this machine and on every machine set up for
     handover (asked in parallel; one that does not answer is reported)."""
     import threading
     here = {"machine": _here(), "local": True, "reachable": True,
-            "sessions": open_sessions_here()}
+            "sessions": open_sessions_here(names)}
     boards = [here]
     if remotes and handover_supported():
         found = []
@@ -7335,7 +7624,7 @@ def session_board(remotes: bool = True) -> list:
             try:
                 rem = get_remote(name)
                 rem.push_agent()
-                ans = rem.agent("board", timeout=30)
+                ans = rem.agent("board", timeout=30, names=names)
                 row.update(reachable=True, host=ans.get("host"), sessions=ans["sessions"])
             except HandoverError as e:
                 row["error"] = str(e)
@@ -7357,7 +7646,7 @@ def session_board(remotes: bool = True) -> list:
     return boards
 
 def cmd_board(args):
-    boards = session_board(remotes=not args.local)
+    boards = session_board(remotes=not args.local, names=True)
     if args.json:
         print(json.dumps({"machines": boards}, indent=2))
         return 0
@@ -7368,7 +7657,3084 @@ def cmd_board(args):
         for s in sorted(b["sessions"], key=lambda s: s.get("project") or ""):
             state = s["status"] + (f": {s['waiting_for']}" if s.get("waiting_for") else "")
             print(f"   {AGENT_NAMES.get(s['agent'], s['agent']):<12} {state:<28} "
-                  f"{s.get('project')}" + ("   (handed over)" if s.get("handed_over") else ""))
+                  f"{s.get('project')}" + ("   (handed over)" if s.get("handed_over") else "")
+                  + (f"\n      “{s['title']}”" if s.get("title") else ""))
+    return 0
+
+# --------------------------------------------------------------------------- #
+# Keeping an eye, cleaning up, looking back: notices when a session waits,
+# tidying the registry, backups on another machine, what a session changed,
+# a usage report, sharing a session, and taking a leaked key out of a history.
+# --------------------------------------------------------------------------- #
+
+# ---- notices: a session waits for you, or finished a long piece of work ---- #
+
+def notices_state() -> Path:
+    return aht_home() / "run" / "notices.json"
+
+def send_to_phone(title: str, message: str) -> str:
+    """Pass a notice on to the phone, if the user set that up:
+    notify_phone = "imessage:<phone or Apple ID>" or "ntfy:<topic or URL>"."""
+    target = str(cfg_get("notify_phone") or "")
+    if os.environ.get("AHT_NOTIFY_LOG"):                 # tests: note it, send nothing
+        with open(os.environ["AHT_NOTIFY_LOG"], "a") as fh:
+            fh.write(json.dumps({"title": title, "message": message, "phone": target}) + "\n")
+        return "logged"
+    if target.startswith("imessage:") and IS_MAC:
+        who = target.split(":", 1)[1].strip()
+        script = ('on run argv\n tell application "Messages"\n'
+                  '  set s to 1st account whose service type = iMessage\n'
+                  '  send (item 1 of argv) to participant (item 2 of argv) of s\n'
+                  ' end tell\nend run')
+        r = subprocess.run(["osascript", "-e", script, f"{title}: {message}", who],
+                           capture_output=True, text=True, timeout=30)
+        return "sent" if r.returncode == 0 else "failed: " + (r.stderr or "").strip()[-160:]
+    if target.startswith("ntfy:"):
+        topic = target.split(":", 1)[1].strip()
+        url = topic if topic.startswith("http") else "https://ntfy.sh/" + topic
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, data=message.encode(),
+                                         headers={"Title": title.encode("ascii", "replace")})
+            urllib.request.urlopen(req, timeout=15).read()
+            return "sent"
+        except Exception as e:
+            return f"failed: {e}"
+    return "off"
+
+def app_running() -> bool:
+    """The aht app marks itself alive every 20 seconds; it then shows the
+    notices itself, so a click on one goes to the session."""
+    try:
+        return time.time() - (aht_home() / "run" / "app-alive").stat().st_mtime < 90
+    except OSError:
+        return False
+
+def _notify(title: str, message: str, info: dict = None) -> None:
+    if os.environ.get("AHT_NOTIFY_LOG"):
+        send_to_phone(title, message)
+        return
+    notify_user(title, message, info)
+    if cfg_get("notify_phone"):
+        r = send_to_phone(title, message)
+        if r.startswith("failed"):
+            warn(f"NOTICE to the phone {r}")
+
+def check_notices(remotes: bool = None) -> list:
+    """Compare the open sessions with the last look and announce what changed:
+    a session that now waits for you, and one that finished after working a
+    while.  Other machines are asked only while a project is handed over."""
+    try:
+        st = json.loads(notices_state().read_text())
+    except Exception:
+        st = {}
+    seen, last_remote = st.get("seen") or {}, float(st.get("remote_at") or 0)
+    away = any(e.get("away") for e in load_registry().get("projects", {}).values())
+    ask_remote = (remotes if remotes is not None else
+                  away and time.time() - last_remote >= 55)
+    boards = session_board(remotes=ask_remote and handover_supported())
+    if ask_remote:
+        last_remote = time.time()
+    now, out, fresh = time.time(), [], {}
+    finished_after = float(cfg_get("notify_finished_minutes", 3)) * 60
+    for b in boards:
+        if not b["reachable"]:
+            # a machine that did not answer keeps what was known about it
+            fresh.update({k: v for k, v in seen.items() if v.get("machine") == b["machine"]})
+            continue
+        for s in b["sessions"]:
+            if s["agent"] != "claude":
+                continue
+            key = f"{b['machine']}:{s.get('pid')}:{s.get('session')}"
+            raw = s.get("raw_status") or ""
+            prev = seen.get(key) or {}
+            busy_since = prev.get("busy_since") if prev.get("raw") in ("busy", "shell") else None
+            if raw in ("busy", "shell") and busy_since is None:
+                busy_since = now
+            fresh[key] = {"machine": b["machine"], "raw": raw, "busy_since": busy_since,
+                          "project": s.get("project")}
+            name = os.path.basename(s.get("project") or "") or "a session"
+            where = "" if b.get("local") else f" on {b['machine']}"
+            if not prev:
+                continue                          # first sight: nothing changed yet
+            info = {"machine": b["machine"], "local": bool(b.get("local")), "pid": s.get("pid"),
+                    "session": s.get("session"), "project": s.get("project")}
+            if raw == "waiting" and prev.get("raw") != "waiting" and cfg_get("notify_waiting", True):
+                out.append({"kind": "waiting", "title": f"{name}{where} waits for you",
+                            "message": s.get("waiting_for") or "it needs an answer",
+                            "info": dict(info, kind="waiting")})
+            if raw == "idle" and prev.get("raw") in ("busy", "shell") and \
+                    cfg_get("notify_finished", True) and prev.get("busy_since") and \
+                    now - prev["busy_since"] >= finished_after:
+                mins = int((now - prev["busy_since"]) // 60)
+                out.append({"kind": "finished", "title": f"{name}{where} is done",
+                            "message": f"the agent finished after {mins} minute(s)",
+                            "info": dict(info, kind="finished")})
+    told = list(st.get("limits_told") or [])
+    if cfg_get("notify_limit", True):
+        tgt = limit_switch_target()
+        for h in limit_stops(12):
+            key = f"{h['session']}:{int(h.get('at') or 0)}"
+            if key in told:
+                continue
+            told.append(key)
+            if h["over"]:
+                continue
+            name = os.path.basename(h.get("project") or "") or "a session"
+            msg = f"resets {h['resets']}" if h.get("resets") else "no tokens left for now"
+            if claude_auto_continue() and h.get("resets"):
+                msg += " — it continues by itself then"
+            elif tgt:
+                msg += f" — open aht to go on in {AGENT_NAMES[tgt]}"
+            out.append({"kind": "limit", "title": f"{name}: Claude's usage limit",
+                        "message": msg, "info": {"kind": "limit", "session": h.get("session"),
+                                                 "project": h.get("project")}})
+    out += night_shift_tick()
+    notices_state().parent.mkdir(parents=True, exist_ok=True)
+    tmp = notices_state().with_suffix(".new")
+    tmp.write_text(json.dumps({"seen": fresh, "remote_at": last_remote, "at": now,
+                               "limits_told": told[-200:]}))
+    os.replace(tmp, notices_state())
+    for n in out:
+        _notify(n["title"], n["message"], n.get("info"))
+        log(f"NOTICE {n['title']}: {n['message']}")
+    return out
+
+def cmd_notices(args):
+    if args.test:
+        _notify("aht", "This is how a notice from aht looks.")
+        print("sent to this Mac" + ("" if not cfg_get("notify_phone")
+                                    else f" and to {cfg_get('notify_phone')}"))
+        return 0
+    got = check_notices()
+    if args.json:
+        print(json.dumps({"notices": got}, indent=2))
+    elif not args.quiet:
+        for n in got:
+            print(f"{n['title']}: {n['message']}")
+    return 0
+
+# ---- tidy up ---------------------------------------------------------------- #
+
+def _last_activity(entry: dict):
+    try:
+        return _hist_stats(entry).get("last_activity")
+    except Exception:
+        return None
+
+def _strong(c: dict) -> bool:
+    """A suggestion worth showing: the same folder name, the exact old path,
+    or at least three of the files the sessions worked on."""
+    for r in c.get("reasons", []):
+        if r in ("leaf-name", "exact-encode", "same name"):
+            return True
+        m = re.match(r"files (\d+)/(\d+)", r)
+        if m and int(m.group(1)) >= 3:
+            return True
+    return False
+
+def _latest_jsonl(d: Path):
+    try:
+        files = [f for f in d.glob("*.jsonl") if f.is_file()]
+    except OSError:
+        return None
+    return max(files, key=lambda f: f.stat().st_mtime, default=None)
+
+def tidy_history_text(key: str, max_sessions: int = 10, per_session: int = 40) -> dict:
+    """A history Tidy Up lists, as text to read before deciding: each
+    session (newest first) with its title, dates and what was said — the
+    last `per_session` messages of each.  Keys and passwords are masked."""
+    reg = load_registry()
+    root = claude_backend().root()
+    sessions, path = [], None
+    def claude_files(d):
+        return [{"agent": "claude", "id": f.stem, "file": str(f), "updated": f.stat().st_mtime}
+                for f in (d.glob("*.jsonl") if d.is_dir() else []) if f.is_file()]
+    e = reg.get("projects", {}).get(key)
+    if e:                                   # a tracked folder that is gone
+        path = e["real_path"]
+        store = (e.get("stores") or {}).get("claude") or _key_claude(path)
+        sessions += claude_files(root / store)
+        sessions += list_sessions(path, agents=["kimi", "codex"])
+    elif key and "/" not in key and (root / key).is_dir():
+        path = transcript_cwd(root / key) or key
+        sessions += claude_files(root / key)
+    else:
+        return {"key": key, "error": "no such history"}
+    sessions.sort(key=lambda x: x.get("updated") or 0, reverse=True)
+    L = [f"# History of {path}", "",
+         f"{len(sessions)} session(s), newest first. Up to the last {per_session} messages "
+         "of each are shown; keys and passwords are masked."]
+    for x in sessions[:max_sessions]:
+        title, first, last, msgs = x.get("title"), None, None, []
+        try:
+            for _end, ev in session_events(x["agent"], x["file"]):
+                if ev.get("t"):
+                    first = first or ev["t"]
+                    last = ev["t"]
+                if ev["role"] == "title":
+                    title = ev["text"]
+                elif ev["role"] in ("user", "agent", "summary"):
+                    msgs.append(ev)
+        except OSError:
+            continue
+        span = " – ".join(dict.fromkeys(time.strftime("%Y-%m-%d", time.localtime(t))
+                                        for t in (first, last) if t))
+        L += ["", f"## {title or 'untitled'}", "",
+              f"{AGENT_NAMES.get(x['agent'], x['agent'])} · {span or 'no date'} · "
+              f"{len(msgs)} message(s) · `{x['id']}`"]
+        if len(msgs) > per_session:
+            L += ["", f"*… {len(msgs) - per_session} earlier message(s)*"]
+        for ev in msgs[-per_session:]:
+            who = {"user": "You", "agent": "Agent", "summary": "Summary"}[ev["role"]]
+            L += ["", f"**{who}:** " + _clip(ev["text"], 1500)]
+    if len(sessions) > max_sessions:
+        L += ["", f"*… and {len(sessions) - max_sessions} older session(s)*"]
+    return {"key": key, "path": path, "sessions": len(sessions),
+            "markdown": redact("\n".join(L))}
+
+def tidy_report(roots: list = None) -> dict:
+    """What needs a decision: tracked folders that are gone, histories that no
+    tracked folder owns, and folders listed twice — each with suggestions."""
+    roots = roots or default_roots()
+    reg = load_registry()
+    dirs = list_real_dirs(roots)
+    by_leaf = {}
+    for d in dirs:
+        by_leaf.setdefault(os.path.basename(d).lower(), []).append(d)
+    missing, gone_stores = [], set()
+    for uid, e in sorted(reg.get("projects", {}).items(), key=lambda kv: kv[1]["real_path"]):
+        if os.path.isdir(e["real_path"]):
+            continue
+        cands = [{"path": d, "reasons": ["same name"]}
+                 for d in by_leaf.get(os.path.basename(e["real_path"]).lower(), [])
+                 if not read_marker(d) or read_marker(d) == uid][:5]
+        store = (e.get("stores") or {}).get("claude")
+        if store and (claude_backend().root() / store).is_dir():
+            sc = score_candidates(store, roots, 5, dirs=dirs)["candidates"]
+            for c in sc:
+                if c["path"] not in [x["path"] for x in cands] and not read_marker(c["path"]) \
+                        and _strong(c):
+                    cands.append({"path": c["path"], "reasons": c["reasons"]})
+        st = _hist_stats(e)
+        if not store and (claude_backend().root() / _key_claude(e["real_path"])).is_dir():
+            store = _key_claude(e["real_path"])  # filed under the path, not yet linked
+        latest = _latest_jsonl(claude_backend().root() / store) if store else None
+        agents = agents_of(e.get("stores") or {})
+        if latest and "claude" not in agents:
+            agents = ["claude"] + agents
+        if store:
+            gone_stores.add(store)
+        missing.append({"uuid": uid, "path": e["real_path"], "agents": agents,
+                        "last": st.get("last_activity"), "sessions": st.get("sessions", 0),
+                        "bytes": st.get("bytes", 0),
+                        "title": _session_title({"agent": "claude", "file": str(latest)})
+                        if latest else None,
+                        "history": str(claude_backend().root() / store) if store else None,
+                        "candidates": cands[:5]})
+    owned = registered_history_dirs(reg)
+    orphans = []
+    for d in _iter_history_dirs():
+        if d.name in owned or d.name in gone_stores or not _dir_has_entries(d):
+            continue                        # (a gone folder's history is listed with it)
+        sess = [f for f in d.glob("*.jsonl") if f.is_file()]
+        last = max((f.stat().st_mtime for f in sess), default=None)
+        cwd = transcript_cwd(d)
+        if cwd and _inside(os.path.realpath(cwd), os.path.realpath(str(aht_home()))):
+            continue                        # a second opinion's copy, not a project
+        sc = score_candidates(d.name, roots, 5, dirs=dirs)
+        latest = _latest_jsonl(d)
+        orphans.append({"store": d.name, "was": cwd, "sessions": len(sess),
+                        "bytes": sum(f.stat().st_size for f in d.rglob("*") if f.is_file()),
+                        "title": _session_title({"agent": "claude", "file": str(latest)})
+                        if latest else None, "history": str(d),
+                        "last": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(last))
+                        if last else None,
+                        "candidates": [c for c in sc["candidates"]
+                                       if (not read_marker(c["path"]) or c["path"] == cwd)
+                                       and _strong(c)][:5]})
+    return {"missing": missing, "orphans": orphans, "doubles": stale_doubles(reg)}
+
+def cmd_tidy(args):
+    if args.show:
+        res = tidy_history_text(args.show)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(res.get("markdown") or res.get("error"))
+        return 0 if res.get("markdown") else 1
+    if args.remove_history:
+        res = remove_orphan_history(args.remove_history, args.apply)
+        lines = [f"{'moved to the Trash' if res['applied'] else 'would move to the Trash'}: "
+                 f"{res['store']}"]
+        if res.get("was"):
+            lines.append(f"   the history of {res['was']} ({res.get('sessions', 0)} session(s))")
+        if not args.apply and not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+    if args.relink:
+        uid, dst = args.relink, os.path.realpath(args.to or "")
+        reg = load_registry()
+        e = reg.get("projects", {}).get(uid)
+        if e is None or not os.path.isdir(dst):
+            print("name a tracked project (--relink UUID) and an existing folder (--to)",
+                  file=sys.stderr)
+            return 2
+        if read_marker(dst) and read_marker(dst) != uid:
+            print(f"{dst} belongs to another tracked project already", file=sys.stderr)
+            return 3
+        if not args.apply:
+            print(f"would relink {e['real_path']}  →  {dst}")
+            return 0
+        write_marker(dst, uid)
+        return _tidy_relink(dst, args.json)
+    rep = tidy_report()
+    if args.json:
+        print(json.dumps(rep, indent=2))
+        return 0
+    print(f"{len(rep['missing'])} tracked folder(s) are gone, {len(rep['orphans'])} "
+          f"history store(s) have no folder, {len(rep['doubles'])} folder(s) are listed twice")
+    for m in rep["missing"]:
+        print(f"\n  gone: {m['path']}   [{', '.join(m['agents']) or 'no history'}]")
+        for c in m["candidates"]:
+            print(f"     maybe now: {c['path']}  ({', '.join(c['reasons'])})")
+            print(f"        aht tidy --relink {m['uuid']} --to {shlex.quote(c['path'])} --apply")
+        print(f"     or forget it (its history stays):  aht forget --uuid {m['uuid']} --apply")
+    for o in rep["orphans"]:
+        print(f"\n  no folder: {o['store']}  ({o['sessions']} session(s), was {o['was'] or '?'})")
+        for c in o["candidates"]:
+            print(f"     maybe: {c['path']}  ({', '.join(c['reasons'])})")
+            print(f"        aht bind --store={o['store']} --to={shlex.quote(c['path'])} --apply")
+        print(f"     or move it to the Trash:  aht tidy --remove-history={o['store']} --apply")
+    if rep["doubles"]:
+        print("\n  listed twice: remove the stale entries with  aht prune --apply")
+    return 0
+
+def _to_trash(path: Path) -> bool:
+    """Move a file or folder to the Trash (Finder's Put Back works for it)."""
+    if os.environ.get("AHT_TRASH"):                     # tests: a stand-in Trash
+        dst = Path(os.environ["AHT_TRASH"]) / path.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dst))
+        return True
+    if IS_MAC and os.path.exists("/usr/bin/trash"):
+        r = subprocess.run(["/usr/bin/trash", str(path)], capture_output=True, timeout=120,
+                           cwd="/")
+        if r.returncode == 0 and not path.exists():
+            return True
+    bin_ = Path.home() / ".Trash"
+    if not bin_.is_dir():
+        return False
+    dst = bin_ / path.name
+    if dst.exists():
+        dst = bin_ / f"{path.name} {_stamp()}"
+    shutil.move(str(path), str(dst))
+    return True
+
+def remove_orphan_history(store: str, apply: bool = False) -> dict:
+    """A Claude Code history that no tracked folder owns goes to the Trash —
+    only when the user asks, and never one a tracked project owns or a
+    session uses.  The daily history backups keep it as well."""
+    root = claude_backend().root()
+    d = root / store
+    res = {"store": store, "applied": False, "blockers": []}
+    if not store or "/" in store or store in (".", "..") or not d.is_dir():
+        res["blockers"].append("there is no such history")
+        return res
+    if store in registered_history_dirs(load_registry()):
+        res["blockers"].append("a tracked project owns this history; use Forget for the "
+                               "project instead")
+        return res
+    was = transcript_cwd(d)
+    files = [f for f in d.rglob("*") if f.is_file()]
+    res.update(was=was, sessions=len(list(d.glob("*.jsonl"))),
+               bytes=sum(f.stat().st_size for f in files))
+    if was and any(os.path.realpath(x["cwd"]) == os.path.realpath(was)
+                   for x in running_sessions()):
+        res["blockers"].append("a Claude Code session is open in that folder")
+    if not apply or res["blockers"]:
+        return res
+    res["applied"] = _to_trash(d)
+    if not res["applied"]:
+        res["blockers"].append("it could not be moved to the Trash")
+    log(f"TIDY history {store} (was {was}) to the Trash: {res['applied']}")
+    return res
+
+def _tidy_relink(dst: str, as_json: bool) -> int:
+    """A tracked folder found again: its marker is in place, so this is a
+    move, and reconcile relinks every agent's history to it."""
+    import contextlib, io
+    roots = default_roots()
+    if not any(_inside(dst, os.path.realpath(r)) for r in roots):
+        roots = roots + [os.path.dirname(dst)]     # found outside the watched folders
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_reconcile(argparse.Namespace(
+            roots=roots, apply=True, notify=False,
+            moves="apply", copies="ignore", news="ignore", only=[dst], clear_declines=False))
+    uid, e = _entry_for(load_registry(), dst)
+    if as_json:
+        print(json.dumps({"relinked": bool(e), "path": dst, "uuid": uid}, indent=2))
+    else:
+        print(f"relinked: {dst}" if e else f"could not relink {dst}")
+    return 0 if e else 1
+
+# ---- history backups on another machine too --------------------------------- #
+
+def offsite_remote():
+    name = cfg_get("offsite_backup")
+    return get_remote(name) if name else None
+
+def offsite_backup(pull: bool = False) -> dict:
+    """Copy the history backups to the machine named in offsite_backup (or,
+    with pull, fetch what is missing here from it).  A second copy that does
+    not burn with this Mac."""
+    rem = offsite_remote()
+    if rem is None:
+        raise HandoverError("no machine is set for backups — Settings, or:  "
+                            "aht config --set offsite_backup=<machine>")
+    rem.connect()
+    there = f"{rem.info['home']}/.aht/offsite/{_here()}/backups"
+    here = backups_root()
+    here.mkdir(parents=True, exist_ok=True)
+    if pull:
+        r = rem.rsync(rem.spec(there + "/"), str(here) + "/", skip=[".last-run"])
+    else:
+        rem.agent("prepare", dirs=[there])
+        r = rem.rsync(str(here) + "/", rem.spec(there + "/"), delete=True, skip=[".last-run"])
+    if not r["ok"]:
+        raise HandoverError("copying the backups failed: " + r["error"])
+    stamp = {"machine": rem.name, "at": time.time(), "bytes": r.get("bytes", 0),
+             "files": r.get("files", 0), "pulled": pull}
+    (aht_home() / "run").mkdir(parents=True, exist_ok=True)
+    (aht_home() / "run" / "offsite.json").write_text(json.dumps(stamp))
+    log(f"OFFSITE {'fetched from' if pull else 'copied to'} {rem.name}: "
+        f"{r.get('files', 0)} file(s), {_human(r.get('bytes', 0))}")
+    return stamp
+
+def _spawn_offsite() -> None:
+    try:
+        if os.environ.get("AHT_NO_MIRROR") or not cfg_get("offsite_backup") \
+                or not handover_supported():
+            return
+        subprocess.Popen([sys.executable or "python3", str(Path(__file__).resolve()),
+                          "backup", "--offsite", "--quiet"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         start_new_session=True, cwd="/")
+    except Exception:
+        pass
+
+# ---- what a session changed ------------------------------------------------- #
+
+def session_changes(project: str, sid: str = None) -> dict:
+    """The files a Claude Code session edited: how each looked before the
+    session touched it (from Claude's own /rewind checkpoints) and now."""
+    import difflib
+    real = os.path.realpath(project)
+    store = _store_of(real)
+    sid = sid or latest_session(store)
+    if not sid:
+        return {"project": real, "session": None, "files": []}
+    first, was = {}, None
+    for raw in open(Path(store) / f"{sid}.jsonl", "rb"):
+        if was is None and b'"cwd"' in raw:
+            m = _CWD_RE.search(raw.decode("utf-8", "replace"))
+            was = _unescape_json_str(m.group(1)) if m else None
+        if b'"file-history-snapshot"' not in raw:
+            continue
+        try:
+            e = json.loads(raw)
+        except Exception:
+            continue
+        for path, b in ((e.get("snapshot") or {}).get("trackedFileBackups") or {}).items():
+            if not isinstance(b, dict):
+                continue
+            v = int(b.get("version") or 0)
+            if path not in first or v < first[path][0]:
+                first[path] = (v, b.get("backupFileName"), b.get("backupTime"))
+    fh = claude_home() / "file-history" / sid
+    was = was or real
+    files = []
+    for path, (v, backup, when) in sorted(first.items()):
+        # paths are as the session saw them, relative to where it ran then;
+        # a project that moved since has them under its new place
+        abs_ = os.path.normpath(path if path.startswith("/") else os.path.join(was, path))
+        if was != real and _inside(abs_, was):
+            abs_ = os.path.normpath(os.path.join(real, os.path.relpath(abs_, was)))
+        before = None
+        if backup:
+            try:
+                before = (fh / backup).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                before = None
+                if not (fh / backup).exists():
+                    files.append({"path": abs_, "state": "no checkpoint kept", "diff": ""})
+                    continue
+        try:
+            now = Path(abs_).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            now = None
+        state = ("added" if before is None and now is not None else
+                 "removed" if now is None else
+                 "unchanged" if before == now else "changed")
+        diff = "".join(difflib.unified_diff(
+            (before or "").splitlines(True), (now or "").splitlines(True),
+            "before the session", "now", n=2)) if state != "unchanged" else ""
+        inside = _inside(abs_, real)
+        rel = os.path.relpath(abs_, real) if inside else abs_.replace(str(Path.home()), "~")
+        files.append({"path": abs_, "name": rel, "state": state, "backup": backup,
+                      "inside": inside,
+                      "added": sum(1 for l in diff.splitlines() if l.startswith("+")
+                                   and not l.startswith("+++")),
+                      "removed": sum(1 for l in diff.splitlines() if l.startswith("-")
+                                     and not l.startswith("---")),
+                      "diff": redact(diff[:200000])})
+    title = session_digest(Path(store) / f"{sid}.jsonl", real, turns=0).get("title")
+    order = {"changed": 0, "added": 1, "removed": 2, "no checkpoint kept": 3, "unchanged": 4}
+    files.sort(key=lambda f: (not f["inside"], order.get(f["state"], 5), f["name"]))
+    return {"project": real, "session": sid, "title": title, "worked_in": was,
+            "sessions": _sessions_of(store)[:12], "files": files}
+
+def revert_file(project: str, sid: str, path: str, apply: bool) -> dict:
+    """Put one file back the way it was before the session changed it; what
+    is there now is kept aside first."""
+    ch = session_changes(project, sid)
+    f = next((x for x in ch["files"] if x["path"] == os.path.normpath(path)), None)
+    if f is None or f["state"] in ("unchanged", "no checkpoint kept"):
+        raise HandoverError("that file has nothing to put back from this session")
+    res = {"file": f["path"], "state": f["state"], "applied": False}
+    if not apply:
+        return res
+    keep = aht_home() / "changes-backups" / _stamp()
+    if os.path.exists(f["path"]):
+        dst = keep / f["path"].lstrip("/")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f["path"], dst)
+        res["kept"] = str(dst)
+    if f["backup"]:
+        src = claude_home() / "file-history" / ch["session"] / f["backup"]
+        tmp = f["path"] + ".aht-new"
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, f["path"])
+    else:                                    # the session created it
+        os.unlink(f["path"])
+    res["applied"] = True
+    log(f"REVERT {f['path']} to before session {ch['session']}")
+    return res
+
+def cmd_changes(args):
+    real = os.path.realpath(args.path)
+    try:
+        if args.revert:
+            res = revert_file(real, args.session, os.path.realpath(args.revert), args.apply)
+            print(json.dumps(res, indent=2) if args.json else
+                  (f"put back: {res['file']}  (what was there is kept in {res.get('kept')})"
+                   if res["applied"] else f"would put back: {res['file']}"))
+            return 0
+    except HandoverError as e:
+        print(str(e), file=sys.stderr)
+        return 3
+    ch = session_changes(real, args.session)
+    if args.json:
+        print(json.dumps(ch, indent=2))
+        return 0
+    if not ch["session"]:
+        print("no Claude Code session in this project")
+        return 0
+    mine = [f for f in ch["files"] if f["inside"]]
+    print(f"{ch['title'] or ch['session']}: {len(mine)} file(s) of the project edited"
+          + (f", {len(ch['files']) - len(mine)} outside it" if len(mine) < len(ch["files"]) else ""))
+    for f in ch["files"]:
+        if f["inside"] or args.all:
+            print(f"   {f['state']:<18} {f['name']}  (+{f.get('added', 0)} −{f.get('removed', 0)})")
+    if args.diff:
+        for f in ch["files"]:
+            if f["diff"]:
+                print("\n" + f["diff"])
+    return 0
+
+# ---- usage report and an AI-use statement --------------------------------- #
+
+GAP_CAP = 15 * 60          # a pause longer than this does not count as time worked
+
+def _period(since, until):
+    def parse(s, end=False):
+        if not s:
+            return None
+        if s in ("today", "week", "month"):
+            lt = time.localtime()
+            base = time.mktime((lt.tm_year, lt.tm_mon, 1 if s == "month" else lt.tm_mday,
+                                0, 0, 0, 0, 0, -1))
+            if s == "week":
+                base -= lt.tm_wday * 86400
+            return base
+        t = time.mktime(time.strptime(s[:10], "%Y-%m-%d"))
+        return t + 86400 if end else t
+    return parse(since), parse(until, end=True)
+
+def _area_of(path: str) -> str:
+    areas = cfg_get("report_areas") or {}
+    for name, prefix in sorted(areas.items(), key=lambda kv: -len(str(kv[1]))):
+        if _inside(os.path.realpath(path or "/"), os.path.realpath(_expand(str(prefix)))):
+            return name
+    return "other"
+
+def usage_report(since=None, until=None, project=None, by="project") -> dict:
+    """Sessions, active time and what they were about, per project (or per
+    agent, or per area of work), over a period."""
+    t0, t1 = _period(since, until)
+    rows = {}
+    mine = os.path.realpath(str(aht_home()))
+    for s in list_sessions(project):
+        st = _stat(s["file"])
+        if st is None or (t0 and st.st_mtime < t0):
+            continue
+        if s.get("project") and _inside(os.path.realpath(s["project"]), mine):
+            continue                        # a second opinion's copy
+        times, prompts, title = [], 0, s.get("title")
+        for _end, ev in session_events(s["agent"], s["file"]):
+            if ev["role"] == "title":
+                title = ev["text"]
+                continue
+            t = ev.get("t")
+            if not t or (t0 and t < t0) or (t1 and t >= t1):
+                continue
+            times.append(t)
+            if ev["role"] == "user":
+                prompts += 1
+        if not times:
+            continue
+        # a session can carry copies of older messages: count the time in order
+        times.sort()
+        first, last = times[0], times[-1]
+        active = sum(min(b - a, GAP_CAP) for a, b in zip(times, times[1:]))
+        proj = s.get("project") or "?"
+        key = {"agent": AGENT_NAMES.get(s["agent"], s["agent"]),
+               "area": _area_of(proj)}.get(by, proj)
+        r = rows.setdefault(key, {"key": key, "sessions": 0, "seconds": 0.0, "prompts": 0,
+                                  "agents": {}, "projects": set(), "titles": [],
+                                  "first": first, "last": last})
+        r["sessions"] += 1
+        r["seconds"] += active
+        r["prompts"] += prompts
+        r["agents"][s["agent"]] = r["agents"].get(s["agent"], 0) + 1
+        r["projects"].add(proj)
+        r["first"], r["last"] = min(r["first"], first), max(r["last"], last or first)
+        if title and title not in r["titles"]:
+            r["titles"].append(redact(title))
+    out = []
+    for r in sorted(rows.values(), key=lambda r: -r["seconds"]):
+        r["hours"] = round(r["seconds"] / 3600, 1)
+        r["projects"] = sorted(r["projects"])
+        out.append(r)
+    return {"since": since, "until": until, "by": by, "rows": out,
+            "total_hours": round(sum(r["seconds"] for r in out) / 3600, 1),
+            "total_sessions": sum(r["sessions"] for r in out)}
+
+def ai_use_statement(project: str, since=None, until=None) -> str:
+    """A draft disclosure for a paper, a thesis or a course: which AI coding
+    agents were used, when, how much, and for what."""
+    rep = usage_report(since, until, project, by="agent")
+    if not rep["rows"]:
+        return "No AI coding agent sessions were found for this project in that period."
+    def day(t):
+        return time.strftime("%B %Y", time.localtime(t))
+    first = min(r["first"] for r in rep["rows"])
+    last = max(r["last"] for r in rep["rows"])
+    parts = [f"{r['key']} ({r['sessions']} session{'s' if r['sessions'] != 1 else ''}, "
+             f"about {max(r['hours'], 0.1):.1f} h of active use)" for r in rep["rows"]]
+    tasks = [t for r in rep["rows"] for t in r["titles"]][:8]
+    span = (f"in {day(first)}" if day(first) == day(last)
+            else f"between {day(first)} and {day(last)}")
+    text = f"AI coding assistants were used in this work {span}: " + "; ".join(parts) + "."
+    if tasks:
+        text += (" They were used for tasks such as: "
+                 + "; ".join(_clip(t, 80).rstrip(".") for t in tasks) + ".")
+    text += (" All output of these tools was reviewed, and the author takes full "
+             "responsibility for the content.")
+    return text
+
+def cmd_report(args):
+    rep = usage_report(args.since, args.until, args.project, args.by)
+    if args.statement:
+        if not args.project:
+            print("--statement needs --project", file=sys.stderr)
+            return 2
+        text = ai_use_statement(args.project, args.since, args.until)
+        print(json.dumps({"statement": text}, indent=2) if args.json else text)
+        return 0
+    if args.json:
+        print(json.dumps(rep, indent=2, default=list))
+        return 0
+    print(f"{rep['total_sessions']} session(s), about {rep['total_hours']} h of active use"
+          + (f" since {args.since}" if args.since else "") + f" — by {args.by}")
+    for r in rep["rows"]:
+        label = os.path.basename(r["key"]) if args.by == "project" else r["key"]
+        agents = ", ".join(f"{AGENT_NAMES.get(a, a)} {n}" for a, n in r["agents"].items())
+        print(f"   {r['hours']:>6.1f} h  {r['sessions']:>3} session(s)  {label:<32} {agents}")
+    return 0
+
+# ---- share a session -------------------------------------------------------- #
+
+def _scrub(text: str) -> str:
+    """No keys, and no local paths or names that say whose Mac this is."""
+    text = redact(text)
+    home = str(Path.home())
+    text = text.replace(home, "~")
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[e-mail]", text)
+    text = re.sub(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))"
+                  r"(?:\.\d{1,3}){2,3}\b", "[address]", text)
+    user = os.path.basename(home)
+    host = _here()
+    for word in {user, host} - {"", "home", "user", "root"}:
+        text = re.sub(rf"\b{re.escape(word)}\b", "…", text)
+    return text
+
+def export_session(project: str, sid: str = None, agent: str = None,
+                   fmt: str = "md", tools: bool = False) -> dict:
+    real = os.path.realpath(project)
+    sess = [s for s in list_sessions(real) if (not agent or s["agent"] == agent)]
+    s = next((x for x in sess if x["id"] == sid), None) if sid else (
+        next((x for x in sess if not (x["agent"] == "claude" and _is_scripted(x["file"]))),
+             sess[0] if sess else None))
+    if s is None:
+        raise HandoverError("no such session in this project")
+    title, turns = s.get("title"), []
+    for _end, ev in session_events(s["agent"], s["file"]):
+        if ev["role"] == "title":
+            title = ev["text"]
+        elif ev["role"] in ("user", "agent", "summary"):
+            turns.append((ev["role"], ev.get("t"), _scrub(ev["text"])))
+        elif ev["role"] == "tool" and tools:
+            turns.append(("tool", ev.get("t"), _scrub(f"{ev.get('tool')}: {ev.get('target')}")))
+    who = {"user": "You", "agent": AGENT_NAMES.get(s["agent"], "Agent"),
+           "summary": "Summary of the earlier conversation", "tool": "Tool"}
+    name = os.path.basename(real)
+    when = _when_text(turns[0][1]) if turns and turns[0][1] else ""
+    if fmt == "html":
+        import html as H
+        body = []
+        for role, t, text in turns:
+            body.append(f'<div class="m {role}"><div class="who">{H.escape(who[role])}'
+                        f'<span>{H.escape(_when_text(t) if t else "")}</span></div>'
+                        f'<div class="t">{H.escape(text)}</div></div>')
+        doc = ("<!doctype html><meta charset=utf-8><meta name=viewport "
+               "content='width=device-width'>"
+               f"<title>{H.escape(title or name)}</title><style>"
+               "body{font:15px/1.5 -apple-system,Segoe UI,sans-serif;max-width:760px;margin:2em auto;"
+               "padding:0 1em;color:#222}h1{font-size:1.4em}.sub{color:#777}.m{margin:1.2em 0}"
+               ".who{font-weight:600}.who span{font-weight:400;color:#999;margin-left:.6em;"
+               "font-size:.85em}.t{white-space:pre-wrap}.user .t{background:#f3f5f8;padding:.6em "
+               ".8em;border-radius:8px}.tool .t{font:12px ui-monospace,monospace;color:#666}"
+               "@media(prefers-color-scheme:dark){body{background:#1b1b1d;color:#ddd}"
+               ".user .t{background:#2a2c30}}</style>"
+               f"<h1>{H.escape(title or name)}</h1><p class=sub>{H.escape(name)} · "
+               f"{H.escape(AGENT_NAMES.get(s['agent'], s['agent']))} · {H.escape(when)}. "
+               "Keys, passwords and local paths are removed.</p>" + "".join(body))
+    else:
+        L = [f"# {title or name}", "",
+             f"{name} · {AGENT_NAMES.get(s['agent'], s['agent'])} · {when}. "
+             "Keys, passwords and local paths are removed.", ""]
+        for role, t, text in turns:
+            L += [f"**{who[role]}**" + (f" · {_when_text(t)}" if t else ""), "", text, ""]
+        doc = "\n".join(L)
+    return {"session": s["id"], "agent": s["agent"], "title": title, "format": fmt,
+            "turns": len(turns), "text": doc}
+
+def cmd_share(args):
+    try:
+        ex = export_session(args.path, args.session, args.agent, args.format, args.tools)
+    except HandoverError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if args.out:
+        Path(args.out).write_text(ex["text"], encoding="utf-8")
+        ex["file"] = os.path.realpath(args.out)
+        del ex["text"]
+    if args.json:
+        print(json.dumps(ex, indent=2))
+    elif args.out:
+        print(f"written: {ex['file']}  ({ex['turns']} message(s))")
+    else:
+        print(ex["text"])
+    return 0
+
+# ---- take a leaked key out of the histories (only when asked) --------------- #
+
+def redact_in_histories(fingerprint: str, project: str = None, apply: bool = False) -> dict:
+    """Replace one found secret in every history file that holds it with a
+    marker.  The files are copied aside first, and nothing happens while an
+    agent session is open in an affected project: it writes to those files."""
+    pats = _secret_patterns()
+    hits = []
+    for s in list_sessions(project):
+        try:
+            data = Path(s["file"]).read_bytes()
+        except OSError:
+            continue
+        spans = [(a0, b0) for _k, a0, b0, v in _scan_bytes(data, pats)
+                 if hashlib.sha256(v.encode()).hexdigest()[:16] == fingerprint]
+        if spans:
+            hits.append((s, spans))
+    res = {"fingerprint": fingerprint, "files": len(hits),
+           "places": sum(len(sp) for _s, sp in hits), "applied": False, "blockers": []}
+    for s, _sp in hits:
+        for o in running_sessions(inside=s.get("project") or "/nonexistent"):
+            res["blockers"].append(f"an agent session is open in {s.get('project')} "
+                                   f"(pid {o['pid']}) — exit it first")
+    res["blockers"] = sorted(set(res["blockers"]))
+    if not apply or res["blockers"] or not hits:
+        return res
+    keep = aht_home() / "redacted" / _stamp()
+    marker = b"[removed by aht]"
+    for s, spans in hits:
+        src = Path(s["file"])
+        dst = keep / src.relative_to(src.anchor)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        data = src.read_bytes()
+        out, pos = [], 0
+        for a0, b0 in sorted(spans):
+            if a0 < pos:
+                continue
+            out += [data[pos:a0], marker]
+            pos = b0
+        out.append(data[pos:])
+        tmp = src.with_name(src.name + ".aht-new")
+        tmp.write_bytes(b"".join(out))
+        shutil.copystat(src, tmp)
+        os.replace(tmp, src)
+    res.update(applied=True, kept=str(keep))
+    log(f"REDACT {fingerprint}: {res['places']} place(s) in {res['files']} file(s); "
+        f"originals in {keep}")
+    return res
+
+# --------------------------------------------------------------------------- #
+# Before and after a session: where the last session stopped, Claude's usage
+# limit, a copy of the folder to undo a session with, loose ends, a second
+# opinion and the night shift.  Whatever spends an agent's tokens is off
+# until the user turns it on: informed_sessions, limit_switch,
+# second_opinion, night_shift.
+# --------------------------------------------------------------------------- #
+
+def _spawn_aht(args: list):
+    """Run `aht <args>` detached; its pid, or None."""
+    try:
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable] + args
+        else:
+            cmd = [sys.executable or "python3", str(Path(__file__).resolve())] + args
+        kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL, "close_fds": True, "cwd": "/"}
+        if os.name == "nt":
+            kw["creationflags"] = 0x08000200
+        else:
+            kw["start_new_session"] = True
+        return subprocess.Popen(cmd, **kw).pid
+    except Exception:
+        return None
+
+def _write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(json.dumps(obj, indent=1, default=str))
+    os.replace(tmp, path)
+
+def _session_title(s: dict):
+    if s.get("title") or s["agent"] != "claude":
+        return s.get("title")
+    title = None
+    try:
+        with open(s["file"], "rb") as fh:
+            for line in fh:
+                if b'-title"' in line:
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    title = e.get("aiTitle") or e.get("customTitle") or title
+    except OSError:
+        pass
+    return title
+
+# ---- every session starts informed (USES TOKENS: off unless turned on) ------ #
+
+def informed_note(cwd: str, current: str = None, limit: int = 1600) -> str:
+    """Where the latest earlier session in this folder stopped, whichever
+    agent ran it: a few lines for a new Claude Code session's context.  Kept
+    short, because the model reads every line of it."""
+    real = os.path.realpath(cwd)
+    if real == os.path.realpath(str(Path.home())):
+        return ""
+    for s in list_sessions(real)[:6]:
+        if s["id"] == current or (s["agent"] == "claude" and _is_scripted(s["file"])):
+            continue
+        dig = events_digest(s, real, turns=1, tail=2 << 20)
+        if not dig.get("exchanges"):
+            continue
+        x = dig["exchanges"][-1]
+        title = dig.get("title") or _session_title(s)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["updated"]))
+        L = [f"[aht] The latest earlier session in this folder: {AGENT_NAMES[s['agent']]}, "
+             f"{when}" + (f", “{_clip(title, 80)}”" if title else "") + "."]
+        L.append("- Last request: " + _clip(" ".join(x["you"].split()), 300))
+        if x.get("agent"):
+            L.append("- Where it stopped: " + _clip(" ".join(x["agent"].split()), 500))
+        todos = [str(t.get("content") or t.get("subject") or t.get("title") or "")
+                 for t in dig.get("todos") or []]
+        if todos:
+            L.append("- Open to-dos: " + "; ".join(_clip(t, 100) for t in todos[:5]))
+        if dig.get("touched"):
+            L.append("- Files it changed last: "
+                     + ", ".join(list(reversed(dig["touched"]))[:6]))
+        L.append(f"- Session: {s['id']}")
+        L.append("Use this only when it matters for what the user asks; do not bring "
+                 "it up otherwise.")
+        return _clip(redact("\n".join(L)), limit)
+    return ""
+
+# ---- Claude's usage limit, and going on in another agent ------------------- #
+
+_LIMIT_WORDS = re.compile(r"hit your .{0,24}limit|usage limit|limit reached", re.I)
+
+def _tail_records(path, size: int = 65536) -> list:
+    try:
+        with open(path, "rb") as fh:
+            end = fh.seek(0, 2)
+            fh.seek(max(0, end - size))
+            data = fh.read()
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    if end > size:
+        lines = lines[1:]
+    out = []
+    for raw in lines:
+        try:
+            e = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(e, dict):
+            out.append(e)
+    return out
+
+def _reset_time(text: str, at: float):
+    """When "resets 6:20am (Europe/Lisbon)" or "resets Oct 3, 6am" is, after
+    `at`, in this machine's time; None when the text says it otherwise."""
+    m = re.search(r"resets\s+(?:at\s+)?(?:([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+"
+                  r"(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b", text or "", re.I)
+    if not m or not at:
+        return None
+    h = int(m.group(3)) % 12 + (12 if m.group(5).lower() == "pm" else 0)
+    mi = int(m.group(4) or 0)
+    lt = time.localtime(at)
+    if m.group(1):
+        try:
+            mon = time.strptime(m.group(1).title(), "%b").tm_mon
+        except ValueError:
+            return None
+        t = time.mktime((lt.tm_year, mon, int(m.group(2)), h, mi, 0, 0, 0, -1))
+        if t < at - 86400:
+            t = time.mktime((lt.tm_year + 1, mon, int(m.group(2)), h, mi, 0, 0, 0, -1))
+        return t
+    t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, 0, 0, 0, -1))
+    if t <= at:
+        t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, h, mi, 0, 0, 0, -1))
+    return t
+
+def limit_stop(jsonl):
+    """{at, text, resets, until} when a Claude Code session's last word is
+    the usage limit; None otherwise."""
+    for e in reversed(_tail_records(jsonl)):
+        t = e.get("type")
+        if t not in ("user", "assistant") or e.get("isSidechain"):
+            continue
+        m = e.get("message") if isinstance(e.get("message"), dict) else {}
+        txt = _text_of(m.get("content")).strip()
+        if t == "user":
+            if e.get("isMeta") or not txt or txt.startswith("<"):
+                continue                    # reminders, a /command's echo
+            return None                     # the user went on after it
+        if (e.get("isApiErrorMessage") or e.get("error")) and _LIMIT_WORDS.search(txt):
+            at = _when(e.get("timestamp"))
+            r = re.search(r"resets\s+([^\n·]+)", txt)
+            return {"at": at, "text": _clip(txt, 200),
+                    "resets": r.group(1).strip() if r else None,
+                    "until": _reset_time(txt, at)}
+        return None
+    return None
+
+def limit_stops(hours: float = 12) -> list:
+    """Claude Code sessions that stopped at the usage limit in the last
+    `hours`, newest first.  Read from the end of recent transcripts: no
+    tokens."""
+    root = claude_backend().root()
+    since, now = time.time() - hours * 3600, time.time()
+    mine = os.path.realpath(str(aht_home()))
+    owner = _store_owners()
+    out = []
+    for d in (root.iterdir() if root.is_dir() else []):
+        if not d.is_dir() or d.name.startswith(STAGING_PREFIX):
+            continue
+        for f in d.glob("*.jsonl"):
+            st = _stat(f)
+            if not st or st.st_mtime < since:
+                continue
+            hit = limit_stop(f)
+            if not hit:
+                continue
+            proj = owner.get(d.name) or transcript_cwd(d)
+            if proj and _inside(os.path.realpath(proj), mine):
+                continue                    # a second opinion's copy
+            hit.update(session=f.stem, project=proj,
+                       over=bool(hit["until"] and now >= hit["until"]))
+            out.append(hit)
+    out.sort(key=lambda h: h.get("at") or 0, reverse=True)
+    return out
+
+def limit_switch_target():
+    """The agent to offer when Claude is out of tokens: only when the user
+    turned that on (it spends the other agent's tokens) and it is installed."""
+    if not cfg_get("limit_switch", False):
+        return None
+    t = str(cfg_get("limit_switch_to", "kimi"))
+    return t if t in SWITCH_TARGETS and t != "claude" and agent_cli(t) else None
+
+def set_claude_auto_continue(on: bool) -> None:
+    """Claude Code's autoContinueAtUsageLimit in ~/.claude/settings.json (a
+    copy of the file is kept first)."""
+    f = claude_home() / "settings.json"
+    data = json.loads(f.read_text()) if f.is_file() else {}
+    if f.is_file():
+        shutil.copy2(f, str(f) + ".bak-aht")
+    data["autoContinueAtUsageLimit"] = bool(on)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f.name + ".aht-new")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, f)
+    log(f"CLAUDE autoContinueAtUsageLimit = {bool(on)}")
+
+def cmd_limits(args):
+    if args.auto_continue:
+        set_claude_auto_continue(args.auto_continue == "on")
+        print("Claude Code now " + ("continues a session by itself when the limit resets"
+                                    if args.auto_continue == "on" else
+                                    "waits for you after the limit resets"))
+        return 0
+    hits = limit_stops(args.hours)
+    tgt = limit_switch_target()
+    auto = claude_auto_continue()
+    if args.json:
+        print(json.dumps({"limits": hits, "switch_to": tgt, "auto_continue": auto,
+                          "switch_enabled": bool(cfg_get("limit_switch", False))},
+                         indent=2))
+        return 0
+    if not hits:
+        print(f"no session stopped at Claude's usage limit in the last {args.hours:g} hours")
+        return 0
+    for h in hits:
+        when = time.strftime("%H:%M", time.localtime(h["at"])) if h.get("at") else "?"
+        print(f"{h.get('project') or '?'}\n   stopped at {when}: {h['text']}"
+              + ("   (over now)" if h["over"] else
+                 "   (continues by itself then)" if auto else ""))
+        if tgt and h.get("project"):
+            print(f"   go on in {AGENT_NAMES[tgt]}:  aht switch {shlex.quote(h['project'])} "
+                  f"--to {tgt} --session {h['session']} --apply")
+    if not tgt:
+        print("\n(to be offered another agent here: aht config --set limit_switch=true "
+              "— that agent's tokens are used)")
+    return 0
+
+# ---- checkpoints: a copy of the folder when a session starts --------------- #
+
+CHECKPOINT_SKIP = HANDOVER_SKIP + (".git", ".aht")
+OPINION_SKIP = HANDOVER_SKIP + (".aht",)
+CLONES_PER_SECOND = 6000        # measured: 98,212 files cloned in 16.6 s (APFS, M-series)
+
+def checkpoint_skip() -> list:
+    extra = cfg_get("checkpoint_excludes") or []
+    return list(CHECKPOINT_SKIP) + [str(x) for x in extra if x]
+
+def checkpoints_root() -> Path:
+    return aht_home() / "checkpoints"
+
+_OUT_OF_TM = set()
+
+def keep_out_of_time_machine(path: Path) -> None:
+    """Time Machine does not keep copy-on-write copies shared: it would store
+    every checkpoint and second-opinion copy in full.  A sticky exclusion
+    (no admin rights needed) keeps them out of the backups."""
+    if not IS_MAC or str(path) in _OUT_OF_TM:
+        return
+    _OUT_OF_TM.add(str(path))
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["/usr/bin/tmutil", "isexcluded", str(path)],
+                           capture_output=True, text=True, timeout=20, cwd="/")
+        if "[Excluded]" not in r.stdout:
+            subprocess.run(["/usr/bin/tmutil", "addexclusion", str(path)],
+                           capture_output=True, timeout=20, cwd="/")
+            log(f"TIME MACHINE: {path} left out of the backups")
+    except Exception as e:
+        warn(f"TIME MACHINE exclusion for {path}: {e}")
+
+def checkpoint_coverage(max_files: int = None) -> dict:
+    """How many files each tracked project would copy at a session start,
+    and which ones are over the limit (they get no copy).  For those, the
+    biggest top-level folders — candidates for checkpoint_excludes."""
+    limit = int(max_files or cfg_get("checkpoint_max_files", 20000))
+    skip = checkpoint_skip()
+    rows = []
+    for e in load_registry().get("projects", {}).values():
+        real = e["real_path"]
+        if not os.path.isdir(real) or e.get("away"):
+            continue
+        files = _list_tree(real, skip) or {}
+        row = {"project": real, "files": len(files), "over": len(files) > limit,
+               "seconds": round(len(files) / CLONES_PER_SECOND, 1)}
+        if row["over"]:
+            top = {}
+            for rel in files:
+                head = rel.split(os.sep, 1)[0] if os.sep in rel else "(files at the top)"
+                top[head] = top.get(head, 0) + 1
+            row["biggest"] = [{"name": k, "files": v} for k, v in
+                              sorted(top.items(), key=lambda kv: -kv[1])[:4]]
+        rows.append(row)
+    rows.sort(key=lambda r: -r["files"])
+    return {"max": limit, "projects": rows, "over": [r for r in rows if r["over"]]}
+
+def _project_key(real: str) -> str:
+    return read_marker(real) or ("p-" + hashlib.sha256(real.encode()).hexdigest()[:16])
+
+_CLONEFILE = []
+
+def _clone(src: str, dst: str) -> bool:
+    """A copy-on-write copy (APFS clonefile): instant, and it takes no room
+    until one of the two changes.  False where the disk cannot do that."""
+    if not _CLONEFILE:
+        f = None
+        if IS_MAC:
+            try:
+                import ctypes
+                f = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).clonefile
+                f.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+                f.restype = ctypes.c_int
+            except Exception:
+                f = None
+        _CLONEFILE.append(f)
+    f = _CLONEFILE[0]
+    return bool(f) and f(os.fsencode(src), os.fsencode(dst), 1) == 0   # CLONE_NOFOLLOW
+
+def _list_tree(root: str, skip, cap: int = None):
+    """{rel: size} of the files and links under `root`; None past `cap` files."""
+    out = {}
+    for dp, dns, fns in os.walk(root):
+        keep = []
+        for d in dns:
+            if _skip_name(d, skip):
+                continue
+            if os.path.islink(os.path.join(dp, d)):
+                fns.append(d)
+            else:
+                keep.append(d)
+        dns[:] = keep
+        for n in fns:
+            if _skip_name(n, skip):
+                continue
+            p = os.path.join(dp, n)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                out[os.path.relpath(p, root)] = st.st_size if stat.S_ISREG(st.st_mode) else 0
+                if cap and len(out) > cap:
+                    return None
+    return out
+
+def _put(src: str, dst: str) -> None:
+    """One file or link from src to dst: copy-on-write where possible."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if _clone(src, dst):
+        return
+    if os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+    else:
+        shutil.copy2(src, dst)
+
+def copy_tree(src: str, dst: str, skip, cap: int = None,
+              copy_limit: int = 100 << 20) -> dict:
+    """Copy a folder, copy-on-write where the disk can.  A real copy is made
+    only while the folder stays under `copy_limit` bytes."""
+    files = _list_tree(src, skip, cap)
+    if files is None:
+        return {"ok": False, "why": f"the folder holds more than {cap} files"}
+    total, method = sum(files.values()), None
+    os.makedirs(dst, exist_ok=True)
+    for rel in files:
+        s, d = os.path.join(src, rel), os.path.join(dst, rel)
+        try:
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+        except OSError:
+            continue
+        if method != "copy" and _clone(s, d):
+            method = "clone"
+            continue
+        if method is None:
+            if total > copy_limit:
+                shutil.rmtree(dst, ignore_errors=True)
+                return {"ok": False, "why": "this disk cannot make copy-on-write copies, "
+                        f"and the folder is too big to copy ({total >> 20} MB)"}
+            method = "copy"
+        try:
+            if os.path.islink(s):
+                os.symlink(os.readlink(s), d)
+            else:
+                shutil.copy2(s, d)
+        except OSError:
+            pass                            # gone meanwhile
+    return {"ok": True, "method": method or "clone", "files": len(files), "bytes": total}
+
+def take_checkpoint(project: str, session: str = None, agent: str = "claude") -> dict:
+    real = os.path.realpath(project)
+    if not os.path.isdir(real) or real == os.path.realpath(str(Path.home())):
+        return {"ok": False, "why": "not a project folder"}
+    key = _project_key(real)
+    keep_out_of_time_machine(checkpoints_root())
+    d = checkpoints_root() / key / f"{_stamp()}-{(session or agent)[:8]}"
+    if d.exists():
+        return {"ok": False, "why": "one was just taken"}
+    skip = checkpoint_skip()
+    res = copy_tree(real, str(d / "files"), skip,
+                    cap=int(cfg_get("checkpoint_max_files", 20000)))
+    if not res["ok"]:
+        shutil.rmtree(d, ignore_errors=True)
+        log(f"CHECKPOINT {real}: none — {res['why']}")
+        return res
+    meta = dict(res, project=real, session=session or None, agent=agent, at=time.time(),
+                skip=skip)            # an undo compares with the same names left out
+    _write_json(d / "meta.json", meta)        # written last: marks it complete
+    prune_checkpoints(key)
+    log(f"CHECKPOINT {real}: {res['files']} file(s), {res['method']}")
+    return dict(meta, id=d.name)
+
+def prune_checkpoints(key: str) -> None:
+    base = checkpoints_root() / key
+    if not base.is_dir():
+        return
+    keep = max(1, int(cfg_get("checkpoint_keep", 10)))
+    now = time.time()
+    done = sorted(p for p in base.iterdir() if (p / "meta.json").is_file())
+    old = done[:-keep] + [p for p in done[-keep:]
+                          if now - p.stat().st_mtime > 30 * 86400]
+    old += [p for p in base.iterdir() if p.is_dir() and not (p / "meta.json").exists()
+            and now - p.stat().st_mtime > 3600]         # an interrupted copy
+    for p in old:
+        shutil.rmtree(p, ignore_errors=True)
+
+def checkpoints_on() -> bool:
+    """On by default only on macOS, where the copies are copy-on-write and
+    cost no room; elsewhere they are real copies, so the user turns them on."""
+    if os.environ.get("AHT_NO_CHECKPOINT"):
+        return False
+    if not IS_MAC and "checkpoints" not in load_config():
+        return False
+    return bool(cfg_get("checkpoints", True))
+
+def _spawn_checkpoint(cwd: str, sid, agent: str) -> None:
+    if not checkpoints_on():
+        return
+    _spawn_aht(["checkpoint", cwd, "--agent", agent, "--quiet"]
+               + (["--session", sid] if sid else []))
+
+def list_checkpoints(project: str) -> list:
+    real = os.path.realpath(project)
+    base = checkpoints_root() / _project_key(real)
+    out = []
+    for d in sorted(base.iterdir() if base.is_dir() else [], reverse=True):
+        try:
+            meta = json.loads((d / "meta.json").read_text())
+        except Exception:
+            continue
+        out.append(dict(meta, id=d.name, path=str(d / "files")))
+    if out:
+        sess = {s["id"]: s for s in list_sessions(real)}
+        for c in out:
+            s = sess.get(c.get("session") or "")
+            c["title"] = _session_title(s) if s else None
+    return out
+
+def _is_binary(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return b"\0" in fh.read(8192)
+    except OSError:
+        return False
+
+def _file_row(name: str, before, now, state: str) -> dict:
+    """One changed file as the window shows it: a line diff for text."""
+    import difflib
+    row = {"name": name, "state": state, "added": 0, "removed": 0, "diff": ""}
+    if any(p and (os.path.islink(p) or _is_binary(p)) for p in (before, now)):
+        row["binary"] = True
+        return row
+    def text(p):
+        try:
+            return Path(p).read_text(encoding="utf-8", errors="replace") if p else ""
+        except OSError:
+            return ""
+    diff = "".join(difflib.unified_diff(text(before).splitlines(True),
+                                        text(now).splitlines(True), "before", "now", n=2))
+    row["added"] = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
+    row["removed"] = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
+    row["diff"] = redact(diff[:200000])
+    return row
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        sa, sb_ = os.lstat(a), os.lstat(b)
+    except OSError:
+        return False
+    la, lb = stat.S_ISLNK(sa.st_mode), stat.S_ISLNK(sb_.st_mode)
+    if la or lb:
+        return la and lb and os.readlink(a) == os.readlink(b)
+    if sa.st_size != sb_.st_size:
+        return False
+    if sa.st_mtime_ns == sb_.st_mtime_ns:     # a copy keeps the time to the nanosecond
+        return True
+    return file_sha256(a) == file_sha256(b)
+
+def tree_changes(now_root: str, then_root: str, skip) -> dict:
+    """{changed, added, removed}: `now_root` against `then_root`."""
+    now, then = _list_tree(now_root, skip) or {}, _list_tree(then_root, skip) or {}
+    return {"changed": sorted(r for r in set(now) & set(then)
+                              if not _same_file(os.path.join(now_root, r),
+                                                os.path.join(then_root, r))),
+            "added": sorted(set(now) - set(then)),
+            "removed": sorted(set(then) - set(now))}
+
+def _rows(ch: dict, now_root: str, then_root: str, diffs: bool) -> list:
+    rows = []
+    for state in ("changed", "added", "removed"):
+        for rel in ch[state]:
+            if diffs:
+                rows.append(_file_row(rel, None if state == "added" else os.path.join(then_root, rel),
+                                      None if state == "removed" else os.path.join(now_root, rel),
+                                      state))
+            else:
+                rows.append({"name": rel, "state": state})
+    return rows
+
+def undo_session(project: str, cid: str = None, session: str = None,
+                 apply: bool = False, diffs: bool = False) -> dict:
+    """Put the folder back the way it was when a session started: files it
+    changed or removed come back, files it made go.  What is there now is
+    set aside first, so the undo can itself be undone."""
+    real = os.path.realpath(project)
+    res = {"project": real, "applied": False, "blockers": [], "warnings": []}
+    cps = list_checkpoints(real)
+    if cid:
+        cp = next((c for c in cps if c["id"] == cid), None)
+    elif session:       # the earliest start of that session: all of it
+        cp = next((c for c in reversed(cps) if c.get("session") == session), None)
+    else:
+        cp = cps[0] if cps else None
+    res["checkpoints"] = [{k: c.get(k) for k in ("id", "at", "agent", "session", "title", "files")}
+                          for c in cps]
+    if cp is None:
+        res["blockers"].append("aht has no copy of this folder from "
+                               + (f"the start of {cid or session}" if cid or session
+                                  else "a session start"))
+        return res
+    ch = tree_changes(real, cp["path"], cp.get("skip") or CHECKPOINT_SKIP)
+    res.update(checkpoint={k: cp.get(k) for k in ("id", "at", "agent", "session", "title")},
+               changed=len(ch["changed"]), added=len(ch["added"]),
+               removed=len(ch["removed"]), files=_rows(ch, real, cp["path"], diffs))
+    act = activity_in(real)
+    for s in act["sessions"]:
+        if s.get("status") != "idle":
+            res["blockers"] += _activity_blockers({"sessions": [s]}, "on this machine")
+        else:
+            res["warnings"].append("a session is still open in this project; tell it that "
+                                   "the files were put back")
+    if not apply or res["blockers"] or not res["files"]:
+        return res
+    keep = aht_home() / "undo" / _stamp()
+    for rel in ch["changed"] + ch["added"]:
+        dst = keep / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(os.path.join(real, rel), str(dst))
+    for rel in ch["changed"] + ch["removed"]:
+        _put(os.path.join(cp["path"], rel), os.path.join(real, rel))
+    res.update(applied=True, kept=str(keep))
+    log(f"UNDO {real} to {cp['id']}: {res['changed']} changed, {res['added']} made, "
+        f"{res['removed']} removed; set aside in {keep}")
+    return res
+
+def cmd_checkpoint(args):
+    if args.coverage:
+        cov = checkpoint_coverage(args.max)
+        if args.json:
+            print(json.dumps(cov, indent=2))
+            return 0
+        home = str(Path.home())
+        print(f"limit: {cov['max']:,} files per project")
+        for r in cov["projects"][:args.top]:
+            name = r["project"].replace(home, "~", 1)
+            what = "no copy" if r["over"] else f"about {r['seconds']:g} s"
+            print(f"  {'✗' if r['over'] else '✓'} {r['files']:>9,} files  {what:<12} {name}")
+            for b in r.get("biggest") or []:
+                print(f"        {b['files']:>9,}  {b['name']}/")
+        if cov["over"]:
+            print("\nleave big folders out of the copies:  aht config --set "
+                  "checkpoint_excludes=results,data   (names, comma-separated)")
+        return 0
+    if not args.path:
+        print("name a folder, or use --coverage", file=sys.stderr)
+        return 2
+    res = take_checkpoint(args.path, args.session, args.agent)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    elif not args.quiet:
+        print(f"checkpoint {res['id']}: {res['files']} file(s) ({res['method']})"
+              if res.get("ok", True) and res.get("id") else f"no checkpoint: {res.get('why')}")
+    return 0 if res.get("id") else 1
+
+def cmd_undo(args):
+    real = os.path.realpath(args.path)
+    if args.list:
+        cps = list_checkpoints(real)
+        if args.json:
+            print(json.dumps({"project": real, "checkpoints": cps}, indent=2))
+            return 0
+        if not cps:
+            print("no checkpoints of this folder yet (one is taken when a session starts)")
+        for c in cps:
+            print(f"{c['id']}   {time.strftime('%Y-%m-%d %H:%M', time.localtime(c['at']))}  "
+                  f"{AGENT_NAMES.get(c.get('agent'), c.get('agent'))}"
+                  + (f" — {c['title']}" if c.get("title") else "")
+                  + f"   ({c.get('files')} files)")
+        return 0
+    res = undo_session(real, args.checkpoint, args.session, args.apply, args.diff)
+    lines = []
+    cp = res.get("checkpoint")
+    if cp:
+        lines.append(f"{'put back' if res['applied'] else 'would put back'}: {real}\n"
+                     f"   as it was at {time.strftime('%Y-%m-%d %H:%M', time.localtime(cp['at']))}"
+                     + (f", when “{cp['title']}” started" if cp.get("title") else ""))
+        for f in res["files"]:
+            mark = {"changed": "~", "added": "-", "removed": "+"}[f["state"]]
+            lines.append(f"   {mark} {f['name']}" + ("   (made since: set aside)"
+                                                     if f["state"] == "added" else ""))
+            if args.diff and f.get("diff"):
+                lines.append(f["diff"])
+        if not res["files"]:
+            lines.append("   nothing changed since then")
+        elif res["applied"]:
+            lines.append(f"   what was there is kept in {res['kept']}")
+        elif not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+    return _emit(args, res, lines)
+
+# ---- loose ends ------------------------------------------------------------ #
+
+_OFFER = re.compile(r"\b(say the word|just say so|want me to|shall I|should I|"
+                    r"if you(?:'d| would)? (?:like|want|prefer)|let me know)\b", re.I)
+
+def _ends_on_question(dig: dict):
+    """("question" | "offer", sentence) when the agent's last message ends by
+    asking you something or offering a next step; None otherwise."""
+    ex = dig.get("exchanges") or []
+    txt = (ex[-1].get("agent") or "").strip() if ex else ""
+    txt = re.split(r"\n\s*\**(?:Sources|References|Links)\**:?\**\s*\n", txt)[0].strip()
+    para = re.split(r"\n\s*\n", txt)[-1].strip() if txt else ""
+    sents = [x.strip(" *_-#>`") for x in re.split(r"(?<!e\.g\.)(?<!i\.e\.)(?<=[.!?])\s+",
+                                                    " ".join(para.split()))]
+    sents = [x for x in sents if x]
+    def whole(i):               # "Just say so." means little without the one before
+        return sents[i] if len(sents[i]) >= 40 or i == 0 else sents[i - 1] + " " + sents[i]
+    n = len(sents)
+    for i in reversed(range(max(0, n - 3), n)):
+        if sents[i].endswith("?"):
+            return "question", redact(_clip(whole(i), 240))
+    for i in reversed(range(max(0, n - 2), n)):
+        if _OFFER.search(sents[i]):
+            return "offer", redact(_clip(whole(i), 240))
+    return None
+
+def loose_ends(days: int = 30) -> list:
+    """Projects worked on in the last `days` with something left open:
+    work not committed, open to-do items, or a last session that ended on a
+    question to you."""
+    reg = load_registry()
+    now = time.time()
+    open_here = set()
+    for s in open_sessions_here():
+        open_here.add(os.path.realpath(s.get("project") or "/"))
+    rows = []
+    for e in reg.get("projects", {}).values():
+        real = e["real_path"]
+        if not os.path.isdir(real) or e.get("away"):
+            continue
+        sessions = [s for s in list_sessions(real)
+                    if not (s["agent"] == "claude" and _is_scripted(s["file"]))]
+        if not sessions or now - (sessions[0]["updated"] or 0) > days * 86400:
+            continue
+        items = []
+        if os.path.exists(os.path.join(real, ".git")):
+            try:
+                r = subprocess.run(["git", "-C", real, "--no-optional-locks", "status",
+                                    "--porcelain"], capture_output=True, text=True,
+                                   timeout=15, cwd="/")
+                n = len([l for l in r.stdout.splitlines() if l.strip()]) \
+                    if r.returncode == 0 else 0
+            except Exception:
+                n = 0
+            if n:
+                items.append({"kind": "uncommitted", "count": n,
+                              "text": f"{n} file(s) not committed"})
+        s = sessions[0]
+        dig = events_digest(s, real, turns=1, tail=4 << 20)
+        todos = [redact(_clip(str(t.get("content") or t.get("subject") or t.get("title")
+                                  or ""), 120)) for t in dig.get("todos") or []]
+        todos = [t for t in todos if t]
+        if todos:
+            items.append({"kind": "todos", "count": len(todos),
+                          "text": f"{len(todos)} open to-do item(s)", "items": todos[:8]})
+        q = _ends_on_question(dig)
+        if q:
+            items.append({"kind": q[0], "text": q[1]})
+        if items:
+            rows.append({"project": real, "agent": s["agent"], "session": s["id"],
+                         "title": dig.get("title") or _session_title(s),
+                         "last": s["updated"], "open": _inside_any(real, open_here),
+                         "items": items})
+    rows.sort(key=lambda r: r["last"] or 0, reverse=True)
+    return rows
+
+def _inside_any(real: str, paths) -> bool:
+    return any(_inside(p, real) for p in paths)
+
+def cmd_loose_ends(args):
+    rows = loose_ends(args.days)
+    if args.json:
+        print(json.dumps({"loose_ends": rows}, indent=2))
+        return 0
+    if not rows:
+        print(f"nothing left open in the projects of the last {args.days} days")
+    for r in rows:
+        print(r["project"] + ("   (a session is open)" if r["open"] else ""))
+        for it in r["items"]:
+            if it["kind"] == "question":
+                print(f"   ? it asked you: {it['text']}")
+            elif it["kind"] == "offer":
+                print(f"   → it offered: {it['text']}")
+            else:
+                print(f"   • {it['text']}")
+                for t in it.get("items") or []:
+                    print(f"       - {t}")
+    return 0
+
+# ---- a second opinion (USES TOKENS: off unless turned on) ------------------ #
+
+OPINION_AGENTS = ("claude", "kimi")
+OPINION_NOTE = ("\n\n(You work in a copy of the project, made to compare two agents on "
+                "the same task. Make the changes the task needs, then say in a few "
+                "lines what you changed and why.)")
+
+def opinions_root() -> Path:
+    return aht_home() / "opinions"
+
+def _opinion_cmd(agent: str, exe: str, task: str) -> list:
+    if agent == "claude":       # edits yes, commands no
+        return [exe, "-p", task + OPINION_NOTE, "--permission-mode", "acceptEdits",
+                "--output-format", "json"]
+    return [exe, "-p", task + OPINION_NOTE, "--output-format", "text"]   # -p decides itself
+
+def _opinion_meta(rid: str) -> dict:
+    return json.loads((opinions_root() / rid / "meta.json").read_text())
+
+def start_second_opinion(project: str, task: str, agents=OPINION_AGENTS) -> dict:
+    real = os.path.realpath(project)
+    res = {"project": real, "applied": False, "blockers": [], "warnings": []}
+    agents = list(dict.fromkeys(agents))
+    if not cfg_get("second_opinion", False):
+        res["blockers"].append("a second opinion uses the tokens of both agents, so it is "
+                               "off: turn it on in the window's Settings, or with "
+                               "aht config --set second_opinion=true")
+    if not os.path.isdir(real):
+        res["blockers"].append(f"not a folder: {real}")
+    if not (task or "").strip():
+        res["blockers"].append("say what both should do (--task)")
+    if len(agents) != 2:
+        res["blockers"].append("name two different agents")
+    for a in agents:
+        if a not in OPINION_AGENTS:
+            res["blockers"].append(f"{a}: a second opinion works with "
+                                   f"{' and '.join(AGENT_NAMES[x] for x in OPINION_AGENTS)}")
+        elif not agent_cli(a):
+            res["blockers"].append(f"{AGENT_NAMES[a]} is not installed on this machine")
+    if res["blockers"]:
+        return res
+    rid = _stamp()
+    keep_out_of_time_machine(opinions_root())
+    base = opinions_root() / rid
+    name = os.path.basename(real)
+    cap = int(cfg_get("checkpoint_max_files", 20000))
+    got = copy_tree(real, str(base / "start" / name), OPINION_SKIP, cap=cap)
+    for a in agents:
+        if got["ok"]:
+            got = copy_tree(str(base / "start" / name), str(base / a / name), (), cap=cap)
+    if not got["ok"]:
+        shutil.rmtree(base, ignore_errors=True)
+        res["blockers"].append(f"no copies made: {got['why']}")
+        return res
+    _write_json(base / "meta.json", {
+        "id": rid, "project": real, "task": task.strip(), "agents": agents,
+        "started": time.time(), "state": {a: {"state": "starting"} for a in agents}})
+    _spawn_aht(["second-opinion", "--run", rid])
+    res.update(applied=True, id=rid)
+    log(f"OPINION {rid} {real}: {' and '.join(agents)}")
+    return res
+
+def _opinion_answer(agent: str, out: Path) -> dict:
+    try:
+        raw = out.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"answer": ""}
+    if agent == "claude":
+        try:
+            obj = json.loads(raw)
+            u = obj.get("usage") or {}
+            return {"answer": redact(_clip(str(obj.get("result") or ""), 6000)),
+                    "cost_usd": obj.get("total_cost_usd"),
+                    "tokens": sum(int(u.get(k) or 0) for k in (
+                        "input_tokens", "output_tokens", "cache_creation_input_tokens",
+                        "cache_read_input_tokens"))}
+        except Exception:
+            pass
+    return {"answer": redact(_clip(raw, 6000))}
+
+def run_second_opinion(rid: str) -> None:
+    """Both agents at once, each in its own copy; the state is kept in the
+    run's meta.json for the window and `--show`."""
+    base = opinions_root() / rid
+    meta = _opinion_meta(rid)
+    name = os.path.basename(meta["project"])
+    env = dict(os.environ)
+    env.pop("CLAUDECODE", None)
+    procs = {}
+    for a in meta["agents"]:
+        with open(base / f"{a}.out", "wb") as out, open(base / f"{a}.err", "wb") as err:
+            try:
+                p = subprocess.Popen(_opinion_cmd(a, agent_cli(a), meta["task"]),
+                                     cwd=str(base / a / name), stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=err, env=env)
+            except OSError as e:
+                meta["state"][a] = {"state": "failed", "error": str(e)}
+                continue
+        procs[a] = (p, time.time())
+        meta["state"][a] = {"state": "working", "pid": p.pid, "started": time.time()}
+    _write_json(base / "meta.json", meta)
+    deadline = time.time() + 3600
+    while procs:
+        time.sleep(1)
+        for a, (p, t0) in list(procs.items()):
+            rc = p.poll()
+            if rc is None and time.time() > deadline:
+                p.kill()
+                rc = p.wait()
+            if rc is None:
+                continue
+            ans = _opinion_answer(a, base / f"{a}.out")
+            if rc != 0 and not ans.get("answer"):
+                try:
+                    ans["answer"] = redact((base / f"{a}.err").read_text(
+                        errors="replace").strip()[-600:])
+                except OSError:
+                    pass
+            meta["state"][a] = dict(ans, state="done" if rc == 0 else "failed", exit=rc,
+                                    seconds=int(time.time() - t0))
+            del procs[a]
+            _write_json(base / "meta.json", meta)
+    meta["finished"] = time.time()
+    _write_json(base / "meta.json", meta)
+    _notify(f"Second opinion: {name}",
+            " and ".join(AGENT_NAMES[a] for a in meta["agents"])
+            + " are done — open aht to compare")
+
+def list_opinions() -> list:
+    out = []
+    root = opinions_root()
+    for d in sorted(root.iterdir() if root.is_dir() else [], reverse=True):
+        try:
+            m = json.loads((d / "meta.json").read_text())
+        except Exception:
+            continue
+        out.append({k: m.get(k) for k in ("id", "project", "task", "agents", "started",
+                                          "finished", "taken")}
+                   | {"states": {a: s.get("state") for a, s in m["state"].items()}})
+    return out
+
+def show_opinion(rid: str, diffs: bool = False) -> dict:
+    meta = _opinion_meta(rid)
+    base = opinions_root() / rid
+    name = os.path.basename(meta["project"])
+    start = str(base / "start" / name)
+    res = dict(meta, results={})
+    for a in meta["agents"]:
+        tree = str(base / a / name)
+        st = dict(meta["state"].get(a) or {})
+        st.pop("pid", None)
+        ch = tree_changes(tree, start, OPINION_SKIP)
+        st["files"] = _rows(ch, tree, start, diffs)
+        res["results"][a] = st
+    res.pop("state", None)
+    if os.path.isdir(meta["project"]):
+        since = tree_changes(meta["project"], start, OPINION_SKIP)
+        res["project_changed"] = since["changed"] + since["added"] + since["removed"]
+    return res
+
+def take_opinion(rid: str, agent: str, apply: bool = False) -> dict:
+    """Bring one agent's changes into the project.  Refused for files that
+    changed in the project since the copies were made."""
+    meta = _opinion_meta(rid)
+    real = meta["project"]
+    base = opinions_root() / rid
+    name = os.path.basename(real)
+    start, tree = str(base / "start" / name), str(base / agent / name)
+    res = {"project": real, "id": rid, "from": agent, "applied": False,
+           "blockers": [], "warnings": []}
+    if agent not in meta["agents"]:
+        res["blockers"].append(f"{agent} did not work on this one")
+        return res
+    if (meta["state"].get(agent) or {}).get("state") == "working":
+        res["blockers"].append(f"{AGENT_NAMES[agent]} is still working")
+    ch = tree_changes(tree, start, OPINION_SKIP)
+    touched = ch["changed"] + ch["added"] + ch["removed"]
+    moved = [rel for rel in touched
+             if not (_same_file(os.path.join(real, rel), os.path.join(start, rel))
+                     or not (os.path.lexists(os.path.join(real, rel))
+                             or os.path.lexists(os.path.join(start, rel))))]
+    if moved:
+        res["blockers"].append("changed in the project since the copies were made: "
+                               + ", ".join(moved[:8]))
+    res["blockers"] += _activity_blockers(
+        {"sessions": [s for s in activity_in(real)["sessions"] if s.get("status") != "idle"]},
+        "on this machine")
+    res["files"] = _rows(ch, tree, start, False)
+    if not apply or res["blockers"] or not touched:
+        return res
+    keep = aht_home() / "undo" / _stamp()
+    for rel in touched:
+        cur = os.path.join(real, rel)
+        if os.path.lexists(cur):
+            (keep / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(cur, str(keep / rel))
+    for rel in ch["changed"] + ch["added"]:
+        _put(os.path.join(tree, rel), os.path.join(real, rel))
+    meta["taken"] = agent
+    _write_json(base / "meta.json", meta)
+    res.update(applied=True, kept=str(keep))
+    log(f"OPINION {rid}: took {agent}'s {len(touched)} file(s) into {real}; kept {keep}")
+    return res
+
+def cmd_second_opinion(args):
+    if args.run:
+        run_second_opinion(args.run)
+        return 0
+    if args.list:
+        rows = list_opinions()
+        if args.json:
+            print(json.dumps({"opinions": rows}, indent=2))
+            return 0
+        for r in rows:
+            print(f"{r['id']}  {r['project']}\n   {_clip(r['task'], 100)}\n   "
+                  + ", ".join(f"{AGENT_NAMES[a]}: {s}" for a, s in r["states"].items())
+                  + (f"   (took {AGENT_NAMES[r['taken']]}'s)" if r.get("taken") else ""))
+        return 0
+    if args.discard:
+        base = opinions_root() / args.discard
+        if not (base / "meta.json").is_file():
+            print(f"no second opinion {args.discard}", file=sys.stderr)
+            return 1
+        shutil.rmtree(base)
+        print(f"removed the copies of {args.discard}")
+        return 0
+    if args.show:
+        res = show_opinion(args.show, args.diff)
+        if args.json:
+            print(json.dumps(res, indent=2, default=str))
+            return 0
+        print(f"{res['project']}\n   task: {res['task']}")
+        for a, r in res["results"].items():
+            print(f"\n{AGENT_NAMES[a]} — {r.get('state')}"
+                  + (f", {r['seconds']} s" if r.get("seconds") else "")
+                  + (f", ${r['cost_usd']:.2f}" if r.get("cost_usd") else ""))
+            for f in r["files"]:
+                print(f"   {f['state']:<8} {f['name']}")
+            if r.get("answer"):
+                print("   " + r["answer"].replace("\n", "\n   "))
+        return 0
+    if args.take:
+        res = take_opinion(args.take, args.agent or "", args.apply)
+        lines = [f"{'took' if res['applied'] else 'would take'} "
+                 f"{AGENT_NAMES.get(res['from'], res['from'])}'s changes into {res['project']}"]
+        lines += [f"   {f['state']:<8} {f['name']}" for f in res.get("files") or []]
+        if res["applied"]:
+            lines.append(f"   what was there is kept in {res['kept']}")
+        elif not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+    if not args.path:
+        print("name a project folder, or use --list / --show / --take", file=sys.stderr)
+        return 2
+    agents = [a.strip() for a in (args.agents or ",".join(OPINION_AGENTS)).split(",")]
+    res = start_second_opinion(args.path, args.task or "", agents)
+    lines = []
+    if res["applied"]:
+        lines += [f"started {res['id']}: {' and '.join(AGENT_NAMES[a] for a in agents)} "
+                  "work on the task, each in its own copy",
+                  f"   see how it goes:  aht second-opinion --show {res['id']}"]
+    return _emit(args, res, lines)
+
+# ---- the night shift (USES TOKENS: off unless turned on) ------------------- #
+
+def night_jobs_path() -> Path:
+    return aht_home() / "night-shift.json"
+
+def _load_jobs() -> list:
+    try:
+        return json.loads(night_jobs_path().read_text())
+    except Exception:
+        return []
+
+def _next_time(hhmm: str, after: float) -> float:
+    m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", (hhmm or "").strip())
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise ValueError(f"not a time of day: {hhmm!r} (use HH:MM)")
+    lt = time.localtime(after)
+    h, mi = int(m.group(1)), int(m.group(2))
+    t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, 0, 0, 0, -1))
+    if t <= after:
+        t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, h, mi, 0, 0, 0, -1))
+    return t
+
+def plan_night_shift(project: str, task: str, start: str, back: str,
+                     remote: str = None, apply: bool = False) -> dict:
+    """Hand a project over with a task at `start`, take it back at `back`."""
+    real = os.path.realpath(project)
+    res = {"project": real, "applied": False, "blockers": [], "warnings": []}
+    if not cfg_get("night_shift", False):
+        res["blockers"].append("the night shift runs an agent with your task, which uses "
+                               "tokens, so it is off: turn it on in the window's Settings, "
+                               "or with aht config --set night_shift=true")
+    if not handover_supported():
+        res["blockers"].append("the night shift needs handover, which this build lacks")
+    if not (task or "").strip():
+        res["blockers"].append("say what the agent should work on (--task)")
+    rem = remote or cfg_get("default_remote") or next(iter(sorted(remotes_config())), None)
+    if rem not in remotes_config():
+        res["blockers"].append("no machine to hand over to; add one first (aht remote add)")
+    now = time.time()
+    try:
+        t0 = now if start in (None, "", "now") else _next_time(start, now)
+        t1 = _next_time(back, t0)
+    except ValueError as e:
+        res["blockers"].append(str(e))
+        return res
+    if any(j["project"] == real and j["state"] in ("planned", "starting", "started",
+                                                   "returning") for j in _load_jobs()):
+        res["blockers"].append("this project already has a night shift")
+    job = {"id": _stamp(), "project": real, "task": (task or "").strip(), "remote": rem,
+           "start_at": t0, "back_at": t1, "state": "planned", "log": []}
+    res["job"] = job
+    if not apply or res["blockers"]:
+        return res
+    with Lock(timeout=10):
+        jobs = [j for j in _load_jobs() if now - j.get("back_at", now) < 30 * 86400]
+        jobs.append(job)
+        _write_json(night_jobs_path(), jobs)
+    log(f"NIGHT {real}: planned {time.ctime(t0)} to {time.ctime(t1)} on {rem}")
+    res["applied"] = True
+    if t0 <= now:
+        night_shift_tick()
+    return res
+
+def _job_note(j: dict, text: str) -> None:
+    j.setdefault("log", []).append(f"{time.strftime('%Y-%m-%d %H:%M')} {text}")
+    del j["log"][:-20]
+
+def night_shift_tick() -> list:
+    """Run by the notices agent every half minute: start what is due, take
+    back what is over.  The work itself happens in a process of its own."""
+    out = []
+    if not night_jobs_path().is_file():
+        return out
+    try:
+        with Lock(timeout=5):
+            jobs, now, changed = _load_jobs(), time.time(), False
+            for j in jobs:
+                st, name = j.get("state"), os.path.basename(j["project"])
+                if st in ("starting", "returning"):
+                    if not _pid_alive(int(j.get("pid") or 0)):
+                        j["state"] = "failed" if st == "starting" else "started"
+                        j["retry_at"] = now + 300
+                        _job_note(j, "the step ended without a word")
+                        changed = True
+                elif st == "planned" and now >= j["start_at"]:
+                    if now - j["start_at"] > 3600:
+                        j["state"] = "missed"
+                        _job_note(j, "not started: this Mac was asleep or off at the time")
+                        out.append({"kind": "night", "title": f"Night shift: {name}",
+                                    "message": "did not start — this Mac was asleep at "
+                                               "the time"})
+                    else:
+                        j["state"], j["pid"] = "starting", _spawn_aht(
+                            ["night-shift", "--step", j["id"]])
+                    changed = True
+                elif st == "started" and now >= j["back_at"] and now >= j.get("retry_at", 0):
+                    j["state"], j["pid"] = "returning", _spawn_aht(
+                        ["night-shift", "--step", j["id"]])
+                    changed = True
+            if changed:
+                _write_json(night_jobs_path(), jobs)
+    except TimeoutError:
+        pass
+    return out
+
+def _update_job(jid: str, **fields) -> dict:
+    with Lock(timeout=30):
+        jobs = _load_jobs()
+        j = next((x for x in jobs if x["id"] == jid), None)
+        if j is None:
+            return {}
+        note = fields.pop("note", None)
+        j.update(fields)
+        if note:
+            _job_note(j, note)
+        _write_json(night_jobs_path(), jobs)
+        return j
+
+def night_shift_step(jid: str) -> None:
+    j = next((x for x in _load_jobs() if x["id"] == jid), None)
+    if not j:
+        return
+    name = os.path.basename(j["project"])
+    me = [sys.executable or "python3", str(Path(__file__).resolve())]
+    if j["state"] == "starting":
+        r = subprocess.run(me + ["handover", j["project"], "--to", j["remote"],
+                                 "--task=" + j["task"], "--apply", "--json"],
+                           capture_output=True, text=True, timeout=7200, cwd="/")
+        try:
+            d = json.loads(r.stdout)
+        except Exception:
+            d = {"error": (r.stderr or r.stdout).strip()[-300:]}
+        if d.get("applied"):
+            _update_job(jid, state="started", note=f"handed over to {j['remote']}")
+            _notify(f"Night shift: {name}", f"working on {j['remote']} until "
+                    + time.strftime("%H:%M", time.localtime(j["back_at"])))
+        else:
+            why = "; ".join((d.get("blockers") or [])[:2]) or d.get("error") or "it failed"
+            _update_job(jid, state="failed", note=f"not handed over: {why}")
+            _notify(f"Night shift: {name}", f"did not start — {why}")
+        return
+    if j["state"] == "returning":
+        r = subprocess.run(me + ["reclaim", j["project"], "--stop", "--apply", "--json"],
+                           capture_output=True, text=True, timeout=7200, cwd="/")
+        try:
+            d = json.loads(r.stdout)
+        except Exception:
+            d = {"error": (r.stderr or r.stdout).strip()[-300:]}
+        if d.get("applied"):
+            _update_job(jid, state="back", note="taken back")
+            _notify(f"Night shift: {name}", "is back on this Mac — see what changed in aht")
+            return
+        why = "; ".join((d.get("blockers") or [])[:2]) or d.get("error") or "it failed"
+        first = not j.get("told_late")
+        _update_job(jid, state="started", retry_at=time.time() + 300, told_late=True,
+                    note=f"not taken back yet: {why}")
+        if first:
+            _notify(f"Night shift: {name}", "still busy — aht takes it back once the "
+                    "session is done")
+
+def cmd_night_shift(args):
+    if args.step:
+        night_shift_step(args.step)
+        return 0
+    if args.cancel:
+        j = _update_job(args.cancel)
+        if not j:
+            print(f"no night shift {args.cancel}", file=sys.stderr)
+            return 1
+        was = j["state"]
+        _update_job(args.cancel, state="cancelled", note="cancelled")
+        print("cancelled" + (" — the project is still over there; take it back with "
+                             f"aht reclaim {shlex.quote(j['project'])}"
+                             if was in ("started", "returning") else ""))
+        return 0
+    if args.list or not args.path:
+        jobs = _load_jobs()
+        if args.json:
+            print(json.dumps({"jobs": jobs}, indent=2))
+            return 0
+        if not jobs:
+            print("no night shift planned")
+        for j in jobs:
+            fmt = lambda t: time.strftime("%a %H:%M", time.localtime(t))
+            print(f"{j['id']}  {j['state']:<10} {j['project']} on {j['remote']}, "
+                  f"{fmt(j['start_at'])} → {fmt(j['back_at'])}\n   {_clip(j['task'], 100)}")
+            for l in j.get("log", [])[-3:]:
+                print(f"     {l}")
+        return 0
+    res = plan_night_shift(args.path, args.task, args.start, args.back, args.to, args.apply)
+    j = res.get("job") or {}
+    lines = []
+    if j:
+        fmt = lambda t: time.strftime("%a %H:%M", time.localtime(t))
+        lines += [f"{'planned' if res['applied'] else 'would plan'}: {j['project']}",
+                  f"   {fmt(j['start_at'])}  hand over to {j['remote']} with the task",
+                  f"   {fmt(j['back_at'])}  take it back (once the session is done)",
+                  "   this Mac has to be awake then; the agent there uses its tokens"]
+        if not res["applied"] and not res["blockers"]:
+            lines.append("(dry run — pass --apply to plan it)")
+    return _emit(args, res, lines)
+
+# ---- sessions for Spotlight and other front-ends ---------------------------- #
+
+def cmd_sessions(args):
+    """Every indexed session, newest first: what the app puts in Spotlight."""
+    update_search_index()
+    rows = []
+    try:
+        db = _open_search_db()
+        q = ("select agent, session, project, title, started, updated, live from sessions "
+             "where live = 1 order by updated desc limit ?")
+        for a, s, p, t, st, up, live in db.execute(q, (args.limit,)):
+            if p and _inside(os.path.realpath(p), os.path.realpath(str(aht_home()))):
+                continue
+            rows.append({"agent": a, "session": s, "project": p,
+                         "title": redact(t) if t else None, "started": st, "updated": up})
+        db.close()
+    except Exception as e:
+        print(json.dumps({"error": str(e)}) if args.json else str(e), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"sessions": rows}, indent=2))
+    else:
+        for r in rows:
+            print(f"{AGENT_NAMES.get(r['agent'], r['agent']):<12} "
+                  f"{r['title'] or r['session']}   {r['project']}")
+    return 0
+
+# ---- a session carries its iTerm2 tab's title (what the Claude app shows) ---- #
+
+TABS_FRESH = 20                 # seconds a look at iTerm2's tabs stays good
+_TABS_SCRIPT = """
+tell application "iTerm2"
+  set sep to character id 31
+  set out to ""
+  set wi to 0
+  repeat with w in windows
+    set wi to wi + 1
+    set ti to 0
+    repeat with t in tabs of w
+      set ti to ti + 1
+      set n to count of sessions of t
+      set i to 0
+      repeat with s in sessions of t
+        set i to i + 1
+        set v to ""
+        set u to ""
+        try
+          set v to (variable named "tab.titleOverride") of s
+        end try
+        try
+          set u to (variable named "user.ahtTitle") of s
+        end try
+        set out to out & (tty of s) & sep & i & sep & n & sep & wi & sep & ti & sep & u & sep & v & linefeed
+      end repeat
+    end repeat
+  end repeat
+  return out
+end tell
+"""
+
+def tabs_cache_path() -> Path:
+    return aht_home() / "run" / "iterm-tabs.json"
+
+def tab_names_path() -> Path:
+    return aht_home() / "run" / "tab-names.json"
+
+def _iterm_running() -> bool:
+    try:
+        r = subprocess.run(["ps", "-Ac", "-o", "comm="], capture_output=True, text=True,
+                           timeout=10, cwd="/")
+        return any(l.strip() == "iTerm2" for l in r.stdout.splitlines())
+    except Exception:
+        return False
+
+def iterm_tabs(max_age: float = TABS_FRESH) -> dict:
+    """{tty: {"title": the tab's own title ("" when none was set), "pane": n,
+    "panes": n, "window": n, "tab": n}} for every iTerm2 session.  Asking iTerm2 takes about a
+    second, so the answer is kept for `max_age` seconds.  Only the title you
+    gave a tab counts, not the one programs write into it."""
+    if os.environ.get("AHT_ITERM_TABS"):                # tests: a stand-in
+        try:
+            return json.loads(Path(os.environ["AHT_ITERM_TABS"]).read_text())
+        except Exception:
+            return {}
+    try:
+        c = json.loads(tabs_cache_path().read_text())
+        if time.time() - float(c.get("at") or 0) < max_age:
+            return c.get("tabs") or {}
+    except Exception:
+        pass
+    if not IS_MAC or not _iterm_running():
+        return {}
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-"], input=_TABS_SCRIPT,
+                           capture_output=True, text=True, timeout=20, cwd="/")
+    except Exception as e:
+        warn(f"TABS iTerm2 did not answer: {e}")
+        return {}
+    tabs = {}
+    for line in r.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) >= 7 and parts[0].startswith("/dev/"):
+            # the title the user gave the tab; else the one aht gave a tab it
+            # opened again (a script cannot set the first kind)
+            override = "\x1f".join(parts[6:]).strip()
+            mine = parts[5].strip()
+            if override == "missing value":         # AppleScript's word for "not set"
+                override = ""
+            if mine == "missing value":
+                mine = ""
+            tabs[parts[0]] = {"title": override or mine,
+                              "override": bool(override),
+                              "pane": int(parts[1] or 1), "panes": int(parts[2] or 1),
+                              "window": int(parts[3] or 1), "tab": int(parts[4] or 1)}
+    if r.returncode != 0:
+        warn(f"TABS iTerm2: {(r.stderr or '').strip()[-200:]}")
+        return tabs
+    _write_json(tabs_cache_path(), {"at": time.time(), "tabs": tabs})
+    return tabs
+
+def _session_record(pid) -> dict:
+    try:
+        return json.loads((claude_home() / "sessions" / f"{pid}.json").read_text())
+    except Exception:
+        return {}
+
+def _hook_ancestry():
+    """(tty, pid of the Claude Code process) for the session a hook runs in:
+    the hook itself has no terminal, the Claude process it came from has."""
+    if os.environ.get("AHT_TTY"):                       # tests: a stand-in
+        return os.environ["AHT_TTY"], int(os.environ.get("AHT_CLAUDE_PID") or 0) or None
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,ppid=,tty="], capture_output=True,
+                           text=True, timeout=10, cwd="/")
+    except Exception:
+        return None, None
+    table = {}
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[0].isdigit() and f[1].isdigit():
+            table[int(f[0])] = (int(f[1]), f[2])
+    sessions = claude_home() / "sessions"
+    pid, tty, cpid = os.getpid(), None, None
+    for _ in range(30):
+        if pid not in table:
+            break
+        ppid, t = table[pid]
+        if cpid is None and (sessions / f"{pid}.json").is_file():
+            cpid = pid
+        if tty is None and t not in ("??", "-", ""):
+            tty = "/dev/" + t
+        if tty and cpid:
+            break
+        pid = ppid
+    return tty, cpid
+
+def _current_title(transcript) -> str:
+    """The session's own title (what /rename, the Claude app or a hook set),
+    from the end of its transcript; "" when it has none."""
+    try:
+        with open(transcript, "rb") as fh:
+            end = fh.seek(0, 2)
+            fh.seek(max(0, end - (256 << 10)))
+            data = fh.read()
+    except (OSError, TypeError):
+        return ""
+    for raw in reversed(data.split(b"\n")):
+        if b'"custom-title"' in raw:
+            try:
+                return str(json.loads(raw).get("customTitle") or "")
+            except Exception:
+                continue
+    return ""
+
+def _transcript_of(cwd: str, sid: str):
+    root = claude_backend().root()
+    for c in dict.fromkeys((cwd, os.path.realpath(cwd))):
+        f = root / _key_claude(c) / f"{sid}.jsonl"
+        if f.is_file():
+            return f
+    return None
+
+def _is_fork(transcript) -> bool:
+    try:
+        with open(transcript, "rb") as fh:
+            return b'"forkedFrom"' in fh.read(1 << 20)
+    except (OSError, TypeError):
+        return False
+
+def _load_tab_names() -> dict:
+    try:
+        return json.loads(tab_names_path().read_text())
+    except Exception:
+        return {}
+
+def tab_session_name(data: dict, event: str):
+    """The name this session should carry, from its iTerm2 tab's title — or
+    None to leave its name alone: no title on the tab, a name someone gave
+    the session (you with /rename, or in the Claude app), or the name it
+    already has.  Another open session with that name makes it "<title> · 2"
+    ("<title> ⑂ 2" for a branch)."""
+    sid = str(data.get("session_id") or "")
+    if not sid:
+        return None
+    state = _load_tab_names()
+    entry = state.get(sid) or {}
+    pend = entry.get("pending") or {}
+    if pend.get("name"):                        # asked for in aht's window
+        name = str(pend["name"])
+        entry.update(names=((entry.get("names") or []) + [name])[-10:],
+                     pinned=bool(pend.get("pin")), at=time.time())
+        entry.pop("pending", None)
+        state[sid] = entry
+        _write_json(tab_names_path(), state)
+        log(f"TAB NAME {sid[:8]} -> {name!r} (asked for in aht)")
+        return name if name != _current_title(data.get("transcript_path")) else None
+    if entry.get("pinned"):
+        return None                             # named in aht's window: it stays
+    if not IS_MAC and not os.environ.get("AHT_ITERM_TABS"):
+        return None
+    if not cfg_get("tab_names", True):
+        return None
+    tty, cpid = _hook_ancestry()
+    if not tty:
+        return None
+    if event == "SessionStart":
+        tabs = iterm_tabs()
+        if tty not in tabs:                     # a new tab: look now
+            tabs = iterm_tabs(max_age=0)
+    else:                                       # a prompt must not wait for iTerm2
+        tabs = iterm_tabs(max_age=10 ** 9)
+        try:
+            age = time.time() - tabs_cache_path().stat().st_mtime
+        except OSError:
+            age = 10 ** 9
+        if age > TABS_FRESH and not os.environ.get("AHT_ITERM_TABS"):
+            _spawn_aht(["tab-names", "--refresh", "--quiet"])
+    base = " ".join(str((tabs.get(tty) or {}).get("title") or "").split())[:80]
+    if not base:
+        return None
+    given = {n for e in state.values() for n in (e or {}).get("names") or []}
+    current = _current_title(data.get("transcript_path"))
+    if current and current not in given:
+        return None                             # a name someone chose: it stays
+    taken = set()
+    for s in running_sessions():
+        if s.get("pid") == cpid or s.get("session") in (None, sid):
+            continue
+        t = _current_title(_transcript_of(s["cwd"], s["session"]))
+        if t:
+            taken.add(t.casefold())
+    name = base
+    if base.casefold() in taken:
+        mark = "⑂" if _is_fork(data.get("transcript_path")) else "·"
+        n = 2
+        while f"{base} {mark} {n}".casefold() in taken:
+            n += 1
+        name = f"{base} {mark} {n}"
+    if name == current:
+        return None
+    ours = entry.get("names") or []
+    state[sid] = dict(entry, names=(ours + [name])[-10:], tab=base, at=time.time())
+    for k in sorted(state, key=lambda k: (state[k] or {}).get("at") or 0)[:-500]:
+        del state[k]
+    _write_json(tab_names_path(), state)
+    log(f"TAB NAME {sid[:8]} -> {name!r}")
+    return name
+
+def _prompt_hook(data: dict) -> int:
+    """UserPromptSubmit: rename the session when its tab's title changed.
+    Prints JSON only when there is a name to set; nothing goes into the
+    conversation."""
+    try:
+        name = tab_session_name(data, "UserPromptSubmit")
+    except Exception as e:
+        warn(f"HOOK tab name: {e}")
+        return 0
+    if name:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                 "sessionTitle": name}}))
+    return 0
+
+def handover_session_name(sid, real: str, machine: str) -> str:
+    """What a handed-over session is called on the other machine: the name
+    aht gave it from its tab, with the machine's name, so the Claude app
+    tells it apart from a session on this Mac."""
+    state = _load_tab_names()
+    entry = state.get(str(sid or "")) or {}
+    names = entry.get("names") or []
+    if not names:
+        return os.path.basename(real)
+    name = f"{entry.get('tab') or names[-1]} @ {machine}"
+    if sid:                         # aht's name: renamed after the tab once it is back
+        state[str(sid)] = dict(entry, names=(names + [name])[-10:], at=time.time())
+        _write_json(tab_names_path(), state)
+    return name
+
+def _auto_title(transcript) -> str:
+    """The title Claude Code gave the session itself (it shows when nobody
+    named the session)."""
+    try:
+        with open(transcript, "rb") as fh:
+            end = fh.seek(0, 2)
+            fh.seek(max(0, end - (1 << 20)))
+            data = fh.read()
+    except (OSError, TypeError):
+        return ""
+    for raw in reversed(data.split(b"\n")):
+        if b'"ai-title"' in raw:
+            try:
+                return str(json.loads(raw).get("aiTitle") or "")
+            except Exception:
+                continue
+    return ""
+
+def _ttys() -> dict:
+    """{pid: its terminal} for the processes that have one."""
+    if os.environ.get("AHT_TTYS"):                      # tests: a stand-in
+        return {int(k): v for k, v in json.loads(os.environ["AHT_TTYS"]).items()}
+    out = {}
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,tty="], capture_output=True, text=True,
+                           timeout=10, cwd="/")
+        for line in r.stdout.splitlines():
+            f = line.split()
+            if len(f) == 2 and f[0].isdigit() and f[1] not in ("??", "-"):
+                out[int(f[0])] = "/dev/" + f[1]
+    except Exception:
+        pass
+    return out
+
+def session_names(fresh: bool = False) -> list:
+    """The open Claude Code sessions here with their names: the name, where
+    it came from ("tab", "aht" = set in aht's window, "yours" = /rename or the
+    Claude app, "automatic" = Claude's own title), the tab's title and a
+    name waiting for the session's next prompt."""
+    tabs = iterm_tabs(max_age=0 if fresh else 10 ** 9)
+    ttys = _ttys()
+    state = _load_tab_names()
+    given = {n for e in state.values() for n in (e or {}).get("names") or []}
+    rows = []
+    for s in running_sessions():
+        sid = s.get("session") or ""
+        tr = _transcript_of(s["cwd"], sid) if sid else None
+        custom, entry = _current_title(tr), state.get(sid) or {}
+        origin = ("aht" if entry.get("pinned") and custom else
+                  "tab" if custom and custom in given else
+                  "yours" if custom else "automatic")
+        rec = _session_record(s["pid"])
+        rows.append({"pid": s["pid"], "session": sid, "project": s["cwd"],
+                     "tty": ttys.get(s["pid"]),
+                     "tab": (tabs.get(ttys.get(s["pid"], "")) or {}).get("title") or None,
+                     "name": custom or _auto_title(tr) or None, "origin": origin,
+                     "pending": (entry.get("pending") or {}).get("name"),
+                     "fork": _is_fork(tr), "in_app": bool(rec.get("bridgeSessionId"))})
+    return rows
+
+def rename_session(sid: str, name: str, pin: bool = True) -> dict:
+    """Give an open session a name.  Claude Code takes a new name from a hook
+    only, so it is applied at the session's next prompt (typed here or in
+    the Claude app).  An empty name hands the session back to its tab."""
+    state = _load_tab_names()
+    entry = dict(state.get(sid) or {})
+    name = " ".join((name or "").split())[:80]
+    if name:
+        entry.update(pending={"name": name, "pin": pin}, at=time.time())
+    else:
+        entry.pop("pending", None)
+        entry["pinned"] = False
+    state[sid] = entry
+    _write_json(tab_names_path(), state)
+    log(f"TAB NAME {sid[:8]}: " + (f"{name!r} at the next prompt" if name else "follows its tab"))
+    return {"session": sid, "pending": name or None}
+
+def sync_all_plan(rows: list) -> list:
+    """Every open session that has a tab title gets it, also the ones named
+    some other way; a clash becomes "· 2" (a branch "⑂ 2").  A session
+    without a tab keeps its name, unless it merely inherited a tab name that
+    a session in that tab now carries."""
+    def free(base, fork, taken):
+        name, n, mark = base, 2, ("⑂" if fork else "·")
+        while name.casefold() in taken:
+            name, n = f"{base} {mark} {n}", n + 1
+        return name
+    kept = {str(r["name"]).casefold() for r in rows
+            if not r.get("tab") and r.get("name") and r.get("origin") != "tab"}
+    taken, plan, done = set(kept), [], set()
+    for r in sorted(rows, key=lambda r: r["pid"]):
+        base = " ".join(str(r.get("tab") or "").split())[:80]
+        if not base or not r.get("session") or r["session"] in done:
+            continue
+        done.add(r["session"])
+        name = free(base, r.get("fork"), taken)
+        taken.add(name.casefold())
+        if name != r.get("name") or r.get("origin") in ("aht", "yours") or r.get("pending"):
+            plan.append({"session": r["session"], "project": r["project"],
+                         "from": r.get("name"), "to": name})
+    for r in sorted(rows, key=lambda r: r["pid"]):
+        if r.get("tab") or r.get("origin") != "tab" or r["session"] in done \
+                or str(r.get("name") or "").casefold() not in taken:
+            continue
+        done.add(r["session"])
+        name = free(str(r["name"]), r.get("fork"), taken)
+        taken.add(name.casefold())
+        plan.append({"session": r["session"], "project": r["project"],
+                     "from": r.get("name"), "to": name})
+    return plan
+
+def cmd_tab_names(args):
+    if args.rename:
+        res = rename_session(args.rename, args.to or "")
+        print(json.dumps(res) if args.json else
+              (f"named “{res['pending']}” at the session's next prompt" if res["pending"]
+               else "the session follows its tab again"))
+        return 0
+    if args.sync_all:
+        rows = session_names(fresh=True)
+        plan = sync_all_plan(rows)
+        if args.apply:
+            for x in plan:
+                rename_session(x["session"], x["to"], pin=False)
+        if args.json:
+            print(json.dumps({"plan": plan, "applied": bool(args.apply)}, indent=2))
+            return 0
+        if not plan:
+            print("every session with a tab title already carries it")
+        for x in plan:
+            print(f"{x['from'] or '(no name)':<34} -> {x['to']}   {x['project']}")
+        if plan:
+            print("applied at each session's next prompt" if args.apply
+                  else "(dry run — pass --apply; each takes the name at its next prompt)")
+        return 0
+    if args.refresh:
+        tabs = iterm_tabs(max_age=0)
+        try:
+            save_workspace(workspace_snapshot(tabs))
+        except Exception as e:
+            warn(f"WORKSPACE not saved: {e}")
+        if not args.quiet:
+            print(f"{len(tabs)} iTerm2 session(s) seen")
+        return 0
+    rows = session_names(fresh=args.fresh)
+    if args.json:
+        print(json.dumps({"enabled": bool(cfg_get("tab_names", True)), "sessions": rows},
+                         indent=2))
+        return 0
+    if not rows:
+        print("no Claude Code session open")
+    for r in rows:
+        name = (r["name"] or "–") + (f"  → {r['pending']} (next prompt)" if r["pending"] else "")
+        print(f"{r['tab'] or '(no tab title)':<22} {name:<34} {r['origin']:<10} "
+              f"{'in the app' if r['in_app'] else 'not in the app':<15} {r['project']}")
+    return 0
+
+# ---- iTerm2: go to a session's tab, type into a tab, the whole workspace ------ #
+
+def _as_text(s: str) -> str:
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+_FIND_SESSION = """
+on run argv
+  set want to item 1 of argv
+  set what to item 2 of argv
+  set txt to ""
+  if (count of argv) > 2 then set txt to item 3 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            if what is "goto" then
+              try
+                set index of w to 1
+              end try
+              tell t to select
+              tell s to select
+              activate
+            else
+              tell s to write text txt
+            end if
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "none"
+end run
+"""
+
+def _iterm_session(tty: str, what: str, text: str = "") -> bool:
+    """Do something with the iTerm2 session on `tty`: bring it to the front
+    ("goto") or type a line into it ("write")."""
+    if os.environ.get("AHT_ITERM_LOG"):                 # tests: note it, touch nothing
+        with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
+            fh.write(json.dumps({"tty": tty, "what": what, "text": text}) + "\n")
+        return True
+    if not IS_MAC or not _iterm_running():
+        return False
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-", tty, what, text], input=_FIND_SESSION,
+                           capture_output=True, text=True, timeout=20, cwd="/")
+    except Exception:
+        return False
+    return r.stdout.strip() == "ok"
+
+def _resolve_open(target: str):
+    """An open Claude session by pid, session id or project folder."""
+    rows = running_sessions()
+    if str(target).isdigit():
+        return next((s for s in rows if s["pid"] == int(target)), None)
+    hit = [s for s in rows if s.get("session") == target]
+    if hit:
+        return hit[0]
+    real = os.path.realpath(os.path.expanduser(str(target)))
+    hit = sorted((s for s in rows if os.path.realpath(s["cwd"]) == real),
+                 key=lambda s: -(s.get("since") or 0))
+    return hit[0] if hit else None
+
+def goto_session(target: str) -> dict:
+    s = _resolve_open(target)
+    if s is None:
+        return {"ok": False, "why": "no open Claude Code session matches"}
+    tty = _ttys().get(s["pid"])
+    if not tty:
+        return {"ok": False, "why": "it runs in the background, not in a terminal tab"}
+    ok = _iterm_session(tty, "goto")
+    return {"ok": ok, "tty": tty, "why": None if ok else "it is not in an iTerm2 tab"}
+
+def cmd_goto(args):
+    res = goto_session(args.target)
+    if args.json:
+        print(json.dumps(res))
+    elif not res["ok"]:
+        print(res["why"], file=sys.stderr)
+    return 0 if res["ok"] else 1
+
+# ---- sessions that need a look: duplicates, stuck ones, outside the app ----- #
+
+KEEP_FLAGS = {"--dangerously-skip-permissions": 0, "--allow-dangerously-skip-permissions": 0,
+              "--permission-mode": 1, "--model": 1, "--effort": 1, "--add-dir": 1,
+              "--agent": 1, "--chrome": 0, "--no-chrome": 0, "--verbose": 0}
+
+def _claude_flags(cmdline: str) -> list:
+    """The options a session was started with that it keeps when it starts
+    again (permissions, model, effort, extra folders); a first prompt and the
+    session it resumed are left out."""
+    try:
+        parts = shlex.split(cmdline)
+    except ValueError:
+        parts = cmdline.split()
+    out, i = [], 1
+    while i < len(parts):
+        key = parts[i].split("=", 1)[0]
+        if key in KEEP_FLAGS:
+            if "=" in parts[i] or KEEP_FLAGS[key] == 0:
+                out.append(parts[i])
+                i += 1
+            else:
+                out += parts[i:i + 2]
+                i += 2
+            continue
+        i += 1
+    return out
+
+def _cmdline(pid: int) -> str:
+    if os.environ.get("AHT_CMDLINES"):                  # tests: a stand-in
+        return json.loads(os.environ["AHT_CMDLINES"]).get(str(pid), "")
+    try:
+        return subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=10, cwd="/").stdout.strip()
+    except Exception:
+        return ""
+
+def _version(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:3])
+
+def installed_claude_version() -> str:
+    """The Claude Code version a new session gets; asked once per binary."""
+    if os.environ.get("AHT_CLAUDE_VERSION") is not None:          # tests
+        return os.environ["AHT_CLAUDE_VERSION"]
+    exe = find_claude()
+    if not exe:
+        return ""
+    real = os.path.realpath(exe)
+    cache = aht_home() / "run" / "claude-version.json"
+    try:
+        c = json.loads(cache.read_text())
+        if c.get("exe") == real and c.get("mtime") == os.stat(real).st_mtime:
+            return c.get("version") or ""
+    except Exception:
+        pass
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                             timeout=20, cwd="/").stdout
+        m = re.search(r"\d+\.\d+\.\d+", out)
+        v = m.group(0) if m else ""
+        _write_json(cache, {"exe": real, "mtime": os.stat(real).st_mtime, "version": v})
+        return v
+    except Exception:
+        return ""
+
+def claude_auto_continue() -> bool:
+    """Claude Code's own autoContinueAtUsageLimit: a session that stopped at
+    the usage limit goes on by itself when the limit resets."""
+    try:
+        return bool(json.loads((claude_home() / "settings.json").read_text())
+                    .get("autoContinueAtUsageLimit"))
+    except Exception:
+        return False
+
+def session_checkup() -> list:
+    """Open Claude Code sessions worth a look, each with what is the matter:
+    "twice" (one conversation open in two processes), "stuck" (working for
+    hours, nothing written since), "outside the app" (started before Remote
+    Control was on), "older" (runs an older Claude Code than installed)."""
+    now = time.time()
+    rows = running_sessions()
+    count = {}
+    for s in rows:
+        if s.get("session"):
+            count[s["session"]] = count.get(s["session"], 0) + 1
+    ttys = _ttys()
+    tabs = iterm_tabs(max_age=10 ** 9)
+    rc = claude_remote_control()
+    have = installed_claude_version()
+    out = []
+    for s in rows:
+        rec = _session_record(s["pid"])
+        tr = _transcript_of(s["cwd"], s["session"]) if s.get("session") else None
+        st = _stat(tr) if tr else None
+        issues = []
+        if count.get(s.get("session"), 0) > 1:
+            issues.append("twice")
+        if s.get("status") in ("busy", "shell") and s.get("since") and now - s["since"] > 3 * 3600 \
+                and (st is None or now - st.st_mtime > 3 * 3600):
+            issues.append("stuck")
+        if rc and not rec.get("bridgeSessionId") and rec.get("kind", "interactive") == "interactive":
+            issues.append("outside the app")
+        if have and rec.get("version") and _version(rec["version"]) < _version(have):
+            issues.append("older")
+        tty = ttys.get(s["pid"])
+        out.append({"pid": s["pid"], "session": s.get("session"), "project": s["cwd"],
+                    "status": s.get("status"), "since": s.get("since"),
+                    "name": _current_title(tr) or _auto_title(tr) or None,
+                    "version": rec.get("version"), "installed": have or None,
+                    "tty": tty, "tab": (tabs.get(tty or "") or {}).get("title") or None,
+                    "in_iterm": bool(tty and tty in tabs), "in_app": bool(rec.get("bridgeSessionId")),
+                    "background": not tty, "issues": issues,
+                    "can_restart": bool(tty and tty in tabs and s.get("session")
+                                        and (s.get("status") == "idle" or "stuck" in issues))})
+    return out
+
+def _gone(pid: int) -> bool:
+    if not _pid_alive(pid):
+        return True
+    try:                                # ended, but not yet collected by its parent
+        st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                            text=True, timeout=5, cwd="/").stdout.strip()
+        return st.startswith("Z") or not st
+    except Exception:
+        return False
+
+def _wait_gone(pid: int, secs: float) -> bool:
+    end = time.time() + secs
+    while time.time() < end:
+        if _gone(pid):
+            return True
+        time.sleep(0.2)
+    return _gone(pid)
+
+def close_session(pid: int, apply: bool = False) -> dict:
+    """End one Claude Code process (SIGTERM: it exits the way it does on
+    /exit; its conversation stays and can be resumed)."""
+    s = next((x for x in running_sessions() if x["pid"] == int(pid)), None)
+    res = {"pid": int(pid), "applied": False, "blockers": []}
+    if s is None:
+        res["blockers"].append("no open Claude Code session has that process")
+        return res
+    res.update(session=s.get("session"), project=s["cwd"],
+               resume=f"cd {shlex.quote(s['cwd'])} && claude --resume {s.get('session')}")
+    if not apply:
+        return res
+    import signal
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except OSError as e:
+        res["blockers"].append(str(e))
+        return res
+    res["applied"] = _wait_gone(int(pid), 15)
+    if not res["applied"]:
+        res["blockers"].append("it did not end within 15 seconds")
+    log(f"SESSION closed pid {pid} ({s['cwd']}): {res['applied']}")
+    return res
+
+def restart_session(pid: int, apply: bool = False) -> dict:
+    """End an idle (or stuck) session and start it again in the same iTerm2
+    tab, with the options it had: it then runs the installed Claude Code and,
+    with Remote Control on for every session, appears in the Claude app."""
+    pid = int(pid)
+    row = next((r for r in session_checkup() if r["pid"] == pid), None)
+    res = {"pid": pid, "applied": False, "blockers": []}
+    if row is None:
+        res["blockers"].append("no open Claude Code session has that process")
+        return res
+    if not row["in_iterm"]:
+        res["blockers"].append("it is not in an iTerm2 tab, so aht cannot start it there again")
+    elif not row["can_restart"]:
+        res["blockers"].append("it is working or waiting for you; restart it once it is idle")
+    flags = _claude_flags(_cmdline(pid))
+    env = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 " if row.get("tab") and not \
+        (iterm_tabs(max_age=10 ** 9).get(row["tty"]) or {}).get("override") else ""
+    cmd = (f"cd {shlex.quote(row['project'])} && {env}claude "
+           + " ".join(shlex.quote(f) for f in flags + ["--resume", row["session"] or ""]))
+    res.update(session=row["session"], project=row["project"], tab=row.get("tab"),
+               command=cmd, issues=row["issues"])
+    if not apply or res["blockers"]:
+        return res
+    done = close_session(pid, apply=True)
+    if not done["applied"]:
+        res["blockers"] += done["blockers"]
+        return res
+    time.sleep(0.5)                     # the shell gets its prompt back
+    res["applied"] = _iterm_session(row["tty"], "write", cmd)
+    if not res["applied"]:
+        res["blockers"].append("the session ended, but its tab is gone; continue it with: "
+                               + cmd)
+    log(f"SESSION restarted pid {pid} in {row['tty']}: {cmd}")
+    return res
+
+def cmd_sessions_checkup(args):
+    if args.close:
+        res = close_session(args.close, args.apply)
+        lines = [("closed" if res["applied"] else "would close") +
+                 f": pid {res['pid']} {res.get('project') or ''}"]
+        if res.get("resume") and not res["blockers"]:
+            lines.append(f"   continue it later with: {res['resume']}")
+        if not args.apply and not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+    if args.restart:
+        res = restart_session(args.restart, args.apply)
+        lines = [("restarted" if res["applied"] else "would restart") +
+                 f": pid {res['pid']} {res.get('project') or ''}"]
+        if res.get("command"):
+            lines.append(f"   in its tab: {res['command']}")
+        if not args.apply and not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+    rows = session_checkup()
+    if args.json:
+        print(json.dumps({"sessions": rows, "auto_continue": claude_auto_continue()}, indent=2))
+        return 0
+    words = {"twice": "open twice", "stuck": "working for hours, nothing written",
+             "outside the app": "not in the Claude app", "older": "older Claude Code"}
+    shown = [r for r in rows if r["issues"]]
+    if not shown:
+        print("every open Claude Code session looks fine")
+    for r in shown:
+        print(f"pid {r['pid']:<7} {(r['name'] or '–')[:40]:<42} {r['project']}")
+        print("        " + ", ".join(words[i] for i in r["issues"])
+              + (f"   (runs {r['version']}, {r['installed']} installed)" if "older" in r["issues"] else "")
+              + ("   — can restart in its tab" if r["can_restart"] else ""))
+    return 0
+
+# ---- the workspace: iTerm2's windows, tabs and the sessions in them --------- #
+
+_SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "csh"}
+
+def workspaces_dir() -> Path:
+    return aht_home() / "workspaces"
+
+def _tty_processes() -> dict:
+    """{tty: [(pid, command line)]} for the processes that have a terminal."""
+    if os.environ.get("AHT_TTY_PROCS"):                 # tests: a stand-in
+        return {k: [tuple(x) for x in v] for k, v in json.loads(os.environ["AHT_TTY_PROCS"]).items()}
+    out = {}
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,tty=,args="], capture_output=True, text=True,
+                           timeout=15, cwd="/")
+    except Exception:
+        return out
+    for line in r.stdout.splitlines():
+        f = line.split(None, 2)
+        if len(f) == 3 and f[0].isdigit() and f[1] not in ("??", "-"):
+            out.setdefault("/dev/" + f[1], []).append((int(f[0]), f[2]))
+    return out
+
+def _cwds(pids) -> dict:
+    pids = [int(p) for p in pids]
+    if not pids:
+        return {}
+    if os.environ.get("AHT_CWDS"):                      # tests: a stand-in
+        return {int(k): v for k, v in json.loads(os.environ["AHT_CWDS"]).items()}
+    out = {}
+    if IS_LINUX:
+        for p in pids:
+            try:
+                out[p] = os.readlink(f"/proc/{p}/cwd")
+            except OSError:
+                pass
+        return out
+    lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
+    try:
+        r = subprocess.run([lsof, "-a", "-p", ",".join(map(str, pids)), "-d", "cwd", "-Fpn"],
+                           capture_output=True, text=True, timeout=30, cwd="/")
+        pid = None
+        for line in r.stdout.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:])
+            elif line.startswith("n") and pid:
+                out[pid] = line[1:]
+    except Exception:
+        pass
+    return out
+
+def workspace_snapshot(tabs: dict = None) -> dict:
+    """Every iTerm2 window, tab and pane: its title, its folder, and the agent
+    session that runs in it (with the options it was started with)."""
+    tabs = iterm_tabs() if tabs is None else tabs
+    procs = _tty_processes()
+    sessions = {s["pid"]: s for s in running_sessions()}
+    rows, want = [], {}
+    for tty, t in tabs.items():
+        here = procs.get(tty, [])
+        e = {"window": int(t.get("window") or 1), "tab": int(t.get("tab") or 1),
+             "pane": int(t.get("pane") or 1), "title": t.get("title") or "",
+             "cwd": None, "agent": None, "session": None, "args": [], "name": None}
+        cl = next(((pid, a) for pid, a in here if pid in sessions), None)
+        other = next(((pid, m.group(1)) for pid, a in here
+                      for m in [_AGENT_PROC.search(" ".join(a.split()[:2]))] if m), None)
+        shell = min((pid for pid, a in here if a.split() and
+                     os.path.basename(a.split()[0]).lstrip("-") in _SHELLS), default=None)
+        if cl:
+            s = sessions[cl[0]]
+            tr = _transcript_of(s["cwd"], s["session"]) if s.get("session") else None
+            e.update(agent="claude", session=s.get("session"), cwd=s["cwd"],
+                     args=_claude_flags(cl[1]),
+                     name=_current_title(tr) or _auto_title(tr) or None)
+        elif other:
+            e["agent"] = other[1]
+            want[other[0]] = e
+        elif shell:
+            want[shell] = e
+        rows.append(e)
+    for pid, cwd in _cwds(list(want)).items():
+        if pid in want:
+            want[pid]["cwd"] = cwd
+    rows.sort(key=lambda e: (e["window"], e["tab"], e["pane"]))
+    return {"at": time.time(), "seen": time.time(), "host": _here(), "tabs": rows}
+
+def _ws_key(w: dict) -> str:
+    return json.dumps([{k: e.get(k) for k in ("window", "tab", "pane", "title", "cwd",
+                                              "agent", "session")} for e in w.get("tabs", [])],
+                      sort_keys=True)
+
+def save_workspace(snap: dict):
+    """Keep the snapshot when the layout changed; a layout seen again only
+    gets its "seen" time renewed.  The last 40 layouts are kept."""
+    if not snap.get("tabs"):
+        return None
+    d = workspaces_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    files = sorted(d.glob("*.json"))
+    if files:
+        try:
+            last = json.loads(files[-1].read_text())
+            if _ws_key(last) == _ws_key(snap):
+                last["seen"] = snap["seen"]
+                _write_json(files[-1], last)
+                return files[-1]
+        except Exception:
+            pass
+    f = d / f"{_stamp()}.json"
+    if f.exists():
+        f = d / f"{_stamp()}-{len(files)}.json"
+    _write_json(f, snap)
+    for old in files[:-39]:
+        old.unlink()
+    return f
+
+def iterm_started():
+    """When the running iTerm2 started (seconds since 1970), or None."""
+    try:
+        r = subprocess.run(["ps", "-Ac", "-o", "lstart=,comm="], capture_output=True,
+                           text=True, timeout=10, cwd="/")
+        for line in r.stdout.splitlines():
+            if line.strip().endswith(" iTerm2"):
+                return time.mktime(time.strptime(" ".join(line.split()[:5]),
+                                                 "%a %b %d %H:%M:%S %Y"))
+    except Exception:
+        pass
+    return None
+
+def list_workspaces() -> list:
+    rows = []
+    for f in sorted(workspaces_dir().glob("*.json"), reverse=True) if workspaces_dir().is_dir() else []:
+        try:
+            w = json.loads(f.read_text())
+        except Exception:
+            continue
+        rows.append({"id": f.stem, "at": w.get("at"), "seen": w.get("seen") or w.get("at"),
+                     "windows": len({e["window"] for e in w["tabs"]}),
+                     "tabs": len({(e["window"], e["tab"]) for e in w["tabs"]}),
+                     "sessions": sum(1 for e in w["tabs"] if e.get("agent")),
+                     "titles": [e["title"] for e in w["tabs"] if e.get("title")]})
+    return rows
+
+def default_workspace(rows: list):
+    """The layout to offer: the last one seen before iTerm2 last started
+    (what a restart or an update closed), else the newest."""
+    start = None if os.environ.get("AHT_ITERM_TABS") else iterm_started()
+    before = [r for r in rows if start and (r["seen"] or 0) < start - 5]
+    return (before or rows or [None])[0]
+
+def restore_plan(w: dict) -> dict:
+    """What a restore opens: every agent session that is not open now, and
+    every titled tab that is not there now; the rest is skipped."""
+    open_ids = {s.get("session") for s in running_sessions()}
+    titles_now = {str(t.get("title") or "") for t in iterm_tabs(max_age=10 ** 9).values()} - {""}
+    windows, skipped = {}, []
+    for e in w.get("tabs", []):
+        why = None
+        if e.get("agent") == "claude" and e.get("session") in open_ids:
+            why = "its session is open"
+        elif not e.get("agent") and not e.get("title"):
+            why = "a plain tab without a title"
+        elif not e.get("agent") and e["title"] in titles_now:
+            why = "a tab with that title is open"
+        elif e.get("cwd") and not os.path.isdir(e["cwd"]):
+            why = "its folder is gone"
+        if why:
+            skipped.append(dict(e, why=why))
+            continue
+        windows.setdefault(e["window"], {}).setdefault(e["tab"], []).append(e)
+    plan = [[panes for _t, panes in sorted(tabs.items())] for _w, tabs in sorted(windows.items())]
+    return {"windows": plan, "skipped": skipped,
+            "opens": sum(len(p) for win in plan for p in win)}
+
+def _restore_command(e: dict) -> str:
+    steps = []
+    if e.get("title"):
+        steps.append("printf '\\033]1;%s\\007' " + shlex.quote(e["title"]))
+    run = []
+    if e.get("cwd"):
+        run.append("cd " + shlex.quote(e["cwd"]))
+    if e.get("agent") == "claude" and e.get("session"):
+        env = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 " if e.get("title") else ""
+        run.append(env + "claude " + " ".join(shlex.quote(a) for a in
+                                              list(e.get("args") or []) + ["--resume", e["session"]]))
+    elif e.get("agent") == "kimi":
+        run.append("kimi -c")
+    if run:
+        steps.append(" && ".join(run))
+    return "; ".join(steps) or "true"
+
+def restore_workspace(wid: str = None, apply: bool = False) -> dict:
+    rows = list_workspaces()
+    pick = next((r for r in rows if r["id"] == wid), None) if wid else default_workspace(rows)
+    res = {"applied": False, "blockers": [], "workspace": pick}
+    if pick is None:
+        res["blockers"].append("no saved workspace yet (aht saves one while you work in "
+                               "iTerm2 with Claude Code)")
+        return res
+    w = json.loads((workspaces_dir() / f"{pick['id']}.json").read_text())
+    plan = restore_plan(w)
+    res.update(plan=plan)
+    if not plan["opens"]:
+        res["blockers"].append("everything in it is open already")
+    if not apply or res["blockers"]:
+        return res
+    L = ['tell application "iTerm2"', "activate"]
+    for win in plan["windows"]:
+        for ti, panes in enumerate(win):
+            if ti == 0:
+                L += ["set w to (create window with default profile)", "set s to current session of w"]
+            else:
+                L += ["tell w to set t to (create tab with default profile)",
+                      "set s to current session of t"]
+            for pi, e in enumerate(panes):
+                if pi:
+                    L += ["tell s to set s2 to (split vertically with default profile)",
+                          "set s to s2"]
+                L.append("delay 0.3")
+                if e.get("title"):
+                    L.append(f'tell s to set variable named "user.ahtTitle" to {_as_text(e["title"])}')
+                L.append(f"tell s to write text {_as_text(_restore_command(e))}")
+    L.append("end tell")
+    if os.environ.get("AHT_ITERM_LOG"):                 # tests: note it, open nothing
+        with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
+            fh.write(json.dumps({"what": "restore", "script": "\n".join(L)}) + "\n")
+        res["applied"] = True
+        return res
+    r = subprocess.run(["/usr/bin/osascript", "-"], input="\n".join(L), capture_output=True,
+                       text=True, timeout=120, cwd="/")
+    res["applied"] = r.returncode == 0
+    if r.returncode != 0:
+        res["blockers"].append("iTerm2 said: " + (r.stderr or "").strip()[-300:])
+    log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)")
+    return res
+
+def cmd_workspace(args):
+    if args.save:
+        f = save_workspace(workspace_snapshot(iterm_tabs(max_age=0)))
+        print(json.dumps({"saved": str(f) if f else None}) if args.json else
+              (f"saved: {f}" if f else "nothing to save (is iTerm2 running?)"))
+        return 0
+    if args.restore is not None:
+        res = restore_workspace(args.restore or None, args.apply)
+        lines = []
+        pk = res.get("workspace")
+        if pk:
+            lines.append(f"workspace {pk['id']}: {pk['tabs']} tab(s) in {pk['windows']} "
+                         f"window(s), {pk['sessions']} session(s)")
+        for win in (res.get("plan") or {}).get("windows", []):
+            for panes in win:
+                for e in panes:
+                    lines.append(f"   open  {e.get('title') or '(no title)':<22} "
+                                 f"{e.get('name') or e.get('agent') or ''}  {e.get('cwd') or ''}")
+        for e in (res.get("plan") or {}).get("skipped", []):
+            lines.append(f"   skip  {e.get('title') or '(no title)':<22} {e['why']}")
+        if not args.apply and not res["blockers"]:
+            lines.append("(dry run — pass --apply to open them)")
+        return _emit(args, res, lines)
+    rows = list_workspaces()
+    if args.json:
+        print(json.dumps({"workspaces": rows,
+                          "default": (default_workspace(rows) or {}).get("id")}, indent=2))
+        return 0
+    if not rows:
+        print("no saved workspace yet")
+    for r in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["seen"] or 0))
+        print(f"{r['id']}  last seen {when}: {r['tabs']} tab(s), {r['sessions']} session(s)  "
+              + ", ".join(r["titles"][:8]))
     return 0
 
 def build_parser():
@@ -7510,6 +10876,11 @@ def build_parser():
 
     s = sub.add_parser("backup")
     s.add_argument("--auto", action="store_true")
+    s.add_argument("--offsite", action="store_true",
+                   help="copy the backups to the machine set as offsite_backup")
+    s.add_argument("--fetch-offsite", action="store_true", dest="fetch_offsite",
+                   help="bring backups back from that machine (on a new Mac)")
+    s.add_argument("--quiet", action="store_true")
     s.add_argument("--project")
     s.add_argument("--uuid")
     s.add_argument("--list", action="store_true")
@@ -7540,6 +10911,9 @@ def build_parser():
     s.add_argument("--to", metavar="NAME")
     s.add_argument("--on", action="store_true")
     s.add_argument("--off", action="store_true")
+    s.add_argument("--all", action="store_true", help="with --on / --off: every tracked "
+                   "project at once")
+    s.add_argument("--apply", action="store_true", help="with --all")
     s.add_argument("--run", action="store_true", help="sync now")
     s.add_argument("--due", action="store_true",
                    help="with --run: only what the interval says is due")
@@ -7620,6 +10994,9 @@ def build_parser():
     s = sub.add_parser("secrets", help="what looks like a key, a token or a password "
                        "in the agents' histories (shown masked)")
     s.add_argument("path", nargs="?")
+    s.add_argument("--redact", metavar="FINGERPRINT",
+                   help="take this find out of the history files (they are copied first)")
+    s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_secrets)
 
@@ -7655,6 +11032,174 @@ def build_parser():
     s.add_argument("--local", action="store_true", help="this machine only")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_board)
+
+    s = sub.add_parser("notices", help="announce sessions that wait for you or "
+                       "finished; run every half minute by aht's notices agent")
+    s.add_argument("--test", action="store_true", help="send a sample notice")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_notices)
+
+    s = sub.add_parser("tidy", help="tracked folders that are gone, histories without "
+                       "a folder, folders listed twice — with suggestions")
+    s.add_argument("--remove-history", metavar="STORE", dest="remove_history",
+                   help="move a history that no folder owns to the Trash")
+    s.add_argument("--show", metavar="KEY", help="a listed history as text to read (the "
+                   "project id, or the history's name: --show=-Users-…)")
+    s.add_argument("--relink", metavar="UUID", help="a gone project found again …")
+    s.add_argument("--to", metavar="PATH", help="… at this folder")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_tidy)
+
+    s = sub.add_parser("changes", help="what a Claude Code session changed in the files")
+    s.add_argument("path")
+    s.add_argument("--session")
+    s.add_argument("--diff", action="store_true", help="show the changes line by line")
+    s.add_argument("--all", action="store_true", help="also files outside the project")
+    s.add_argument("--revert", metavar="FILE", help="put this file back as it was "
+                   "before the session")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_changes)
+
+    s = sub.add_parser("report", help="sessions and active time per project, agent "
+                       "or area; an AI-use statement")
+    s.add_argument("--since", help="YYYY-MM-DD, or today / week / month")
+    s.add_argument("--until", help="YYYY-MM-DD (that day included)")
+    s.add_argument("--project", metavar="PATH")
+    s.add_argument("--by", choices=("project", "agent", "area"), default="project")
+    s.add_argument("--statement", action="store_true",
+                   help="a draft disclosure of AI use for --project")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_report)
+
+    s = sub.add_parser("share", help="a session as a clean page: no keys, no local paths")
+    s.add_argument("path")
+    s.add_argument("--session")
+    s.add_argument("--agent", choices=sorted(AGENT_NAMES))
+    s.add_argument("--format", choices=("md", "html"), default="md")
+    s.add_argument("--tools", action="store_true", help="also list the tools it used")
+    s.add_argument("--out", metavar="FILE")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_share)
+
+    s = sub.add_parser("limits", help="sessions that stopped at Claude's usage limit "
+                       "(and, if turned on, the agent to go on in)")
+    s.add_argument("--hours", type=float, default=12)
+    s.add_argument("--auto-continue", choices=("on", "off"), dest="auto_continue",
+                   help="Claude Code's own setting: go on by itself when the limit resets "
+                        "(uses tokens)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_limits)
+
+    s = sub.add_parser("checkpoint", help="copy a folder now, to undo a session with "
+                       "later (the Claude hook does this when a session starts)")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--coverage", action="store_true",
+                   help="how many files each project would copy, and which are over "
+                        "the limit")
+    s.add_argument("--max", type=int, help="with --coverage: try this limit instead")
+    s.add_argument("--top", type=int, default=15)
+    s.add_argument("--session")
+    s.add_argument("--agent", default="claude")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_checkpoint)
+
+    s = sub.add_parser("undo", help="put a folder back the way it was when a session "
+                       "started; what is there now is set aside")
+    s.add_argument("path")
+    s.add_argument("--list", action="store_true", help="the copies kept of this folder")
+    s.add_argument("--checkpoint", metavar="ID")
+    s.add_argument("--session", metavar="ID", help="to before this session's first start")
+    s.add_argument("--diff", action="store_true")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_undo)
+
+    s = sub.add_parser("loose-ends", help="projects with work not committed, open to-dos "
+                       "or a last session that asked you something")
+    s.add_argument("--days", type=int, default=30)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_loose_ends)
+
+    s = sub.add_parser("second-opinion", help="the same task by two agents, each in a "
+                       "copy, to compare (uses both agents' tokens; off by default)")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--task", metavar="TEXT")
+    s.add_argument("--agents", metavar="A,B", help="default: claude,kimi")
+    s.add_argument("--list", action="store_true")
+    s.add_argument("--show", metavar="ID")
+    s.add_argument("--diff", action="store_true")
+    s.add_argument("--take", metavar="ID", help="bring one agent's changes into the project")
+    s.add_argument("--from", dest="agent", choices=OPINION_AGENTS)
+    s.add_argument("--discard", metavar="ID", help="remove the copies")
+    s.add_argument("--run", metavar="ID", help=argparse.SUPPRESS)
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_second_opinion)
+
+    s = sub.add_parser("night-shift", help="hand a project over with a task at a time, "
+                       "take it back at another (uses tokens; off by default)")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--task", metavar="TEXT")
+    s.add_argument("--start", metavar="HH:MM", default="now")
+    s.add_argument("--back", metavar="HH:MM", default="07:00")
+    s.add_argument("--to", metavar="NAME")
+    s.add_argument("--list", action="store_true")
+    s.add_argument("--cancel", metavar="ID")
+    s.add_argument("--step", metavar="ID", help=argparse.SUPPRESS)
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_night_shift)
+
+    s = sub.add_parser("sessions", help="every session aht knows, newest first")
+    s.add_argument("--limit", type=int, default=500)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_sessions)
+
+    s = sub.add_parser("tab-names", help="the open Claude sessions, their iTerm2 tab "
+                       "titles and the names the Claude app shows")
+    s.add_argument("--refresh", action="store_true", help="look at iTerm2's tabs again")
+    s.add_argument("--fresh", action="store_true",
+                   help="ask iTerm2 now instead of using the last look")
+    s.add_argument("--rename", metavar="SESSION", help="give this open session a name "
+                   "(applied at its next prompt)")
+    s.add_argument("--to", metavar="NAME", help="with --rename; empty: follow the tab again")
+    s.add_argument("--sync-all", action="store_true", dest="sync_all",
+                   help="every open session takes its tab's title, also ones named "
+                        "otherwise (applied at each one's next prompt)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_tab_names)
+
+    s = sub.add_parser("goto", help="bring the iTerm2 tab of an open Claude session to "
+                       "the front")
+    s.add_argument("target", help="its project folder, session id or process id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_goto)
+
+    s = sub.add_parser("checkup", help="open Claude sessions worth a look: open twice, "
+                       "stuck, not in the Claude app, older Claude Code")
+    s.add_argument("--close", metavar="PID", type=int, help="end that session's process "
+                   "(its conversation stays)")
+    s.add_argument("--restart", metavar="PID", type=int, help="end it and start it again "
+                   "in its iTerm2 tab")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_sessions_checkup)
+
+    s = sub.add_parser("workspace", help="iTerm2's windows and tabs with their sessions: "
+                       "saved while you work, opened again after a restart")
+    s.add_argument("--save", action="store_true", help="save it now")
+    s.add_argument("--restore", nargs="?", const="", metavar="ID",
+                   help="open a saved one again (default: the one before iTerm2 last "
+                        "started)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_workspace)
 
     s = sub.add_parser("_agent")           # the far end of a handover (stdin: JSON)
     s.set_defaults(fn=cmd_agent)

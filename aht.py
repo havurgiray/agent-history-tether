@@ -5002,6 +5002,8 @@ def _mux_name(real: str, uid: str) -> str:
     return f"aht-{slug[:20].strip('-') or 'project'}-{uid[:6]}"
 
 def _here() -> str:
+    if os.environ.get("AHT_MACHINE_NAME"):          # demos and tests
+        return os.environ["AHT_MACHINE_NAME"]
     return platform.node().split(".")[0] or "this machine"
 
 def find_tool(name: str):

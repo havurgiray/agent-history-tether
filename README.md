@@ -338,7 +338,10 @@ behave the same.
 - **Notices** — `aht notices` (run every 30 seconds by a LaunchAgent) tells
   you when a session, here or on another machine, starts waiting for you or
   finishes a long piece of work; optionally also on the phone
-  (`notify_phone = imessage:<you>` or `ntfy:<topic>`).
+  (`notify_phone = imessage:<you>` or `ntfy:<topic>`).  With
+  `session_corner` on, the app also lists this Mac's open Claude sessions
+  in the screen's top-right corner: working, waiting for you, or done
+  (until you click it, which goes to its tab, or it works again).
 - **What changed** — `aht changes <folder> [--diff]`: every file a Claude
   Code session edited, before and now, from Claude's own checkpoints;
   `--revert <file> --apply` puts one back (the current one is kept aside).
@@ -464,7 +467,8 @@ for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
 `handover_mosh`, `rsync_path`, `terminal_app`; notices and reports:
 `notify_waiting`, `notify_finished`, `notify_finished_minutes`,
-`notify_phone`, `notify_limit`, `offsite_backup`, `report_areas`, `hotkey`;
+`notify_phone`, `notify_limit`, `session_corner`, `offsite_backup`,
+`report_areas`, `hotkey`;
 before and after a session: `checkpoints`, `checkpoint_keep`,
 `checkpoint_max_files`, `checkpoint_excludes`, `spotlight`, `tab_names`,
 `workspace_save_minutes`, `workspace_keep`, and — off by default because

@@ -156,6 +156,8 @@ CONFIG_DEFAULTS = {
     "workspace_save_minutes": 10,    # the app saves the iTerm2 layout this often
                                      #   (0: only when a session gets a prompt)
     "workspace_keep":   40,          #   the last this many layouts are kept
+    "session_corner":   False,       # the app lists the open Claude sessions in
+                                     #   the screen's top-right corner
 }
 
 POLICY_CHOICES = {

@@ -4350,6 +4350,344 @@ struct SettingsView: View {
     }
 }
 
+// ---- the session corner: the open Claude sessions, top right of the screen ------
+
+struct CornerRow: Identifiable, Equatable {
+    let id: String              // the session id
+    let pid: Int
+    let name: String
+    let project: String
+    let state: String           // "waiting", "done", "working" or "idle"
+    let age: String             // how long it has been so, "" for idle
+    let recent: Double          // the order: working now first, then by when it last ran
+}
+
+let CORNER_STATE = HOME + "/.aht/run/corner.json"
+
+/// Claude Code keeps a record of each open session (<claude home>/sessions/
+/// <pid>.json) with what it is doing; the corner reads them every second and
+/// a half. A session that goes from working to idle is "done" until you
+/// click it in the corner or it starts working again. The marks are kept in
+/// a file, so they outlast the app restarting. The name is the one the
+/// Claude app shows, from the session's conversation file.
+final class CornerModel: ObservableObject {
+    @Published var rows: [CornerRow] = []
+    var sessionsDir = HOME + "/.claude/sessions"
+    private var last: [String: String] = [:]    // session → its status at the last look
+    private var done: [String: Double] = [:]    // session → when it finished
+    private var runSince: [String: Double] = [:]
+    private var byPid: [Int: (CornerRow, String)] = [:]
+    private var titles: [String: (end: UInt64, custom: String, auto: String)] = [:]
+
+    init() {
+        if let d = FileManager.default.contents(atPath: CORNER_STATE),
+           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            last = j["last"] as? [String: String] ?? [:]
+            done = (j["done"] as? [String: NSNumber] ?? [:]).mapValues { $0.doubleValue }
+        }
+    }
+
+    func poll() {
+        let fm = FileManager.default
+        let now = Date().timeIntervalSince1970
+        var status: [String: String] = [:]
+        var found: [Int: (CornerRow, String)] = [:]
+        for f in (try? fm.contentsOfDirectory(atPath: sessionsDir)) ?? [] where f.hasSuffix(".json") {
+            guard let pid = Int(f.dropLast(5)), pid > 0,
+                  kill(pid_t(pid), 0) == 0 || errno == EPERM else { continue }
+            guard let d = fm.contents(atPath: sessionsDir + "/" + f),
+                  let r = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                  let sid = r["sessionId"] as? String else {
+                if let old = byPid[pid] {             // caught mid-write: as it was
+                    found[pid] = old
+                    status[old.0.id] = old.1
+                }
+                continue
+            }
+            let st = r["status"] as? String ?? "idle"
+            let working = st == "busy" || st == "shell"
+            let wasWorking = last[sid] == "busy" || last[sid] == "shell"
+            let at = ((r["statusUpdatedAt"] as? NSNumber)?.doubleValue).map { $0 / 1000 } ?? now
+            if working {
+                done[sid] = nil
+                if !wasWorking || runSince[sid] == nil { runSince[sid] = at }
+            } else {
+                runSince[sid] = nil
+                if st == "idle" && wasWorking { done[sid] = now }
+            }
+            status[sid] = st
+            let cwd = r["cwd"] as? String ?? ""
+            let state = st == "waiting" ? "waiting" : working ? "working"
+                : done[sid] != nil ? "done" : "idle"
+            let since = working ? runSince[sid] ?? at : state == "done" ? done[sid] ?? at : at
+            let own = (r["name"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+            let t = title(sid, cwd)
+            let name = t.custom ?? (r["nameSource"] as? String == "user" && !own.isEmpty ? own : nil)
+                ?? t.auto ?? (own.isEmpty ? (cwd as NSString).lastPathComponent : own)
+            found[pid] = (CornerRow(id: sid, pid: pid, name: name, project: cwd, state: state,
+                                    age: state == "idle" ? "" : Self.age(now - since),
+                                    recent: working ? 1e12 + since : since), st)
+        }
+        byPid = found
+        done = done.filter { status[$0.key] != nil }
+        if status != last {
+            last = status
+            save()
+        }
+        var one: [String: CornerRow] = [:]            // one row per session
+        for (row, _) in found.values where one[row.id] == nil || one[row.id]!.pid < row.pid {
+            one[row.id] = row
+        }
+        let rows = one.values.sorted {
+            ($0.recent, $1.name.lowercased(), $1.pid) > ($1.recent, $0.name.lowercased(), $0.pid)
+        }
+        if rows != self.rows { self.rows = rows }
+    }
+
+    /// The session's title from its conversation file (Claude Code's own
+    /// encoding of the folder): the last one a rename, the app or aht's
+    /// hook set, else Claude's automatic one. Only what was added to the
+    /// file since the last look is read; the first look reads up to 8 MB.
+    private func title(_ sid: String, _ cwd: String) -> (custom: String?, auto: String?) {
+        let projects = ((sessionsDir as NSString).deletingLastPathComponent as NSString)
+            .appendingPathComponent("projects")
+        func key(_ p: String) -> String {
+            String(String.UnicodeScalarView(p.unicodeScalars.map {
+                (48...57).contains($0.value) || (65...90).contains($0.value)
+                    || (97...122).contains($0.value) ? $0 : "-"
+            }))
+        }
+        for c in Set([cwd, (cwd as NSString).resolvingSymlinksInPath]) {
+            let path = projects + "/" + key(c) + "/" + sid + ".jsonl"
+            guard let fh = FileHandle(forReadingAtPath: path) else { continue }
+            defer { try? fh.close() }
+            let size = (try? fh.seekToEnd()) ?? 0
+            var t = titles[path] ?? (0, "", "")
+            if size < t.end { t = (0, "", "") }       // written anew
+            if size > t.end {
+                let from = t.end > 0 ? t.end : (size > 8 << 20 ? size - (8 << 20) : 0)
+                try? fh.seek(toOffset: from)
+                let data = fh.readData(ofLength: Int(size - from))
+                if let v = Self.lastOf(data, "custom-title", "customTitle") { t.custom = v }
+                if let v = Self.lastOf(data, "ai-title", "aiTitle") { t.auto = v }
+                if let nl = data.lastIndex(of: 10) {  // a line half written: read again
+                    t.end = from + UInt64(nl - data.startIndex + 1)
+                }
+                titles[path] = t
+            }
+            return (t.custom.isEmpty ? nil : t.custom, t.auto.isEmpty ? nil : t.auto)
+        }
+        return (nil, nil)
+    }
+
+    /// The `field` of the last line of type `kind` in a piece of a JSONL file.
+    static func lastOf(_ data: Data, _ kind: String, _ field: String) -> String? {
+        let mark = Data("\"\(kind)\"".utf8)
+        var upper = data.endIndex
+        for _ in 0..<20 {
+            guard upper > data.startIndex,
+                  let r = data.range(of: mark, options: .backwards, in: data.startIndex..<upper)
+            else { return nil }
+            let start = data[..<r.lowerBound].lastIndex(of: 10).map { $0 + 1 } ?? data.startIndex
+            let end = data[r.upperBound...].firstIndex(of: 10) ?? data.endIndex
+            if let j = (try? JSONSerialization.jsonObject(with: data.subdata(in: start..<end)))
+                as? [String: Any], j["type"] as? String == kind,
+               let v = j[field] as? String, !v.isEmpty {
+                return v
+            }
+            upper = start
+        }
+        return nil
+    }
+
+    /// You looked at it: it is no longer "done".
+    func seen(_ r: CornerRow) {
+        done[r.id] = nil
+        save()
+        poll()
+    }
+
+    static func age(_ s: Double) -> String {
+        s < 60 ? "now" : s < 3600 ? "\(Int(s / 60))m" : s < 86400 ? "\(Int(s / 3600))h"
+            : "\(Int(s / 86400))d"
+    }
+
+    private func save() {
+        guard let d = try? JSONSerialization.data(withJSONObject: ["last": last, "done": done])
+        else { return }
+        try? d.write(to: URL(fileURLWithPath: CORNER_STATE), options: .atomic)
+    }
+}
+
+struct CornerBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .popover
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+}
+
+struct CornerView: View {
+    @ObservedObject var c: CornerModel
+    let open: (CornerRow) -> Void
+    let hide: () -> Void
+    @State private var hover: String?
+    static let most = 12
+
+    var summary: String {
+        let n = { (s: String) in c.rows.filter { $0.state == s }.count }
+        let parts = [(n("waiting"), "waiting"), (n("done"), "done"), (n("working"), "working")]
+            .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+        return parts.isEmpty ? "\(c.rows.count) open, all idle" : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 6) {
+                Image(systemName: "infinity").font(.system(size: 9, weight: .semibold))
+                Text(c.rows.isEmpty ? "No Claude session open" : summary)
+                    .font(.system(size: 10.5, weight: .medium))
+                Spacer(minLength: 8)
+                Button(action: hide) {
+                    Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                        .frame(width: 14, height: 14).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Hide the corner (the aht menu brings it back)")
+            }
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 6).padding(.top, 1).padding(.bottom, c.rows.isEmpty ? 1 : 3)
+            ForEach(c.rows.prefix(Self.most)) { r in row(r) }
+            if c.rows.count > Self.most {
+                Text("+\(c.rows.count - Self.most) more").font(.system(size: 10.5))
+                    .foregroundColor(.secondary).padding(.horizontal, 6).padding(.top, 1)
+            }
+        }
+        .padding(5)
+        .frame(width: 252)
+        .background(CornerBackground())
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+    }
+
+    func row(_ r: CornerRow) -> some View {
+        let (icon, tint): (String, Color) = {
+            switch r.state {
+            case "waiting": return ("exclamationmark.circle.fill", .orange)
+            case "done": return ("checkmark.circle.fill", .green)
+            case "working": return ("circle.dotted", .blue)
+            default: return ("circle", .secondary)
+            }
+        }()
+        return Button(action: { open(r) }) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(tint).frame(width: 14)
+                Text(r.name).font(.system(size: 12, weight: r.state == "done"
+                                          || r.state == "waiting" ? .semibold : .regular))
+                    .foregroundColor(r.state == "idle" ? .secondary : .primary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 6)
+                Text(r.state == "waiting" ? "waits " + r.age : r.age)
+                    .font(.system(size: 10).monospacedDigit()).foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(hover == r.id ? Color.primary.opacity(0.09)
+                      : r.state == "done" ? Color.green.opacity(0.13)
+                      : r.state == "waiting" ? Color.orange.opacity(0.13) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { inside in
+            if inside { hover = r.id } else if hover == r.id { hover = nil }
+        }
+        .help((r.project as NSString).abbreviatingWithTildeInPath + "\n"
+              + (r.state == "done" ? "Done. A click goes to its tab and clears the mark."
+                 : "A click goes to its tab."))
+    }
+}
+
+/// Takes clicks without making aht the front app first.
+final class CornerHostingView<V: View>: NSHostingView<V> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// The floating panel in the top-right corner of the screen with the menu bar.
+final class CornerPanel {
+    let model = CornerModel()
+    private var panel: NSPanel?
+    private var timer: Timer?
+    private var size = CGSize.zero
+    var onHide: () -> Void = {}
+
+    var shown: Bool { panel?.isVisible ?? false }
+
+    func show(sessionsDir: String) {
+        model.sessionsDir = sessionsDir
+        if panel == nil {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 252, height: 40),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.isFloatingPanel = true
+            p.level = .floating
+            p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary,
+                                    .ignoresCycle]
+            p.isOpaque = false
+            p.backgroundColor = .clear
+            p.hasShadow = true
+            p.hidesOnDeactivate = false
+            p.isReleasedWhenClosed = false
+            p.contentView = CornerHostingView(rootView: CornerView(
+                c: model,
+                open: { [weak self] r in self?.open(r) },
+                hide: { [weak self] in self?.onHide() }))
+            panel = p
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                queue: .main) { [weak self] _ in self?.place(force: true) }
+        }
+        model.poll()
+        place(force: true)
+        panel?.orderFrontRegardless()
+        if timer == nil {
+            timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+                self?.model.poll()
+                self?.place()
+            }
+        }
+    }
+
+    func hide() {
+        timer?.invalidate()
+        timer = nil
+        panel?.orderOut(nil)
+    }
+
+    /// Top right, just under the menu bar; it grows downwards.
+    private func place(force: Bool = false) {
+        guard let p = panel, let v = p.contentView,
+              let screen = NSScreen.screens.first else { return }
+        let fit = v.fittingSize
+        guard force || fit != size else { return }
+        size = fit
+        let vf = screen.visibleFrame
+        p.setFrame(NSRect(x: vf.maxX - fit.width - 10, y: vf.maxY - fit.height - 8,
+                          width: fit.width, height: fit.height), display: true)
+    }
+
+    private func open(_ r: CornerRow) {
+        model.seen(r)
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = sh(PY, [ahtScript(), "goto", String(r.pid)], mergeStderr: true)
+        }
+    }
+}
+
 // ---- the app -------------------------------------------------------------------
 
 let NOTICE_QUEUE = HOME + "/.aht/run/app-notices.jsonl"

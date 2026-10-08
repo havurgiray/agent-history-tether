@@ -267,6 +267,17 @@ piece of work that took a while.
 - **Claude's usage limit:** when a session stops because the limit is
   reached, a notice says so, with the time it resets (Settings → Safety
   nets → *Tell me when Claude stops at its usage limit*).
+- **Sessions in the corner:** a small list in the screen's top-right
+  corner shows every open Claude session on this Mac: **working** (blue),
+  **waiting for you** (orange) or **done** (green), with how long it has
+  been so, under the name the Claude app shows. The sessions working now
+  come first, the one that started last on top; the rest follow by when
+  they last worked. *Done* stays until you click that session there, which
+  brings its tab to the front, or until it starts working again. Turn it
+  on or off in the aht menu (*Sessions in the Corner*) or in Settings →
+  Notices; the × on the list turns it off too. It reads Claude Code's own
+  records of its sessions every second and a half, so it needs no tokens
+  and hardly any time.
 
 **In the terminal:**
 

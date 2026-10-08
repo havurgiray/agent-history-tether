@@ -978,6 +978,8 @@ final class AppModel: ObservableObject {
     @Published var showWorkspace = false
     @Published var workspacePick: String?
     @Published var workspacePlan: [String: Any] = [:]
+    @Published var workspaceDefault: String?
+    var autosaving = false
 
     func openWorkspaces() {
         workspaces = nil
@@ -986,9 +988,33 @@ final class AppModel: ObservableObject {
             let d = ahtJSON(["workspace", "--json"]) ?? [:]
             DispatchQueue.main.async {
                 self.workspaces = (d["workspaces"] as? [[String: Any]]) ?? []
+                self.workspaceDefault = d["default"] as? String
                 self.pickWorkspace(d["default"] as? String)
             }
         }
+    }
+
+    /// Every minute; the core saves when workspace_save_minutes have passed.
+    func autosaveWorkspace() {
+        guard !autosaving else { return }
+        autosaving = true
+        DispatchQueue.global(qos: .utility).async {
+            _ = aht(["workspace", "--save", "--auto", "--quiet"])
+            DispatchQueue.main.async { self.autosaving = false }
+        }
+    }
+
+    func applyWorkspaceSaving(_ every: String, _ keep: String) {
+        guard let e = Int(every.filter { $0.isNumber }), let k = Int(keep.filter { $0.isNumber }),
+              k >= 1 else {
+            _ = alert("Not a number", "Enter how many minutes between saves (0 saves only when "
+                      + "a session gets a prompt) and how many layouts to keep (at least 1).")
+            return
+        }
+        set("workspace_save_minutes", String(e))
+        set("workspace_keep", String(k))
+        config["workspace_save_minutes"] = e
+        config["workspace_keep"] = k
     }
 
     func pickWorkspace(_ id: String?) {
@@ -3657,12 +3683,61 @@ struct WorkspaceSheet: View {
         return f.string(from: Date(timeIntervalSince1970: (any as? NSNumber)?.doubleValue ?? 0))
     }
 
+    func savingRule() -> String {
+        let every = m.config["workspace_save_minutes"] as? Int ?? 10
+        let keep = m.config["workspace_keep"] as? Int ?? 40
+        return (every > 0 ? "Saved every \(every) minutes while iTerm2 is open, and" : "Saved")
+            + " when a session gets a prompt; a layout that did not change is not saved "
+            + "again. The last \(keep) are kept (Settings → Restore my workspace)."
+    }
+
+    func row(_ w: [String: Any]) -> some View {
+        let id = w["id"] as? String ?? ""
+        let picked = m.workspacePick == id
+        let titles = (w["titles"] as? [String]) ?? []
+        return Button(action: { m.pickWorkspace(id) }) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text("last seen " + when(w["seen"]))
+                    if id == m.workspaceDefault {
+                        Text("before iTerm2 started").font(.caption2)
+                            .padding(.horizontal, 4)
+                            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                    }
+                }
+                Text("\(w["tabs"] as? Int ?? 0) tabs, \(w["sessions"] as? Int ?? 0) sessions")
+                    .font(.caption).foregroundColor(.secondary)
+                if !titles.isEmpty {
+                    Text(titles.prefix(6).joined(separator: ", ")).font(.caption)
+                        .foregroundColor(.secondary).lineLimit(1)
+                }
+            }
+            .padding(.vertical, 5).padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(picked ? Color.accentColor.opacity(0.22) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    func dot(_ e: [String: Any]) -> some View {
+        let hex = (e["color"] as? String ?? "").dropFirst()
+        let v = Int(hex, radix: 16) ?? -1
+        return Circle()
+            .fill(v < 0 || hex.count != 6 ? Color.clear
+                  : Color(red: Double((v >> 16) & 255) / 255, green: Double((v >> 8) & 255) / 255,
+                          blue: Double(v & 255) / 255))
+            .frame(width: 9, height: 9)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             headed("Restore the workspace", "Restore my workspace")
-            Text("aht keeps your iTerm2 windows and tabs, their titles and the sessions in them, "
-                 + "while you work. Opening one again resumes each session where it was, in a "
-                 + "tab with its title. Sessions and titled tabs that are open now are skipped.")
+            Text("aht keeps your iTerm2 windows and tabs, their titles, colours and the sessions "
+                 + "in them, while you work. Opening one again resumes each session where it was, "
+                 + "in a tab with its title and colour, and starts iTerm2 if it is closed. "
+                 + "Sessions and titled tabs that are open now are skipped.")
                 .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             if let ws = m.workspaces {
                 if ws.isEmpty {
@@ -3670,19 +3745,13 @@ struct WorkspaceSheet: View {
                          + "iTerm2, or now with Save Now.").foregroundColor(.secondary)
                 } else {
                     HSplitView {
-                        List(selection: Binding(get: { m.workspacePick },
-                                                set: { m.pickWorkspace($0) })) {
-                            ForEach(ws.indices, id: \.self) { i in
-                                let w = ws[i]
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("last seen " + when(w["seen"]))
-                                    Text("\(w["tabs"] as? Int ?? 0) tabs, \(w["sessions"] as? Int ?? 0) sessions")
-                                        .font(.caption).foregroundColor(.secondary)
-                                }
-                                .tag(Optional(w["id"] as? String ?? ""))
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(ws.indices, id: \.self) { i in row(ws[i]) }
                             }
+                            .padding(4)
                         }
-                        .frame(minWidth: 210, idealWidth: 230)
+                        .frame(minWidth: 230, idealWidth: 260)
                         ScrollView {
                             VStack(alignment: .leading, spacing: 4) {
                                 let plan = (m.workspacePlan["plan"] as? [String: Any]) ?? [:]
@@ -3690,7 +3759,10 @@ struct WorkspaceSheet: View {
                                 ForEach(Array(wins.enumerated()), id: \.offset) { wi, win in
                                     Text("Window \(wi + 1)").font(.subheadline.bold()).padding(.top, 4)
                                     ForEach(Array(win.joined().enumerated()), id: \.offset) { _, e in
-                                        Text(openLine(e)).lineLimit(1)
+                                        HStack(spacing: 6) {
+                                            dot(e)
+                                            Text(openLine(e)).lineLimit(1)
+                                        }
                                     }
                                 }
                                 let skipped = (plan["skipped"] as? [[String: Any]]) ?? []
@@ -3713,12 +3785,19 @@ struct WorkspaceSheet: View {
             } else {
                 ProgressView().frame(maxWidth: .infinity)
             }
+            Text(savingRule()).font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             HStack {
-                Button("Save Now") { m.saveWorkspaceNow() }
+                Button("Save Now") { m.saveWorkspaceNow() }.disabled(m.working != nil)
+                if let w = m.working {
+                    ProgressView().controlSize(.small)
+                    Text(w).foregroundColor(.secondary)
+                }
                 Spacer()
                 Button("Close") { m.showWorkspace = false }.keyboardShortcut(.cancelAction)
                 Button("Open Them") { m.restoreWorkspace() }
-                    .disabled(((m.workspacePlan["plan"] as? [String: Any])?["opens"] as? Int ?? 0) == 0)
+                    .disabled(m.working != nil
+                              || ((m.workspacePlan["plan"] as? [String: Any])?["opens"] as? Int ?? 0) == 0)
             }
         }
         .padding(20).frame(width: 820, height: 560)
@@ -3921,6 +4000,8 @@ struct SettingsView: View {
     @EnvironmentObject var m: AppModel
     @State private var maxFiles = ""
     @State private var excludes = ""
+    @State private var wsEvery = ""
+    @State private var wsKeep = ""
 
     func choice(_ title: String, _ key: String, _ options: [(String, String)]) -> some View {
         HStack {
@@ -4057,6 +4138,26 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundColor((m.status["claude_remote_control"] as? Bool ?? false)
                                              ? .secondary : .orange)
+                    }
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Restore my workspace"); HelpButton("Restore my workspace") }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Save the iTerm2 layout every")
+                            TextField("10", text: $wsEvery)
+                                .textFieldStyle(.roundedBorder).frame(width: 50)
+                            Text("minutes, keep the last")
+                            TextField("40", text: $wsKeep)
+                                .textFieldStyle(.roundedBorder).frame(width: 50)
+                            Button("Apply") { m.applyWorkspaceSaving(wsEvery, wsKeep) }
+                            Spacer()
+                        }
+                        Text("While this app runs and iTerm2 is open; a layout that did not "
+                             + "change is not saved again. It is also saved when a session gets "
+                             + "a prompt. 0 minutes: only then. No tokens.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -4207,6 +4308,8 @@ struct SettingsView: View {
         }
         .onAppear {
             maxFiles = String(m.config["checkpoint_max_files"] as? Int ?? 20000)
+            wsEvery = String(m.config["workspace_save_minutes"] as? Int ?? 10)
+            wsKeep = String(m.config["workspace_keep"] as? Int ?? 40)
             excludes = ((m.config["checkpoint_excludes"] as? [String]) ?? []).joined(separator: ", ")
         }
     }
@@ -4237,6 +4340,10 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         model.refresh()
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
             self.model.refresh()
+        }
+        // the iTerm2 layout, for Restore Workspace (the core keeps the pace)
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            self.model.autosaveWorkspace()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             self.model.offerInstallIfNeeded()

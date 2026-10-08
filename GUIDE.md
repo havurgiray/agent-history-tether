@@ -737,20 +737,23 @@ in the morning.
 
 ## Restore my workspace
 
-Your iTerm2 windows and tabs, their titles and the Claude sessions in them,
-back after a restart or a macOS update, each session where it left off.
+Your iTerm2 windows and tabs, their titles, colours and the Claude sessions
+in them, back after a restart or a macOS update, each session where it left
+off.
 
 > **Example.** You work with a dozen titled tabs: *Paper*, *Server*,
 > *Slides* … macOS restarts for an update. Afterwards: Sessions tab →
 > **Restore Workspace…**. aht offers the workspace as it was before iTerm2
 > last started, and lists what it opens. **Open Them**: a window with the
-> same tabs, titled as before, each resuming its session with the options
-> it was started with.
+> same tabs, titled and coloured as before, each resuming its session with
+> the options it was started with. iTerm2 does not need to be open first.
 
-- **Saving is automatic.** While you work with Claude Code in iTerm2, aht
-  keeps the layout whenever it changes (it looks at most every 20 seconds,
-  when a session gets a prompt). **Save Now** in the same sheet keeps it at
-  once. The last 40 layouts are kept, so an older one can be opened too.
+- **Saving is automatic.** While the aht app runs and iTerm2 is open, aht
+  looks at the layout every 10 minutes, and also when a session gets a
+  prompt. A layout that did not change is not saved again; its "last seen"
+  time moves on. **Save Now** in the same sheet keeps it at once. The last
+  40 layouts are kept; click one on the left to see what it would open.
+  Settings → Restore my workspace changes both numbers.
 - **What opens:** every Claude session that is not open now (resumed by its
   id, with the options it had — permissions, model, effort, extra folders,
   never a first prompt again), Kimi Code with its last session in that
@@ -759,12 +762,23 @@ back after a restart or a macOS update, each session where it left off.
 - **Tab titles:** iTerm2 does not let a script set the title you set with
   *Edit Tab Title*, so aht sets it the way a program does and keeps Claude
   Code from writing over it in those tabs. Session names stay as they were.
+- **Tab colours and profiles:** each tab opens with the iTerm2 profile it
+  had (the default one if that profile is gone) and its tab colour. A
+  script cannot ask iTerm2 for a tab's colour, so aht reads it from
+  iTerm2's own saved window state, which iTerm2 writes every few minutes:
+  a colour you set just now is in the next save after that.
+- **iTerm2 closed?** Open Them starts it, waits until it is ready, and puts
+  the first tab into the empty window iTerm2 opens as it starts. Tabs that
+  iTerm2 brought back by itself are not opened twice, and neither are tabs
+  from a second click on Open Them.
 - The first time, macOS asks whether aht may control iTerm2; allow it.
 
 **In the terminal:**
 
 - `aht workspace` — list the saved layouts, with their tabs and sessions.
 - `aht workspace --save` — save the layout now.
+- `aht workspace --save --auto` — save it if `workspace_save_minutes` have
+  passed since the last time (what the app does every minute).
 - `aht workspace --restore` — show what opening the layout from before
   iTerm2 last started would open; `--apply` opens it.
 - `aht workspace --restore <id> --apply` — open an older layout from the
@@ -1013,6 +1027,9 @@ all of them can be set with `aht config --set name=value` and put back with
 - `hotkey` (ctrl+opt+cmd+a) — the shortcut that opens the search.
 - `spotlight` (on) — session titles in Spotlight.
 - `tab_names` (on) — name each Claude session after its iTerm2 tab.
+- `workspace_save_minutes` (10), `workspace_keep` (40) — how often the app
+  saves the iTerm2 layout for *Restore my workspace* (0: only when a
+  session gets a prompt), and how many layouts are kept.
 
 **Before and after a session**
 

@@ -1704,6 +1704,90 @@ ck(d.get("applied") and d["plan"]["opens"] == 2 and "--resume w1" in script
    and "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1" in script,
    f"workspace: opened again, each session resumed with its options, tabs titled ({d.get('plan')})")
 
+# a second click right away opens nothing twice (a session takes a while to start)
+d2 = JS("workspace", "--restore", "--apply", "--json", extra_env=wenv)
+ck(not d2.get("applied") and "everything in it is open already" in (d2.get("blockers") or [])
+   and sum(1 for x in ilines() if x.get("what") == "restore") == 1,
+   f"workspace: a second Open Them right away opens nothing twice ({d2.get('blockers')})")
+(sb / ".aht" / "run" / "workspace-opened.json").unlink()
+
+# tab colours come from iTerm2's saved window state, profiles from iTerm2
+import plistlib, sqlite3 as _sq
+def keyed(obj):
+    """An NSKeyedArchiver plist, as iTerm2 writes its saved sessions."""
+    objs = ["$null"]
+    def enc(o):
+        if isinstance(o, dict):
+            i = len(objs)
+            objs.append(None)
+            ks = [enc(k) for k in o]
+            vs = [enc(v) for v in o.values()]
+            objs[i] = {"NS.keys": ks, "NS.objects": vs, "$class": plistlib.UID(0)}
+            return plistlib.UID(i)
+        objs.append(o)
+        return plistlib.UID(len(objs) - 1)
+    root = enc(obj)
+    return plistlib.dumps({"$archiver": "NSKeyedArchiver", "$version": 100000,
+                           "$top": {"root": root}, "$objects": objs}, fmt=plistlib.FMT_BINARY)
+orange = {"Red Component": 1.0, "Green Component": 0.5, "Blue Component": 0.0,
+          "Color Space": "sRGB"}
+state = sb / "iterm-state.sqlite"
+db = _sq.connect(str(state))
+db.execute("CREATE TABLE Node (key text not null, identifier text not null, "
+           "parent integer not null, data blob)")
+for key, blob in (
+        ("Session", keyed({"TTY": "/dev/ttysW2", "Bookmark": {
+            "Use Separate Colors for Light and Dark Mode": True,
+            "Use Tab Color (Light)": True, "Tab Color (Light)": orange,
+            "Use Tab Color (Dark)": True, "Tab Color (Dark)": orange}})),
+        ("Session", keyed({"TTY": "/dev/ttysW1", "Bookmark": {
+            "Use Tab Color": False, "Tab Color": orange}})),
+        ("Session", b"not a plist at all, Tab Color"),
+        ("Screen State", keyed({"TTY": "/dev/ttysW1"}))):
+    db.execute("INSERT INTO Node VALUES (?, '', 0, ?)", (key, blob))
+db.commit()
+db.close()
+tabs_file.write_text(json.dumps({
+    "/dev/ttysW1": {"title": "Paper", "override": True, "pane": 1, "panes": 1, "window": 1,
+                    "tab": 1, "profile": "Work"},
+    "/dev/ttysW2": {"title": "Notes", "override": True, "pane": 1, "panes": 1, "window": 1,
+                    "tab": 2, "profile": "Default"}}))
+cenv = dict(wenv, AHT_ITERM_STATE=str(state),
+            AHT_TTY_PROCS=json.dumps({"/dev/ttysW1": [[shell.pid, "-zsh"]],
+                                      "/dev/ttysW2": [[shell.pid, "-zsh"]]}))
+newest = Path(JS("workspace", "--save", "--json", extra_env=cenv).get("saved") or "missing")
+snap2 = json.loads(newest.read_text())
+c1 = next((e for e in snap2["tabs"] if e["title"] == "Paper"), {})
+c2 = next((e for e in snap2["tabs"] if e["title"] == "Notes"), {})
+ck(c2.get("color") == "#ff8000" and c1.get("color") is None and c1.get("profile") == "Work",
+   f"workspace: each tab's colour and profile are kept ({c1}, {c2})")
+tabs_file.write_text(json.dumps({"/dev/ttysW3": {"title": "", "override": False, "pane": 1,
+                                                 "panes": 1, "window": 1, "tab": 1}}))
+d = JS("workspace", "--restore", newest.stem, "--apply", "--json",
+       extra_env=dict(cenv, AHT_ITERM_STARTED="1",
+                      AHT_TTY_PROCS=json.dumps({"/dev/ttysW3": [[shell.pid, "-zsh"]]})))
+script = [x["script"] for x in ilines() if x.get("what") == "restore"][-1]
+ck(d.get("applied") and "set w to current window" in script
+   and 'create tab with profile "Default"' in script and "create tab with default profile" in script
+   and "bg;red;brightness;255" in script and "bg;green;brightness;128" in script
+   and "bg;blue;brightness;0" in script and script.count("brightness") == 3
+   and script.count("; clear") == 2,
+   "workspace: tabs open with their profile and colour, in the window iTerm2 opened as it started")
+(sb / ".aht" / "run" / "workspace-opened.json").unlink()
+
+# saved every few minutes by the app, the last workspace_keep kept
+run("config", "--set", "workspace_keep=2", "--no-reload")
+a1 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
+a2 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
+run("config", "--set", "workspace_save_minutes=0", "--no-reload")
+a3 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
+kept = len(list((sb / ".aht" / "workspaces").glob("*.json")))
+ck(a1.get("saved") and not a2.get("saved") and "ago" in str(a2.get("skipped"))
+   and a3.get("skipped") == "off" and kept == 2,
+   f"workspace: saved on a timer, not more often, and only the last 2 kept ({a1}, {a2}, {a3}, {kept})")
+run("config", "--unset", "workspace_keep")
+run("config", "--unset", "workspace_save_minutes")
+
 # go to a session's tab; a background session has none
 p2 = fake_claude("w2")
 genv = dict(wenv, AHT_TTYS=json.dumps({str(p2.pid): "/dev/ttysW3"}))

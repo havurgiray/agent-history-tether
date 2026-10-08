@@ -123,6 +123,22 @@ for n, (folder, status, waiting, in_app, version) in enumerate(OPEN, 1):
 env.update({"AHT_ITERM_TABS": str(D / "tabs.json"), "AHT_TTYS": json.dumps(ttys)})
 aht("search", "--update")
 
+# two saved iTerm2 layouts for Restore Workspace: tabs with colours, the four
+# open sessions (skipped) and two that are not open now
+COLORS = {"paper": "#eddd68", "docs-site": "#6fa1f1", "thesis": "#b990d4",
+          "benchmarks": "#bcd660", "course-notes": "#ea7468", "budget-tool": "#ebaf5a"}
+wsd = home / ".aht" / "workspaces"
+wsd.mkdir(parents=True, exist_ok=True)
+for name, hours, folders in (("20260930-091500", 30, PROJECTS),
+                             ("20260929-171000", 52, PROJECTS[:4])):
+    rows = [{"window": 1, "tab": n, "pane": 1, "title": p[1] or p[0].replace("-", " ").title(),
+             "profile": "Default", "color": COLORS[p[0]], "cwd": str(roots / p[0]),
+             "agent": "claude", "session": sids[p[0]], "args": [], "name": p[2]}
+            for n, p in enumerate(folders, 1)]
+    t = now - hours * 3600
+    (wsd / f"{name}.json").write_text(json.dumps({"at": t - 3600, "seen": t, "host": "my-mac",
+                                                  "tabs": rows}))
+
 try:
     shutil.rmtree(OUT, ignore_errors=True)
     r = subprocess.run([APP, "--snapshot", str(OUT), "--select-first"]

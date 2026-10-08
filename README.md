@@ -402,10 +402,20 @@ behave the same.
   second, so that runs in the background).  Clashes among open sessions
   become `Paper · 2`, branches `Paper ⑂ 2`; a name the user set stays; a
   handed-over session is `Paper @ <machine>`.  `aht tab-names` lists them.
-- **Workspace** — `aht workspace`: iTerm2's windows, tabs, titles and the
-  sessions in them are saved while you work (on the prompt hook's
-  background refresh); `--restore [--apply]` opens the layout from before
-  iTerm2 last started again, each session resumed by id with its options.
+  (a UserPromptSubmit hook that asks iTerm2 for that one tab, about 0.2 s).
+  Clashes among open sessions become `Paper · 2`, branches `Paper ⑂ 2`; a
+  handed-over session is `Paper @ <machine>`.  The latest name wins both
+  ways: a session renamed with `/rename`, in the app or in aht's window
+  gives its tab the name, through iTerm2's Python API (switch it on in
+  iTerm2 → Settings → General → Magic; with it off, the tab keeps its
+  title).  `aht tab-names` lists them.
+- **Workspace** — `aht workspace`: iTerm2's windows, tabs, titles, tab
+  colours, profiles and the sessions in them are saved while you work
+  (every `workspace_save_minutes` by the app, and on the prompt hook's
+  background refresh; the last `workspace_keep` are kept);
+  `--restore [--apply]` opens the layout from before iTerm2 last started
+  again, starting iTerm2 if needed, each session resumed by id with its
+  options.
 - **Go to a tab, and a checkup** — `aht goto <project|session|pid>` brings a
   session's iTerm2 tab to the front; `aht checkup` marks sessions open
   twice, stuck, outside the Claude app or on an older Claude Code, and
@@ -460,8 +470,9 @@ for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `notify_waiting`, `notify_finished`, `notify_finished_minutes`,
 `notify_phone`, `notify_limit`, `offsite_backup`, `report_areas`, `hotkey`;
 before and after a session: `checkpoints`, `checkpoint_keep`,
-`checkpoint_max_files`, `checkpoint_excludes`, `spotlight`, `tab_names`, and — off by default because they use
-tokens — `informed_sessions`, `limit_switch` / `limit_switch_to`,
+`checkpoint_max_files`, `checkpoint_excludes`, `spotlight`, `tab_names`,
+`workspace_save_minutes`, `workspace_keep`, and — off by default because
+they use tokens — `informed_sessions`, `limit_switch` / `limit_switch_to`,
 `second_opinion`, `night_shift`.
 
 Every platform has a tray, shown as an ∞ icon in the bar: `aht.app` (or the

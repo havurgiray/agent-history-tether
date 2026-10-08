@@ -153,6 +153,9 @@ CONFIG_DEFAULTS = {
     "spotlight":        True,        # session titles in Spotlight (the app)
     "tab_names":        True,        # a Claude session is named after its iTerm2
                                      #   tab (what the Claude app shows)
+    "workspace_save_minutes": 10,    # the app saves the iTerm2 layout this often
+                                     #   (0: only when a session gets a prompt)
+    "workspace_keep":   40,          #   the last this many layouts are kept
 }
 
 POLICY_CHOICES = {
@@ -9756,23 +9759,31 @@ tell application "iTerm2"
   repeat with w in windows
     set wi to wi + 1
     set ti to 0
-    repeat with t in tabs of w
-      set ti to ti + 1
-      set n to count of sessions of t
-      set i to 0
-      repeat with s in sessions of t
-        set i to i + 1
-        set v to ""
-        set u to ""
+    try
+      repeat with t in tabs of w
+        set ti to ti + 1
         try
-          set v to (variable named "tab.titleOverride") of s
+          set n to count of sessions of t
+          set i to 0
+          repeat with s in sessions of t
+            set i to i + 1
+            set v to ""
+            set u to ""
+            set p to ""
+            try
+              set v to (variable named "tab.titleOverride") of s
+            end try
+            try
+              set u to (variable named "user.ahtTitle") of s
+            end try
+            try
+              set p to profile name of s
+            end try
+            set out to out & (tty of s) & sep & i & sep & n & sep & wi & sep & ti & sep & p & sep & u & sep & v & linefeed
+          end repeat
         end try
-        try
-          set u to (variable named "user.ahtTitle") of s
-        end try
-        set out to out & (tty of s) & sep & i & sep & n & sep & wi & sep & ti & sep & u & sep & v & linefeed
       end repeat
-    end repeat
+    end try
   end repeat
   return out
 end tell
@@ -9819,11 +9830,12 @@ def iterm_tabs(max_age: float = TABS_FRESH) -> dict:
     tabs = {}
     for line in r.stdout.splitlines():
         parts = line.split("\x1f")
-        if len(parts) >= 7 and parts[0].startswith("/dev/"):
+        if len(parts) >= 8 and parts[0].startswith("/dev/"):
             # the title the user gave the tab; else the one aht gave a tab it
             # opened again (a script cannot set the first kind)
-            override = "\x1f".join(parts[6:]).strip()
-            mine = parts[5].strip()
+            override = "\x1f".join(parts[7:]).strip()
+            mine = parts[6].strip()
+            profile = parts[5].strip()
             if override == "missing value":         # AppleScript's word for "not set"
                 override = ""
             if mine == "missing value":
@@ -9831,7 +9843,8 @@ def iterm_tabs(max_age: float = TABS_FRESH) -> dict:
             tabs[parts[0]] = {"title": override or mine,
                               "override": bool(override),
                               "pane": int(parts[1] or 1), "panes": int(parts[2] or 1),
-                              "window": int(parts[3] or 1), "tab": int(parts[4] or 1)}
+                              "window": int(parts[3] or 1), "tab": int(parts[4] or 1),
+                              "profile": "" if profile == "missing value" else profile}
     if r.returncode != 0:
         warn(f"TABS iTerm2: {(r.stderr or '').strip()[-200:]}")
         return tabs
@@ -10534,10 +10547,108 @@ def _cwds(pids) -> dict:
         pass
     return out
 
+def _iterm_state_path() -> Path:
+    return Path(os.environ.get("AHT_ITERM_STATE") or Path.home() / "Library" /
+                "Application Support" / "iTerm2" / "SavedState" / "restorable-state.sqlite")
+
+def _keyed_archive(blob: bytes):
+    """The top object of an NSKeyedArchiver plist, with lazy look-ups: a
+    dict's values are read only when asked for (a saved iTerm2 session also
+    holds its screen contents, which aht never reads)."""
+    import plistlib
+    pl = plistlib.loads(blob)
+    objs = pl["$objects"]
+    def val(x, depth=0):
+        if isinstance(x, plistlib.UID):
+            x = objs[x.data]
+        if depth > 40:
+            return None
+        if isinstance(x, dict):
+            if "NS.keys" in x:
+                return {str(val(k, depth + 1)): v for k, v in zip(x["NS.keys"], x["NS.objects"])}
+            if "NS.objects" in x:
+                return [val(v, depth + 1) for v in x["NS.objects"]]
+            if "NS.string" in x:
+                return x["NS.string"]
+            return None
+        return None if x == "$null" else x
+    def deep(x, depth=0):
+        v = val(x, depth)
+        if isinstance(v, dict):
+            return {k: deep(w, depth + 1) for k, w in v.items()}
+        return v
+    top = pl["$top"]
+    return val(top.get("root", next(iter(top.values()), None))), deep
+
+def _dark_mode() -> bool:
+    try:
+        r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                           capture_output=True, text=True, timeout=5, cwd="/")
+        return r.stdout.strip().lower() == "dark"
+    except Exception:
+        return False
+
+def _tab_color(bookmark: dict, dark: bool):
+    """"#rrggbb" for the tab colour a session's profile sets, or None."""
+    mode, other = (" (Dark)", " (Light)") if dark else (" (Light)", " (Dark)")
+    # separate light and dark colours: this mode's first; then any colour set
+    order = ((mode, "", other) if bookmark.get("Use Separate Colors for Light and Dark Mode")
+             else ("", mode, other))
+    for sfx in order:
+        c = bookmark.get("Tab Color" + sfx)
+        if bookmark.get("Use Tab Color" + sfx) and isinstance(c, dict):
+            try:
+                return "#" + "".join(f"{round(max(0.0, min(1.0, float(c[k + ' Component']))) * 255):02x}"
+                                     for k in ("Red", "Green", "Blue"))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+def iterm_tab_colors() -> dict:
+    """{tty: "#rrggbb"} for the iTerm2 tabs that have a colour.  A script cannot
+    ask iTerm2 for it, so it comes from iTerm2's saved window state (which
+    iTerm2 writes every few minutes).  Any surprise in that file means no
+    colours, never an error."""
+    if os.environ.get("AHT_ITERM_TABS") and not os.environ.get("AHT_ITERM_STATE"):
+        return {}                                       # tests: never the real one
+    if not IS_MAC and not os.environ.get("AHT_ITERM_STATE"):
+        return {}
+    path = _iterm_state_path()
+    if not path.is_file():
+        return {}
+    try:
+        import sqlite3
+        from urllib.parse import quote
+        db = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=3)
+        try:
+            rows = db.execute("SELECT data FROM Node WHERE key = 'Session' ORDER BY rowid").fetchall()
+        finally:
+            db.close()
+    except Exception as e:
+        warn(f"TABS iTerm2's saved state: {e}")
+        return {}
+    dark, out = _dark_mode(), {}
+    for (blob,) in rows:
+        if not blob or b"Tab Color" not in blob:
+            continue
+        try:
+            o, deep = _keyed_archive(blob)
+            tty = deep(o.get("TTY"))
+            color = _tab_color(deep(o.get("Bookmark")) or {}, dark)
+        except Exception:
+            continue
+        if isinstance(tty, str) and tty.startswith("/dev/"):
+            if color:
+                out[tty] = color
+            else:
+                out.pop(tty, None)
+    return out
+
 def workspace_snapshot(tabs: dict = None) -> dict:
     """Every iTerm2 window, tab and pane: its title, its folder, and the agent
     session that runs in it (with the options it was started with)."""
     tabs = iterm_tabs() if tabs is None else tabs
+    colors = iterm_tab_colors() if tabs else {}
     procs = _tty_processes()
     sessions = {s["pid"]: s for s in running_sessions()}
     rows, want = [], {}
@@ -10545,6 +10656,7 @@ def workspace_snapshot(tabs: dict = None) -> dict:
         here = procs.get(tty, [])
         e = {"window": int(t.get("window") or 1), "tab": int(t.get("tab") or 1),
              "pane": int(t.get("pane") or 1), "title": t.get("title") or "",
+             "profile": t.get("profile") or None, "color": colors.get(tty) or t.get("color"),
              "cwd": None, "agent": None, "session": None, "args": [], "name": None}
         cl = next(((pid, a) for pid, a in here if pid in sessions), None)
         other = next(((pid, m.group(1)) for pid, a in here
@@ -10570,18 +10682,26 @@ def workspace_snapshot(tabs: dict = None) -> dict:
     return {"at": time.time(), "seen": time.time(), "host": _here(), "tabs": rows}
 
 def _ws_key(w: dict) -> str:
-    return json.dumps([{k: e.get(k) for k in ("window", "tab", "pane", "title", "cwd",
-                                              "agent", "session")} for e in w.get("tabs", [])],
+    return json.dumps([{k: e.get(k) for k in ("window", "tab", "pane", "title", "cwd", "agent",
+                                              "session", "profile", "color")}
+                       for e in w.get("tabs", [])],
                       sort_keys=True)
+
+def _ws_files(d: Path) -> list:
+    """The saved layouts, oldest first ("…-1" is a second one in the same second)."""
+    def key(f):
+        stamp, _, n = f.stem.partition("-")[2].partition("-")
+        return (f.stem.split("-")[0], stamp, int(n) if n.isdigit() else 0)
+    return sorted(d.glob("*.json"), key=key) if d.is_dir() else []
 
 def save_workspace(snap: dict):
     """Keep the snapshot when the layout changed; a layout seen again only
-    gets its "seen" time renewed.  The last 40 layouts are kept."""
+    gets its "seen" time renewed.  The last `workspace_keep` layouts are kept."""
     if not snap.get("tabs"):
         return None
     d = workspaces_dir()
     d.mkdir(parents=True, exist_ok=True)
-    files = sorted(d.glob("*.json"))
+    files = _ws_files(d)
     if files:
         try:
             last = json.loads(files[-1].read_text())
@@ -10595,9 +10715,33 @@ def save_workspace(snap: dict):
     if f.exists():
         f = d / f"{_stamp()}-{len(files)}.json"
     _write_json(f, snap)
-    for old in files[:-39]:
+    keep = max(1, int(cfg_get("workspace_keep", 40)))
+    for old in _ws_files(d)[:-keep]:
         old.unlink()
     return f
+
+def workspace_autosave_path() -> Path:
+    return aht_home() / "run" / "workspace-autosave"
+
+def autosave_workspace() -> dict:
+    """The app calls this every minute; it saves when `workspace_save_minutes`
+    have passed since the last time, iTerm2 is open, and that is switched on."""
+    every = int(cfg_get("workspace_save_minutes", 10) or 0)
+    if every <= 0:
+        return {"saved": None, "skipped": "off"}
+    if not os.environ.get("AHT_ITERM_TABS") and not (IS_MAC and _iterm_running()):
+        return {"saved": None, "skipped": "iTerm2 is not open"}
+    stamp = workspace_autosave_path()
+    try:
+        ago = time.time() - stamp.stat().st_mtime
+    except OSError:
+        ago = None
+    if ago is not None and ago < every * 60 - 5:
+        return {"saved": None, "skipped": f"saved {int(ago)} s ago"}
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    f = save_workspace(workspace_snapshot(iterm_tabs(max_age=0)))
+    return {"saved": str(f) if f else None}
 
 def iterm_started():
     """When the running iTerm2 started (seconds since 1970), or None."""
@@ -10614,7 +10758,7 @@ def iterm_started():
 
 def list_workspaces() -> list:
     rows = []
-    for f in sorted(workspaces_dir().glob("*.json"), reverse=True) if workspaces_dir().is_dir() else []:
+    for f in reversed(_ws_files(workspaces_dir())):
         try:
             w = json.loads(f.read_text())
         except Exception:
@@ -10633,11 +10777,32 @@ def default_workspace(rows: list):
     before = [r for r in rows if start and (r["seen"] or 0) < start - 5]
     return (before or rows or [None])[0]
 
-def restore_plan(w: dict) -> dict:
+def workspace_opened_path() -> Path:
+    return aht_home() / "run" / "workspace-opened.json"
+
+OPENED_FRESH = 180      # seconds a tab aht just opened counts as open
+
+def _just_opened() -> dict:
+    try:
+        o = json.loads(workspace_opened_path().read_text())
+        if time.time() - float(o.get("at") or 0) < OPENED_FRESH:
+            return o
+    except Exception:
+        pass
+    return {}
+
+def restore_plan(w: dict, tabs: dict = None) -> dict:
     """What a restore opens: every agent session that is not open now, and
-    every titled tab that is not there now; the rest is skipped."""
-    open_ids = {s.get("session") for s in running_sessions()}
-    titles_now = {str(t.get("title") or "") for t in iterm_tabs(max_age=10 ** 9).values()} - {""}
+    every titled tab that is not there now; the rest is skipped.  What a
+    restore opened a moment ago counts as open (a session takes a few
+    seconds to start)."""
+    if tabs is None:
+        running = os.environ.get("AHT_ITERM_TABS") or not IS_MAC or _iterm_running()
+        tabs = iterm_tabs() if running else {}
+    opened = _just_opened()
+    open_ids = {s.get("session") for s in running_sessions()} | set(opened.get("sessions") or [])
+    titles_now = ({str(t.get("title") or "") for t in tabs.values()}
+                  | set(opened.get("titles") or [])) - {""}
     windows, skipped = {}, []
     for e in w.get("tabs", []):
         why = None
@@ -10659,6 +10824,11 @@ def restore_plan(w: dict) -> dict:
 
 def _restore_command(e: dict) -> str:
     steps = []
+    m = re.fullmatch(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})", str(e.get("color") or ""))
+    if m:                       # iTerm2's own escape code for a tab's colour
+        steps.append("printf '" + "".join(f"\\033]6;1;bg;{c};brightness;{int(h, 16)}\\007"
+                                          for c, h in zip(("red", "green", "blue"), m.groups()))
+                     + "'")
     if e.get("title"):
         steps.append("printf '\\033]1;%s\\007' " + shlex.quote(e["title"]))
     run = []
@@ -10672,7 +10842,41 @@ def _restore_command(e: dict) -> str:
         run.append("kimi -c")
     if run:
         steps.append(" && ".join(run))
+    if steps and len(run) <= 1:         # a plain tab: a clean screen, not these lines
+        steps.append("clear")
     return "; ".join(steps) or "true"
+
+def _with_profile(statement: str, profile) -> list:
+    """An AppleScript line that opens a window, tab or pane with the profile
+    the tab had; the default profile when that one is gone."""
+    plain = statement.format("default profile")
+    if not profile:
+        return [plain]
+    var = statement.split(" to (")[0].split()[-1]
+    return ["try", "  " + statement.format("profile " + _as_text(profile)),
+            "on error", "  " + plain, "end try",
+            f"if {var} is missing value then", "  " + plain, "end if"]
+
+def _start_iterm() -> str:
+    """Start iTerm2 and wait until it answers a script; "" when it does,
+    else what went wrong."""
+    r = subprocess.run(["/usr/bin/open", "-b", "com.googlecode.iterm2"], capture_output=True,
+                       text=True, timeout=30, cwd="/")
+    if r.returncode != 0:
+        return "iTerm2 did not start: " + (r.stderr or "").strip()[-200:]
+    count, steady, deadline = None, 0, time.time() + 40
+    while time.time() < deadline:
+        q = subprocess.run(["/usr/bin/osascript", "-e", 'tell application "iTerm2" to count windows'],
+                           capture_output=True, text=True, timeout=20, cwd="/")
+        n = q.stdout.strip() if q.returncode == 0 else None
+        # ready once it answers, and its own windows (restored ones too) are
+        # all there: the same count three times in a row
+        steady = steady + 1 if n is not None and n == count else 0
+        count = n
+        if steady >= 3:
+            return ""
+        time.sleep(0.5)
+    return "iTerm2 started but did not answer in time; try again in a moment"
 
 def restore_workspace(wid: str = None, apply: bool = False) -> dict:
     rows = list_workspaces()
@@ -10689,24 +10893,70 @@ def restore_workspace(wid: str = None, apply: bool = False) -> dict:
         res["blockers"].append("everything in it is open already")
     if not apply or res["blockers"]:
         return res
+    (aht_home() / "run").mkdir(parents=True, exist_ok=True)
+    lock = open(aht_home() / "run" / "workspace-restore.lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        res["blockers"].append("a restore is opening tabs right now")
+        return res
+    try:
+        return _restore_now(res, pick, w)
+    finally:
+        lock.close()
+
+def _restore_now(res: dict, pick: dict, w: dict) -> dict:
+    testing = bool(os.environ.get("AHT_ITERM_LOG"))
+    started = bool(os.environ.get("AHT_ITERM_STARTED")) if testing else False
+    if not testing and not _iterm_running():
+        why = _start_iterm()
+        if why:
+            res["blockers"].append(why)
+            return res
+        started = True
+    # a fresh look: what iTerm2 brought back itself when it started is not
+    # opened twice, and a double click finds the first restore's tabs
+    tabs = iterm_tabs(max_age=0)
+    plan = restore_plan(w, tabs)
+    res["plan"] = plan
+    if not plan["opens"]:
+        res["blockers"].append("everything in it is open already")
+        return res
+    # the empty window iTerm2 opens when it starts takes the first tab
+    reuse = started and len(tabs) == 1 and not next(iter(tabs.values())).get("title") and \
+        all(os.path.basename(a.split()[0]).lstrip("-") in _SHELLS | {"login"}
+            for _pid, a in _tty_processes().get(next(iter(tabs)), []) if a.split())
+    _write_json(workspace_opened_path(), {
+        "at": time.time(), "workspace": pick["id"],
+        "sessions": [e["session"] for win in plan["windows"] for panes in win for e in panes
+                     if e.get("session")],
+        "titles": [e["title"] for win in plan["windows"] for panes in win for e in panes
+                   if e.get("title")]})
     L = ['tell application "iTerm2"', "activate"]
+    first = True
     for win in plan["windows"]:
         for ti, panes in enumerate(win):
-            if ti == 0:
-                L += ["set w to (create window with default profile)", "set s to current session of w"]
+            if ti == 0 and first and reuse:
+                L += ["set w to current window", "set s to current session of w"]
+            elif ti == 0:
+                L += _with_profile("set w to (create window with {})", panes[0].get("profile"))
+                L += ["set s to current session of w"]
             else:
-                L += ["tell w to set t to (create tab with default profile)",
-                      "set s to current session of t"]
+                L += _with_profile("tell w to set t to (create tab with {})", panes[0].get("profile"))
+                L += ["set s to current session of t"]
+            first = False
             for pi, e in enumerate(panes):
                 if pi:
-                    L += ["tell s to set s2 to (split vertically with default profile)",
-                          "set s to s2"]
+                    L += _with_profile("tell s to set s2 to (split vertically with {})",
+                                       e.get("profile"))
+                    L += ["set s to s2"]
                 L.append("delay 0.3")
                 if e.get("title"):
                     L.append(f'tell s to set variable named "user.ahtTitle" to {_as_text(e["title"])}')
                 L.append(f"tell s to write text {_as_text(_restore_command(e))}")
     L.append("end tell")
-    if os.environ.get("AHT_ITERM_LOG"):                 # tests: note it, open nothing
+    if testing:                                         # tests: note it, open nothing
         with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
             fh.write(json.dumps({"what": "restore", "script": "\n".join(L)}) + "\n")
         res["applied"] = True
@@ -10716,10 +10966,25 @@ def restore_workspace(wid: str = None, apply: bool = False) -> dict:
     res["applied"] = r.returncode == 0
     if r.returncode != 0:
         res["blockers"].append("iTerm2 said: " + (r.stderr or "").strip()[-300:])
-    log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)")
+        warn(f"WORKSPACE not restored {pick['id']}: {(r.stderr or '').strip()[-300:]}")
+        try:
+            workspace_opened_path().unlink()
+        except OSError:
+            pass
+    else:
+        log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)"
+            + (", iTerm2 started first" if started else ""))
     return res
 
 def cmd_workspace(args):
+    if args.save and args.auto:
+        res = autosave_workspace()
+        if args.json:
+            print(json.dumps(res))
+        elif not args.quiet:
+            print(f"saved: {res['saved']}" if res.get("saved") else
+                  f"not saved: {res.get('skipped') or 'nothing to save'}")
+        return 0
     if args.save:
         f = save_workspace(workspace_snapshot(iterm_tabs(max_age=0)))
         print(json.dumps({"saved": str(f) if f else None}) if args.json else
@@ -11212,6 +11477,9 @@ def build_parser():
     s = sub.add_parser("workspace", help="iTerm2's windows and tabs with their sessions: "
                        "saved while you work, opened again after a restart")
     s.add_argument("--save", action="store_true", help="save it now")
+    s.add_argument("--auto", action="store_true",
+                   help="with --save: only when workspace_save_minutes have passed (the app)")
+    s.add_argument("--quiet", action="store_true")
     s.add_argument("--restore", nargs="?", const="", metavar="ID",
                    help="open a saved one again (default: the one before iTerm2 last "
                         "started)")

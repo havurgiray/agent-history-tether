@@ -798,20 +798,33 @@ glance when you steer it from the phone.
 > the app says *Paper review* too.
 
 - **When:** a session gets the name when it starts. After you rename a
-  tab, the session follows at your next prompt (from the Mac or the phone).
+  tab, the session follows at your next prompt (from the Mac or the phone):
+  aht looks at that tab right then, which takes about a fifth of a second.
 - **Two sessions, one title:** a second open session under the same tab
   title (another tab, a split pane, the original next to its branch)
   becomes *Paper · 2*. A branch (`/branch`) that is open next to its
   original becomes *Paper ⑂ 2*.
-- **Your own names stay:** a session you named yourself (`/rename`, a name
-  given to `/branch`, or renamed in the Claude app) keeps its name.
+- **The latest name wins, both ways:** rename the tab and the session
+  follows. Rename the session yourself (`/rename`, in the Claude app, or
+  **Rename…** in the Sessions tab) and its tab takes the name: at once from
+  aht's window, otherwise at the session's next prompt. If both were renamed
+  since that session's last prompt, the tab's title wins.
+- **For the tab to take a name, switch on iTerm2's Python API:** iTerm2 →
+  Settings → General → Magic → *Enable Python API*. iTerm2 lets no script
+  change a title you gave a tab; its Python API can, the same way *Edit Tab
+  Title* does. aht asks iTerm2 for a one-time key each time (over
+  AppleScript, which aht may use already), so you won't see a prompt. With
+  the API off, the tab keeps its title and the session its name; the
+  Sessions tab and Settings say so. A tab that holds more than one session
+  (split panes) keeps its title, since that title would name them all.
 - **Handed over:** on your other machine a session is called
   *Paper @ homebox*, so you can tell it from one on this Mac.
 - **See and change the names** in the **Sessions** tab: under each Claude
   session its name, where the name came from (*from its tab*, *named by
   you*, *named in aht*, *Claude's own title*) and the tab's title.
-  **Rename…** gives a session a name of your choice; it stays whatever the
-  tab is called, until **Follow the Tab Again**.
+  **Rename…** gives a session a name of your choice and gives its tab that
+  name too. It stays until you rename the tab, or until **Follow the Tab
+  Again**.
 - **Name Sessions After Their Tabs…** (Sessions tab, when iTerm2 is
   installed) gives every open session its tab's title at once, also the ones
   you named yourself. It shows the list of changes first.
@@ -838,8 +851,8 @@ glance when you steer it from the phone.
   their name, where the name came from, and whether they are in the Claude
   app (`--fresh` asks iTerm2 now instead of using its last look).
 - `aht tab-names --rename <session id> --to "Paper review"` — give an open
-  session that name, at its next prompt; `--to ""` lets it follow its tab
-  again.
+  session that name, at its next prompt, and its tab right away; `--to ""`
+  lets it follow its tab again.
 - `aht tab-names --sync-all` — show which sessions would take their tab's
   title; `--apply` does it, at each one's next prompt.
 - `aht config --set tab_names=false` — stop naming sessions after their
@@ -1019,6 +1032,8 @@ all of them can be set with `aht config --set name=value` and put back with
 - `notify_phone` (none) — `imessage:<your number or Apple ID>` or
   `ntfy:<topic>`.
 - `notify_limit` (on) — a session stopped at Claude's usage limit.
+- `session_corner` (off) — the app lists the open Claude sessions in the
+  screen's top-right corner (*Sessions in the corner*).
 
 **Search, reports, the Mac**
 

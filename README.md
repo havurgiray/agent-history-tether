@@ -398,10 +398,6 @@ behave the same.
   session is named after its iTerm2 tab's own title, which is what the
   Claude app (Remote Control), `/resume` and the prompt bar show.  Set by
   the SessionStart hook and, after a tab is renamed, at the next prompt
-  (a UserPromptSubmit hook that answers from a cache; asking iTerm2 takes a
-  second, so that runs in the background).  Clashes among open sessions
-  become `Paper · 2`, branches `Paper ⑂ 2`; a name the user set stays; a
-  handed-over session is `Paper @ <machine>`.  `aht tab-names` lists them.
   (a UserPromptSubmit hook that asks iTerm2 for that one tab, about 0.2 s).
   Clashes among open sessions become `Paper · 2`, branches `Paper ⑂ 2`; a
   handed-over session is `Paper @ <machine>`.  The latest name wins both

@@ -2946,6 +2946,7 @@ def cmd_status(args):
         "hook_installed": hook_installed(),
         "prompt_hook_installed": hook_installed("UserPromptSubmit"),
         "claude_remote_control": claude_remote_control(),
+        "iterm_api": iterm_api_on() if IS_MAC else None,
         "claude_auto_continue": claude_auto_continue(),
         "terminals": {"installed": [t for t in TERMINALS if app_installed(t)],
                       "chosen": cfg_get("terminal_app"), "used": terminal_choice()}
@@ -9789,6 +9790,44 @@ tell application "iTerm2"
 end tell
 """
 
+_TAB_SCRIPT = """
+on run argv
+  set want to item 1 of argv
+  set sep to character id 31
+  tell application "iTerm2"
+    set all to tty of every session of every tab of every window
+    repeat with wi from 1 to count of all
+      set ws to item wi of all
+      repeat with ti from 1 to count of ws
+        set ts to item ti of ws
+        repeat with si from 1 to count of ts
+          if item si of ts is want then
+            set s to session si of tab ti of window wi
+            set v to ""
+            set u to ""
+            set k to ""
+            try
+              set v to (variable named "tab.titleOverride") of s
+            end try
+            try
+              set u to (variable named "user.ahtTitle") of s
+            end try
+            try
+              set k to (variable named "tab.id") of s
+            end try
+            if v is missing value then set v to ""
+            if u is missing value then set u to ""
+            if k is missing value then set k to ""
+            return "ok" & sep & (count of ts) & sep & k & sep & u & sep & v
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "none"
+end run
+"""
+
 def tabs_cache_path() -> Path:
     return aht_home() / "run" / "iterm-tabs.json"
 
@@ -9851,6 +9890,280 @@ def iterm_tabs(max_age: float = TABS_FRESH) -> dict:
     _write_json(tabs_cache_path(), {"at": time.time(), "tabs": tabs})
     return tabs
 
+def _live_tabs_file() -> Path:
+    return Path(os.environ.get("AHT_ITERM_LIVE") or os.environ["AHT_ITERM_TABS"])
+
+def _note_tab_title(tty: str, title: str, override: bool) -> None:
+    """Tell the kept look at all tabs what one tab is called now."""
+    try:
+        c = json.loads(tabs_cache_path().read_text())
+        if tty in (c.get("tabs") or {}):
+            c["tabs"][tty].update(title=title, override=override)
+            _write_json(tabs_cache_path(), c)
+    except Exception:
+        pass
+
+def iterm_tab(tty: str):
+    """One iTerm2 tab, asked for now (about 0.15 s, where all tabs take
+    seconds): {"title", "override", "id" (the tab's id in iTerm2's API),
+    "panes"}; {} when the terminal is not an iTerm2 tab, None when iTerm2
+    did not answer."""
+    if os.environ.get("AHT_ITERM_TABS"):                # tests: a stand-in
+        try:
+            e = json.loads(_live_tabs_file().read_text()).get(tty)
+        except Exception:
+            return None
+        return {} if e is None else {
+            "title": str(e.get("title") or ""), "override": bool(e.get("override")),
+            "id": str(e.get("id") or ""), "panes": int(e.get("panes") or 1)}
+    if not IS_MAC or not _iterm_running():
+        return {}
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-", tty], input=_TAB_SCRIPT,
+                           capture_output=True, text=True, timeout=5, cwd="/")
+    except Exception as e:
+        warn(f"TABS iTerm2 did not answer: {e}")
+        return None
+    out = r.stdout.rstrip("\n")
+    parts = out.split("\x1f")
+    if r.returncode != 0 or not (out == "none" or parts[0] == "ok" and len(parts) >= 5):
+        warn(f"TABS iTerm2: {(r.stderr or '').strip()[-200:]}")
+        return None
+    if out == "none":
+        return {}
+    override = "\x1f".join(parts[4:]).strip()
+    tab = {"title": override or parts[3].strip(), "override": bool(override),
+           "id": parts[2].strip(), "panes": int(parts[1]) if parts[1].isdigit() else 1}
+    _note_tab_title(tty, tab["title"], tab["override"])
+    return tab
+
+def iterm_tab_title(tty: str):
+    """The title of one iTerm2 tab, asked for now: "" when the tab has none
+    or the terminal is not an iTerm2 tab, None when iTerm2 did not answer.
+    The kept look at all tabs learns it too."""
+    tab = iterm_tab(tty)
+    return None if tab is None else str(tab.get("title") or "")
+
+# A script cannot set a title you gave a tab; iTerm2's Python API can, the
+# same way Edit Tab Title does.  aht speaks it itself (a WebSocket on a Unix
+# socket, carrying protobuf; iterm2.com/python-api), so it needs no
+# packages.  iTerm2 serves it only with Settings → General → Magic → Enable
+# Python API switched on, and lets aht in with a one-time key it hands out
+# over AppleScript.
+
+def iterm_api_socket() -> Path:
+    if os.environ.get("AHT_ITERM_API"):                 # tests: a stand-in
+        return Path(os.environ["AHT_ITERM_API"])
+    return Path.home() / "Library" / "Application Support" / "iTerm2" / "private" / "socket"
+
+def iterm_api_on() -> bool:
+    """iTerm2's Python API is switched on (and iTerm2 is open)."""
+    try:
+        return stat.S_ISSOCK(iterm_api_socket().stat().st_mode)
+    except OSError:
+        return False
+
+def _pb_varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+def _pb(num: int, value) -> bytes:
+    """One protobuf field: an int, a float (a double), a str or bytes."""
+    import struct
+    if isinstance(value, float):
+        return _pb_varint(num << 3 | 1) + struct.pack("<d", value)
+    if isinstance(value, int):
+        return _pb_varint(num << 3) + _pb_varint(value)
+    if isinstance(value, str):
+        value = value.encode()
+    return _pb_varint(num << 3 | 2) + _pb_varint(len(value)) + value
+
+def _pb_fields(buf: bytes) -> dict:
+    """{field number: [values]} of a protobuf message: ints for numbers,
+    bytes for the rest."""
+    out, i = {}, 0
+    def varint():
+        nonlocal i
+        n = shift = 0
+        while True:
+            b = buf[i]
+            i += 1
+            n |= (b & 0x7F) << shift
+            shift += 7
+            if not b & 0x80:
+                return n
+    while i < len(buf):
+        key = varint()
+        wire = key & 7
+        if wire == 0:
+            v = varint()
+        elif wire in (1, 5):
+            v, i = buf[i:i + (8 if wire == 1 else 4)], i + (8 if wire == 1 else 4)
+        elif wire == 2:
+            n = varint()
+            v, i = buf[i:i + n], i + n
+        else:
+            raise ValueError(f"protobuf wire type {wire}")
+        out.setdefault(key >> 3, []).append(v)
+    return out
+
+def _ws_send(sock, payload: bytes, opcode: int = 2) -> None:
+    """One WebSocket frame from a client (so masked)."""
+    import struct
+    n, mask = len(payload), os.urandom(4)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 1 << 16:
+        head += bytes([0x80 | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+    sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+def _ws_recv(sock, rfile) -> bytes:
+    """One whole WebSocket message, its frames put together."""
+    import struct
+    def exact(n):
+        b = rfile.read(n)
+        if b is None or len(b) < n:
+            raise ConnectionError("iTerm2 closed the connection")
+        return b
+    data = b""
+    while True:
+        b0, b1 = exact(2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", exact(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", exact(8))[0]
+        mask = exact(4) if b1 & 0x80 else None
+        part = exact(n)
+        if mask:
+            part = bytes(b ^ mask[i % 4] for i, b in enumerate(part))
+        op = b0 & 0x0F
+        if op == 8:
+            raise ConnectionError("iTerm2 closed the connection")
+        if op == 9:                                     # ping
+            _ws_send(sock, part, 10)
+            continue
+        if op == 10:
+            continue
+        data += part
+        if b0 & 0x80:
+            return data
+
+def _iterm_api_key():
+    """(cookie, key) for one connection to iTerm2's API."""
+    if os.environ.get("AHT_ITERM_API_KEY"):             # tests: a stand-in
+        return tuple(os.environ["AHT_ITERM_API_KEY"].split(" ", 1))
+    r = subprocess.run(["/usr/bin/osascript", "-e", 'tell application "iTerm2" to '
+                        'request cookie and key for app named "aht"'],
+                       capture_output=True, text=True, timeout=10, cwd="/")
+    cookie, _, key = r.stdout.strip().partition(" ")
+    if r.returncode != 0 or not cookie or not key:
+        raise RuntimeError("iTerm2 gave aht no key for its Python API: "
+                           + ((r.stderr or "").strip()[-160:] or "no answer"))
+    return cookie, key
+
+def iterm_api(request: bytes, timeout: float = 5) -> dict:
+    """Send one request (a ClientOriginatedMessage with id 1) to iTerm2's
+    Python API; the fields of its answer."""
+    import base64
+    import socket
+    cookie, key = _iterm_api_key()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(str(iterm_api_socket()))
+        sock.sendall((
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}\r\n"
+            "Sec-WebSocket-Protocol: api.iterm2.com\r\nOrigin: ws://localhost/\r\n"
+            "x-iterm2-library-version: python 2.26\r\nx-iterm2-advisory-name: aht\r\n"
+            "x-iterm2-disable-auth-ui: true\r\n"
+            f"x-iterm2-cookie: {cookie}\r\nx-iterm2-key: {key}\r\n\r\n").encode())
+        rfile = sock.makefile("rb")
+        status = rfile.readline().decode("latin-1").strip()
+        while rfile.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        if status.split(" ")[1:2] != ["101"]:
+            raise RuntimeError(f"iTerm2's Python API said “{status or 'nothing'}”")
+        _ws_send(sock, request)
+        while True:
+            answer = _pb_fields(_ws_recv(sock, rfile))
+            if answer.get(1) == [1]:
+                break
+        try:
+            _ws_send(sock, (1000).to_bytes(2, "big"), 8)    # goodbye
+        except OSError:
+            pass
+        return answer
+    finally:
+        sock.close()
+
+def tab_text(title: str) -> str:
+    """A title as an iTerm2 tab shows it when aht sets it: iTerm2 keeps a
+    backslash before a straight double quote, so those become curly ones."""
+    out, opening = [], True
+    for ch in title:
+        out.append(("“" if opening else "”") if ch == '"' else ch)
+        opening ^= ch == '"'
+    return "".join(out)
+
+def set_tab_title(tty: str, title: str) -> str:
+    """Give the iTerm2 tab on `tty` a title, as Edit Tab Title does (as
+    tab_text() writes it).  "" when done, else why not: "api-off"
+    (iTerm2's Python API is switched off), "panes" (the tab holds more than
+    one session, and its title would name them all), "no-tab", or what
+    went wrong."""
+    title = tab_text(title)
+    if os.environ.get("AHT_ITERM_TABS") and not os.environ.get("AHT_ITERM_API"):
+        if os.environ.get("AHT_ITERM_API_OFF"):         # tests: a stand-in
+            return "api-off"
+        try:
+            tabs = json.loads(_live_tabs_file().read_text())
+        except Exception:
+            return "no-tab"
+        if tty not in tabs:
+            return "no-tab"
+        if int(tabs[tty].get("panes") or 1) > 1:
+            return "panes"
+        tabs[tty].update(title=title, override=True)
+        _live_tabs_file().write_text(json.dumps(tabs))
+        return ""
+    if not iterm_api_on():
+        return "api-off"
+    tab = iterm_tab(tty)
+    if tab is None:
+        return "iTerm2 did not answer"
+    if not tab or not tab["id"]:
+        return "no-tab"
+    if tab["panes"] > 1:
+        return "panes"
+    # the title is a template: "\(…)" in it would be filled in, so a
+    # backslash is doubled; then doubled again inside the call's quotes
+    call = 'iterm2.set_title(title: "' + title.replace("\\", "\\\\\\\\") + '")'
+    try:
+        answer = iterm_api(_pb(1, 1) + _pb(132, _pb(7, _pb(1, tab["id"])) + _pb(5, call)
+                                                 + _pb(6, -1.0)))
+    except Exception as e:
+        return str(e)[:200] or type(e).__name__
+    if answer.get(2):
+        return "iTerm2: " + answer[2][0].decode(errors="replace")[:200]
+    res = _pb_fields((answer.get(132) or [b""])[0])
+    if res.get(1):
+        err = _pb_fields(res[1][0])
+        return "iTerm2: " + ((err.get(2) or [b""])[0].decode(errors="replace")[:200]
+                             or f"status {(err.get(1) or ['?'])[0]}")
+    _note_tab_title(tty, title, True)
+    log(f"TAB TITLE {tty} -> {title!r}")
+    return ""
+
 def _session_record(pid) -> dict:
     try:
         return json.loads((claude_home() / "sessions" / f"{pid}.json").read_text())
@@ -9891,18 +10204,24 @@ def _current_title(transcript) -> str:
     """The session's own title (what /rename, the Claude app or a hook set),
     from the end of its transcript; "" when it has none."""
     try:
-        with open(transcript, "rb") as fh:
-            end = fh.seek(0, 2)
-            fh.seek(max(0, end - (256 << 10)))
-            data = fh.read()
+        fh = open(transcript, "rb")
     except (OSError, TypeError):
         return ""
-    for raw in reversed(data.split(b"\n")):
-        if b'"custom-title"' in raw:
-            try:
-                return str(json.loads(raw).get("customTitle") or "")
-            except Exception:
-                continue
+    with fh:                    # backwards, a piece at a time, up to 8 MB
+        end = pos = fh.seek(0, 2)
+        carry = b""
+        while pos > 0 and end - pos < (8 << 20):
+            start = max(0, pos - (256 << 10))
+            fh.seek(start)
+            lines = (fh.read(pos - start) + carry).split(b"\n")
+            carry = lines.pop(0) if start > 0 else b""  # a line cut in two: next round
+            for raw in reversed(lines):
+                if b'"custom-title"' in raw:
+                    try:
+                        return str(json.loads(raw).get("customTitle") or "")
+                    except Exception:
+                        continue
+            pos = start
     return ""
 
 def _transcript_of(cwd: str, sid: str):
@@ -9928,52 +10247,77 @@ def _load_tab_names() -> dict:
 
 def tab_session_name(data: dict, event: str):
     """The name this session should carry, from its iTerm2 tab's title — or
-    None to leave its name alone: no title on the tab, a name someone gave
-    the session (you with /rename, or in the Claude app), or the name it
-    already has.  Another open session with that name makes it "<title> · 2"
-    ("<title> ⑂ 2" for a branch)."""
+    None to leave its name alone.  The latest rename wins, on either side:
+    rename the tab and the session follows; rename the session (/rename,
+    /branch, the Claude app, aht's window) and its tab takes the name — when
+    iTerm2's Python API is on, else the tab keeps its title and the session
+    its name.  Both renamed since the last look: the tab wins.  A tab
+    without a title leaves the session's name alone.  Another open session
+    with that name makes it "<title> · 2" ("<title> ⑂ 2" for a branch)."""
     sid = str(data.get("session_id") or "")
     if not sid:
         return None
     state = _load_tab_names()
     entry = state.get(sid) or {}
-    pend = entry.get("pending") or {}
+    current = _current_title(data.get("transcript_path"))
+    tabs_on = bool(IS_MAC or os.environ.get("AHT_ITERM_TABS")) and cfg_get("tab_names", True)
+
+    def remember(**now):
+        # what this look found: the tab's title ("tab"), the session's name
+        # ("name") and, right after aht renamed it, the name before ("was")
+        if any(entry.get(k) != v for k, v in now.items()):
+            state[sid] = dict(entry, at=time.time(), **now)
+            for k in sorted(state, key=lambda k: (state[k] or {}).get("at") or 0)[:-500]:
+                del state[k]
+            _write_json(tab_names_path(), state)
+
+    pend = entry.pop("pending", None) or {}
     if pend.get("name"):                        # asked for in aht's window
         name = str(pend["name"])
-        entry.update(names=((entry.get("names") or []) + [name])[-10:],
-                     pinned=bool(pend.get("pin")), at=time.time())
-        entry.pop("pending", None)
-        state[sid] = entry
-        _write_json(tab_names_path(), state)
+        tab = None
+        if tabs_on:                             # its tab took it already, or not
+            tty = _hook_ancestry()[0]
+            tab = iterm_tab_title(tty) if tty else ""
+        remember(names=((entry.get("names") or []) + [name])[-10:], name=name,
+                 was=current, pinned=bool(pend.get("pin")),
+                 **({} if tab is None else {"tab": " ".join(tab.split())[:80]}))
         log(f"TAB NAME {sid[:8]} -> {name!r} (asked for in aht)")
-        return name if name != _current_title(data.get("transcript_path")) else None
-    if entry.get("pinned"):
-        return None                             # named in aht's window: it stays
-    if not IS_MAC and not os.environ.get("AHT_ITERM_TABS"):
-        return None
-    if not cfg_get("tab_names", True):
+        return name if name != current else None
+    if not tabs_on:
         return None
     tty, cpid = _hook_ancestry()
     if not tty:
         return None
-    if event == "SessionStart":
-        tabs = iterm_tabs()
-        if tty not in tabs:                     # a new tab: look now
-            tabs = iterm_tabs(max_age=0)
-    else:                                       # a prompt must not wait for iTerm2
-        tabs = iterm_tabs(max_age=10 ** 9)
+    # this tab as it is now (a rename a moment ago counts); the last look at
+    # all tabs only when iTerm2 does not answer
+    live = iterm_tab_title(tty)
+    if live is None:
+        live = (iterm_tabs(max_age=10 ** 9).get(tty) or {}).get("title")
+    if event != "SessionStart":                 # the look at all tabs, for the rest
         try:
             age = time.time() - tabs_cache_path().stat().st_mtime
         except OSError:
             age = 10 ** 9
         if age > TABS_FRESH and not os.environ.get("AHT_ITERM_TABS"):
             _spawn_aht(["tab-names", "--refresh", "--quiet"])
-    base = " ".join(str((tabs.get(tty) or {}).get("title") or "").split())[:80]
-    if not base:
-        return None
+    base = " ".join(str(live or "").split())[:80]
     given = {n for e in state.values() for n in (e or {}).get("names") or []}
-    current = _current_title(data.get("transcript_path"))
-    if current and current not in given:
+    known = entry.get("tab")
+    moved = known is not None and known != base         # the tab renamed since
+    renamed = (bool(current) and current not in given   # the session renamed since
+               and entry.get("name") is not None
+               and current not in (entry.get("name"), entry.get("was")))
+    if renamed and not moved:                   # its new name is the latest: the tab takes it
+        why = set_tab_title(tty, current) if tab_text(current) != base else ""
+        if why:
+            log(f"TAB NAME {sid[:8]}: its tab keeps its title ({why})")
+        remember(tab=base if why else tab_text(current), name=current, was=None, pinned=False)
+        return None
+    if not base or entry.get("pinned") and not moved:
+        remember(tab=base, name=current, was=None)
+        return None                             # no title, or named in aht's window
+    if current and current not in given and not moved:
+        remember(tab=base, name=current, was=None)
         return None                             # a name someone chose: it stays
     taken = set()
     for s in running_sessions():
@@ -9990,12 +10334,10 @@ def tab_session_name(data: dict, event: str):
             n += 1
         name = f"{base} {mark} {n}"
     if name == current:
+        remember(tab=base, name=current, was=None)
         return None
-    ours = entry.get("names") or []
-    state[sid] = dict(entry, names=(ours + [name])[-10:], tab=base, at=time.time())
-    for k in sorted(state, key=lambda k: (state[k] or {}).get("at") or 0)[:-500]:
-        del state[k]
-    _write_json(tab_names_path(), state)
+    remember(names=((entry.get("names") or []) + [name])[-10:], tab=base, name=name,
+             was=current, pinned=False)
     log(f"TAB NAME {sid[:8]} -> {name!r}")
     return name
 
@@ -10088,10 +10430,12 @@ def session_names(fresh: bool = False) -> list:
                      "fork": _is_fork(tr), "in_app": bool(rec.get("bridgeSessionId"))})
     return rows
 
-def rename_session(sid: str, name: str, pin: bool = True) -> dict:
+def rename_session(sid: str, name: str, pin: bool = True, tab: bool = False) -> dict:
     """Give an open session a name.  Claude Code takes a new name from a hook
     only, so it is applied at the session's next prompt (typed here or in
-    the Claude app).  An empty name hands the session back to its tab."""
+    the Claude app).  With `tab`, its iTerm2 tab takes the name right away
+    ("tab" in the answer: "" when it did, else why not).  An empty name
+    hands the session back to its tab."""
     state = _load_tab_names()
     entry = dict(state.get(sid) or {})
     name = " ".join((name or "").split())[:80]
@@ -10103,7 +10447,13 @@ def rename_session(sid: str, name: str, pin: bool = True) -> dict:
     state[sid] = entry
     _write_json(tab_names_path(), state)
     log(f"TAB NAME {sid[:8]}: " + (f"{name!r} at the next prompt" if name else "follows its tab"))
-    return {"session": sid, "pending": name or None}
+    res = {"session": sid, "pending": name or None}
+    if name and tab and cfg_get("tab_names", True):
+        ttys = _ttys()
+        tty = next((ttys.get(s["pid"]) for s in running_sessions()
+                    if s.get("session") == sid and ttys.get(s["pid"])), None)
+        res["tab"] = set_tab_title(tty, name) if tty else "no-tab"
+    return res
 
 def sync_all_plan(rows: list) -> list:
     """Every open session that has a tab title gets it, also the ones named
@@ -10141,10 +10491,19 @@ def sync_all_plan(rows: list) -> list:
 
 def cmd_tab_names(args):
     if args.rename:
-        res = rename_session(args.rename, args.to or "")
-        print(json.dumps(res) if args.json else
-              (f"named “{res['pending']}” at the session's next prompt" if res["pending"]
-               else "the session follows its tab again"))
+        res = rename_session(args.rename, args.to or "", tab=True)
+        why = {"api-off": "its tab keeps its title: switch on iTerm2 → Settings → General → "
+                          "Magic → Enable Python API to let it take the name too",
+               "panes": "its tab keeps its title: it holds more than one session",
+               "no-tab": "it is not in an iTerm2 tab"}
+        if args.json:
+            print(json.dumps(res))
+        elif not res["pending"]:
+            print("the session follows its tab again")
+        else:
+            print(f"named “{res['pending']}” at the session's next prompt; "
+                  + ("its tab took the name now" if res.get("tab") == ""
+                     else why.get(res.get("tab"), f"its tab kept its title ({res.get('tab')})")))
         return 0
     if args.sync_all:
         rows = session_names(fresh=True)

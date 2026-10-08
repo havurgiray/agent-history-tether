@@ -1600,6 +1600,30 @@ ck(tab_hook("UserPromptSubmit", "t3", "/dev/ttysT2", c.pid) == "Paper v2 ⑂ 2",
 d_ = fake_claude("t4", title="My own name")
 ck(tab_hook("UserPromptSubmit", "t4", "/dev/ttysT1", d_.pid) is None,
    "tab names: a name the user gave the session stays")
+tabs_file.write_text(json.dumps({"/dev/ttysT1": {"title": "Paper v3", "pane": 1, "panes": 1},
+                                 "/dev/ttysT2": {"title": "Paper v2", "pane": 1, "panes": 1}}))
+ck(tab_hook("UserPromptSubmit", "t4", "/dev/ttysT1", d_.pid) == "Paper v3",
+   "tab names: renaming the tab afterwards wins over the name given before")
+with open(tstore / "t4.jsonl", "a") as fh:
+    fh.write(title_line("Paper v3", "t4"))
+live = sb / "iterm-live.json"
+live.write_text(json.dumps({"/dev/ttysT1": {"title": "Paper v4", "pane": 1, "panes": 1}}))
+ck(tab_hook("UserPromptSubmit", "t4", "/dev/ttysT1", d_.pid, AHT_ITERM_LIVE=str(live))
+   == "Paper v4",
+   "tab names: the tab is looked at as it is now, not as aht last saw all tabs")
+with open(tstore / "t4.jsonl", "a") as fh:
+    fh.write(title_line("Paper v4", "t4") + title_line("Mine again", "t4"))
+ck(tab_hook("UserPromptSubmit", "t4", "/dev/ttysT1", d_.pid, AHT_ITERM_LIVE=str(live)) is None,
+   "tab names: a name given after the tab's rename stays")
+# a long session: its name is found further back than the last part
+with open(tstore / "t4.jsonl", "a") as fh:
+    filler = json.dumps({"type": "assistant", "message": {"role": "assistant",
+                                                         "content": "x" * 4000}}) + "\n"
+    fh.write(filler * 100)
+ck(tab_hook("UserPromptSubmit", "t4", "/dev/ttysT1", d_.pid, AHT_ITERM_LIVE=str(live)) is None,
+   "tab names: in a long session the name it has is still found, so it stays")
+tabs_file.write_text(json.dumps({"/dev/ttysT1": {"title": "Paper v2", "pane": 1, "panes": 1},
+                                 "/dev/ttysT2": {"title": "Paper v2", "pane": 1, "panes": 1}}))
 run("config", "--set", "tab_names=false")
 e_ = fake_claude("t5")
 ck(tab_hook("SessionStart", "t5", "/dev/ttysT1", e_.pid) is None,
@@ -1635,7 +1659,158 @@ ck(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid) is None,
 run("tab-names", "--rename", "t1", "--to", "")
 ck(str(tab_hook("UserPromptSubmit", "t1", "/dev/ttysT1", a.pid)).startswith("Paper v2"),
    "rename: following the tab again brings the tab's title back")
-for pr in (a, b, c, d_, e_, f_):
+
+# the other way round: a session renamed gives its tab the name (the latest act wins)
+live2 = sb / "iterm-live2.json"
+def tab_now(**kw):
+    t = json.loads(live2.read_text())
+    if kw:
+        t["/dev/ttysT3"].update(kw)
+        live2.write_text(json.dumps(t))
+    return t["/dev/ttysT3"]["title"]
+live2.write_text(json.dumps({"/dev/ttysT3": {"title": "Thesis", "override": True,
+                                             "panes": 1, "id": "7"}}))
+k_ = fake_claude("t9")
+L = {"AHT_ITERM_LIVE": str(live2)}
+def say(t):
+    with open(tstore / "t9.jsonl", "a") as fh:
+        fh.write(title_line(t, "t9"))
+ck(tab_hook("SessionStart", "t9", "/dev/ttysT3", k_.pid, **L) == "Thesis",
+   "tab names: a session in a third tab takes its title")
+say("Thesis")
+tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, **L)
+say("Chapter 2")                                            # /rename
+ck(tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, **L) is None
+   and tab_now() == "Chapter 2",
+   "tab names: a session renamed with /rename gives its tab the name")
+say("Chapter 3")
+ck(tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, AHT_ITERM_API_OFF="1", **L) is None
+   and tab_now() == "Chapter 2"
+   and tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, AHT_ITERM_API_OFF="1",
+                **L) is None,
+   "tab names: with iTerm2's Python API off the tab keeps its title, the session its name")
+say("Chapter 4")
+tab_now(title="Thesis final")
+ck(tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, **L) == "Thesis final",
+   "tab names: both renamed since the last look: the tab wins")
+ck(tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, **L) is None
+   and tab_now() == "Thesis final",
+   "tab names: the name aht gave, not taken yet, is not mistaken for a rename")
+say("Thesis final")
+T = {"AHT_ITERM_TABS": str(tabs_file), "AHT_ITERM_LIVE": str(live2),
+     "AHT_TTYS": json.dumps({str(k_.pid): "/dev/ttysT3"})}
+d = JS("tab-names", "--rename", "t9", "--to", "Defence", "--json", extra_env=T)
+ck(d.get("tab") == "" and tab_now() == "Defence",
+   f"rename: aht's Rename… gives the tab the name right away ({d})")
+ck(tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, **L) == "Defence",
+   "rename: … and the session at its next prompt")
+say("Defence")
+tab_now(title="Viva")
+ck(tab_hook("UserPromptSubmit", "t9", "/dev/ttysT3", k_.pid, **L) == "Viva",
+   "rename: renaming the tab afterwards wins over a name set in aht")
+say("Viva")
+tab_now(panes=2)
+d = JS("tab-names", "--rename", "t9", "--to", "Two panes", "--json", extra_env=T)
+ck(d.get("tab") == "panes" and tab_now() == "Viva",
+   "rename: a tab holding two sessions keeps its title (it would name both)")
+r = run("tab-names", "--rename", "t9", "--to", "Off", extra_env=dict(T, AHT_ITERM_API_OFF="1"))
+ck("Enable Python API" in r.stdout, f"rename: says how to let the tab take names ({r.stdout!r})")
+run("tab-names", "--rename", "t9", "--to", "")
+
+# aht speaks iTerm2's Python API itself: a WebSocket on a Unix socket, protobuf in it
+import socket as _so, threading as _th
+def pb_varint(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7F, n >> 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+def pb_len(num, b):
+    b = b.encode() if isinstance(b, str) else b
+    return pb_varint(num << 3 | 2) + pb_varint(len(b)) + b
+def pb_read(buf):
+    out, i = {}, 0
+    def vi():
+        nonlocal i
+        n = s_ = 0
+        while True:
+            c_ = buf[i]; i += 1
+            n |= (c_ & 0x7F) << s_; s_ += 7
+            if not c_ & 0x80:
+                return n
+    while i < len(buf):
+        key = vi(); w = key & 7
+        if w == 0:
+            v = vi()
+        elif w == 1:
+            v = buf[i:i + 8]; i += 8
+        else:
+            n = vi(); v = buf[i:i + n]; i += n
+        out.setdefault(key >> 3, []).append(v)
+    return out
+def fake_iterm(path, answer, seen):
+    srv = _so.socket(_so.AF_UNIX, _so.SOCK_STREAM)
+    srv.bind(str(path)); srv.listen(1)
+    def serve():
+        conn, _ = srv.accept()
+        f = conn.makefile("rb")
+        head = b""
+        while not head.endswith(b"\r\n\r\n"):
+            head += f.readline()
+        seen["head"] = head.decode()
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                     b"Connection: Upgrade\r\nSec-WebSocket-Protocol: api.iterm2.com\r\n\r\n")
+        b0, b1 = f.read(2)
+        mask, n = f.read(4), b1 & 0x7F
+        seen["masked"] = bool(b1 & 0x80)
+        seen["req"] = bytes(c_ ^ mask[i % 4] for i, c_ in enumerate(f.read(n)))
+        conn.sendall(b"\x89\x00")                               # a ping first
+        seen["pong"] = f.read(6)[:1] == b"\x8a"
+        conn.sendall(bytes([0x82, len(answer)]) + answer)
+        try:
+            f.read(8)
+        except OSError:
+            pass
+        conn.close(); srv.close()
+    t = _th.Thread(target=serve, daemon=True); t.start()
+    return t
+api_sock = sb / "api.sock"
+seen = {}
+ok_answer = pb_varint(1 << 3) + pb_varint(1) + pb_len(132, pb_len(2, pb_len(1, "null")))
+th = fake_iterm(api_sock, ok_answer, seen)
+tab_now(panes=1)
+probe = ("import sys; sys.path.insert(0, sys.argv[1]); import aht; "
+         "print(repr(aht.set_tab_title('/dev/ttysT3', sys.argv[2])))")
+api_env = dict(env, AHT_ITERM_API=str(api_sock), AHT_ITERM_API_KEY="cookie1 key1",
+               AHT_ITERM_TABS=str(tabs_file), AHT_ITERM_LIVE=str(live2))
+r = subprocess.run([PY, "-c", probe, str(HERE.parent), 'A "b" \\(x) ⑂'], env=api_env,
+                   capture_output=True, text=True, timeout=30)
+th.join(10)
+req = pb_read(seen.get("req", b""))
+inv = pb_read(req.get(132, [b""])[0])
+ck(r.stdout.strip() == "''" and seen.get("masked") and seen.get("pong")
+   and "x-iterm2-cookie: cookie1" in seen.get("head", "")
+   and "x-iterm2-key: key1" in seen.get("head", "")
+   and "Sec-WebSocket-Protocol: api.iterm2.com" in seen.get("head", "")
+   and req.get(1) == [1] and pb_read(inv.get(7, [b""])[0]).get(1) == [b"7"]
+   and inv.get(5, [b""])[0].decode() == 'iterm2.set_title(title: "A “b” \\\\\\\\(x) ⑂")',
+   f"iTerm2 API: the tab's title set as Edit Tab Title does ({r.stdout.strip()} "
+   f"{r.stderr[-300:]} {inv})")
+api_sock.unlink()
+seen = {}
+bad = pb_varint(1 << 3) + pb_varint(1) + pb_len(132, pb_len(1, pb_varint(1 << 3) + pb_varint(4)
+                                                          + pb_len(2, "no such tab")))
+th = fake_iterm(api_sock, bad, seen)
+r = subprocess.run([PY, "-c", probe, str(HERE.parent), "X"], env=api_env,
+                   capture_output=True, text=True, timeout=30)
+th.join(10)
+ck("no such tab" in r.stdout, f"iTerm2 API: its refusal is reported ({r.stdout.strip()})")
+api_sock.unlink()
+r = subprocess.run([PY, "-c", probe, str(HERE.parent), "X"], env=api_env,
+                   capture_output=True, text=True, timeout=30)
+ck(r.stdout.strip() == "'api-off'", f"iTerm2 API: switched off, said so ({r.stdout.strip()})")
+for pr in (a, b, c, d_, e_, f_, k_):
     pr.kill(); pr.wait()
     (rec / f"{pr.pid}.json").unlink()
 

@@ -875,10 +875,14 @@ final class AppModel: ObservableObject {
         guard let sid = r.session else { return }
         let a = NSAlert()
         a.messageText = "Name this session"
+        let api = status["iterm_api"] as? Bool ?? false
         a.informativeText = "The name shows in the Claude app, in /resume and in the session's "
             + "prompt bar. Claude Code takes it at the session's next prompt — when you next "
-            + "send it a message, here or in the app. A name set here stays, whatever the tab "
-            + "is called." + (r.tab.map { "\n\nIts iTerm2 tab is called “\($0)”." } ?? "")
+            + "send it a message, here or in the app. It stays until you rename the tab."
+            + (r.tab.map { "\n\nIts iTerm2 tab is called “\($0)”." } ?? "")
+            + (!r.inIterm ? "" : api ? " The tab takes the new name now."
+               : " The tab keeps its title: to let it take the name too, switch on iTerm2 → "
+                 + "Settings → General → Magic → Enable Python API.")
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         field.stringValue = r.pendingTitle ?? r.title ?? r.tab ?? ""
         a.accessoryView = field
@@ -891,8 +895,20 @@ final class AppModel: ObservableObject {
         let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard pick == 0 && !name.isEmpty || pick == 2 else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            aht(["tab-names", "--rename=" + sid, "--to=" + (pick == 2 ? "" : name)])
-            DispatchQueue.main.async { self.refreshBoard() }
+            let d = ahtJSON(["tab-names", "--rename=" + sid, "--to=" + (pick == 2 ? "" : name),
+                             "--json"]) ?? [:]
+            let why = d["tab"] as? String ?? ""
+            DispatchQueue.main.async {
+                self.refreshBoard()
+                if why == "panes" {
+                    _ = alert("The tab kept its title", "Its tab holds more than one session, "
+                              + "and a title would name them all. The session takes the name "
+                              + "at its next prompt.")
+                } else if !["", "api-off", "no-tab"].contains(why) {
+                    _ = alert("The tab kept its title", "iTerm2 did not take it: \(why)\n\nThe "
+                              + "session takes the name at its next prompt.")
+                }
+            }
         }
     }
 
@@ -1964,6 +1980,7 @@ final class AppModel: ObservableObject {
         config[key] = (value == "true" || value == "false") ? (value == "true") as Any
                                                              : value as Any
         background { aht(["config", "--set", "\(key)=\(value)", "--no-reload"]) }
+        onChange?()
     }
 
     /// "" = automatic: iTerm when installed, else Terminal.
@@ -4070,6 +4087,15 @@ struct SettingsView: View {
                             toggle("When a session waits for you", "notify_waiting")
                             toggle("When a long piece of work is done", "notify_finished")
                         }
+                        Toggle("Show the open Claude sessions in the screen's top-right corner",
+                               isOn: Binding(get: { m.flag("session_corner", false) },
+                                             set: { m.set("session_corner", $0 ? "true" : "false") }))
+                        Text("Each one shows whether it works, waits for you or is done. "
+                             + "“Done” stays until you click the session there (that goes to "
+                             + "its tab) or it starts working again. Also in the aht menu: "
+                             + "Sessions in the Corner.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         HStack {
                             Text("Also send them to my phone:")
                             TextField("imessage:+43… or ntfy:my-topic",
@@ -4127,10 +4153,19 @@ struct SettingsView: View {
                              + "session's prompt bar. It is set when a session starts, and "
                              + "at the next prompt after you rename the tab. A second open "
                              + "session under the same tab title becomes “· 2” (a branch "
-                             + "“⑂ 2”). A name you give a session yourself (/rename, or in "
-                             + "the app) stays. No tokens.")
+                             + "“⑂ 2”). The latest name wins: name a session yourself "
+                             + "(/rename, in the app, or Rename… in the Sessions tab) and its "
+                             + "tab takes the name; rename the tab and the session follows. "
+                             + "No tokens.")
                             .font(.caption).foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                        if !(m.status["iterm_api"] as? Bool ?? true) {
+                            Text("Tabs keep their titles for now: iTerm2 lets aht change a "
+                                 + "title you gave a tab only through its Python API. To switch "
+                                 + "it on: iTerm2 → Settings → General → Magic → Enable Python API.")
+                                .font(.caption).foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         Text((m.status["claude_remote_control"] as? Bool ?? false)
                              ? "Remote Control is on for every session, so each one is in the app."
                              : "Remote Control is off: in Claude Code, /config → Enable Remote "
@@ -4324,6 +4359,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     var item: NSStatusItem!
     let menu = NSMenu()
     let model = AppModel()
+    let corner = CornerPanel()
     var window: NSWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -4336,7 +4372,13 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         item.button?.toolTip = "agent-history-tether"
         menu.delegate = self
         item.menu = menu
-        model.onChange = { [weak self] in self?.updateIcon() }
+        model.onChange = { [weak self] in
+            self?.updateIcon()
+            self?.syncCorner()
+        }
+        corner.onHide = { [weak self] in
+            self?.model.set("session_corner", "false")
+        }
         model.refresh()
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
             self.model.refresh()
@@ -4628,6 +4670,8 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
             add(disabled: "\(away.count) handed over to " + hosts.joined(separator: ", "))
         }
         add("Search Sessions…", #selector(searchFromMenu))
+        add("Sessions in the Corner", #selector(toggleCorner))
+        menu.items.last?.state = model.flag("session_corner", false) ? .on : .off
         if model.waiting > 0 {
             add(disabled: "⚠ \(model.waiting) session\(model.waiting == 1 ? "" : "s") "
                 + "waiting for you")
@@ -4660,6 +4704,26 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     }
 
     @objc func reconcile() { model.reconcile() }
+
+    @objc func toggleCorner() {
+        model.set("session_corner", model.flag("session_corner", false) ? "false" : "true")
+    }
+
+    /// The corner shows while the setting is on.
+    func syncCorner() {
+        if model.flag("session_corner", false) {
+            if !corner.shown {
+                let roots = (model.status["backends"] as? [[String: Any]]) ?? []
+                let root = roots.first { $0["name"] as? String == "claude" }?["root"] as? String
+                corner.show(sessionsDir: root.map {
+                    (($0 as NSString).deletingLastPathComponent as NSString)
+                        .appendingPathComponent("sessions")
+                } ?? HOME + "/.claude/sessions")
+            }
+        } else if corner.shown {
+            corner.hide()
+        }
+    }
     @objc func toggleWatch() { model.toggleWatch() }
     @objc func quit() { NSApp.terminate(nil) }
 
@@ -4731,6 +4795,17 @@ if CommandLine.arguments.contains("--selftest") {
     let r = aht(["version"])
     print("TRAY SELFTEST \(r.ok ? "OK" : "FAIL") — core: \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))")
     exit(r.ok ? 0 : 1)
+}
+
+// corner-rows: what the session corner lists right now, one session a line
+if CommandLine.arguments.contains("--corner-rows") {
+    let c = CornerModel()
+    c.poll()
+    for r in c.rows {
+        print([r.state, r.age, r.name, (r.project as NSString).abbreviatingWithTildeInPath]
+              .joined(separator: "\t"))
+    }
+    exit(0)
 }
 
 // notify: post one notice as aht and leave (the core uses this while the
@@ -4841,6 +4916,18 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         }
     }
     let size = NSSize(width: 900, height: 620)
+    let corner = CornerModel()                  // the session corner, with demo rows
+    corner.rows = [("Slides", "working", "now"), ("Budget", "working", "12m"),
+                   ("Server", "waiting", "waits 2m"), ("Paper review", "done", "4m"),
+                   ("Thesis chapter 3 — literature and related work", "idle", "")]
+        .enumerated().map { i, r in
+            CornerRow(id: "demo\(i)", pid: 100 + i, name: r.0, project: "~/Desktop/" + r.0,
+                      state: r.1, age: r.2.replacingOccurrences(of: "waits ", with: ""),
+                      recent: Double(10 - i))
+        }
+    snapshot(CornerView(c: corner, open: { _ in }, hide: {}).padding(12),
+             dir + "/corner.png", NSSize(width: 276, height: 190))
+    if args.contains("--corner-only") { exit(0) }
     model.refreshBoard()                        // the Sessions tab shows real rows
     let boardEnd = Date().addingTimeInterval(60)
     while model.boardAt == nil && Date() < boardEnd {

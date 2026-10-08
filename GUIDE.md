@@ -273,11 +273,15 @@ piece of work that took a while.
   been so, under the name the Claude app shows. The sessions working now
   come first, the one that started last on top; the rest follow by when
   they last worked. *Done* stays until you click that session there, which
-  brings its tab to the front, or until it starts working again. Turn it
-  on or off in the aht menu (*Sessions in the Corner*) or in Settings →
-  Notices; the × on the list turns it off too. It reads Claude Code's own
-  records of its sessions every second and a half, so it needs no tokens
-  and hardly any time.
+  brings its tab to the front, or until it starts working again. Drag the
+  list anywhere you like (it stays there); a double-click on its top line
+  puts it back in the corner. Drag its left or right edge to make it wider
+  or narrower (a name that does not fit ends in "…"), and its bottom edge
+  to list more or fewer sessions; the rest show as "+n more", so it never
+  needs to scroll. Turn it on or off in the aht menu (*Sessions in the
+  Corner*) or in Settings → Notices; the × on the list turns it off too.
+  It reads Claude Code's own records of its sessions every second and a
+  half, so it needs no tokens and hardly any time.
 
 **In the terminal:**
 

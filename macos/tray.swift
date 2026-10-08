@@ -4372,6 +4372,8 @@ let CORNER_STATE = HOME + "/.aht/run/corner.json"
 /// Claude app shows, from the session's conversation file.
 final class CornerModel: ObservableObject {
     @Published var rows: [CornerRow] = []
+    @Published var width: CGFloat = 252         // how wide the list is
+    @Published var most = 12                    // how many sessions it lists, the rest "+n more"
     var sessionsDir = HOME + "/.claude/sessions"
     private var last: [String: String] = [:]    // session → its status at the last look
     private var done: [String: Double] = [:]    // session → when it finished
@@ -4534,8 +4536,10 @@ struct CornerView: View {
     @ObservedObject var c: CornerModel
     let open: (CornerRow) -> Void
     let hide: () -> Void
+    var drag: (CGPoint, Bool) -> Void = { _, _ in }   // from where (true: let go)
+    var home: () -> Void = {}                   // back to the corner
     @State private var hover: String?
-    static let most = 12
+    @State private var dragged = Date.distantPast
 
     var summary: String {
         let n = { (s: String) in c.rows.filter { $0.state == s }.count }
@@ -4550,6 +4554,7 @@ struct CornerView: View {
                 Image(systemName: "infinity").font(.system(size: 9, weight: .semibold))
                 Text(c.rows.isEmpty ? "No Claude session open" : summary)
                     .font(.system(size: 10.5, weight: .medium))
+                    .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 8)
                 Button(action: hide) {
                     Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
@@ -4560,18 +4565,32 @@ struct CornerView: View {
             }
             .foregroundColor(.secondary)
             .padding(.horizontal, 6).padding(.top, 1).padding(.bottom, c.rows.isEmpty ? 1 : 3)
-            ForEach(c.rows.prefix(Self.most)) { r in row(r) }
-            if c.rows.count > Self.most {
-                Text("+\(c.rows.count - Self.most) more").font(.system(size: 10.5))
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { home() }
+            .help("Drag the list anywhere, or its sides and bottom to resize it; "
+                  + "double-click this line to put it back in the corner")
+            ForEach(c.rows.prefix(c.most)) { r in row(r) }
+            if c.rows.count > c.most {
+                Text("+\(c.rows.count - c.most) more").font(.system(size: 10.5))
+                    .lineLimit(1)
                     .foregroundColor(.secondary).padding(.horizontal, 6).padding(.top, 1)
             }
         }
         .padding(5)
-        .frame(width: 252)
+        .frame(width: c.width)
         .background(CornerBackground())
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
             .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+        .simultaneousGesture(DragGesture(minimumDistance: 3)
+            .onChanged { v in
+                dragged = Date()
+                drag(v.startLocation, false)
+            }
+            .onEnded { v in
+                dragged = Date()
+                drag(v.startLocation, true)
+            })
     }
 
     func row(_ r: CornerRow) -> some View {
@@ -4583,38 +4602,107 @@ struct CornerView: View {
             default: return ("circle", .secondary)
             }
         }()
-        return Button(action: { open(r) }) {
-            HStack(spacing: 7) {
-                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(tint).frame(width: 14)
-                Text(r.name).font(.system(size: 12, weight: r.state == "done"
-                                          || r.state == "waiting" ? .semibold : .regular))
-                    .foregroundColor(r.state == "idle" ? .secondary : .primary)
-                    .lineLimit(1).truncationMode(.tail)
-                Spacer(minLength: 6)
-                Text(r.state == "waiting" ? "waits " + r.age : r.age)
-                    .font(.system(size: 10).monospacedDigit()).foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 6).padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(hover == r.id ? Color.primary.opacity(0.09)
-                      : r.state == "done" ? Color.green.opacity(0.13)
-                      : r.state == "waiting" ? Color.orange.opacity(0.13) : Color.clear))
-            .contentShape(Rectangle())
+        return HStack(spacing: 7) {
+            Image(systemName: icon).font(.system(size: 11, weight: .semibold))
+                .foregroundColor(tint).frame(width: 14)
+            Text(r.name).font(.system(size: 12, weight: r.state == "done"
+                                      || r.state == "waiting" ? .semibold : .regular))
+                .foregroundColor(r.state == "idle" ? .secondary : .primary)
+                .lineLimit(1).truncationMode(.tail)
+            Spacer(minLength: 6)
+            Text(r.state == "waiting" ? "waits " + r.age : r.age)
+                .font(.system(size: 10).monospacedDigit()).foregroundColor(.secondary)
+                .lineLimit(1).fixedSize().layoutPriority(1)
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 6).padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(hover == r.id ? Color.primary.opacity(0.09)
+                  : r.state == "done" ? Color.green.opacity(0.13)
+                  : r.state == "waiting" ? Color.orange.opacity(0.13) : Color.clear))
+        .contentShape(Rectangle())
+        .onTapGesture {                         // a drag that ends here is no click
+            if Date().timeIntervalSince(dragged) > 0.4 { open(r) }
+        }
         .onHover { inside in
             if inside { hover = r.id } else if hover == r.id { hover = nil }
         }
-        .help((r.project as NSString).abbreviatingWithTildeInPath + "\n"
+        .help(r.name + "\n" + (r.project as NSString).abbreviatingWithTildeInPath + "\n"
               + (r.state == "done" ? "Done. A click goes to its tab and clears the mark."
                  : "A click goes to its tab."))
     }
 }
 
-/// Takes clicks without making aht the front app first.
+/// What a drag on the list takes hold of: its sides change its width, its
+/// bottom how many sessions it lists; anywhere else it moves the list.
+struct CornerEdges: OptionSet {
+    let rawValue: Int
+    static let left = CornerEdges(rawValue: 1)
+    static let right = CornerEdges(rawValue: 2)
+    static let bottom = CornerEdges(rawValue: 4)
+
+    init(rawValue: Int) { self.rawValue = rawValue }
+
+    /// At `p` (from the list's top left) on a list of `size`.
+    init(at p: CGPoint, in size: CGSize) {
+        var e: CornerEdges = []
+        if p.x < 6 { e.insert(.left) } else if p.x > size.width - 6 { e.insert(.right) }
+        if p.y > size.height - 6 { e.insert(.bottom) }
+        self = e
+    }
+
+    var cursor: NSCursor {
+        if #available(macOS 15, *), !isEmpty {
+            let at: NSCursor.FrameResizePosition = self == .left ? .left : self == .right ? .right
+                : self == .bottom ? .bottom : contains(.left) ? .bottomLeft : .bottomRight
+            return .frameResize(position: at, directions: .all)
+        }
+        return isEmpty ? .arrow : contains(.bottom) ? .resizeUpDown : .resizeLeftRight
+    }
+}
+
+/// macOS lets only the app in front change the pointer; this lets aht do it
+/// too, so the corner can show the resize pointer while you work elsewhere.
+/// The switch is not public, so it is looked up as aht starts: without it
+/// the pointer just stays an arrow.
+func pointerInBackground() {
+    typealias Connection = @convention(c) () -> Int32
+    typealias SetProperty = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32
+    let loaded = UnsafeMutableRawPointer(bitPattern: -2)        // RTLD_DEFAULT
+    guard let conn = dlsym(loaded, "_CGSDefaultConnection"),
+          let set = dlsym(loaded, "CGSSetConnectionProperty") else { return }
+    let me = unsafeBitCast(conn, to: Connection.self)()
+    _ = unsafeBitCast(set, to: SetProperty.self)(me, me, "SetsCursorInBackground" as CFString,
+                                                 kCFBooleanTrue)
+}
+
+/// Takes clicks without making aht the front app first, and shows the
+/// resize pointer over the list's sides and bottom.
 final class CornerHostingView<V: View>: NSHostingView<V> {
+    private var area: NSTrackingArea?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let a = area { removeTrackingArea(a) }
+        let a = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited,
+                                                      .activeAlways, .inVisibleRect],
+                               owner: self)
+        addTrackingArea(a)
+        area = a
+    }
+
+    override func mouseMoved(with e: NSEvent) {
+        super.mouseMoved(with: e)
+        let p = convert(e.locationInWindow, from: nil)
+        CornerEdges(at: CGPoint(x: p.x, y: isFlipped ? p.y : bounds.height - p.y),
+                    in: bounds.size).cursor.set()
+    }
+
+    override func mouseExited(with e: NSEvent) {
+        super.mouseExited(with: e)
+        if e.trackingArea === area { NSCursor.arrow.set() }
+    }
 }
 
 /// The floating panel in the top-right corner of the screen with the menu bar.
@@ -4626,6 +4714,31 @@ final class CornerPanel {
     var onHide: () -> Void = {}
 
     var shown: Bool { panel?.isVisible ?? false }
+
+    /// Where you dragged it: its top-left corner (it grows downwards).
+    private var spot: NSPoint? {
+        get {
+            guard let a = UserDefaults.standard.array(forKey: "cornerTopLeft") as? [Double],
+                  a.count == 2 else { return nil }
+            return NSPoint(x: a[0], y: a[1])
+        }
+        set {
+            if let p = newValue {
+                UserDefaults.standard.set([Double(p.x), Double(p.y)], forKey: "cornerTopLeft")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "cornerTopLeft")
+            }
+        }
+    }
+    /// A drag under way: where it started, and the list as it was then.
+    private var held: (mouse: NSPoint, frame: NSRect, edges: CornerEdges, width: CGFloat,
+                       shown: Int, most: Int)?
+
+    init() {
+        let d = UserDefaults.standard
+        if d.double(forKey: "cornerWidth") > 0 { model.width = CGFloat(d.double(forKey: "cornerWidth")) }
+        if d.object(forKey: "cornerRows") != nil { model.most = max(0, d.integer(forKey: "cornerRows")) }
+    }
 
     func show(sessionsDir: String) {
         model.sessionsDir = sessionsDir
@@ -4642,10 +4755,17 @@ final class CornerPanel {
             p.hasShadow = true
             p.hidesOnDeactivate = false
             p.isReleasedWhenClosed = false
+            p.acceptsMouseMovedEvents = true
+            pointerInBackground()
             p.contentView = CornerHostingView(rootView: CornerView(
                 c: model,
                 open: { [weak self] r in self?.open(r) },
-                hide: { [weak self] in self?.onHide() }))
+                hide: { [weak self] in self?.onHide() },
+                drag: { [weak self] at, done in self?.drag(at, done) },
+                home: { [weak self] in
+                    self?.spot = nil
+                    self?.place(force: true)
+                }))
             panel = p
             NotificationCenter.default.addObserver(
                 forName: NSApplication.didChangeScreenParametersNotification, object: nil,
@@ -4668,16 +4788,67 @@ final class CornerPanel {
         panel?.orderOut(nil)
     }
 
-    /// Top right, just under the menu bar; it grows downwards.
+    /// Where you put it, else top right just under the menu bar; it grows
+    /// downwards and stays on its screen.
     private func place(force: Bool = false) {
-        guard let p = panel, let v = p.contentView,
-              let screen = NSScreen.screens.first else { return }
+        guard held?.edges.isEmpty != true, let p = panel, let v = p.contentView,
+              let main = NSScreen.screens.first else { return }
         let fit = v.fittingSize
         guard force || fit != size else { return }
         size = fit
-        let vf = screen.visibleFrame
-        p.setFrame(NSRect(x: vf.maxX - fit.width - 10, y: vf.maxY - fit.height - 8,
-                          width: fit.width, height: fit.height), display: true)
+        var top: NSPoint
+        if let at = spot, let screen = NSScreen.screens.first(where: {
+            $0.frame.insetBy(dx: -1, dy: -1).contains(at)
+        }) {
+            let vf = screen.visibleFrame
+            top = NSPoint(x: min(max(at.x, vf.minX), vf.maxX - fit.width),
+                          y: min(max(at.y, vf.minY + fit.height), vf.maxY))
+        } else {
+            let vf = main.visibleFrame
+            top = NSPoint(x: vf.maxX - fit.width - 10, y: vf.maxY - 8)
+        }
+        p.setFrame(NSRect(x: top.x, y: top.y - fit.height, width: fit.width,
+                          height: fit.height), display: true)
+    }
+
+    /// The list follows the mouse, or from a side gets wider or narrower
+    /// (the other side stays put), or from its bottom lists more or fewer
+    /// sessions (the rest are "+n more"). Where you let go is kept.
+    private func drag(_ start: CGPoint, _ done: Bool) {
+        guard let p = panel else { return }
+        let m = NSEvent.mouseLocation
+        let h = held ?? (m, p.frame, CornerEdges(at: start, in: p.frame.size), model.width,
+                         min(model.most, model.rows.count), model.most)
+        held = h
+        let dx = m.x - h.mouse.x, dy = m.y - h.mouse.y
+        if h.edges.isEmpty {
+            p.setFrameOrigin(NSPoint(x: h.frame.minX + dx, y: h.frame.minY + dy))
+        } else {
+            if !h.edges.isDisjoint(with: [.left, .right]) {
+                let room = ((p.screen ?? NSScreen.main)?.visibleFrame.width ?? 800) - 20
+                let w = (h.width + (h.edges.contains(.left) ? -dx : dx)).rounded()
+                model.width = max(150, min(w, 720, room))
+                if h.edges.contains(.right) {
+                    spot = NSPoint(x: h.frame.minX, y: h.frame.maxY)
+                } else if spot != nil {
+                    spot = NSPoint(x: h.frame.maxX - model.width, y: h.frame.maxY)
+                }
+            }
+            if h.edges.contains(.bottom) {              // a session is about 22 points
+                let n = max(0, h.shown + Int((-dy / 22).rounded()))
+                model.most = n < model.rows.count ? n : max(model.rows.count, h.most)
+            }
+            DispatchQueue.main.async { [weak self] in self?.place(force: true) }
+        }
+        guard done else { return }
+        held = nil
+        if h.edges.isEmpty {
+            spot = NSPoint(x: p.frame.minX, y: p.frame.maxY)
+            place(force: true)
+        } else {
+            UserDefaults.standard.set(Double(model.width), forKey: "cornerWidth")
+            UserDefaults.standard.set(model.most, forKey: "cornerRows")
+        }
     }
 
     private func open(_ r: CornerRow) {

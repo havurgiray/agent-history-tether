@@ -16,6 +16,7 @@
 //   from aht.app:   offers to install the core, watcher and hook on first launch
 //   --selftest      headless check that the core answers (CI)
 //   --snapshot DIR  render every tab of the window into DIR as PNG files
+//   --chimes DIR    write aht's own chimes into DIR as WAV files
 //   --spotlight-check WORD   are sessions with WORD in the title in Spotlight?
 //   aht://…         open parts of the window from Shortcuts, a link or a script:
 //                   aht://search?q=WORDS, aht://sessions, aht://loose-ends,
@@ -647,6 +648,9 @@ final class AppModel: ObservableObject {
     }
     func text(_ key: String, _ fallback: String) -> String {
         return config[key] as? String ?? fallback
+    }
+    func number(_ key: String, _ fallback: Int) -> Int {
+        return config[key] as? Int ?? (config[key] as? String).flatMap { Int($0) } ?? fallback
     }
 
     // ---- doing ----
@@ -1981,6 +1985,22 @@ final class AppModel: ObservableObject {
                                                              : value as Any
         background { aht(["config", "--set", "\(key)=\(value)", "--no-reload"]) }
         onChange?()
+    }
+
+    /// A chime picked in Settings plays at once, at the volume set.
+    func playChime(_ choice: String) {
+        ChimePlayer.shared.play(choice, volume: number("chime_volume", 70), now: true)
+    }
+
+    func chooseChimeFile(_ key: String) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a short sound for the chime"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let path = (url.path as NSString).abbreviatingWithTildeInPath
+        set(key, path)
+        playChime(path)
     }
 
     /// "" = automatic: iTerm when installed, else Terminal.
@@ -4019,6 +4039,7 @@ struct SettingsView: View {
     @State private var excludes = ""
     @State private var wsEvery = ""
     @State private var wsKeep = ""
+    @State private var chimeVolume = 70.0
 
     func choice(_ title: String, _ key: String, _ options: [(String, String)]) -> some View {
         HStack {
@@ -4035,6 +4056,44 @@ struct SettingsView: View {
     func toggle(_ title: String, _ key: String) -> some View {
         Toggle(title, isOn: Binding(get: { m.flag(key) },
                                     set: { m.set(key, $0 ? "true" : "false") }))
+    }
+
+    /// aht's chimes, the sounds of macOS and your own, none, or a file; the
+    /// one picked plays at once.
+    func chimePicker(_ title: String, _ key: String) -> some View {
+        let now = m.text(key, CHIME_DEFAULTS[key] ?? "")
+        let file = "\u{1}file"
+        return HStack(spacing: 6) {
+            Text(title).frame(width: 170, alignment: .leading)
+            Picker("", selection: Binding(get: { now }, set: { v in
+                if v == file { m.chooseChimeFile(key) } else { m.set(key, v); m.playChime(v) }
+            })) {
+                ForEach(Chimes.long, id: \.self) { Text($0).tag($0) }
+                Divider()
+                ForEach(Chimes.short, id: \.self) { Text($0).tag($0) }
+                Divider()
+                ForEach(ChimePlayer.soundNames(), id: \.self) { Text($0).tag($0) }
+                Divider()
+                if now.contains("/") { Text(ChimePlayer.label(now)).tag(now) }
+                Text("None").tag("")
+                Text("Choose a File…").tag(file)
+            }
+            .labelsHidden().frame(width: 130)
+            Button { m.playChime(now) } label: { Image(systemName: "play.fill") }
+                .help("Play it").disabled(now.isEmpty).fixedSize()
+        }
+    }
+
+    func doneAfter() -> some View {
+        let now = m.number("chime_done_after", 30)
+        var options = [(0, "any length"), (10, "10 seconds"), (30, "30 seconds"),
+                       (60, "1 minute"), (180, "3 minutes"), (600, "10 minutes")]
+        if !options.contains(where: { $0.0 == now }) { options.append((now, "\(now) seconds")) }
+        return Picker("", selection: Binding(get: { now },
+                                             set: { m.set("chime_done_after", String($0)) })) {
+            ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
+        }
+        .labelsHidden().fixedSize()
     }
 
     func tokenToggle(_ title: String, _ key: String, _ cost: String?) -> some View {
@@ -4109,6 +4168,47 @@ struct SettingsView: View {
                              + "seconds. iMessage goes to your own number or Apple ID; ntfy "
                              + "to a topic you follow in the ntfy app.")
                             .font(.caption).foregroundColor(.secondary)
+                    }
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Chimes"); HelpButton("Chimes") }) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle("Play a chime when a session here is done or waits for you",
+                               isOn: Binding(get: { m.flag("chimes", false) },
+                                             set: { m.set("chimes", $0 ? "true" : "false") }))
+                        VStack(alignment: .leading, spacing: 6) {
+                            chimePicker("Waits for you", "chime_waiting")
+                            HStack(spacing: 6) {
+                                chimePicker("Is done", "chime_done")
+                                Text("after working at least").padding(.leading, 6)
+                                doneAfter()
+                            }
+                            chimePicker("Hits the usage limit", "chime_limit")
+                            HStack(spacing: 6) {
+                                Text("Volume").frame(width: 170, alignment: .leading)
+                                Image(systemName: "speaker.fill").foregroundColor(.secondary)
+                                Slider(value: $chimeVolume, in: 0...100, onEditingChanged: { on in
+                                    guard !on else { return }
+                                    m.set("chime_volume", String(Int(chimeVolume.rounded())))
+                                    if let c = ["chime_done", "chime_waiting", "chime_limit"]
+                                        .map({ m.text($0, CHIME_DEFAULTS[$0] ?? "") })
+                                        .first(where: { !$0.isEmpty }) {
+                                        m.playChime(c)
+                                    }
+                                })
+                                .frame(width: 160)
+                                Image(systemName: "speaker.wave.3.fill").foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(.leading, 20)
+                        .disabled(!m.flag("chimes", false))
+                        Text("A session on this Mac chimes the moment it is done or begins to "
+                             + "wait (aht looks every second and a half; no tokens). One on "
+                             + "another machine, and the usage limit, chime with their notice. "
+                             + "With chimes on, those notices make no sound of their own, so you "
+                             + "hear one sound, not two. Also in the aht menu: Chimes.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -4345,6 +4445,7 @@ struct SettingsView: View {
             maxFiles = String(m.config["checkpoint_max_files"] as? Int ?? 20000)
             wsEvery = String(m.config["workspace_save_minutes"] as? Int ?? 10)
             wsKeep = String(m.config["workspace_keep"] as? Int ?? 40)
+            chimeVolume = Double(m.number("chime_volume", 70))
             excludes = ((m.config["checkpoint_excludes"] as? [String]) ?? []).joined(separator: ", ")
         }
     }
@@ -4369,7 +4470,8 @@ let CORNER_STATE = HOME + "/.aht/run/corner.json"
 /// a half. A session that goes from working to idle is "done" until you
 /// click it in the corner or it starts working again. The marks are kept in
 /// a file, so they outlast the app restarting. The name is the one the
-/// Claude app shows, from the session's conversation file.
+/// Claude app shows, from the session's conversation file. The chimes
+/// hear from it, too, when a session begins waiting for you or finishes.
 final class CornerModel: ObservableObject {
     @Published var rows: [CornerRow] = []
     @Published var width: CGFloat = 252         // how wide the list is
@@ -4380,6 +4482,11 @@ final class CornerModel: ObservableObject {
     private var runSince: [String: Double] = [:]
     private var byPid: [Int: (CornerRow, String)] = [:]
     private var titles: [String: (end: UInt64, custom: String, auto: String)] = [:]
+    /// What changed since the last look: a session that began waiting for
+    /// you, or one that is done, with how long that piece of work took.
+    var onNews: (([(kind: String, worked: Double)]) -> Void)?
+    private var turnSince: [String: Double] = [:]   // session → when it last left idle
+    private var lastLook = 0.0
 
     init() {
         if let d = FileManager.default.contents(atPath: CORNER_STATE),
@@ -4394,6 +4501,9 @@ final class CornerModel: ObservableObject {
         let now = Date().timeIntervalSince1970
         var status: [String: String] = [:]
         var found: [Int: (CornerRow, String)] = [:]
+        var news: [String: (kind: String, worked: Double)] = [:]
+        let fresh = now - lastLook < 10             // after a pause it is old news
+        lastLook = now
         for f in (try? fm.contentsOfDirectory(atPath: sessionsDir)) ?? [] where f.hasSuffix(".json") {
             guard let pid = Int(f.dropLast(5)), pid > 0,
                   kill(pid_t(pid), 0) == 0 || errno == EPERM else { continue }
@@ -4417,6 +4527,15 @@ final class CornerModel: ObservableObject {
                 runSince[sid] = nil
                 if st == "idle" && wasWorking { done[sid] = now }
             }
+            let began = turnSince[sid] ?? at
+            turnSince[sid] = st == "idle" ? nil : began
+            if fresh, (r["kind"] as? String ?? "interactive") == "interactive" {   // not `claude -p`
+                if st == "waiting", let was = last[sid], was != "waiting" {
+                    news[sid] = ("waiting", now - began)
+                } else if st == "idle" && wasWorking {
+                    news[sid] = ("done", now - began)
+                }
+            }
             status[sid] = st
             let cwd = r["cwd"] as? String ?? ""
             let state = st == "waiting" ? "waiting" : working ? "working"
@@ -4432,6 +4551,7 @@ final class CornerModel: ObservableObject {
         }
         byPid = found
         done = done.filter { status[$0.key] != nil }
+        turnSince = turnSince.filter { status[$0.key] != nil }
         if status != last {
             last = status
             save()
@@ -4444,6 +4564,7 @@ final class CornerModel: ObservableObject {
             ($0.recent, $1.name.lowercased(), $1.pid) > ($1.recent, $0.name.lowercased(), $0.pid)
         }
         if rows != self.rows { self.rows = rows }
+        if !news.isEmpty { onNews?(Array(news.values)) }
     }
 
     /// The session's title from its conversation file (Claude Code's own
@@ -4714,6 +4835,8 @@ final class CornerPanel {
     var onHide: () -> Void = {}
 
     var shown: Bool { panel?.isVisible ?? false }
+    /// The chimes need the sessions watched while the list is hidden, too.
+    var listening = false { didSet { pace() } }
 
     /// Where you dragged it: its top-left corner (it grows downwards).
     private var spot: NSPoint? {
@@ -4774,18 +4897,29 @@ final class CornerPanel {
         model.poll()
         place(force: true)
         panel?.orderFrontRegardless()
-        if timer == nil {
-            timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
-                self?.model.poll()
-                self?.place()
-            }
-        }
+        pace()
     }
 
     func hide() {
-        timer?.invalidate()
-        timer = nil
         panel?.orderOut(nil)
+        pace()
+    }
+
+    /// A look every second and a half, while the list shows or the chimes
+    /// listen.
+    private func pace() {
+        if shown || listening {
+            if timer == nil {
+                timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+                    guard let self = self else { return }
+                    self.model.poll()
+                    if self.shown { self.place() }
+                }
+            }
+        } else {
+            timer?.invalidate()
+            timer = nil
+        }
     }
 
     /// Where you put it, else top right just under the menu bar; it grows
@@ -4859,6 +4993,253 @@ final class CornerPanel {
     }
 }
 
+// ---- chimes ------------------------------------------------------------------
+
+/// aht's own chimes, made here from a few sine waves, so no sound file
+/// ships: every note comes from one scale (G major) and starts softly and
+/// rings out like a small bell, so two chimes in a row never clash.
+enum Chimes {
+    /// in the order the menu lists them (the guide says what each sounds like):
+    /// the longer ones, then the short ones
+    static let long = ["Bloom", "Settle", "Doorbell", "Tap", "Ask", "Ebb", "Drop"]
+    static let short = ["Ebb1", "Ebb2", "Ebb3", "Felt", "Hush", "Pluck", "Bubble", "Puff"]
+    static let own = long + short
+    static let rate = 44100.0
+    enum Timbre { case bell, wood, soft, ding, felt, hush, drop, bubble, pluck, puff }
+
+    /// (when it starts in s, its pitch in Hz, how loud)
+    private static func score(_ name: String) -> (Timbre, [(Double, Double, Double)]) {
+        let G4 = 392.00, B4 = 493.88, D5 = 587.33, G5 = 783.99, B5 = 987.77
+        let D6 = 1174.66, G6 = 1567.98
+        switch name {
+        case "Bloom": return (.bell, [(0, G5, 0.7), (0.075, B5, 0.75), (0.15, D6, 1)])
+        case "Settle": return (.bell, [(0, D6, 0.8), (0.13, G5, 1)])
+        case "Doorbell": return (.bell, [(0, B5, 1), (0.3, G5, 0.9)])
+        case "Tap": return (.wood, [(0, G5, 0.8), (0.13, G5, 1)])
+        case "Ask": return (.bell, [(0, D6, 0.85), (0.14, G6, 0.8)])
+        case "Ebb": return (.soft, [(0, D5, 1), (0.16, B4, 0.9), (0.32, G4, 0.85)])
+        case "Drop": return (.drop, [(0, 880, 1)])
+        case "Ebb1": return (.ding, [(0, D5, 1)])        // Ebb's notes, one at a time
+        case "Ebb2": return (.ding, [(0, B4, 1)])
+        case "Ebb3": return (.ding, [(0, G4, 1)])
+        case "Felt": return (.felt, [(0, G4, 1)])
+        case "Hush": return (.hush, [(0, B4, 1)])
+        case "Pluck": return (.pluck, [(0, G4, 1)])
+        case "Bubble": return (.bubble, [(0, 330, 1)])
+        case "Puff": return (.puff, [(0, 0, 1)])
+        default: return (.bell, [])
+        }
+    }
+
+    /// the partials of a note: (× its pitch, how loud, how long it rings in
+    /// s), its attack in s, how long the chime lasts after its last note,
+    /// and how much quieter than the others it is meant to be (in dB)
+    private static func voice(_ t: Timbre) -> ([(Double, Double, Double)], Double, Double, Double) {
+        switch t {
+        case .bell: return ([(1, 1, 0.42), (1.0016, 0.3, 0.5), (2, 0.14, 0.22), (3, 0.04, 0.12),
+                             (4.17, 0.05, 0.08), (5.43, 0.02, 0.05)], 0.004, 1.3, 0)
+        case .wood: return ([(1, 1, 0.16), (3.93, 0.2, 0.035), (9.2, 0.05, 0.012)], 0.002, 0.55, 0)
+        case .soft: return ([(1, 1, 0.45), (2, 0.06, 0.2)], 0.018, 1.2, 0)
+        case .ding: return ([(1, 1, 0.075), (2, 0.06, 0.033)], 0.018, 0.2, 0)  // Ebb's, short
+        case .felt: return ([(1, 1, 0.09), (2, 0.18, 0.05), (3, 0.05, 0.03)], 0.008, 0.2, 0)
+        case .hush: return ([(1, 1, 10), (2, 0.08, 10)], 0.1, 0.2, 0)  // swells, fades, no strike
+        case .drop: return ([(1, 1, 0.06)], 0.002, 0.45, 0)
+        case .bubble: return ([(1, 1, 0.07)], 0.012, 0.2, 0)
+        case .pluck: return ([(1, 1, 0.12)], 0.004, 0.22, 0)
+        case .puff: return ([(1, 1, 0.06)], 0.03, 0.22, 5)              // noise sounds louder
+        }
+    }
+
+    /// One note as it sounds, before its attack is shaped: n samples.
+    private static func note(_ t: Timbre, _ hz: Double, _ n: Int,
+                             _ partials: [(Double, Double, Double)]) -> [Double] {
+        var y = [Double](repeating: 0, count: n)
+        var seed: UInt32 = 0x2545F491                   // the same noise every time
+        func noise() -> Double {
+            seed = seed &* 1664525 &+ 1013904223
+            return Double(seed) / 2147483647.5 - 1
+        }
+        let ring = partials[0].2
+        switch t {
+        case .drop, .bubble:                            // the pitch leaps up as it dies
+            let (leap, quick) = t == .drop ? (0.9, 0.02) : (0.7, 0.04)
+            var phase = 0.0
+            for i in 0..<n {
+                let s = Double(i) / rate
+                phase += 2 * Double.pi * hz * (1 + leap * (1 - exp(-s / quick))) / rate
+                y[i] = sin(phase) * exp(-s / ring)
+            }
+        case .pluck:                                    // a soft plucked string (Karplus-Strong)
+            let len = max(2, Int((rate / hz).rounded()))
+            let keep = exp(-1 / (hz * ring))            // what is left after each round
+            var line = [Double](repeating: 0, count: len)
+            for k in 0..<len {                          // plucked a third along, softly:
+                let u = Double(k) / Double(len)         // its shape, and a little noise
+                line[k] = (u < 1 / 3.0 ? u * 3 : (1 - u) * 1.5) - 0.5 + 0.05 * noise()
+            }
+            var j = 0
+            for i in 0..<n {                            // each round a little duller
+                y[i] = line[j]
+                line[j] = (0.25 * line[(j + len - 1) % len] + 0.5 * line[j]
+                           + 0.25 * line[(j + 1) % len]) * keep
+                j = (j + 1) % len
+            }
+        case .puff:                                     // a breath: noise, low and muffled
+            var a = 0.0, b = 0.0, last = 0.0, high = 0.0
+            for i in 0..<n {
+                a += (noise() - a) * 0.11               // two low-passes, about 800 Hz
+                b += (a - b) * 0.11
+                high = 0.98 * (high + b - last)         // and no rumble below about 140 Hz
+                last = b
+                y[i] = high * exp(-Double(i) / rate / ring)
+            }
+        default:
+            let slower = (783.99 / hz).squareRoot()     // low notes ring longer
+            for i in 0..<n {
+                let s = Double(i) / rate
+                for (k, a, r) in partials {
+                    y[i] += a * exp(-s / (r * slower)) * sin(2 * Double.pi * hz * k * s)
+                }
+            }
+        }
+        return y
+    }
+
+    static func samples(_ name: String) -> [Float] {
+        let (timbre, notes) = score(name)
+        guard let lastAt = notes.map({ $0.0 }).max() else { return [] }
+        let (partials, attack, tail, quieter) = voice(timbre)
+        var x = [Float](repeating: 0, count: Int((lastAt + tail) * rate))
+        for (at, hz, gain) in notes {
+            let start = Int(at * rate)
+            for (i, v) in note(timbre, hz, x.count - start, partials).enumerated() {
+                let t = Double(i) / rate
+                let rise = t < attack ? 0.5 - 0.5 * cos(Double.pi * t / attack) : 1
+                x[start + i] += Float(gain * rise * v)
+            }
+        }
+        if !short.contains(name) { x = room(x) }  // a short one stays dry: the echo would cancel it
+        let fade = min(Int(0.25 * rate), x.count / 2)   // the very end goes quiet smoothly
+        for i in 0..<fade {
+            x[x.count - 1 - i] *= Float(0.5 - 0.5 * cos(Double.pi * Double(i) / Double(fade)))
+        }
+        // as loud as the sounds of macOS at their loudest moment (50 ms), so a
+        // short chime is no louder than a long one; never near clipping
+        let win = Int(0.05 * rate)
+        var sum: Float = 0, most: Float = 0
+        for i in 0..<x.count {
+            sum += x[i] * x[i] - (i >= win ? x[i - win] * x[i - win] : 0)
+            most = max(most, sum)
+        }
+        let peak = x.map { abs($0) }.max() ?? 0
+        guard most > 0, peak > 0 else { return x }
+        let level = Float(0.0891 * pow(10, -quieter / 20))   // -21 dB
+        let gain = min(level / (most / Float(win)).squareRoot(), 0.7 / peak)
+        return x.map { $0 * gain }
+    }
+
+    /// A small room around the notes: four damped combs into two all-passes
+    /// (the shape of Freeverb), mixed in quietly.
+    private static func room(_ x: [Float]) -> [Float] {
+        var wet = [Float](repeating: 0, count: x.count)
+        for n in [1116, 1188, 1277, 1356] {
+            var buf = [Float](repeating: 0, count: n), i = 0, low: Float = 0
+            for t in 0..<x.count {
+                let out = buf[i]
+                low = out * 0.6 + low * 0.4
+                buf[i] = x[t] + low * 0.55
+                wet[t] += out
+                i = (i + 1) % n
+            }
+        }
+        for n in [556, 441] {
+            var buf = [Float](repeating: 0, count: n), i = 0
+            for t in 0..<wet.count {
+                let b = buf[i]
+                buf[i] = wet[t] + b * 0.5
+                wet[t] = b - wet[t]
+                i = (i + 1) % n
+            }
+        }
+        return zip(x, wet).map { $0 + $1 * 0.08 }
+    }
+
+    /// The chime as a WAV file (16-bit, mono).
+    static func wav(_ name: String) -> Data? {
+        let s = samples(name)
+        guard !s.isEmpty else { return nil }
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        d.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + s.count * 2))
+        d.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(UInt32(rate)); u32(UInt32(rate) * 2); u16(2); u16(16)
+        d.append(contentsOf: Array("data".utf8)); u32(UInt32(s.count * 2))
+        for v in s { u16(UInt16(bitPattern: Int16(max(-1, min(1, v)) * 32767))) }
+        return d
+    }
+}
+
+/// The chime each event plays until you pick another.
+let CHIME_DEFAULTS = ["chime_done": "Bloom", "chime_waiting": "Doorbell", "chime_limit": "Ebb"]
+
+/// Plays what a chime setting names: one of aht's own chimes, a sound of
+/// macOS or of ~/Library/Sounds by its name, or a sound file by its path.
+/// "" plays nothing.
+final class ChimePlayer {
+    static let shared = ChimePlayer()
+    private var sounds: [String: NSSound] = [:]
+    private var last = Date.distantPast
+
+    /// The sounds of macOS and your own, by name; one named like an aht
+    /// chime is left out (aht's own come first).
+    static func soundNames() -> [String] {
+        var names = Set<String>()
+        for d in [HOME + "/Library/Sounds", "/Library/Sounds", "/System/Library/Sounds"] {
+            for f in (try? FileManager.default.contentsOfDirectory(atPath: d)) ?? []
+            where ["aiff", "aif", "wav", "caf", "mp3", "m4a"]
+                .contains((f as NSString).pathExtension.lowercased()) {
+                names.insert((f as NSString).deletingPathExtension)
+            }
+        }
+        return names.subtracting(Chimes.own)
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    /// What the menu shows for a setting: a file by its name.
+    static func label(_ choice: String) -> String {
+        choice.isEmpty ? "None" : choice.contains("/")
+            ? ((choice as NSString).lastPathComponent as NSString).deletingPathExtension : choice
+    }
+
+    private func sound(_ choice: String) -> NSSound? {
+        if let s = sounds[choice] { return s }
+        var s: NSSound?
+        if Chimes.own.contains(choice) {
+            s = Chimes.wav(choice).flatMap { NSSound(data: $0) }
+        } else if choice.contains("/") {
+            s = NSSound(contentsOf: URL(fileURLWithPath: (choice as NSString).expandingTildeInPath),
+                        byReference: true)
+        } else if !choice.isEmpty {
+            s = NSSound(named: NSSound.Name(choice))?.copy() as? NSSound
+        }
+        sounds[choice] = s
+        return s
+    }
+
+    /// Plays it at `volume` (0–100). Unless `now` (one picked in Settings),
+    /// a second must have passed since the last chime, so sessions that
+    /// finish together make one chime, not a chord.
+    @discardableResult
+    func play(_ choice: String, volume: Int, now: Bool = false) -> Bool {
+        guard now || Date().timeIntervalSince(last) > 1, let s = sound(choice) else { return false }
+        if s.isPlaying { s.stop() }
+        s.volume = Float(max(0, min(100, volume))) / 100
+        last = Date()
+        return s.play()
+    }
+}
+
 // ---- the app -------------------------------------------------------------------
 
 let NOTICE_QUEUE = HOME + "/.aht/run/app-notices.jsonl"
@@ -4890,6 +5271,13 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         }
         corner.onHide = { [weak self] in
             self?.model.set("session_corner", "false")
+        }
+        corner.model.onNews = { [weak self] news in
+            if news.contains(where: { $0.kind == "waiting" }) {
+                self?.chime("waiting")
+            } else if let w = news.map({ $0.worked }).max() {
+                self?.chime("done", worked: w)
+            }
         }
         model.refresh()
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
@@ -5055,8 +5443,16 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
             c.title = n["title"] as? String ?? "aht"
             c.body = n["message"] as? String ?? ""
             c.sound = .default
-            c.userInfo = (n["info"] as? [String: Any] ?? [:]).compactMapValues {
-                $0 is NSNull ? nil : $0 }
+            let info = n["info"] as? [String: Any] ?? [:]
+            c.userInfo = info.compactMapValues { $0 is NSNull ? nil : $0 }
+            // with chimes on, a notice they cover comes without its own sound:
+            // a session here chimed already, one elsewhere and the limit now
+            if model.flag("chimes", false),
+               let k = ["waiting": "waiting", "finished": "done", "limit": "limit"][
+                   info["kind"] as? String ?? ""] {
+                c.sound = nil
+                if !(info["local"] as? Bool ?? false) { chime(k) }
+            }
             let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
             UNUserNotificationCenter.current().add(req) { err in
                 if err != nil { notifyUser(c.title, c.body) }   // not allowed: the plain kind
@@ -5184,6 +5580,8 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         add("Search Sessions…", #selector(searchFromMenu))
         add("Sessions in the Corner", #selector(toggleCorner))
         menu.items.last?.state = model.flag("session_corner", false) ? .on : .off
+        add("Chimes", #selector(toggleChimes))
+        menu.items.last?.state = model.flag("chimes", false) ? .on : .off
         if model.waiting > 0 {
             add(disabled: "⚠ \(model.waiting) session\(model.waiting == 1 ? "" : "s") "
                 + "waiting for you")
@@ -5221,20 +5619,37 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         model.set("session_corner", model.flag("session_corner", false) ? "false" : "true")
     }
 
-    /// The corner shows while the setting is on.
+    @objc func toggleChimes() {
+        model.set("chimes", model.flag("chimes", false) ? "false" : "true")
+    }
+
+    /// The corner shows while the setting is on; the sessions are watched
+    /// while it shows or the chimes are on.
     func syncCorner() {
+        let roots = (model.status["backends"] as? [[String: Any]]) ?? []
+        let root = roots.first { $0["name"] as? String == "claude" }?["root"] as? String
+        let dir = root.map {
+            (($0 as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent("sessions")
+        } ?? HOME + "/.claude/sessions"
         if model.flag("session_corner", false) {
-            if !corner.shown {
-                let roots = (model.status["backends"] as? [[String: Any]]) ?? []
-                let root = roots.first { $0["name"] as? String == "claude" }?["root"] as? String
-                corner.show(sessionsDir: root.map {
-                    (($0 as NSString).deletingLastPathComponent as NSString)
-                        .appendingPathComponent("sessions")
-                } ?? HOME + "/.claude/sessions")
-            }
+            if !corner.shown { corner.show(sessionsDir: dir) }
         } else if corner.shown {
             corner.hide()
         }
+        corner.model.sessionsDir = dir
+        corner.listening = model.flag("chimes", false)
+    }
+
+    /// A session here is done or began waiting for you, or a notice came in:
+    /// its chime, when the chimes are on and one is set for it. "Done" only
+    /// after a piece of work that took a while (`chime_done_after`).
+    func chime(_ kind: String, worked: Double = .infinity) {
+        let key = "chime_" + kind
+        guard model.flag("chimes", false), let fallback = CHIME_DEFAULTS[key],
+              kind != "done" || worked >= Double(model.number("chime_done_after", 30))
+        else { return }
+        ChimePlayer.shared.play(model.text(key, fallback), volume: model.number("chime_volume", 70))
     }
     @objc func toggleWatch() { model.toggleWatch() }
     @objc func quit() { NSApp.terminate(nil) }
@@ -5306,7 +5721,24 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
 if CommandLine.arguments.contains("--selftest") {
     let r = aht(["version"])
     print("TRAY SELFTEST \(r.ok ? "OK" : "FAIL") — core: \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))")
-    exit(r.ok ? 0 : 1)
+    let bad = Chimes.own.filter { n in                // each chime sounds, softly, no click
+        let s = Chimes.samples(n), peak = s.map { abs($0) }.max() ?? 0
+        return s.count < 4410 || peak < 0.05 || peak > 0.75 || abs(s[0]) > 0.01
+            || abs(s[s.count - 1]) > 0.01
+    }
+    print("CHIMES \(bad.isEmpty ? "OK" : "FAIL \(bad)") — \(Chimes.own.count) made")
+    exit(r.ok && bad.isEmpty ? 0 : 1)
+}
+
+// chimes: aht's own chimes as WAV files in DIR, to hear or look at them
+//   --chimes DIR
+if let i = CommandLine.arguments.firstIndex(of: "--chimes"), i + 1 < CommandLine.arguments.count {
+    for n in Chimes.own {
+        let f = URL(fileURLWithPath: CommandLine.arguments[i + 1]).appendingPathComponent(n + ".wav")
+        guard (try? Chimes.wav(n)?.write(to: f)) != nil else { print("could not write \(f.path)"); exit(1) }
+        print(f.path)
+    }
+    exit(0)
 }
 
 // corner-rows: what the session corner lists right now, one session a line

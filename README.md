@@ -99,7 +99,7 @@ terminal.
 | Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
 | Second opinion, informed sessions (use tokens; off by default) | window and terminal | terminal | untested |
 | Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab, checkup | ✓ (iTerm2) | — | — |
-| The window, Spotlight, `aht://` links, Finder Quick Actions, search shortcut, in-app guide | ✓ | — | — |
+| The window, the session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut, in-app guide | ✓ | — | — |
 
 "terminal" means the `aht` command does it; the guide gives each one.  CI
 runs the whole test suite on Linux and macOS for every push, and on real
@@ -341,7 +341,10 @@ behave the same.
   (`notify_phone = imessage:<you>` or `ntfy:<topic>`).  With
   `session_corner` on, the app also lists this Mac's open Claude sessions
   in the screen's top-right corner: working, waiting for you, or done
-  (until you click it, which goes to its tab, or it works again).
+  (until you click it, which goes to its tab, or it works again).  With
+  `chimes` on, the app plays a short chime the moment one of them is done
+  or waits for you: aht's own chimes (made by the app, no sound files), a
+  macOS sound or a file of yours, one for each.
 - **What changed** — `aht changes <folder> [--diff]`: every file a Claude
   Code session edited, before and now, from Claude's own checkpoints;
   `--revert <file> --apply` puts one back (the current one is kept aside).
@@ -467,7 +470,9 @@ for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
 `handover_mosh`, `rsync_path`, `terminal_app`; notices and reports:
 `notify_waiting`, `notify_finished`, `notify_finished_minutes`,
-`notify_phone`, `notify_limit`, `session_corner`, `offsite_backup`,
+`notify_phone`, `notify_limit`, `session_corner`, `chimes` /
+`chime_done` / `chime_waiting` / `chime_limit` / `chime_done_after` /
+`chime_volume`, `offsite_backup`,
 `report_areas`, `hotkey`;
 before and after a session: `checkpoints`, `checkpoint_keep`,
 `checkpoint_max_files`, `checkpoint_excludes`, `spotlight`, `tab_names`,

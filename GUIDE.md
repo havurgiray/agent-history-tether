@@ -21,8 +21,8 @@ acts only with `--apply`.
 - **The ∞ in the menu bar.** A number next to it counts the sessions that
   wait for you. The menu shows the status (also a project where Claude
   stopped at its usage limit), **Open aht…**, **Guide**, **Search
-  Sessions…**, **Find Moved Folders Now**, **Pause / Resume Watching** and
-  **Quit**. The menu changes nothing on its own, so a stray click is
+  Sessions…**, **Sessions in the Corner** and **Chimes** (each on or off),
+  **Find Moved Folders Now**, **Pause / Resume Watching** and **Quit**. The menu changes nothing on its own, so a stray click is
   harmless.
 - **From anywhere:** ⌃⌥⌘A opens the search. **In Finder**, right-click a
   project folder: under **Quick Actions** (or **Services**) are *aht: Show in
@@ -290,6 +290,69 @@ piece of work that took a while.
 - `aht limits` — list the sessions that stopped at Claude's usage limit in
   the last 12 hours, and when the limit resets.
 - `aht limits --hours 48` — look back two days instead.
+
+## Chimes when a session is done or waits for you
+
+A short chime the moment a Claude session on this Mac finishes a piece of
+work or starts waiting for you, so you hear it without looking. Each of
+these has its own sound, and you choose it. The chimes are off until you
+turn them on: Settings → Chimes, or **Chimes** in the aht menu.
+
+> **Example.** Three sessions work on three projects while you read a
+> paper. A *doorbell* means one needs an answer from you (a permission, a
+> question); three notes going up mean one is done. The corner, or the
+> number next to the ∞, shows which.
+
+- **Waits for you** (Doorbell), **Is done** (Bloom) and **Hits the usage
+  limit** (Ebb, when Claude stops at its usage limit) each have their own
+  chime. A chime you pick
+  plays at once, so you hear what you chose; ▶ plays it again.
+- **Is done … after working at least** 30 seconds (from *any length* to 10
+  minutes): a quick answer in the session you are typing in stays quiet.
+- **aht's own chimes** are made by the app itself from notes of one scale,
+  so two in a row never clash. Each is about as loud as the sounds of macOS
+  at its loudest moment, so a short one is no louder than a long one:
+  - *Bloom*: three notes going up (made for "done").
+  - *Settle*: a falling fifth, calmer.
+  - *Doorbell*: ding-dong (made for "waits for you").
+  - *Tap*: two light wooden knocks.
+  - *Ask*: two notes going up, like a question.
+  - *Ebb*: three low notes going down (made for the usage limit).
+  - *Drop*: a single water drop.
+
+  The short ones, a fifth of a second each:
+  - *Ebb1*, *Ebb2*, *Ebb3*: Ebb's notes, one each, from high to low.
+  - *Felt*: one low note, like a piano with felt on its hammers.
+  - *Hush*: a soft tone that swells and fades, with no strike at all.
+  - *Pluck*: a soft plucked string.
+  - *Bubble*: a low bubble, rising.
+  - *Puff*: a short breath, no note; the quietest.
+
+  Below them in the list are the sounds of macOS (Glass, Ping, Purr…) and
+  any in your `~/Library/Sounds`. **Choose a File…** takes any short sound
+  file, and **None** keeps that one quiet.
+- **Volume** sets the chimes only, not your Mac; letting go of the slider
+  plays one.
+- **How it knows:** aht reads Claude Code's own records of its sessions
+  every second and a half, as the corner does, so it needs no tokens. Only
+  sessions you work in chime, not scripted ones (`claude -p`), and sessions
+  that finish together make one chime. A session on another machine, and
+  the usage limit, chime when their notice arrives, so those notices must
+  be on (see *Know when a session needs you*). With chimes on, these
+  notices make no sound of their own, so you hear one sound, not two.
+- Only the Mac app plays chimes, and only while it runs.
+
+**In the terminal:**
+
+- `aht config --set chimes=true` — turn the chimes on.
+- `aht config --set chime_done=Glass` — the chime for "done": one of aht's
+  own (Bloom, Settle, Doorbell, Tap, Ask, Ebb, Drop, and the short Ebb1,
+  Ebb2, Ebb3, Felt, Hush, Pluck, Bubble, Puff), a sound of macOS by its
+  name, or the path of a sound file; `chime_done=` for none. The same for
+  `chime_waiting` and `chime_limit`.
+- `aht config --set chime_done_after=60` — chime "done" only after at least
+  a minute of work.
+- `aht config --set chime_volume=40` — quieter chimes (0 to 100).
 
 ## Every session starts informed (uses tokens, off by default)
 
@@ -941,6 +1004,8 @@ a part opens its section; the **?** at the top opens the whole guide.
 - **Histories:** notifications, automatic backups, **Back Up Now**,
   **Check All for Secrets…**
 - **Notices:** waiting for you, done; also to your phone.
+- **Chimes:** on or off; a chime each for waits for you, done and the usage
+  limit; their volume.
 - **The Claude app on your phone:** name sessions after their iTerm2 tabs;
   whether Remote Control is on for every session.
 - **Safety nets (no tokens):** a copy of the folder at each session start,
@@ -1049,6 +1114,14 @@ all of them can be set with `aht config --set name=value` and put back with
 - `notify_limit` (on) — a session stopped at Claude's usage limit.
 - `session_corner` (off) — the app lists the open Claude sessions in the
   screen's top-right corner (*Sessions in the corner*).
+- `chimes` (off) — the app plays a chime when a session here is done or
+  waits for you (*Chimes when a session is done or waits for you*).
+- `chime_done` (Bloom), `chime_waiting` (Doorbell), `chime_limit` (Ebb) —
+  which chime: one of aht's own, a sound of macOS by its name, or the path
+  of a sound file; empty for none.
+- `chime_done_after` (30) — "done" chimes only after at least that many
+  seconds of work.
+- `chime_volume` (70) — how loud the chimes are, 0 to 100.
 
 **Search, reports, the Mac**
 

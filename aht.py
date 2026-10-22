@@ -158,6 +158,13 @@ CONFIG_DEFAULTS = {
     "workspace_keep":   40,          #   the last this many layouts are kept
     "session_corner":   False,       # the app lists the open Claude sessions in
                                      #   the screen's top-right corner
+    "chimes":           False,       # the app chimes when a session here is done
+                                     #   or waits for you
+    "chime_done":       "Bloom",     #   aht's own chime, a macOS sound's name or
+    "chime_waiting":    "Doorbell",  #   a sound file; "" = none
+    "chime_limit":      "Ebb",       #   (with the usage-limit notice)
+    "chime_done_after": 30,          #   "done" after work of this many seconds
+    "chime_volume":     70,          #   0-100
 }
 
 POLICY_CHOICES = {
@@ -185,6 +192,8 @@ def _coerce(key: str, raw: str):
         raise ValueError(f"{key} expects a boolean, got {raw!r}")
     if isinstance(d, float):
         return float(raw)
+    if key == "chime_volume":
+        return max(0, min(100, int(raw)))
     if isinstance(d, int) and not isinstance(d, bool):
         return int(raw)
     if key == "log_level":

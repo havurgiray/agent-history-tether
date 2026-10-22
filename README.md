@@ -541,6 +541,13 @@ Cursor/OpenCode/Copilot layouts are implemented from best-effort knowledge and
 self-verify at runtime (they no-op rather than guess); the tray UIs need a
 real desktop of each OS for full exercise.
 
+## Privacy
+
+aht runs on your computer and sends the author nothing; with its default
+settings it makes no network connections.  [PRIVACY.md](PRIVACY.md) lists
+what it reads, changes and keeps, what can leave your device once you set
+it up, and how to delete all of it.
+
 ## License
 
 Copyright (C) 2026 Giray Havur

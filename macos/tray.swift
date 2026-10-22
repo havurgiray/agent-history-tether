@@ -4872,6 +4872,9 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     var window: NSWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // with no window open macOS takes the app for idle and quits it
+        // ("automatic termination"); the menu bar app is meant to stay
+        ProcessInfo.processInfo.disableAutomaticTermination("aht lives in the menu bar")
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // the aht mark: a loop with no loose end (template = follows the bar's theme)
         let img = NSImage(systemSymbolName: "infinity",

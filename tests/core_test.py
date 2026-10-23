@@ -1072,7 +1072,9 @@ KEY = "sk-" + "ant-" + "api03-" + "Xq7" * 12            # a made-up key, built i
 projX = os.path.realpath(str(roots / "Across"))
 os.makedirs(projX)
 Path(projX, "app.py").write_text("print('hi')\n")
-T = time.time() - 3 * 86400
+# noon three days ago: the sessions below sit seconds apart on two days,
+# and the journal counts days, so no offset may cross a midnight
+T = time.mktime(time.localtime(time.time() - 3 * 86400)[:3] + (12, 0, 0, 0, 0, -1))
 cstore = tools / "claude" / enc(projX)
 cstore.mkdir()
 def cline(**kw):

@@ -1,0 +1,49 @@
+{
+  "mirrored": [
+    {
+      "project": "/Users/me/code/api",
+      "remote": "box",
+      "status": "paused",
+      "reason": "paused: this sync would remove 25 of the 34 files on box \u2014 allow it once, or stop syncing",
+      "paused": {
+        "at": "2026-10-27T21:20:07",
+        "remote": "box",
+        "marker": null,
+        "owner": null,
+        "reason": "removals",
+        "changed": 0,
+        "new": 0,
+        "removed": 25,
+        "history": 0,
+        "files": [
+          "src/m00.py",
+          "src/m01.py",
+          "src/m02.py",
+          "src/m03.py",
+          "src/m04.py",
+          "src/m05.py",
+          "src/m06.py",
+          "src/m07.py",
+          "src/m08.py",
+          "src/m09.py",
+          "src/m10.py",
+          "src/m11.py",
+          "src/m12.py",
+          "src/m13.py",
+          "src/m14.py",
+          "src/m15.py",
+          "src/m16.py",
+          "src/m17.py",
+          "src/m18.py",
+          "src/m19.py",
+          "src/m20.py",
+          "src/m21.py",
+          "src/m22.py",
+          "src/m23.py",
+          "src/m24.py"
+        ],
+        "total": 34
+      }
+    }
+  ]
+}

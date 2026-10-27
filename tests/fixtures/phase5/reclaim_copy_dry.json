@@ -1,0 +1,50 @@
+{
+  "command": "reclaim",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/api",
+  "mode": "copy",
+  "remote": "box",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "there": {
+    "sessions": [],
+    "processes": [],
+    "claude_version": "9.9.9"
+  },
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9",
+    "wrote_the_history": "9.9.9"
+  },
+  "removals": {
+    "removed": 0,
+    "total": 31,
+    "files": [],
+    "over": false
+  },
+  "conflicts": {
+    "project": [
+      "README.md"
+    ]
+  },
+  "plan": {
+    "project": {
+      "take": 0,
+      "new": 1,
+      "delete": 0,
+      "conflict": 1,
+      "kept": 0
+    },
+    "history": {
+      "take": 0,
+      "new": 0,
+      "delete": 0,
+      "conflict": 0,
+      "kept": 0
+    }
+  }
+}

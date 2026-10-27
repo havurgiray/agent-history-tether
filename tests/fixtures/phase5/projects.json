@@ -1,0 +1,71 @@
+{
+  "paused": {
+    "uuid": "411427d023d84383a4e8ed65b59d16d2",
+    "real_path": "/Users/me/code/api",
+    "exists": true,
+    "stores": [],
+    "updated_at": "2026-10-27T21:20:00",
+    "is_git": false,
+    "away": null,
+    "away_remote": null,
+    "away_since": null,
+    "mirror": "box",
+    "mirror_synced_at": 1793132401.572458,
+    "mirror_status": "paused",
+    "mirror_paused": {
+      "at": "2026-10-27T21:20:03",
+      "changed": 1,
+      "files": [
+        "README.md",
+        "src/new_there.py"
+      ],
+      "history": 0,
+      "marker": null,
+      "new": 1,
+      "owner": null,
+      "reason": "changed",
+      "remote": "box",
+      "removed": 0,
+      "total": 33
+    },
+    "handing": null,
+    "copy_of": null,
+    "relay": null,
+    "pickup_from": null,
+    "agents": [],
+    "open": null,
+    "limit": null,
+    "sessions": 0,
+    "bytes": 0,
+    "last_activity": null
+  },
+  "copy": {
+    "uuid": "411427d023d84383a4e8ed65b59d16d2",
+    "real_path": "/home/me/code/api",
+    "exists": true,
+    "stores": [],
+    "updated_at": "2026-10-27T21:20:12",
+    "is_git": false,
+    "away": null,
+    "away_remote": null,
+    "away_since": null,
+    "mirror": null,
+    "mirror_synced_at": null,
+    "mirror_status": null,
+    "mirror_paused": null,
+    "handing": null,
+    "copy_of": {
+      "from": "mac",
+      "kind": "sync",
+      "at": "2026-10-27T21:20:00"
+    },
+    "relay": null,
+    "pickup_from": null,
+    "agents": [],
+    "open": null,
+    "limit": null,
+    "sessions": 0,
+    "bytes": 0,
+    "last_activity": null
+  }
+}

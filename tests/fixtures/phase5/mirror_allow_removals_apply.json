@@ -1,0 +1,22 @@
+{
+  "command": "mirror",
+  "mode": "allow-removals",
+  "project": "/Users/me/code/api",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "remote": "box",
+  "paused": null,
+  "mirrored": [
+    {
+      "project": "/Users/me/code/api",
+      "remote": "box",
+      "ended_pause": "removals",
+      "replaced": 0,
+      "removed": 25,
+      "status": "synced",
+      "bytes": 0,
+      "files": 0
+    }
+  ]
+}

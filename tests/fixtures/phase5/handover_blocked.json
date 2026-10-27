@@ -1,0 +1,46 @@
+{
+  "command": "handover",
+  "applied": false,
+  "blockers": [
+    "the copy on box was changed since 21:20 (1 changed: README.md) \u2014 bring them here first (aht reclaim /Users/me/code/api --from box --apply), or pass --replace-there to set them aside there"
+  ],
+  "warnings": [],
+  "project": "/Users/me/code/api",
+  "remote": "box",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "there": {
+    "host": "box",
+    "system": "Darwin",
+    "home": "/home/me",
+    "claude": "/usr/local/bin/claude",
+    "claude_version": "9.9.9",
+    "path_exists": true,
+    "path_writable": true,
+    "free_bytes": 123456789012,
+    "sessions": [],
+    "processes": []
+  },
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9"
+  },
+  "session": null,
+  "sessions": 0,
+  "title": null,
+  "outside_not_carried": [],
+  "task": null,
+  "copy_changed": {
+    "changed": 1,
+    "new": 0,
+    "removed": 0,
+    "history": 0,
+    "files": [
+      "README.md"
+    ],
+    "conversations": [],
+    "since": "2026-10-27T21:20:09"
+  }
+}

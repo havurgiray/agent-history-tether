@@ -1,0 +1,65 @@
+{
+  "command": "mirror",
+  "mode": "replace",
+  "project": "/Users/me/code/web",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "remote": "box",
+  "paused": {
+    "at": "2026-10-27T21:20:10",
+    "changed": 0,
+    "files": [
+      "notes.txt"
+    ],
+    "history": 0,
+    "marker": null,
+    "new": 0,
+    "owner": "none",
+    "reason": "other-folder",
+    "remote": "box",
+    "removed": 0,
+    "total": 1
+  },
+  "removals": {
+    "removed": 1,
+    "total": 1,
+    "files": [
+      "notes.txt"
+    ],
+    "over": false
+  },
+  "check": {
+    "changes": null,
+    "removals": {
+      "removed": 1,
+      "total": 1,
+      "files": [
+        "notes.txt"
+      ],
+      "over": false
+    },
+    "names": [],
+    "pause": {
+      "at": "2026-10-27T21:20:10",
+      "remote": "box",
+      "marker": null,
+      "owner": "none",
+      "reason": "other-folder",
+      "changed": 0,
+      "new": 0,
+      "removed": 0,
+      "history": 0,
+      "files": [
+        "notes.txt"
+      ],
+      "total": 1
+    }
+  },
+  "aside": "/home/me/.aht/remote/replaced/972eb4a28245488bb1b62d6d87b59b2f/",
+  "would": {
+    "replace": 1,
+    "remove": 1,
+    "total": 1
+  }
+}

@@ -186,3 +186,12 @@ label.check { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
 .fix code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; overflow-wrap: anywhere; }
 details.later > summary { cursor: pointer; }
 details.later > summary h3 { display: inline; }
+/* Keep in sync that paused to ask: what it found there, and the ways on */
+.callout.sync > * + * { margin-top: 6px; }
+.callout ul.files { margin: 4px 0 0; padding-left: 18px; }
+.callout ul.files li { overflow-wrap: anywhere; }
+/* a folder here that another machine keeps in sync */
+.copyof .badge { color: var(--accent); }
+/* Machines: the projects kept in sync with one, and the paused ones */
+.synced { margin-top: 4px; }
+.synced button.link { font-size: inherit; }

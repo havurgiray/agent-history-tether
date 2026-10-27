@@ -1,0 +1,22 @@
+{
+  "command": "mirror",
+  "mode": "replace",
+  "project": "/Users/me/code/web",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "remote": "box",
+  "paused": null,
+  "mirrored": [
+    {
+      "project": "/Users/me/code/web",
+      "remote": "box",
+      "ended_pause": "other-folder",
+      "replaced": 1,
+      "removed": 1,
+      "status": "synced",
+      "bytes": 44,
+      "files": 2
+    }
+  ]
+}

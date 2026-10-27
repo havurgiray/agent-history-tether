@@ -1,0 +1,18 @@
+{
+  "on": true,
+  "applied": false,
+  "blockers": [],
+  "projects": [
+    {
+      "uuid": "5d6308df20d04accb411692c0bd9ba6d",
+      "project": "/home/me/code/notes",
+      "files": 2,
+      "bytes": 55
+    }
+  ],
+  "bytes": 55,
+  "remote": "mac",
+  "copies_skipped": [
+    "/home/me/code/api"
+  ]
+}

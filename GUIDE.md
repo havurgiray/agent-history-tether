@@ -1486,7 +1486,9 @@ the laptop or your phone.
   says it.
 - **Keep in sync:** tick it for a project, and aht copies it in the
   background every 30 minutes, so a handover only sends the last changes.
-  A Release pauses it (see below). A sync run checks each project again
+  It never overwrites work done in the copy there: it pauses and asks (see
+  *Keep in sync looks first* below). A Release pauses it too (see below).
+  A sync run checks each project again
   right before it sends it: one released, handed over or switched off
   while the run is under way is not sent, and the run lists it as
   *paused*, or as *skipped* with why (*Keep in sync is off for it now*).
@@ -1494,7 +1496,12 @@ the laptop or your phone.
   Sync…*. aht first adds up what the first copy sends (projects inside
   another project travel with it; rebuilt folders such as `node_modules`
   stay behind) and asks. The first copy runs in the background and can
-  take hours for tens of gigabytes; after that only changes travel.
+  take hours for tens of gigabytes; after that only changes travel. A
+  paused project stays paused, and the question names it. Under each
+  machine, aht's window says how many projects are kept in sync with it
+  and which are paused (*4 projects kept in sync with box · 2 paused: api,
+  web*); a click on a name opens that project. On a Mac, *2 paused* sits
+  next to the **Sync** menu and shows them in Projects.
 - **Nothing is lost:** whatever a transfer replaces is set aside first: in
   `~/.aht/handover/<project id>/replaced/` here, and in
   `~/.aht/remote/replaced/` on the other machine (Claude's checkpoints and
@@ -1515,6 +1522,95 @@ the laptop or your phone.
   Windows machine yet*, and nothing is made on the PC. A PC can ask your
   Mac and Linux machines, though: see *A Windows PC with your other
   machines*.
+
+**Keep in sync looks first.** Before each sync, aht compares the copy on
+the other machine with the list of that copy it kept after the last sync,
+handover or take-back. So no clock matters. When the copy there was worked
+on, the sync pauses, sends nothing, and the project asks what to do. A file
+that was only touched does not pause it: when a file's size is the same on
+both machines, aht compares its content on both.
+
+> **Example.** You keep paper in sync with box. One evening you fix a typo
+> in `README.md` on box itself and add `notes/box.md`. At the next sync,
+> paper shows *Keep in sync with box is paused*: *The copy on box was
+> changed since the last sync (1 changed and 1 new): README.md,
+> notes/box.md. Nothing was sent; that work is still there.* (in aht's
+> window *Keep in sync with box paused: the copy there was changed*). A
+> notice says *Keep in sync paused: paper*. **Bring Them Here…** brings
+> both files into this Mac's copy; then the sync runs, and the copy on box
+> is the same as this one again.
+
+- **Why a sync pauses:**
+  - *the copy there was changed:* files there changed, new or removed
+    since the last sync, or a conversation that went on there (a new
+    conversation there does not count: a sync leaves it alone). The pause
+    lists the files.
+  - *it would remove many files there:* more than 200, or more than a
+    quarter of the files there once there are at least 20. These are
+    files gone here since the last sync.
+  - *the folder there holds something else:* the first sync into a folder
+    there that already has files and no project id, or another project's.
+- **The answers.** Each pause offers only those that fit it.
+  - **Bring Them Here…** works like Take Back on the copy: the same plan,
+    the same question. What the changes replace here is set aside first,
+    and a file changed on both machines is kept in both versions (yours
+    stays, theirs goes next to it as `README (from box 2026-10-27).md`).
+    Then the sync runs. Not while a session is open in the folder there.
+    If it would remove many files here (more than 200, or a quarter of
+    20 or more), it lists them and asks first
+    (`aht reclaim <path> --allow-removals`). It never removes anything
+    under `.aht/`, and it stops when the folder there is missing or empty.
+  - **Replace Them…** sends this copy over the one there, once. What it
+    replaces there (the work done there, or the other folder's files) is
+    set aside on box first, in `~/.aht/remote/replaced/<project id>/`.
+  - **Allow the Removals…** lets this one sync remove those files there.
+    They are set aside there first. If they went missing here by mistake,
+    get them back first (Undo a Session, or a backup).
+  - **Stop Syncing** turns Keep in sync off. The copy there stays as it
+    is, with the work done there.
+
+  Each pause gives one notice, to your phone too with *Also send them to
+  my phone*. Ticking **Keep in sync** off and on again ends the pause, but
+  the next sync looks again, and pauses again while the copy there still
+  differs.
+- **Hand Over looks too.** When the copy there was changed since the last
+  sync, handover or take-back, Hand Over stops and names what changed:
+  *the copy on box was changed since 20:23 (1 changed: README.md) — bring
+  them here first (aht reclaim /Users/me/Desktop/paper --apply), or pass
+  --replace-there to set them aside there*. aht's window asks with
+  **Bring Them Here…** and **Replace Them There…**; a Mac with **Bring
+  Them Here…** and **Replace Them…**. Replacing sets that work aside on
+  box before the handover.
+- **Copies from elsewhere.** The other machine keeps a list of the folders
+  that are copies of another machine's projects
+  (`~/.aht/remote/copies.json` there): which project, which machine sent
+  it, and since when. Where aht is installed on box:
+  - Keep in sync for such a folder is refused, since one folder would be
+    synced both ways: *Keep in sync was not turned on: this folder is a
+    copy kept in sync from mac: syncing it from here too would sync one
+    folder both ways. Keep it in sync from mac only, or turn Keep in sync
+    off there first*. A folder handed over from mac is refused too (*it
+    goes back to mac*). An old copy whose project went back home may be
+    kept in sync.
+  - **Keep All Projects in Sync…** leaves those folders out and names them
+    (*Left out: 1 folder that is a copy of another machine's projects
+    (api).*).
+  - the project says where it came from: *Copy kept in sync from mac*,
+    *Handed over from mac*, or *A copy of a project that went back to
+    mac*.
+  - a Claude Code session that starts in the folder gets one line from
+    aht's hook: *[aht] This folder is a copy kept in sync from “mac”;
+    changes made here pause that sync.*
+
+  Turning Keep in sync off on mac asks box to drop that folder from its
+  list. A box that does not answer keeps it there, which only stops box
+  from syncing that folder itself.
+- **Names the other disk cannot hold apart**, such as `README.md` and
+  `readme.md` for a Mac's disk, or one name in two Unicode forms, do not
+  pause a sync. They are listed: `aht mirror --run --json` gives them
+  under `names`, and the dry run of `--replace` or `--allow-removals` warns
+  (*1 × two files whose names differ only in capitals, e.g. README.md /
+  readme.md*).
 
 **A handover cut off halfway.** When the link drops or this Mac sleeps
 during a handover, aht cannot tell at once whether the session there
@@ -1565,10 +1661,11 @@ before the session there starts says *did not finish* at once.
   stays as it is.* The project then shows *Keep in sync with homebox is
   paused* with **Turn Sync Back On…**; the list says *sync paused* in aht's window (its switch
   reads *Keep in sync with homebox (paused)*) and *paused* in the Mac's
-  *In sync* column. **Turn Sync Back On…** asks first: the next sync makes
-  the copy there the same as this one and replaces the work left there,
-  which is set aside on homebox first (in `~/.aht/remote/replaced/`).
-  Once aht has switched the sync back on, a note says *Kept in sync with
+  *In sync* column. **Turn Sync Back On…** asks first. The next sync then
+  looks at the copy there (see *Keep in sync looks first* above): when
+  work was left there, it pauses again and asks, with **Bring Them Here…**
+  and **Replace Them…**. Once aht has switched the sync back on, a note
+  says *Kept in sync with
   homebox again; the next copy runs in the background.* If it could not,
   the note says *The sync was not turned back on:* and aht's reason (for
   example, that no other machine is set up yet). On a Mac, if the list
@@ -1580,7 +1677,8 @@ before the session there starts says *did not finish* at once.
   does a Take Back from it). Hand Over says so first: *the copy that
   Release left on homebox is replaced by this one (aht sets it aside there
   first); Keep in sync with homebox goes on again once the project is back
-  here*.
+  here*. When work was left in that copy, Hand Over stops first and offers
+  Bring Them Here or Replace Them (see *Hand Over looks too* above).
 - **A session started here** while a handover is unfinished is warned.
   After a Release, the next session here is told once that the work done
   there did not come here.
@@ -1647,10 +1745,25 @@ before the session there starts says *did not finish* at once.
   other machine, updated every 30 minutes. After a Release,
   `aht mirror ~/Desktop/paper --on --to homebox` turns the paused sync back
   on.
-- `aht mirror ~/Desktop/paper --off` — stop that; `aht mirror --run` syncs
-  every kept copy now, and lists a paused one as *paused since the project
-  was released; turn Keep in sync on again to send it*. `aht mirror` lists
-  the kept copies, a paused one with *[paused: it was released]*.
+- `aht mirror ~/Desktop/paper --off` — stop that (also **Stop Syncing**:
+  the copy there stays as it is); `aht mirror --run` syncs
+  every kept copy now, and lists a paused one with why: *paused since the
+  project was released; turn Keep in sync on again to send it*, or *paused:
+  1 changed and 1 new in the copy on box — bring them here, replace them,
+  or stop syncing*. `aht mirror` lists the kept copies, a paused one with
+  *[paused: it was released]* or *[paused: the copy there was changed]*.
+- `aht mirror ~/Desktop/paper --replace` — say what Replace Them would
+  set aside in the copy there, without sending anything; `--apply` sends
+  this copy over the one there, once, with theirs set aside there.
+- `aht mirror ~/Desktop/paper --allow-removals` — say how many files the
+  paused sync would remove there; `--apply` lets it, once, with those
+  files set aside there.
+- `aht reclaim ~/Desktop/paper --apply` — for a project that is here,
+  **Bring Them Here**: the changes made in its copy there since the last
+  sync, handover or take-back come here, then the sync runs. Without
+  `--apply` it shows what would come.
+- `aht handover ~/Desktop/paper --replace-there --apply` — hand over
+  although the copy there was changed; that work is set aside there first.
 - `aht mirror --all --on --to homebox` — show what keeping every project in
   sync with homebox would send; `--apply` does it. `aht mirror --all --off
   --apply` stops it for all of them.
@@ -2002,13 +2115,16 @@ a part opens its section; the **?** at the top opens the whole guide.
   that is not a link, **Remove…**).
 - **The project list:** *Where* (here, handed over, handing over, missing,
   a session open, working or waiting for you), *In sync* (when the kept
-  copy was last synced; *paused* while the project is handed over or after
-  a Release), *Last used*,
+  copy was last synced; *paused* while the project is handed over, after
+  a Release, or while a sync waits for an answer), *Last used*,
   *Agents* (whose history it has).
 - **Under the list, for the selected project:** **Hand Over…** or, while it
   is away, **Take Back…**, **Open Session** and **Release…**; while a
   handover is unfinished, a note with **Check Now** and **Release…** (see
-  *Hand a project over to another machine*); **Keep in sync**;
+  *Hand a project over to another machine*); **Keep in sync**, and a note
+  when a sync paused, with **Bring Them Here…**, **Replace Them…**,
+  **Allow the Removals…** or **Stop Syncing** (see *Keep in sync looks
+  first*);
   **Continue Session** (opens the latest session in a new terminal window);
   **Switch Agent**; **Machines**, once you added one, with *Pick Up from
   box…*, *Leave a Note on box…* and, while work picked up from box is
@@ -2027,7 +2143,8 @@ a part opens its section; the **?** at the top opens the whole guide.
   machines*; *Resume*, *Restore…* and *Show Project* on each result, and
   *Continue Here…* on one from another machine.
 - **Machines tab:** the machines you added, with **Sync** (keep every
-  project in sync with it, or stop), **Check**, **Use for Handover** and
+  project in sync with it, or stop) and how many of those syncs are
+  paused, **Check**, **Use for Handover** and
   **Remove…** (refused, with the reason, while the machine holds a
   project), and under each one **Watch** and when aht last heard from it;
   **Add Another…**; machines aht found on your

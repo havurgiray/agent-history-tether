@@ -206,9 +206,9 @@ encrypt it.
 | What | What it holds | How long it is kept |
 |---|---|---|
 | `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`) and whether you watch it (`remotes.<name>.watch`) | until you delete it, or `aht uninstall --purge` |
-| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, or writes a record of a switch, a Pick Up or a note into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
+| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, syncs or hands a project over to another machine (whose `copies.json` names this computer by it), or writes a record of a switch, a Pick Up or a note into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
 | `offsite.json` | which backups were sent to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched; it replaces `run/offsite.json`, which older versions wrote and aht removes | rewritten at each copy and fetch |
-| `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync and with which machine (and, when a release paused that, why, when and for which machine), and how the last take-back or release went (how many files changed, and the names of those kept in both versions); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
+| `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync and with which machine (and, when a release or a sync paused that, why, when and for which machine; for a sync's pause also how many files were changed, new or removed there and the names of up to 50 of them, or for a folder there that held something else the names of up to 50 of its files and its project identifier, if any), names the disk there cannot hold apart (up to 10 groups of each kind), and how the last take-back or release went (how many files changed, and the names of those kept in both versions); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
 | `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session identifiers, the names of your other machines (and, when aht reached one by its Tailscale address, that address), the notices it showed (for example "input needed" or "the agent finished after 4 minute(s)"), warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one, so about 10 MB at most |
 | `aht-watcher.log` (macOS, Windows), `aht-watcher.err` and `aht-notices.err` (macOS) | the background watcher's and the notices check's own output, including any errors, which can name project folders; on Linux the watcher's goes to your user journal instead (`journalctl --user -u aht-watcher`) | not rotated; delete them any time |
 | `backups/` | see [Backups](#backups) | the newest 10 snapshots per project; copies made before a rewrite, until you delete them |
@@ -216,7 +216,7 @@ encrypt it.
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`, on by default), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`) |
 | `workspaces/` | macOS: saved iTerm2 layouts (this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session identifiers, each Claude session's name, with keys masked, and the options it was started with that it keeps when it starts again: permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, and `--verbose`, never a first prompt; the tab titles are kept as iTerm2 has them, so that restoring a layout sets them back) | the newest 40 (`workspace_keep`) |
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
-| `handover/<project id>/` | for a project handed over: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files), and in `replaced/` what a take-back replaced or removed here | the list until the project is back or released, then the newest 5 earlier lists; in `replaced/` the newest 5 folders and every one younger than 30 days |
+| `handover/<project id>/` | for a project handed over: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files); for a project handed over or kept in sync, one file per machine in `there/` (`there/<machine>.json`; an older `there.json` is read the same way): the lists of its files and folders and of its Claude history on both machines (names, sizes, times, link targets, and checksums of the files there up to 64 MB each) as they were after the last sync, handover or take-back with that machine, with that machine's name in aht and the folder's path there, which the next sync, Hand Over and *Bring Them Here* compare the copy there with; and in `replaced/` what a take-back (also *Bring Them Here*) replaced or removed here | the list until the project is back or released, then the newest 5 earlier lists; each machine's file in `there/` until the next sync, handover or take-back with that machine replaces it; in `replaced/` the newest 5 folders and every one younger than 30 days |
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
 | `run/` | short-lived state: notices already shown (with when each of your other machines was last asked for them, and since when one that holds a project of yours has not answered), open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
 | `run/board.json` | for each of your other machines, when it last answered and the sessions it had open then: for each session its agent, project folder (the path there), process and session ids, state and since when, and its name, title and what it waits for, masked as that machine sent them | rewritten each time one of those machines answers; a machine you remove, or add again under the same name, is dropped at once |
@@ -318,7 +318,22 @@ features below send data, and only after you set them up.
    Claude Code's Remote Control.  Whatever a handover or a sync replaces or removes there
    (also Claude Code's checkpoints and plans) is set aside first, in
    `~/.aht/remote/replaced/` there; for each project the newest 5 of those
-   folders and every one younger than 30 days are kept.  To start the
+   folders and every one younger than 30 days are kept.  Each sync and
+   each handover notes the folder there as a copy of a project of this
+   computer, in `~/.aht/remote/copies.json` on that machine: the folder's
+   path there, the project's identifier, this computer's name and its
+   random identifier (from `machine.json`), the kind of copy (kept in
+   sync, handed over, or an old copy whose project went back here), since
+   when, and for a handover the identifier of its attempt.  A take-back
+   changes the note's kind, and turning Keep in sync off asks that machine
+   to drop it.  aht writes that file in one place only, for those steps.
+   When aht is installed on that machine, it reads the file there: to say
+   where such a folder came from (in its window, and in one line its hook
+   adds to a Claude session that starts in the folder), to refuse to keep
+   such a folder in sync from there too, and to leave it out of *Keep All
+   Projects in Sync*.  When aht checks a folder there, that machine also
+   answers whether it counts the folder as such a copy, as a project of its
+   own, or neither.  To start the
    session there, aht writes a few small files in
    `~/.aht/remote/run/aht-<project name>-<6 characters of its id>/` there:
    the note the session reads first, its settings, the command it runs
@@ -407,9 +422,21 @@ features below send data, and only after you set them up.
      subjects, file names and summaries are masked there (as under
      [Security](#security)), and the summary again here.  Leave a Note
      reads the same, without a summary.
+   - *File lists of a project's copy:* before each sync, when Hand Over
+     checks a copy that was synced or handed over before, and for a
+     take-back (also *Bring Them Here*), that machine sends the list of the
+     project's files and folders there and of its Claude history there:
+     names, sizes, modification times, link targets and which files are
+     executable.  It also sends SHA-256 checksums of some files: those
+     whose size is the same on both machines, so that a file that was only
+     touched does not count as changed, and, for a take-back, the
+     conversation files that went on there, to check that each continues
+     the one that left.
    - aht keeps only the last session list of each machine, and when that
      machine last answered, in `~/.aht/run/board.json` (see
      [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)),
+     the file lists from the last sync, handover or take-back of each
+     project with each machine, in `~/.aht/handover/<project id>/there/<machine>.json`,
      and the summary you picked up, with its record, in the project's
      `.aht/handover/` here (with `--apply`: *Open in* or *Copy the Start
      Line*; a look that writes nothing keeps nothing).
@@ -475,7 +502,10 @@ features below send data, and only after you set them up.
    off or offline)."); the one that says it answers again stays on this
    computer.  The notices about a handover that was cut off (it
    finished, it did not finish, or the other machine has not answered for
-   an hour) go there too, and name the project and the machine.
+   an hour) go there too, and name the project and the machine.  So does
+   the one notice when Keep in sync pauses: it names the project and the
+   machine, and how many files were changed there or would be removed
+   ("Keep in sync paused: api").
 3. **Features that start an AI agent**, all off until you turn them on or
    ask for them: informed sessions, going on in another agent at Claude's
    usage limit, second opinion, night shift, switching agents and handing
@@ -501,8 +531,13 @@ features below send data, and only after you set them up.
    (which machine has it, since when, and in which agent).  A note that
    hands work back, or a Pick Up that brings it back to Claude Code's own
    session, gives that session its catch-up, at most 2,000 characters,
-   once.  On another machine, aht installed there adds these lines.
-   These go to Anthropic with your next message in that session.
+   once.  In a folder that `~/.aht/remote/copies.json` names as a copy of
+   another machine's project, the hook adds one line to each Claude
+   session that starts there: that machine's name, and whether the copy is
+   kept in sync from it, was handed over from it, or is an old copy of a
+   project that went back to it.  On another machine, aht installed there
+   adds these lines.  These go to Anthropic with your next message in
+   that session.
 4. **What an agent does with its own files.**  The session names aht
    records become part of the agent's history.  An agent may sync that
    history; Claude Code, for example, shows session names in the Claude app
@@ -584,8 +619,10 @@ access to them and no control over them.
    havurgiray.aht` or `scoop uninstall aht`, and the `%LOCALAPPDATA%\aht`
    folder.
 4. If you used other machines: delete `~/.aht` there too (it holds this
-   computer's backups in `~/.aht/offsite/<id>/` and the copies of aht in
-   `~/.aht/remote/aht-*.py`), any project copies you no longer want, the
+   computer's backups in `~/.aht/offsite/<id>/`, the copies of aht in
+   `~/.aht/remote/aht-*.py`, and the list of folders there that are copies
+   of your projects, `~/.aht/remote/copies.json`), any project copies you
+   no longer want, the
    summaries and records that Pick Up and Leave a Note left in those
    projects' `.aht/handover/`, and `~/.claude.json.bak-aht` if a handover
    left one.  Here, deleting

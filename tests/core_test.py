@@ -975,11 +975,22 @@ def phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row):
        and Path(str(box) + projW, "w.txt").read_text() == "changed there\n",
        f"Release pauses Keep in sync with that machine: the next sync leaves the copy "
        f"there as it is ({row.get('mirror_paused')})")
+    # turned on again, the sync looks first: the work Release left there
+    # (a file and the conversation) pauses it; Replace Them sends this copy
+    # over it, with theirs set aside there
     hrun("mirror", projW, "--on", "--to", "box")
-    J(hrun("mirror", "--run", "--due", "--json"))
-    ck(project_row(projW).get("mirror_paused") is None
-       and Path(str(box) + projW, "w.txt").read_text() == "w\n",
-       "…until it is turned on again")
+    rows = J(hrun("mirror", "--run", "--due", "--json")).get("mirrored") or [{}]
+    p = project_row(projW).get("mirror_paused") or {}
+    ck(rows[0].get("status") == "paused" and p.get("reason") == "changed"
+       and p.get("files") == ["w.txt"] and p.get("history") == 1
+       and Path(str(box) + projW, "w.txt").read_text() == "changed there\n",
+       f"…turned on again, the sync finds the work left there and pauses ({p})")
+    d = J(hrun("mirror", projW, "--replace", "--apply", "--json"))
+    kept = list((bhome / ".aht" / "remote" / "replaced" / entry(projW)[0]).rglob("w.txt"))
+    ck(d.get("applied") and project_row(projW).get("mirror_paused") is None
+       and Path(str(box) + projW, "w.txt").read_text() == "w\n"
+       and any(k.read_text() == "changed there\n" for k in kept),
+       f"…Replace Them sends this copy, theirs set aside there ({d.get('mirrored')})")
     # …or until a handover to that machine sends this copy over the one the
     # release left there (set aside there first): the pause ends with it, so
     # once the project is back the sync goes on
@@ -987,8 +998,13 @@ def phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row):
     Path(str(box) + projW, "w.txt").write_text("changed there again\n")
     J(hrun("reclaim", projW, "--release", "--apply", "--json"))
     paused_again = project_row(projW).get("mirror_paused")
-    plan = J(hrun("handover", projW, "--no-start", "--json"))
-    d = J(hrun("handover", projW, "--apply", "--no-start", "--json"))
+    blocked = J(hrun("handover", projW, "--no-start", "--json"))
+    ck(any("--replace-there" in b for b in blocked.get("blockers", []))
+       and (blocked.get("copy_changed") or {}).get("files") == ["w.txt"],
+       f"a handover over the copy Release left (changed there) blocks: Bring Them Here or "
+       f"--replace-there ({blocked.get('blockers')})")
+    plan = J(hrun("handover", projW, "--no-start", "--replace-there", "--json"))
+    d = J(hrun("handover", projW, "--apply", "--no-start", "--replace-there", "--json"))
     row = project_row(projW)
     ck(paused_again and plan.get("ends_pause") == "box"
        and any("the copy that Release left on box is replaced" in w
@@ -1428,6 +1444,565 @@ def phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row):
                 os.kill(int(rec["pid"]), 15)
             except OSError:
                 pass
+
+FIXTURES5 = HERE / "fixtures" / "phase5"
+
+def phase5_suite(henv, hrun, J, project_row):
+    """Look before a sync overwrites: the copy there is compared with its own
+    list from the last sync; a change there, many removals or another folder
+    pause the sync; Bring Them Here, Replace Them, Allow the Removals; the
+    copies note on the other machine and what it stops there; Hand Over's
+    look at a changed copy."""
+    print("\n[16c] look before a sync overwrites")
+    fx = []
+    def fx5(real, name, part=None):
+        sample = json.loads((FIXTURES5 / name).read_text())
+        return [f"{name}{m}" for m in same_shape(real, sample[part] if part else sample)]
+    box = Path(os.path.realpath(sb)) / "box5"      # a machine of its own for these
+    bhome = box / "home"
+    (bhome / ".claude" / "projects").mkdir(parents=True)
+    hrun("config", "--set", "remotes=" + json.dumps({"box": {"root": str(box)}}))
+    nlog = sb / "notices-phase5.log"
+    def nrun(*a, **extra):
+        return J(run(*a, extra_env=dict(henv, AHT_NOTIFY_LOG=str(nlog), **extra)))
+    def told():
+        return [json.loads(l) for l in nlog.read_text().splitlines()] if nlog.is_file() else []
+    def reg_entry(path):
+        reg = json.loads((sb / ".aht" / "registry.json").read_text())
+        return next((u, e) for u, e in reg["projects"].items() if e["real_path"] == path)
+    def copies_there():
+        try:
+            return json.loads((bhome / ".aht" / "remote" / "copies.json").read_text())
+        except (OSError, ValueError):
+            return {}
+    # box itself, with aht: its own home, its own registry, the Mac as "mac"
+    benv = dict(iso_env("box5"), HOME=str(bhome), AHT_HOME=str(bhome / ".aht"),
+                AHT_ROOT_CLAUDE=str(bhome / ".claude" / "projects"), AHT_MACHINE_NAME="box")
+    def brun(*a):
+        return subprocess.run([PY, CLI, *a], env=benv, capture_output=True, text=True)
+    brun("config", "--set", "remotes=" + json.dumps({"mac": {"root": str(sb / "mac5")}}))
+    here = core._here()
+
+    projS = os.path.realpath(str(roots / "Synced"))
+    os.makedirs(projS + "/src")
+    for i in range(40):
+        Path(projS, "src", f"f{i:02d}.py").write_text(f"x = {i}\n")
+    Path(projS, "README.md").write_text("readme\n")
+    far = Path(str(box) + projS)
+    hrun("mirror", projS, "--on", "--to", "box")
+    rows = nrun("mirror", projS, "--run", "--json").get("mirrored") or [{}]
+    uidS = reg_entry(projS)[0]
+    thr = sb / ".aht" / "handover" / uidS / "there" / "box.json"
+    t1 = json.loads(thr.read_text()) if thr.is_file() else {}
+    c = copies_there().get(str(far)) or {}
+    ck(rows[0].get("status") == "synced" and t1.get("kind") == "sync"
+       and t1.get("remote") == "box" and "src/f00.py" in t1.get("here", {}).get("project", {})
+       and "src/f00.py" in t1.get("there", {}).get("project", {})
+       and c.get("kind") == "sync" and c.get("uuid") == uidS and c.get("from") == here
+       and c.get("from_id") and c.get("at"),
+       f"a sync writes there/box.json (both sides' lists) and box notes its copy in "
+       f"copies.json ({rows[0].get('reason')}, {c})")
+
+    # only touched there: no pause
+    time.sleep(1.1)
+    os.utime(far / "src" / "f01.py")
+    rows = nrun("mirror", projS, "--run", "--json").get("mirrored") or [{}]
+    ck(rows[0].get("status") == "synced" and not told(),
+       f"a file there that was only touched does not pause the sync ({rows[0].get('reason')})")
+
+    # touched there and edited here: the copy there is compared with the
+    # checksum the last sync left in the base, not with this side's file
+    time.sleep(1.1)
+    os.utime(far / "src" / "f02.py")
+    Path(projS, "src", "f02.py").write_text("x = 2  # edited here\n")
+    rows = nrun("mirror", projS, "--run", "--json").get("mirrored") or [{}]
+    sums = (json.loads(thr.read_text()).get("sums") or {}).get("project") or {}
+    ck(rows[0].get("status") == "synced" and not told()
+       and (far / "src" / "f02.py").read_text() == "x = 2  # edited here\n"
+       and len(sums.get("src/f02.py") or "") == 64,
+       f"a file only touched there and edited here does not pause the sync; the base keeps "
+       f"the files' checksums there ({rows[0].get('reason')}, {len(sums)} checksums)")
+
+    # a change there: the sync pauses, names the files, sends nothing, tells once
+    time.sleep(1.1)
+    (far / "README.md").write_text("edited on box\n")
+    (far / "src" / "new_there.py").write_text("y = 1\n")
+    Path(projS, "README.md").write_text("edited here\n")
+    Path(projS, "src", "f00.py").write_text("changed here\n")
+    d = nrun("mirror", projS, "--run", "--json")
+    fx += fx5(d, "mirror_paused.json")
+    p = ((d.get("mirrored") or [{}])[0]).get("paused") or {}
+    again = nrun("mirror", projS, "--run", "--json").get("mirrored") or [{}]
+    due = nrun("mirror", "--run", "--due", "--json").get("mirrored")
+    row = project_row(projS)
+    fx += fx5(row, "projects.json", "paused")
+    ck(p.get("reason") == "changed" and p.get("files") == ["README.md", "src/new_there.py"]
+       and p.get("changed") == 1 and p.get("new") == 1 and p.get("remote") == "box"
+       and (far / "README.md").read_text() == "edited on box\n"
+       and (far / "src" / "f00.py").read_text() == "x = 0\n"
+       and again[0].get("status") == "paused" and due == []
+       and (row.get("mirror_paused") or {}).get("reason") == "changed",
+       f"a change in the copy there pauses the sync, with the files named; nothing is "
+       f"replaced there ({p})")
+    n = told()
+    ck(len(n) == 1 and n[0]["title"] == "Keep in sync paused: Synced"
+       and "Bring Them Here, Replace Them or Stop Syncing" in n[0]["message"],
+       f"…and tells once ({n})")
+
+    # Bring Them Here: Take Back on the synced copy, keeping both where both
+    # changed, then the sync runs
+    d = nrun("reclaim", projS, "--json")
+    fx += fx5(d, "reclaim_copy_dry.json")
+    ck(d.get("mode") == "copy" and not d.get("applied") and d.get("plan", {}).get("project")
+       == {"take": 0, "new": 1, "delete": 0, "conflict": 1, "kept": 1},
+       f"Bring Them Here, dry run: the plan of a Take Back on the copy ({d.get('plan') or d})")
+    d = nrun("reclaim", projS, "--apply", "--json")
+    fx += fx5(d, "reclaim_copy.json")
+    both = [x.name for x in Path(projS).glob("README (from box *).md")]
+    e = reg_entry(projS)[1]
+    ck(d.get("applied") and d.get("mode") == "copy" and (d.get("sync") or {}).get("status")
+       == "synced" and Path(projS, "README.md").read_text() == "edited here\n"
+       and len(both) == 1 and Path(projS, both[0]).read_text() == "edited on box\n"
+       and Path(projS, "src", "new_there.py").is_file()
+       and (far / "README.md").read_text() == "edited here\n"
+       and (far / both[0]).is_file() and (far / "src" / "f00.py").read_text() == "changed here\n"
+       and not (e.get("mirror") or {}).get("paused") and not e.get("away")
+       and (e.get("returned") or {}).get("mode") == "copy",
+       f"…--apply brings them, keeps both versions of what changed on both, then the sync "
+       f"runs ({d.get('error') or d.get('blockers') or d.get('sync')})")
+    note = subprocess.run([PY, CLI, "hook"], env=dict(env, **henv), capture_output=True,
+                          text=True, input=json.dumps({"cwd": projS})).stdout
+    ck("were brought here" in note and "Changed in BOTH copies" in note,
+       f"the next session here is told what came from the copy ({note!r})")
+
+    # Replace Them: once, theirs set aside there
+    time.sleep(1.1)
+    (far / "README.md").write_text("edited on box again\n")
+    nrun("mirror", projS, "--run", "--json")
+    d = nrun("mirror", projS, "--replace", "--json")
+    fx += fx5(d, "mirror_replace_dry.json")
+    dry_ok = d.get("would", {}).get("replace") == 1 and not d.get("applied") \
+        and (far / "README.md").read_text() == "edited on box again\n"
+    d = nrun("mirror", projS, "--replace", "--apply", "--json")
+    fx += fx5(d, "mirror_replace_apply.json")
+    kept = [k for k in (bhome / ".aht" / "remote" / "replaced" / uidS).rglob("README.md")
+            if k.read_text() == "edited on box again\n"]
+    ck(dry_ok and d.get("applied") and (far / "README.md").read_text() == "edited here\n"
+       and len(kept) == 1 and not project_row(projS).get("mirror_paused")
+       and ((d.get("mirrored") or [{}])[0]).get("ended_pause") == "changed",
+       f"--replace sends this copy over the changed one, theirs set aside there "
+       f"({d.get('mirrored')})")
+
+    # many removals here: the sync pauses before it removes them there
+    for i in range(4, 40):
+        Path(projS, "src", f"f{i:02d}.py").unlink()
+    d = nrun("mirror", projS, "--run", "--json")
+    fx += fx5(d, "mirror_paused_removals.json")
+    p = ((d.get("mirrored") or [{}])[0]).get("paused") or {}
+    ck(p.get("reason") == "removals" and p.get("removed") == 36 and p.get("total", 0) >= 40
+       and (far / "src" / "f39.py").is_file(),
+       f"deleting most files here pauses the sync; nothing is removed there ({p})")
+    d = nrun("mirror", projS, "--allow-removals", "--json")
+    fx += fx5(d, "mirror_allow_removals_dry.json")
+    dry_ok = d.get("would") == {"remove": 36, "total": p.get("total")} \
+        and (far / "src" / "f39.py").is_file()
+    d = nrun("mirror", projS, "--allow-removals", "--apply", "--json")
+    fx += fx5(d, "mirror_allow_removals_apply.json")
+    ck(dry_ok and d.get("applied") and not (far / "src" / "f39.py").exists()
+       and list((bhome / ".aht" / "remote" / "replaced" / uidS).rglob("f39.py"))
+       and not project_row(projS).get("mirror_paused"),
+       f"--allow-removals lets that one sync remove them there, set aside there "
+       f"({d.get('mirrored') or d.get('error')})")
+    small = os.path.realpath(str(roots / "Small Sync"))
+    os.makedirs(small)
+    for i in range(5):
+        Path(small, f"s{i}.txt").write_text("s\n")
+    hrun("mirror", small, "--on", "--to", "box")
+    nrun("mirror", small, "--run", "--json")
+    for i in range(4):
+        Path(small, f"s{i}.txt").unlink()
+    rows = nrun("mirror", small, "--run", "--json").get("mirrored") or [{}]
+    ck(rows[0].get("status") == "synced" and not Path(str(box) + small, "s0.txt").exists(),
+       "…but a few files of a small project are removed as usual")
+    hrun("mirror", small, "--off")
+
+    # a first sync into a folder that holds another project: paused
+    projO = os.path.realpath(str(roots / "Other Place"))
+    os.makedirs(projO)
+    Path(projO, "mine.txt").write_text("mine\n")
+    farO = Path(str(box) + projO)
+    (farO / ".aht").mkdir(parents=True)
+    (farO / ".aht" / ".project-id").write_text("someone-elses-id\n")
+    (farO / "theirs.txt").write_text("theirs\n")
+    hrun("mirror", projO, "--on", "--to", "box")
+    d = nrun("mirror", projO, "--run", "--json")
+    fx += fx5(d, "mirror_paused_other_folder.json")
+    p = ((d.get("mirrored") or [{}])[0]).get("paused") or {}
+    ck(p.get("reason") == "other-folder" and p.get("marker") == "someone-elses-id"
+       and "theirs.txt" in p.get("files", []) and (farO / "theirs.txt").is_file()
+       and not (farO / "mine.txt").exists(),
+       f"a first sync into a folder with another project's id pauses; nothing is sent ({p})")
+    r = hrun("mirror", projO, "--off")
+    ck(r.returncode == 0 and not project_row(projO).get("mirror")
+       and (farO / "theirs.txt").is_file(),
+       "Stop Syncing leaves that folder as it is")
+
+    # box: the copy is noted; turning sync on there for it is refused, its
+    # own Keep All leaves it out, its hook and its projects row say whose it is
+    farS = str(far)
+    own = bhome / "code" / "notes"
+    own.mkdir(parents=True)
+    (own / "todo.md").write_text("- box's own\n")
+    brun("tag", farS, "--apply")
+    brun("tag", str(own), "--apply")
+    r = brun("mirror", farS, "--on", "--to", "mac")
+    breg = json.loads((bhome / ".aht" / "registry.json").read_text())
+    ck(r.returncode == 3 and f"a copy kept in sync from {here}" in r.stderr
+       and not any((e.get("mirror") or {}).get("enabled") for e in breg["projects"].values()),
+       f"on box, Keep in sync for the copy kept in sync from here is refused ({r.stderr.strip()})")
+    try:
+        d = json.loads(brun("mirror", "--all", "--on", "--to", "mac", "--json").stdout)
+    except ValueError:
+        d = {}
+    fx += fx5(d, "mirror_all_on.json")
+    ck(d.get("copies_skipped") == [farS]
+       and [x["project"] for x in d.get("projects", [])] == [str(own)],
+       f"box's own Keep All Projects in Sync leaves the copy out ({d.get('copies_skipped')})")
+    try:
+        brow = next(x for x in json.loads(brun("projects", "--json").stdout)["projects"]
+                    if x["real_path"] == farS)
+    except (ValueError, StopIteration):
+        brow = {}
+    fx += fx5(brow, "projects.json", "copy")
+    bnote = subprocess.run([PY, CLI, "hook"], env=benv, capture_output=True, text=True,
+                           input=json.dumps({"cwd": farS})).stdout
+    ck(brow.get("copy_of") == {"from": here, "kind": "sync", "at": c.get("at")}
+       and f"a copy kept in sync from “{here}”" in bnote,
+       f"box's row and hook name the machine it is kept in sync from "
+       f"({brow.get('copy_of')}, {bnote!r})")
+
+    # names the disk there cannot hold apart are listed
+    m = {"files": {"A.txt": [1, 1], "a.txt": [1, 1], "b.txt": [1, 1], "Src/x": [1, 1]},
+         "dirs": ["Src", "src"], "raw": {}, "twins": {"é.txt": ["é.txt", "é.txt"]}}
+    probs = {x["kind"]: x for x in core.name_problems(m, {"case_sensitive": False})}
+    ck(probs.get("case", {}).get("count") == 2 and ["A.txt", "a.txt"] in probs["case"]["names"]
+       and probs.get("unicode", {}).get("count") == 1
+       and [x["kind"] for x in core.name_problems(m, {"case_sensitive": True})] == ["unicode"],
+       f"name_problems: two names one case apart on a disk that ignores case, and "
+       f"Unicode twins ({probs})")
+    os.environ["AHT_CASELESS"] = "1"
+    try:                                    # the probe tries the disk there
+        fsi = core.Remote("box", {"root": str(box)}).connect(projS, fs=True).get("fs")
+    finally:
+        os.environ.pop("AHT_CASELESS", None)
+    ck(fsi == {"case_sensitive": False},
+       f"the probe says whether the disk there ignores case (AHT_CASELESS reaches it) ({fsi})")
+    projK = os.path.realpath(str(roots / "Cases"))
+    os.makedirs(projK)
+    Path(projK, "Readme.md").write_text("one\n")
+    Path(projK, "README.md").write_text("two\n")
+    if len(os.listdir(projK)) == 2:         # a disk that tells them apart (Linux)
+        hrun("mirror", projK, "--on", "--to", "box")
+        d = nrun("mirror", projK, "--run", "--json", AHT_CASELESS="1")
+        r0 = (d.get("mirrored") or [{}])[0]
+        ck(any(x["kind"] == "case" and ["README.md", "Readme.md"] in x["names"]
+               for x in r0.get("names") or []),
+           f"a sync to a disk that ignores case lists the two names (AHT_CASELESS) ({r0})")
+        hrun("mirror", projK, "--off")
+    else:
+        print("  (case clash end to end skipped: this disk ignores case; Linux CI runs it)")
+
+    # Hand Over looks at a changed copy too
+    time.sleep(1.1)
+    (far / "README.md").write_text("box, once more\n")
+    d = nrun("handover", projS, "--no-start", "--json")
+    fx += fx5(d, "handover_blocked.json")
+    d2 = nrun("handover", projS, "--no-start", "--replace-there", "--json")
+    ck(any("--replace-there" in b for b in d.get("blockers", []))
+       and (d.get("copy_changed") or {}).get("files") == ["README.md"]
+       and not any("--replace-there" in b for b in d2.get("blockers", []))
+       and any("sets those changes aside there" in w for w in d2.get("warnings", [])),
+       f"a handover dry run over a changed copy blocks; --replace-there is the way past "
+       f"({d.get('blockers')}, {d2.get('blockers')})")
+
+    # Stop Syncing: box drops its note (another project's note stays)
+    rem = core.Remote("box", {"root": str(box)})
+    other = rem.agent("uncopy", path=farS, uuid="not-this-project")
+    r = hrun("mirror", projS, "--off")
+    ck(other.get("dropped") is False and r.returncode == 0 and farS not in copies_there()
+       and "kept in sync" not in subprocess.run(
+           [PY, CLI, "hook"], env=benv, capture_output=True, text=True,
+           input=json.dumps({"cwd": farS})).stdout,
+       f"Stop Syncing drops box's note on its copy; uncopy leaves another project's "
+       f"({other}, {copies_there()})")
+
+    # a handover and a take back write there.json too, and box's note says
+    # what its copy is: handed over, then returned
+    d = nrun("handover", projS, "--apply", "--no-start", "--replace-there", "--json")
+    k1 = json.loads(thr.read_text()).get("kind")
+    c1 = (copies_there().get(farS) or {}).get("kind")
+    (far / "src" / "f00.py").write_text("done on box\n")
+    d2 = nrun("reclaim", projS, "--apply", "--json")
+    k2 = json.loads(thr.read_text()).get("kind")
+    c2 = (copies_there().get(farS) or {}).get("kind")
+    bnote = subprocess.run([PY, CLI, "hook"], env=benv, capture_output=True, text=True,
+                           input=json.dumps({"cwd": farS})).stdout
+    ck(d.get("applied") and d2.get("applied") and d2.get("mode") == "away"
+       and k1 == "handover" and c1 == "handover" and k2 == "take-back" and c2 == "returned"
+       and Path(projS, "src", "f00.py").read_text() == "done on box\n"
+       and "went back to" in bnote,
+       f"handover and take back write there/box.json; box's note goes handover → returned "
+       f"({d.get('error')}, {d2.get('error') or d2.get('blockers')}, {k1}, {c1}, {k2}, {c2})")
+    # one base per machine: a handover and take back with pc5 leaves box's
+    # alone, so box's changed copy still pauses the sync, Hand Over to box
+    # still blocks, and Bring Them Here asks box
+    pc5 = Path(os.path.realpath(sb)) / "pc5"
+    hrun("config", "--set", "remotes=" + json.dumps(
+        {"box": {"root": str(box)}, "pc5": {"root": str(pc5)}}))
+    projM = os.path.realpath(str(roots / "Two Machines"))
+    os.makedirs(projM)
+    for n in ("README.md", "a.txt", "b.txt"):
+        Path(projM, n).write_text(f"{n}\n")
+    hrun("mirror", projM, "--on", "--to", "box")
+    nrun("mirror", projM, "--run", "--json")
+    uidM = reg_entry(projM)[0]
+    farM = Path(str(box) + projM)
+    d1 = nrun("handover", projM, "--to", "pc5", "--apply", "--no-start", "--json")
+    d2 = nrun("reclaim", projM, "--apply", "--json")
+    bases = sorted(x.name for x in (sb / ".aht" / "handover" / uidM / "there").glob("*.json"))
+    time.sleep(1.1)
+    (farM / "README.md").write_text("README, edited on box\n")
+    p = ((nrun("mirror", projM, "--run", "--json").get("mirrored") or [{}])[0]
+         .get("paused") or {})
+    ho = nrun("handover", projM, "--to", "box", "--no-start", "--json")
+    rc = nrun("reclaim", projM, "--json")
+    ck(d1.get("applied") and d2.get("applied") and d2.get("mode") == "away"
+       and bases == ["box.json", "pc5.json"]
+       and p.get("reason") == "changed" and p.get("files") == ["README.md"]
+       and (farM / "README.md").read_text() == "README, edited on box\n"
+       and any("--from box" in b and "--replace-there" in b for b in ho.get("blockers", []))
+       and rc.get("mode") == "copy" and rc.get("remote") == "box"
+       and (rc.get("plan") or {}).get("project", {}).get("take") == 1,
+       f"one base per machine: after a handover and take back with pc5, box's changed copy "
+       f"still pauses the sync, blocks Hand Over and is what Bring Them Here asks "
+       f"({d1.get('error') or d1.get('blockers')}, {d2.get('error')}, {bases}, {p}, "
+       f"{ho.get('blockers')}, {rc.get('remote')}, {rc.get('plan')})")
+    hrun("mirror", projM, "--off")
+    hrun("config", "--set", "remotes=" + json.dumps({"box": {"root": str(box)}}))
+    # an earlier version's single there.json counts for the machine it names
+    hd0 = sb / ".aht" / "handover" / "0ld0ne"
+    hd0.mkdir(parents=True)
+    (hd0 / "there.json").write_text(json.dumps({
+        "v": 1, "remote": "box", "remote_path": "/x", "at": "2026-10-01T10:00:00",
+        "here": {"project": {}}, "there": {"project": {}}}))
+    snippet = ("import sys, json; sys.path.insert(0, sys.argv[1]); import aht as c; "
+               "print(json.dumps([bool(c.read_there('0ld0ne', 'box', '/x')), "
+               "bool(c.read_there('0ld0ne', 'pc5')), "
+               "(c.read_there('0ld0ne') or {}).get('remote')]))")
+    r = subprocess.run([PY, "-c", snippet, str(HERE.parent)], env=env, capture_output=True,
+                       text=True)
+    ck(r.stdout.strip() == '[true, false, "box"]',
+       f"an earlier version's there.json is read as the base of the machine it names "
+       f"({r.stdout.strip()}{r.stderr[-300:]})")
+    shutil.rmtree(hd0)
+
+    # a copy whose project went home, synced back there: the folder there is
+    # that machine's own live project, so a first sync pauses
+    projQ = os.path.realpath(str(roots / "Went Home"))
+    os.makedirs(projQ)
+    Path(projQ, "a.txt").write_text("a, as it came back\n")
+    Path(projQ, "b.txt").write_text("b\n")
+    hrun("tag", projQ, "--apply")
+    uidQ = reg_entry(projQ)[0]
+    cpm = sb / ".aht" / "remote" / "copies.json"
+    cpm_was = cpm.read_text() if cpm.is_file() else None
+    cpm.parent.mkdir(parents=True, exist_ok=True)
+    cpm.write_text(json.dumps(dict(json.loads(cpm_was or "{}"), **{projQ: {
+        "uuid": uidQ, "from": "box", "from_id": "b0b0b0b0b0b0", "kind": "returned",
+        "attempt": None, "at": "2026-10-27T10:00:00"}})))
+    farQ = Path(str(box) + projQ)
+    (farQ / ".aht").mkdir(parents=True)
+    (farQ / ".aht" / ".project-id").write_text(uidQ + "\n")
+    (farQ / "a.txt").write_text("a, box's own work\n")
+    (farQ / "c.txt").write_text("c\n")
+    brun("tag", str(farQ), "--apply")
+    r = hrun("mirror", projQ, "--on", "--to", "box")
+    row = (nrun("mirror", projQ, "--run", "--json").get("mirrored") or [{}])[0]
+    p = row.get("paused") or {}
+    ck(r.returncode == 0 and p.get("reason") == "other-folder" and p.get("owner") == "own"
+       and p.get("marker") == uidQ and "a live project of box's own" in row.get("reason", "")
+       and (farQ / "a.txt").read_text() == "a, box's own work\n"
+       and not (farQ / "b.txt").exists(),
+       f"a returned copy synced back where it came from pauses: the folder there is that "
+       f"machine's own live project ({r.stderr.strip()}, {p})")
+    hrun("mirror", projQ, "--off")
+    if cpm_was is None:
+        cpm.unlink()
+    else:
+        cpm.write_text(cpm_was)
+
+    # no base (a project synced before there were bases): only files that
+    # differ and are newer there pause; Bring Them Here keeps both
+    projN = os.path.realpath(str(roots / "Synced Before"))
+    os.makedirs(projN)
+    for i in range(4):
+        Path(projN, f"n{i}.txt").write_text(f"n{i}\n")
+    hrun("mirror", projN, "--on", "--to", "box")
+    nrun("mirror", projN, "--run", "--json")
+    uidN = reg_entry(projN)[0]
+    farN = Path(str(box) + projN)
+    def forget_base():
+        shutil.rmtree(sb / ".aht" / "handover" / uidN / "there", ignore_errors=True)
+    forget_base()
+    time.sleep(1.1)
+    Path(projN, "n1.txt").write_text("n1, edited here\n")
+    os.utime(farN / "n3.txt")
+    r1 = (nrun("mirror", projN, "--run", "--json").get("mirrored") or [{}])[0]
+    forget_base()
+    time.sleep(1.1)
+    (farN / "n2.txt").write_text("n2, edited on box\n")
+    p = ((nrun("mirror", projN, "--run", "--json").get("mirrored") or [{}])[0]
+         .get("paused") or {})
+    ck(r1.get("status") == "synced" and (farN / "n1.txt").read_text() == "n1, edited here\n"
+       and p.get("reason") == "changed" and p.get("files") == ["n2.txt"]
+       and p.get("changed") == 1 and (farN / "n2.txt").read_text() == "n2, edited on box\n",
+       f"a sync with no base sends what is newer here, and pauses for a file that differs "
+       f"and is newer there ({r1.get('reason')}, {p})")
+    dry = nrun("reclaim", projN, "--json")
+    d = nrun("reclaim", projN, "--apply", "--json")
+    both = [x.name for x in Path(projN).glob("n2 (from box *).txt")]
+    ck(dry.get("mode") == "copy" and (dry.get("plan") or {}).get("project", {})
+       .get("conflict") == 1 and d.get("applied") and (d.get("sync") or {}).get("status")
+       == "synced" and Path(projN, "n2.txt").read_text() == "n2\n" and len(both) == 1
+       and Path(projN, both[0]).read_text() == "n2, edited on box\n",
+       f"…and Bring Them Here with no base keeps both versions of such a file "
+       f"({dry.get('plan') or dry.get('blockers')}, {d.get('error') or d.get('blockers')})")
+    hrun("mirror", projN, "--off")
+
+    # Replace Them keeps the removals guard: many removals need Allow the
+    # Removals too
+    projR = os.path.realpath(str(roots / "Replace Many"))
+    os.makedirs(projR)
+    for i in range(42):
+        Path(projR, f"r{i:02d}.txt").write_text(f"r{i}\n")
+    hrun("mirror", projR, "--on", "--to", "box")
+    nrun("mirror", projR, "--run", "--json")
+    farR = Path(str(box) + projR)
+    for i in range(6, 42):
+        Path(projR, f"r{i:02d}.txt").unlink()
+    time.sleep(1.1)
+    (farR / "r00.txt").write_text("r0, edited on box\n")
+    p = ((nrun("mirror", projR, "--run", "--json").get("mirrored") or [{}])[0]
+         .get("paused") or {})
+    dry = nrun("mirror", projR, "--replace", "--json")
+    fx += fx5(dry, "mirror_replace_dry.json")
+    rm = dry.get("removals") or {}
+    ap = nrun("mirror", projR, "--replace", "--apply", "--json")
+    still = ((reg_entry(projR)[1].get("mirror") or {}).get("paused") or {}).get("reason")
+    ck(p.get("reason") == "changed" and rm.get("removed") == 36 and rm.get("total") == 43
+       and rm.get("over") is True and len(rm.get("files") or []) == 36
+       and any("--allow-removals" in b for b in dry.get("blockers", []))
+       and not ap.get("applied") and any("--allow-removals" in b for b in ap.get("blockers", []))
+       and (ap.get("removals") or {}).get("over") and (farR / "r41.txt").is_file()
+       and (farR / "r00.txt").read_text() == "r0, edited on box\n" and still == "changed",
+       f"Replace Them over many removals: the dry run says so (removals.over) and --apply "
+       f"refuses without --allow-removals; the pause stays ({p.get('reason')}, {rm}, "
+       f"{ap.get('blockers') or ap.get('mirrored')}, {still})")
+    d = nrun("mirror", projR, "--replace", "--allow-removals", "--apply", "--json")
+    ck(d.get("applied") and not (farR / "r41.txt").exists()
+       and (farR / "r00.txt").read_text() == "r0\n"
+       and list((bhome / ".aht" / "remote" / "replaced").rglob("r41.txt")),
+       f"…with both, it replaces them and removes them there, set aside there "
+       f"({d.get('blockers') or d.get('mirrored')})")
+    hrun("mirror", projR, "--off")
+
+    # Bring Them Here has a removals guard too, never takes the project's
+    # id, and never brings an empty or missing folder here
+    projB = os.path.realpath(str(roots / "Bring Back"))
+    os.makedirs(projB)
+    for i in range(42):
+        Path(projB, f"b{i:02d}.txt").write_text(f"b{i}\n")
+    hrun("mirror", projB, "--on", "--to", "box")
+    nrun("mirror", projB, "--run", "--json")
+    uidB = reg_entry(projB)[0]
+    farB = Path(str(box) + projB)
+    time.sleep(1.1)
+    for i in range(6, 42):
+        (farB / f"b{i:02d}.txt").unlink()
+    (farB / ".aht" / ".project-id").unlink()
+    (farB / "b00.txt").write_text("b0, edited on box\n")
+    nrun("mirror", projB, "--run", "--json")
+    dry = nrun("reclaim", projB, "--json")
+    rm = dry.get("removals") or {}
+    ap = nrun("reclaim", projB, "--apply", "--json")
+    ck(dry.get("mode") == "copy" and rm.get("removed") == 36 and rm.get("total") == 42
+       and rm.get("over") is True and any("--allow-removals" in b for b in dry.get("blockers", []))
+       and not ap.get("applied") and Path(projB, "b41.txt").is_file(),
+       f"Bring Them Here over many removals: the dry run says so and --apply refuses "
+       f"without --allow-removals ({rm}, {dry.get('blockers')}, {ap.get('applied')})")
+    d = nrun("reclaim", projB, "--allow-removals", "--apply", "--json")
+    ck(d.get("applied") and not Path(projB, "b41.txt").exists()
+       and Path(projB, "b00.txt").read_text() == "b0, edited on box\n"
+       and core.read_marker(projB) == uidB,
+       f"…--allow-removals lets it, and the project's id stays "
+       f"({d.get('error') or d.get('blockers')}, {core.read_marker(projB)})")
+    for x in farB.iterdir():
+        shutil.rmtree(x) if x.is_dir() else x.unlink()
+    em = nrun("reclaim", projB, "--allow-removals", "--apply", "--json")
+    shutil.rmtree(farB)
+    gone = nrun("reclaim", projB, "--allow-removals", "--json")
+    ck(not em.get("applied") and any(f"({farB}) is empty" in b for b in em.get("blockers", []))
+       and any(f"({farB}) is missing" in b for b in gone.get("blockers", []))
+       and Path(projB, "b00.txt").is_file() and core.read_marker(projB) == uidB,
+       f"…and an empty or missing folder there is never brought here, whatever is allowed "
+       f"({em.get('blockers')}, {gone.get('blockers')})")
+    hrun("mirror", projB, "--off")
+
+    # what --include carries is looked at too
+    projX = os.path.realpath(str(roots / "With Extra"))
+    os.makedirs(projX)
+    Path(projX, "a.txt").write_text("a\n")
+    xdir = Path(os.path.realpath(sb)) / "extras5" / "notes"
+    xdir.mkdir(parents=True)
+    (xdir / "n.md").write_text("n\n")
+    xfile = xdir.parent / "todo.txt"
+    xfile.write_text("todo\n")
+    hrun("mirror", projX, "--on", "--to", "box")
+    uidX = reg_entry(projX)[0]
+    regf5 = sb / ".aht" / "registry.json"
+    reg = json.loads(regf5.read_text())
+    reg["projects"][uidX]["extras"] = [str(xdir), str(xfile)]
+    regf5.write_text(json.dumps(reg))
+    r1 = (nrun("mirror", projX, "--run", "--json").get("mirrored") or [{}])[0]
+    farXd, farXf = Path(str(box) + str(xdir)), Path(str(box) + str(xfile))
+    trees = sorted(json.loads((sb / ".aht" / "handover" / uidX / "there" / "box.json")
+                              .read_text())["there"])
+    time.sleep(1.1)
+    farXf.write_text("todo, edited on box\n")
+    (farXd / "n.md").write_text("n, edited on box\n")
+    p = ((nrun("mirror", projX, "--run", "--json").get("mirrored") or [{}])[0]
+         .get("paused") or {})
+    ck(r1.get("status") == "synced" and f"extra:{xfile}" in trees and f"extra:{xdir}" in trees
+       and p.get("reason") == "changed" and p.get("files") == sorted([f"{xdir}/n.md", str(xfile)])
+       and farXf.read_text() == "todo, edited on box\n",
+       f"a changed --include'd file or folder there pauses the sync too ({trees}, {p})")
+    hrun("mirror", projX, "--off")
+
+    # uncopy drops only a note on a copy kept in sync
+    notes = copies_there()
+    held = str(Path(os.path.realpath(sb)) / "held-there")
+    notes[held] = {"uuid": "u-held", "from": here, "from_id": "f0f0f0f0f0f0",
+                   "kind": "handover", "attempt": "a1", "at": "2026-10-27T10:00:00"}
+    (bhome / ".aht" / "remote" / "copies.json").write_text(json.dumps(notes))
+    got = core.Remote("box", {"root": str(box)}).agent("uncopy", path=held, uuid="u-held")
+    kept = (copies_there().get(held) or {}).get("kind")
+    ck(got.get("dropped") is False and kept == "handover",
+       f"Stop Syncing leaves the other machine's note on a handed-over copy ({got}, {kept})")
+    notes.pop(held)
+    (bhome / ".aht" / "remote" / "copies.json").write_text(json.dumps(notes))
+    ck(not fx, f"the phase-5 JSON keeps the shape of tests/fixtures/phase5 ({fx})")
+    hrun("config", "--set", "remotes=" + json.dumps(
+        {"box": {"root": str(Path(os.path.realpath(sb)) / "box")}}))
 
 def handover_suite():
     box = Path(os.path.realpath(sb)) / "box"    # a folder standing in for the machine
@@ -1923,6 +2498,7 @@ def handover_suite():
     ck(not [r for r in rows if r["mirror"]], "mirror --all --off: none any more")
 
     phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row)
+    phase5_suite(henv, hrun, J, project_row)
 
     for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
         rec = json.loads(w.read_text())
@@ -2106,8 +2682,9 @@ for n in ("A-first", "X-released", "Y-handed"):
     reg["projects"][uids[n]]["mirror"] = {"enabled": True, "remote": "box"}
 aht.save_registry(reg)
 sent = []
-def connect(self, path=None):
-    self.info = {"sessions": [], "processes": [], "path_writable": True}
+def connect(self, path=None, **kw):
+    self.info = {"sessions": [], "processes": [], "path_writable": True,
+                 "claude_home": os.path.join(S, "box", "home", ".claude")}
     return self.info
 def push(rem, uid, entry, **kw):
     sent.append(os.path.basename(entry["real_path"]))
@@ -4159,6 +4736,8 @@ copy = Path(str(pbox) + syn)
 (copy / ".aht" / "handover").mkdir(parents=True)
 (copy / ".aht" / "handover" / "relay-20990101-000000-0001.md").write_text("left there")
 (copy / "stale.txt").write_text("gone soon")
+# this project's own copy (its id), as an earlier sync left it: no other folder
+(copy / ".aht" / ".project-id").write_text(Path(syn, ".aht", ".project-id").read_text())
 if core.find_rsync() and short_enough(sb):
     d = P("mirror", syn, "--on", "--to", "box", "--run", "--json")
     ck((copy / "a.txt").is_file() and not (copy / "stale.txt").exists()

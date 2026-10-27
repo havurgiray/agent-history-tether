@@ -210,7 +210,7 @@ const tell = (title, body) => ask(title, body, ["OK"]);
 /** A button with a menu under it. */
 function menu(label, items, opts = {}) {
   const wrap = h("span", { class: "menu" });
-  const btn = h("button", { text: label + " ▾", disabled: opts.disabled });
+  const btn = h("button", { text: label + " ▾", disabled: opts.disabled, class: opts.small ? "small" : null });
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     const open = wrap.querySelector(".items");
@@ -364,6 +364,10 @@ const flag = (k, d = true) => (k in S.config ? !!S.config[k] : d);
  * pauses it, so no sync replaces the copy left on that machine until the
  * user turns it back on.  null while it runs. */
 const syncPaused = (p) => (p.mirror && p.mirror_paused ? p.mirror_paused : null);
+/** A folder here that another machine keeps in sync (`copy_of`: {from,
+ * kind}, from this machine's ~/.aht/remote/copies.json; `from`: that
+ * machine's own name), or null. */
+const copyOf = (p) => (p.copy_of && typeof p.copy_of === "object" && p.copy_of.from ? p.copy_of : null);
 
 async function refresh() {
   const [st, cfg, pj] = await Promise.all([J("status", "--json"), J("config", "--json"), J("projects", "--json")]);
@@ -442,7 +446,10 @@ function projState(p) {
   const x = crossing(p);
   if (x && x.kind === "note" && x.arrived) return [`${x.back ? "back" : "note"} from ${x.remote || x.machine || "another machine"}`, "working"];
   if (p.limit) return ["usage limit", "waiting"];
-  if (syncPaused(p)) return ["sync paused", ""];
+  // a pause that asks something (the copy there was changed, say) waits for you
+  if (syncPaused(p)) return ["sync paused", asksForSync(p) ? "waiting" : ""];
+  const c = copyOf(p);
+  if (c) return [`copy from ${c.from}`, ""];
   return ["", ""];
 }
 
@@ -486,6 +493,8 @@ function detail() {
     h("div", { class: "dim small mono", text: tilde(p.real_path) }));
   if (p.handing) d.append(handingBanner(p));
   else if (!p.away && p.exists && syncPaused(p)) d.append(pausedBanner(p));
+  const copy = p.exists && !p.away ? copyOf(p) : null;
+  if (copy) d.append(copyLine(copy));
   const relay = openRelay(p);
   if (relay) d.append(relayLine(p, relay));
   const across = crossing(p), line = across && crossingLine(p, across);
@@ -1447,61 +1456,187 @@ async function cancelNight(p, j) {
   openNightShift(p);
 }
 
+/** Hand Over's dry run blocks over a copy there that was worked on since
+ * both copies last agreed, at a sync, a handover or a take back
+ * (`copy_changed`: {changed, new, removed, history, files, since}, as a
+ * pause counts them; or only its blocker, which names --replace-there,
+ * the way past), or null. */
+const PAST = /--replace-there/;
+function changedThere(plan) {
+  const c = plan && plan.copy_changed;
+  if (c && typeof c === "object") return c;
+  const b = ((plan && plan.blockers) || []).find((x) => PAST.test(x));
+  return b ? { said: b } : null;
+}
+/** The block, and the ways past it: bring that work here first (Take Back
+ * on the copy), or replace it (`--replace-there`: it is set aside there),
+ * which the Hand Over question then names once more. */
+async function changedCopyBlock(p, plan, ch, remote) {
+  const name = base(p.real_path), c = counted(ch);
+  // other blockers come first: no way past this one helps with those
+  const others = (plan.blockers || []).filter((b) => !PAST.test(b));
+  if (others.length || plan.error) return note(p, "Cannot be handed over now:\n\n" + problems({ blockers: others, error: plan.error }));
+  const pick = await ask(`The copy on ${remote} was changed there`,
+    `The copy of “${name}” on ${remote} was worked on since ${ch.since ? clock(ch.since) : "the two copies last agreed"}${c ? ` (${c})` : ""}`
+    + (filesIn(ch).length ? ":" + listed(ch) : ch.said ? `:\n${sentence(ch.said).trim()}` : ".")
+    + `\n\nHanding it over would replace that work. Bring it here first, or replace it: what is replaced is set aside on ${remote} first (in ~/.aht/remote/replaced/), not deleted.`,
+    ["Cancel", "Replace Them There…", "Bring Them Here…"]);
+  if (pick === "Bring Them Here…") return takeBack(p, true);
+  if (pick === "Replace Them There…") return handOver(p, ch);
+}
+
 // Handover (Linux)
-async function handOver(p) {
-  const remote = (S.status.handover || {}).default_remote;
+/** `replacing`: the changed copy there that Replace Them There… lets the
+ * handover replace (`--replace-there`). */
+async function handOver(p, replacing) {
+  const remote = (S.status.handover || {}).default_remote, name = base(p.real_path);
+  const past = replacing ? ["--replace-there"] : [];
   note(p, null);
-  const plan = await busy(`checking ${base(p.real_path)}…`, () => J("handover", p.real_path, "--json", "--to", remote));
+  const plan = await busy(`checking ${name}…`, () => J("handover", p.real_path, "--json", "--to", remote, ...past));
+  const ch = changedThere(plan);
+  if (ch && !replacing) return changedCopyBlock(p, plan, ch, remote);
   if (problems(plan)) return note(p, "Cannot be handed over now:\n\n" + problems(plan));
   const n = plan.plan || {};
   let body = `${n.files || 0} file(s) to send (${bytes(n.bytes)}), history ${bytes(n.history_bytes)}.\nSession: ${plan.title || "the one used last"}`;
   if (n.install_claude) body += `\nClaude Code ${n.install_claude} gets installed on ${remote}.`;
   const stay = plan.outside_not_carried || [];
   if (stay.length) body += "\n\nFiles outside the project that stay here:\n" + stay.slice(0, 6).map((x) => "• " + x).join("\n");
-  for (const w of plan.warnings || []) body += "\n\n⚠ " + w;
+  if (replacing) {
+    const r = ch || replacing, c = counted(r);
+    body += `\n\nThe work done in the copy on ${remote}${r.since ? " since " + clock(r.since) : ""}${c ? ` (${c})` : ""} is set aside there first (in ~/.aht/remote/replaced/), not deleted:` + listed(r);
+  }
+  // …which the core says too, as a warning: once is enough
+  for (const w of plan.warnings || []) if (!(replacing && /aside there$/.test(w))) body += "\n\n⚠ " + w;
   body += "\n\nThe session is resumed there and this folder is marked as away until you take it back.";
-  if (!(await confirmIt(`Hand “${base(p.real_path)}” over to ${remote}?`, body, "Hand Over"))) return;
+  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over"))) return;
   S.moving = p.real_path;             // its own record of it is no unfinished handover
-  const d = await busy(`handing ${base(p.real_path)} over…`, () =>
-    job(["handover", p.real_path, "--apply", "--json", "--to", remote], "handing over", true).then((a) => a.json || {}))
+  const d = await busy(`handing ${name} over…`, () =>
+    job(["handover", p.real_path, "--apply", "--json", "--to", remote, ...past], "handing over", true).then((a) => a.json || {}))
     .finally(() => { S.moving = null; });
   const s = d.sent || {};
   note(p, problems(d) ? "The handover did not go through:\n\n" + problems(d)
     : `Handed over to ${remote}: ${s.files || 0} file(s) sent, ${bytes(s.wire_bytes)} over the network.`);
   refresh();
 }
-async function takeBack(p) {
+/** Take Back, and Bring Them Here (`copy`): the same plan, the same "changed
+ * on both: keep both", the same set-aside.  For a copy kept in sync whose
+ * sync paused over work done there, `reclaim` brings that work here
+ * (`mode: "copy"`), and then the sync runs; nothing was handed over, so no
+ * session there is ended for it.  When that would remove more files here
+ * than aht removes without asking (`removals.over`), the question names
+ * them and going ahead allows them (`--allow-removals`). */
+async function takeBack(p, copy) {
+  const name = base(p.real_path), stop = copy ? [] : ["--stop"];
   note(p, null);
-  const plan = await busy(`checking ${base(p.real_path)}…`, () => J("reclaim", p.real_path, "--stop", "--json"));
-  if (problems(plan)) return note(p, "Cannot be taken back now:\n\n" + problems(plan));
-  const remote = plan.remote || p.away_remote || p.away;
+  let plan = await busy(`checking ${name}…`, () => J("reclaim", p.real_path, ...stop, "--json"));
+  copy = plan.mode ? plan.mode === "copy" : !!copy;
+  // Bring Them Here that would remove many files here asks before it does
+  if (copy) plan = pastRemovals(plan);
+  if (problems(plan)) return note(p, (copy ? "The changes cannot be brought here now:\n\n" : "Cannot be taken back now:\n\n") + problems(plan));
+  const remote = plan.remote || p.away_remote || p.away || p.mirror;
   const n = (plan.plan || {}).project || {};
   let body = `${n.take || 0} file(s) changed there, ${n.new || 0} new, ${n.delete || 0} removed. Whatever they replace here is set aside, not deleted.`;
+  const hs = (plan.plan || {}).history || {};
+  if (copy && (hs.take || hs.new)) body += "\nThe conversation that went on there comes too.";
+  // removals over the limit (`removals.over`): named here, and going ahead allows them
+  const gone = copy ? removalsOf(plan) : null, allow = gone && gone.over ? ["--allow-removals"] : [];
+  if (allow.length) {
+    body += `\n\nIt removes ${removalsCounted(gone)} here, because they are gone from the copy on ${remote}: more than aht removes without asking, so going ahead allows it, once. They are set aside here first, not deleted:`
+      + listed({ files: gone.files, removed: gone.removed }) + `\nIf they went missing on ${remote} by mistake, cancel.`;
+  }
+  // the sync runs after it only when Keep in sync with that machine is on
+  if (copy && p.mirror === remote) body += `\n\nThen the sync runs, and the copy on ${remote} is the same as this one again.`;
   if (plan.would_stop) body += `\n\nThe idle session on ${remote} is ended first.`;
   const both = Object.values(plan.conflicts || {}).flat();
+  const title = copy ? `Bring the changes on ${remote} here?` : `Take “${name}” back from ${remote}?`;
   let extra = [];
   if (both.length) {
     body += "\n\nChanged on BOTH machines:\n" + both.slice(0, 6).map((x) => "• " + x).join("\n") +
       `\n\nKeep Both leaves your version in place and puts the one from ${remote} next to it.`;
-    const pick = await ask(`Take “${base(p.real_path)}” back from ${remote}?`, body, ["Cancel", `Use the Versions from ${remote}`, "Keep Both"]);
+    const pick = await ask(title, body, ["Cancel", `Use the Versions from ${remote}`, "Keep Both"]);
     if (!pick) return;
     if (pick.startsWith("Use")) extra = ["--prefer", "there"];
-  } else if (!(await confirmIt(`Take “${base(p.real_path)}” back from ${remote}?`, body, "Take Back"))) return;
-  const d = await busy(`taking ${base(p.real_path)} back…`, () =>
-    job(["reclaim", p.real_path, "--stop", "--apply", "--json", ...extra], "taking back", true).then((a) => a.json || {}));
-  note(p, problems(d) ? "Taking it back did not go through:\n\n" + problems(d)
-    : "Back on this computer, files and history." + (d.set_aside ? "\nReplaced files are kept in: " + d.set_aside : ""));
+  } else if (!(await confirmIt(title, body, copy ? "Bring Them Here" : "Take Back"))) return;
+  const d = await busy(copy ? `bringing the changes on ${remote} here…` : `taking ${name} back…`, () =>
+    job(["reclaim", p.real_path, ...stop, "--apply", "--json", ...extra, ...allow], copy ? "bringing them here" : "taking back", true).then((a) => a.json || {}));
+  const kept = d.set_aside ? "\nReplaced files are kept in: " + d.set_aside : "";
+  note(p, problems(d) ? (copy ? "The changes did not come here:\n\n" : "Taking it back did not go through:\n\n") + problems(d)
+    : copy ? `The changes from ${remote} are here.${syncedAfter(d, remote)}${kept}`
+    : "Back on this computer, files and history." + kept);
   refresh();
 }
 async function keepInSync(p, on) {
   const remote = (S.status.handover || {}).default_remote;
-  note(p, on ? `Kept in sync with ${remote}; the first copy runs in the background.` : null);
-  await run(["mirror", p.real_path].concat(on ? ["--on", "--to", remote] : ["--off"]));
+  note(p, null);
+  // a folder that is itself a copy kept in sync from that machine is refused
+  const r = await busy(on ? `keeping ${base(p.real_path)} in sync…` : "turning Keep in sync off…", () => run(["mirror", p.real_path].concat(on ? ["--on", "--to", remote] : ["--off"])));
+  if (!r.ok) note(p, (on ? "Keep in sync was not turned on:\n\n" : "Keep in sync was not turned off:\n\n") + ((r.err + r.out).trim() || "aht gave no answer."));
+  else if (on) note(p, `Kept in sync with ${remote}; the first copy runs in the background.`);
   refresh();
 }
-/** Keep in sync paused by a Release: a note with a way to turn it back on. */
+
+// ---- Keep in sync: look before a sync overwrites -------------------------------------
+// Before each sync, aht compares the copy on the other machine with its own
+// list from the last sync.  When that copy was worked on, when the sync
+// would remove many files there, or when the folder there holds something
+// else, the sync pauses, sends nothing, and the project asks
+// (`mirror_paused`: {at, reason, changed, new, removed, files}).
+
+/** What each pause asks, by its `reason`; "released" (a Release) has the
+ * older banner with Turn Sync Back On…. */
+const SYNC_ASKS = ["changed", "removals", "other-folder"];
+const asksForSync = (p) => { const x = syncPaused(p); return !!x && SYNC_ASKS.includes(x.reason); };
+/** "2 changed, 1 new and 1 removed", from a pause's counts. */
+function counted(x) {
+  const parts = [x.changed ? `${x.changed} changed` : null, x.new ? `${x.new} new` : null, x.removed ? `${x.removed} removed` : null,
+    x.history ? `${plural(x.history, "conversation")} continued` : null].filter(Boolean);
+  return parts.length > 1 ? parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1] : parts[0] || "";
+}
+/** The files a pause names (the core sends the first 50), and how many it
+ * stands for: the changed, new and removed ones; for another folder there,
+ * every file in it (`total`). */
+const filesIn = (x) => (Array.isArray(x.files) ? x.files : []);
+const filesOf = (x) => Math.max(filesIn(x).length, x.reason === "other-folder" ? x.total || 0 : (x.changed || 0) + (x.new || 0) + (x.removed || 0));
+/** …as lines for a question: the first 8. */
+function listed(x) {
+  const f = filesIn(x), total = filesOf(x);
+  return f.length ? "\n" + f.slice(0, 8).map((y) => "• " + y).join("\n") + (total > 8 ? `\n… and ${total - Math.min(f.length, 8)} more` : "") : "";
+}
+/** What a sync with Replace Them, or Bring Them Here, would remove (the dry
+ * run's `removals`: {removed, total, files (the first 50), over}); null when
+ * nothing goes, or from an older core that does not say.  `over`: more than
+ * aht removes without asking, so going ahead allows them (`--allow-removals`). */
+function removalsOf(plan) {
+  const r = plan && plan.removals;
+  return r && typeof r === "object" && r.removed > 0 ? r : null;
+}
+/** "25 of the 34 files", or "3 files". */
+const removalsCounted = (r) => (r.total > r.removed ? `${r.removed} of the ${r.total} files` : plural(r.removed, "file"));
+/** A dry run whose removals are over the limit, without the blockers (and
+ * warnings) that allowing them lifts: those name --allow-removals, which
+ * the question then asks for.  Any other blocker stays: a folder there that
+ * is missing or empty cannot be allowed. */
+const ALLOWS = /--allow-removals/;
+function pastRemovals(plan) {
+  if (!(plan && plan.removals && plan.removals.over)) return plan;
+  const keep = (xs) => (xs || []).filter((x) => !ALLOWS.test(x));
+  return Object.assign({}, plan, { blockers: keep(plan.blockers), warnings: keep(plan.warnings) });
+}
+/** What a sync that ran after Bring Them Here (or Replace Them, or Allow
+ * the Removals) says: " The copy on box is the same as this one again." */
+function syncedAfter(d, to) {
+  const rows = d.mirrored || (d.sync ? [d.sync] : []);
+  const r = rows.find((x) => x && x.status) || null;
+  if (!r) return "";
+  if (r.status === "synced") return ` The copy on ${to} is the same as this one again.`;
+  if (r.status === "paused") return ` The sync with ${to} is still paused: ${r.reason || "see the project"}.`;
+  return ` The sync with ${to} did not run: ${r.reason || r.status}.`;
+}
+
+/** The pause on the project row, with what it asks. */
 function pausedBanner(p) {
   const x = syncPaused(p), to = p.mirror;
+  if (SYNC_ASKS.includes(x.reason)) return syncAsks(p, x, to);
   return h("div", { class: "callout row" },
     h("div", { class: "grow" }, h("strong", { text: `Keep in sync with ${to} is paused` }),
       h("div", { class: "small", text: x.reason === "released"
@@ -1512,12 +1647,114 @@ function pausedBanner(p) {
 }
 async function resumeSync(p) {
   const x = syncPaused(p) || {}, to = p.mirror, name = base(p.real_path);
-  if (!(await confirmIt(`Keep “${name}” in sync with ${to} again?`, `The next sync makes the copy on ${to} the same as this one`
-    + (x.reason === "released" ? ", so the work left there when you released it is replaced. " : ". ")
-    + "What a sync replaces there is set aside first, not deleted.", "Turn It On"))) return;
+  if (!(await confirmIt(`Keep “${name}” in sync with ${to} again?`, `The next sync makes the copy on ${to} the same as this one. `
+    + `If that copy was worked on${x.reason === "released" ? " since you released it" : " there"}, the sync pauses first and sends nothing, `
+    + "and asks you here what happens to that work: bring it here, replace it (it is set aside there first, not deleted), or stop syncing.", "Turn It On"))) return;
   const r = await busy(`turning the sync with ${to} back on…`, () => run(["mirror", p.real_path, "--on", "--to", to]));
   note(p, r.ok ? `Kept in sync with ${to} again; the next copy runs in the background.`
     : "The sync was not turned back on:\n\n" + ((r.out + r.err).trim() || "aht gave no answer."));
+  refresh();
+}
+/** A sync that paused to ask: what it found, and the ways on.
+ * - changed: [Bring Them Here…] (Take Back on the copy), [Replace Them…]
+ *   (`mirror --replace`: theirs are set aside there), [Stop Syncing];
+ * - removals: [Allow the Removals…] (`mirror --allow-removals`), [Stop Syncing];
+ * - other-folder: [Replace Them…], [Stop Syncing]. */
+function syncAsks(p, x, to) {
+  const at = x.at ? ` at ${clock(x.at)}` : "", c = counted(x);
+  const [title, text] = {
+    changed: [`Keep in sync with ${to} paused: the copy there was changed`,
+      `The copy on ${to} was worked on since the last sync${c ? ` (${c})` : ""}. The sync paused${at} and sent nothing, so that work is still there.`],
+    removals: [`Keep in sync with ${to} paused: it would remove ${x.removed ? plural(x.removed, "file") : "many files"} there`,
+      `${x.removed ? plural(x.removed, "file") : "Many files"} ${x.removed === 1 ? "is" : "are"} gone here since the last sync: more than aht removes from the copy on ${to} without asking. The sync paused${at} and sent nothing.`],
+    "other-folder": [`Keep in sync with ${to} paused: the folder there holds something else`,
+      `The folder on ${to} already holds ${x.total ? plural(x.total, "file") : "files"} that ${x.total === 1 ? "is" : "are"} not this project's${x.marker ? " (another project's)" : ""}. The first sync paused${at} and sent nothing.`],
+  }[x.reason];
+  const f = filesIn(x);
+  const more = filesOf(x) - Math.min(f.length, 5);
+  return h("div", { class: "callout sync" },
+    h("strong", { text: title }),
+    h("div", { class: "small", text }),
+    f.length ? h("ul", { class: "files small mono" }, f.slice(0, 5).map((y) => h("li", { text: y })),
+      more > 0 ? h("li", { class: "dim", text: `… and ${more} more` }) : null) : null,
+    h("div", { class: "row" },
+      x.reason === "changed" ? h("button", { class: "small primary", text: "Bring Them Here…", onclick: () => takeBack(p, true) }) : null,
+      x.reason !== "removals" ? h("button", { class: "small", text: "Replace Them…", onclick: () => syncAnyway(p, "replace") }) : null,
+      x.reason === "removals" ? h("button", { class: "small", text: "Allow the Removals…", onclick: () => syncAnyway(p, "removals") }) : null,
+      h("button", { class: "small", text: "Stop Syncing", onclick: () => stopSyncing(p) }),
+      h("span", { class: "grow" }), helpBtn("Hand a project over")));
+}
+/** Replace Them (`mirror --replace`) or Allow the Removals (`mirror
+ * --allow-removals`): the dry run looks at the copy there again (`check`:
+ * {changes, removals, pause}; `would`; `aside`: where it is set aside
+ * there); the question names what this one sync replaces or removes there
+ * (`removals`), and where it is set aside first; then the sync runs once
+ * with it, and with --allow-removals when those are over the limit. */
+async function syncAnyway(p, how) {
+  const to = p.mirror, name = base(p.real_path), flag = how === "replace" ? "--replace" : "--allow-removals";
+  note(p, null);
+  // removals over the limit ask here, before Replace Them allows them
+  const plan = pastRemovals(await busy(`checking the copy on ${to}…`, () => dryRun(["mirror", p.real_path, flag, "--json"])));
+  if (problems(plan)) return note(p, (how === "replace" ? "Cannot replace them now:\n\n" : "Cannot allow the removals now:\n\n") + problems(plan));
+  const chk = plan.check || {}, w = plan.would || {}, rm = chk.removals || {};
+  // what the copy there holds now; the pause as it was found, without a new look
+  const x = Object.assign({}, syncPaused(p) || plan.paused || {}, chk.pause || {});
+  const aside = `in ${plan.aside || "~/.aht/remote/replaced/"}`;
+  const warned = (plan.warnings || []).map((t) => "\n\n⚠ " + sentence(t).trim()).join("");
+  // what Replace Them removes there, by name; over the limit, it allows that too
+  const gone = how === "replace" ? removalsOf(plan) : null, allow = gone && gone.over ? ["--allow-removals"] : [];
+  const removes = gone ? `\n\nOn ${to}, this sync removes ${removalsCounted(gone)}, set aside there first:` + listed({ files: gone.files, removed: gone.removed })
+    + (allow.length ? "\n\nThat is more than aht removes without asking, so Replace Them allows these removals too, once." : "") : "";
+  let title, body, ok;
+  if (how === "removals") {
+    const n = w.remove != null ? w.remove : x.removed, total = w.total != null ? w.total : x.total;
+    [title, ok] = [`Remove ${n ? plural(n, "file") : "the files"} from the copy on ${to}?`, "Allow the Removals"];
+    body = `${n === 1 ? "It is" : "They are"} gone here, so this sync removes ${n === 1 ? "it" : "them"} there too, once${n && total ? ` (${n} of the ${total} files there)` : ""}. `
+      + `${n === 1 ? "It is" : "They are"} set aside on ${to} first, ${aside}, not deleted.` + listed({ files: rm.files || filesIn(x), removed: n }) + warned;
+  } else if (x.reason === "other-folder") {
+    const n = w.replace || x.total;
+    [title, ok] = [`Replace what is in the folder on ${to}?`, "Replace Them"];
+    body = `The ${n ? plural(n, "file") : "files"} now in that folder on ${to} ${n === 1 ? "is" : "are"} set aside there first, ${aside}, not deleted. `
+      + `Then “${name}” is copied there and kept in sync.` + listed(x) + removes + warned;
+  } else {
+    const now = chk.changes && counted(chk.changes) ? chk.changes : x, c = counted(now);
+    [title, ok] = [`Replace the work on ${to} with this copy?`, "Replace Them"];
+    body = `This sync makes the copy on ${to} the same as this one, once. The work done there${c ? ` (${c})` : ""} is set aside on ${to} first, ${aside}, not deleted:`
+      + listed(now) + removes + warned + "\n\nTo keep that work instead, use Bring Them Here.";
+  }
+  if (!(await confirmIt(title, body, ok))) return;
+  const d = await busy(`syncing ${name} with ${to}…`, () =>
+    job(["mirror", p.real_path, flag, ...allow, "--apply", "--json"], "syncing", true).then((a) => a.json || { error: ((a.err || "") + (a.out || "")).trim() || null }));
+  const row = (d.mirrored || [])[0] || {};
+  note(p, problems(d) ? (how === "replace" ? "Not replaced:\n\n" : "The removals were not allowed:\n\n") + problems(d)
+    : (how === "replace" ? `Replaced: what was there is set aside on ${to}, ${aside}.`
+      : `Allowed: ${row.removed ? plural(row.removed, "file") : "what the sync"} removed there ${row.removed ? "are" : "is"} set aside on ${to}, ${aside}.`)
+      + (syncedAfter(d, to) || (d.applied ? ` The copy on ${to} is the same as this one again.` : "")));
+  refresh();
+}
+/** On the other machine: "Copy kept in sync from mac".  Work done in it
+ * here is not overwritten: mac's next sync pauses and asks there.  Keep in
+ * sync from here back to mac is refused for it (the core says so). */
+function copyLine(c) {
+  const m = c.from, at = c.since || c.at, since = at ? `, since ${clock(at)}` : "";
+  // `kind`: "sync" (Keep in sync on that machine); from a later aht also
+  // "handover", "brought" and "returned"
+  const [label, more] = {
+    sync: [`Copy kept in sync from ${m}`, `${m} sends its changes here${since}. Work done in it here is not overwritten: ${m}'s next sync pauses and asks there.`],
+    handover: [`Handed over from ${m}`, `It goes back when ${m} takes it back.`],
+    brought: [`Brought here from ${m}`, null],
+    returned: [`A copy of a project that went back to ${m}`, null],
+  }[c.kind || "sync"] || [`Copy from ${m}`, null];
+  return h("div", { class: "row copyof" }, h("span", { class: "badge", text: label }),
+    more ? h("span", { class: "dim small grow", text: more }) : null);
+}
+/** Stop Syncing: Keep in sync goes off; the copy there stays as it is. */
+async function stopSyncing(p) {
+  const to = p.mirror, x = syncPaused(p) || {};
+  note(p, null);
+  const r = await busy("turning Keep in sync off…", () => run(["mirror", p.real_path, "--off"]));
+  note(p, r.ok ? `Keep in sync with ${to} is off. The copy on ${to} stays as it is${x.reason === "changed" ? ", with the work done there" : ""}.`
+    : "Keep in sync was not turned off:\n\n" + ((r.err + r.out).trim() || "aht gave no answer."));
   refresh();
 }
 
@@ -1826,6 +2063,8 @@ function drawMachines(m) {
       send && name === ho.default_remote ? h("span", { class: "badge ok", text: "used for handovers" }) : null,
       h("span", { class: "grow" }),
       send && name !== ho.default_remote ? h("button", { class: "small", text: "Use This One", onclick: async () => { await run(["remote", "default", name]); refresh(); } }) : null,
+      send && !winBox ? menu("Sync", [["Keep All Projects in Sync…", () => syncAll(name, true)],
+        ["Stop Keeping All in Sync…", () => syncAll(name, false), !S.projects.some((p) => p.mirror)]], { right: true, small: true }) : null,
       h("button", { class: "small", text: "Check…", onclick: () => checkMachine(name) }),
       h("button", { class: "small", text: "Remove…", onclick: async () => {
         if (!(await confirmIt(`Remove ${name}?`, "aht forgets this machine. Nothing on it is deleted.", "Remove"))) return;
@@ -1837,9 +2076,50 @@ function drawMachines(m) {
       h("div", { class: "row" },
         h("label", { class: "check", title: winBox ? "aht cannot ask a Windows machine yet." : null },
           h("input", { type: "checkbox", checked: !!r.watch, disabled: winBox, onchange: (e) => watchMachine(name, e.target) }), "Watch"),
-        h("span", { class: "grow" }), heardLine(name, r)));
+        h("span", { class: "grow" }), heardLine(name, r)),
+      send ? syncLine(name) : null);
     m.append(box);
   }
+}
+/** The projects kept in sync with a machine; a paused one asks in its
+ * project, and Keep All Projects in Sync leaves it paused. */
+const syncedWith = (name) => S.projects.filter((p) => p.mirror === name && !p.away);
+const pausedWith = (name) => syncedWith(name).filter((p) => syncPaused(p));
+function syncLine(name) {
+  const all = syncedWith(name), paused = pausedWith(name);
+  if (!all.length) return null;
+  const go = (p) => { S.tab = "projects"; S.selection = p.real_path; drawTop(); draw(); };
+  return h("div", { class: "row small synced" },
+    h("span", { class: "dim", text: `${plural(all.length, "project")} kept in sync with ${name}` }),
+    paused.length ? h("span", { class: "warn", text: `· ${paused.length} paused:` }) : null,
+    paused.map((p) => h("button", { class: "link", text: base(p.real_path), title: tilde(p.real_path), onclick: () => go(p) })));
+}
+/** Keep All Projects in Sync (or Stop Keeping All in Sync): what the first
+ * copy sends, then the question.  A paused project stays paused: it is
+ * named, with "2 paused", to be settled in its own project. */
+async function syncAll(name, on) {
+  const plan = await busy(on ? "adding up what the first copy sends…" : "checking…", () =>
+    dryRun(["mirror", "--all", on ? "--on" : "--off", "--to", name, "--json"]));
+  const paused = on ? pausedWith(name) : [];
+  const stays = paused.length ? `${paused.length} paused: ${paused.map((p) => base(p.real_path)).join(", ")}. `
+    + `${paused.length === 1 ? "It stays" : "They stay"} paused until you choose what happens to the work there, in ${paused.length === 1 ? "its project" : "each project"}.` : "";
+  const rows = plan.projects || [];
+  if (problems(plan) || !rows.length) return tell("Nothing to do", [sentence(problems(plan) || "every project is in sync already").trim(), stays].filter(Boolean).join("\n\n"));
+  const every = Number(S.config.mirror_interval_minutes) || 30;
+  const top = rows.slice(0, 6).map((r) => "• " + base(r.project) + (on ? ` — ${bytes(r.bytes)}` : "")).join("\n");
+  // folders here that are copies of another machine's projects (`copies_skipped`: their paths)
+  const copies = plan.copies_skipped || [];
+  const left = copies.length ? `\n\nLeft out: ${plural(copies.length, "folder")} that ${copies.length === 1 ? "is a copy" : "are copies"} of another machine's projects (${copies.map(base).join(", ")}).` : "";
+  const body = on
+    ? `${plural(rows.length, "project")} get a copy on ${name}, about ${(Number(plan.bytes || 0) / 1e9).toFixed(1)} GB the first time (it runs in the background and can take a while); after that only changes travel, every ${every} minutes. The biggest:\n\n${top}`
+      + "\n\nProjects inside another project travel with it. Rebuilt folders such as node_modules stay behind." + left + (stays ? "\n\n" + stays : "")
+    : `${plural(rows.length, "project")} stop being kept in sync. The copies on the other machine stay where they are.`;
+  if (!(await confirmIt(on ? `Keep every project in sync with ${name}?` : "Stop keeping every project in sync?", body, on ? "Keep All in Sync" : "Stop"))) return;
+  const r = await busy(on ? "switching it on…" : "switching it off…", () => run(["mirror", "--all", on ? "--on" : "--off", "--to", name, "--apply", "--json"]));
+  const d = r.json || {};
+  if (!d.applied) await tell(on ? "Not kept in sync" : "Not stopped", problems(d) || (r.err + r.out).trim() || "aht gave no answer.");
+  else toast(on ? `${plural(rows.length, "project")} kept in sync with ${name}; the first copies run in the background.` : `${plural(rows.length, "project")} no longer kept in sync.`);
+  refresh();
 }
 /** When aht last heard from a machine (`last_heard`: when it last answered
  * the session board, which the notices ask every 2 minutes for a watched

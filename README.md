@@ -287,6 +287,19 @@ session is open in it, and a transfer shows its progress.
 - **Keep in Sync** copies a project in the background (every
   `mirror_interval_minutes`) while the connection is good, so the handover
   itself only sends the last changes.  Transfers are compressed (`rsync -z`).
+  It looks before it overwrites: it compares the copy there with its list
+  from the last sync, and pauses, sending nothing, when that copy was
+  worked on (a file only touched does not count), when it would remove
+  more than 200 files there (or more than a quarter of at least 20), or
+  when a first sync would go into a folder that holds something else.
+  The project then offers *Bring Them Here* (Take Back on the copy: a file
+  changed on both sides keeps both versions), *Replace Them* (`aht mirror
+  <folder> --replace`; theirs are set aside there), *Allow the Removals*
+  (`--allow-removals`) or *Stop Syncing* (`--off`).  Hand Over blocks over a changed copy the
+  same way (`--replace-there` goes past it).  The machine that holds the
+  copies notes them in `~/.aht/remote/copies.json`, so its own aht will
+  not keep such a folder in sync too, and *Keep All Projects in Sync*
+  leaves it out.
 - **What travels**: the folder, the history store, the `/rewind` checkpoints
   and, with `--include <path>`, files and folders outside the project
   (remembered per project; Take Back brings them back, also after a
@@ -330,8 +343,10 @@ session is open in it, and a transfer shows its progress.
   When the project is kept in sync with that machine, Release pauses Keep
   in sync, so no sync replaces the copy left there.  It stays paused until
   you turn it on again (`aht mirror <folder> --on --to box`, or *Turn Sync
-  Back On…*); a later Hand Over to that machine also ends the pause (it
-  sets the released copy aside there first), as does a Take Back from it.
+  Back On…*; the next sync then looks at the copy there first); a later
+  Hand Over to that machine also ends the pause (it sets the released copy
+  aside there first, with `--replace-there` when work was left in it), as
+  does a Take Back from it.
 - **Which session goes on.**  The one you worked in last, picked the way
   `claude --continue` picks it (scripted `claude -p` runs and `/loop`
   sessions do not count) — in both directions.  If that is not the session

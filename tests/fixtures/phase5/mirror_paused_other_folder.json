@@ -1,0 +1,25 @@
+{
+  "mirrored": [
+    {
+      "project": "/Users/me/code/web",
+      "remote": "box",
+      "status": "paused",
+      "reason": "paused: the folder on box holds another folder (1 file) \u2014 replace it (it is set aside there), or stop syncing",
+      "paused": {
+        "at": "2026-10-27T21:20:10",
+        "remote": "box",
+        "marker": null,
+        "owner": "none",
+        "reason": "other-folder",
+        "changed": 0,
+        "new": 0,
+        "removed": 0,
+        "history": 0,
+        "files": [
+          "notes.txt"
+        ],
+        "total": 1
+      }
+    }
+  ]
+}

@@ -248,6 +248,7 @@ struct Project: Identifiable, Hashable {
     let incoming: Incoming?         // work that came from another machine: a note, a pickup
     let pickupFrom: Incoming?       // `pickup_from`: the pickup from another machine open here
     let knowsPickupFrom: Bool       // … the core says it (an older one says it only in `relay`)
+    let copyOf: CopyOf?             // this folder is a copy of a project on another machine
 
     var id: String { path }
     /// The relay Hand Back (switch --back) answers: both ends on this Mac
@@ -294,6 +295,7 @@ struct Project: Identifiable, Hashable {
         syncedAt = (d["mirror_synced_at"] as? NSNumber)?.doubleValue
         syncStatus = d["mirror_status"] as? String
         syncPaused = (d["mirror_paused"] as? [String: Any]).map(SyncPause.init)
+        copyOf = CopyOf(d["copy_of"])
         agents = d["agents"] as? [String] ?? d["stores"] as? [String] ?? []
         open = d["open"] as? String
         let lim = d["limit"] as? [String: Any]
@@ -414,16 +416,60 @@ struct Handing: Hashable {
 
 /// `projects --json`'s `mirror_paused`: Keep in sync stays on but sends
 /// nothing until the user turns it back on. Release pauses it ("released"),
-/// so the next sync does not overwrite the work left on that machine.
+/// so the next sync does not overwrite the work left on that machine. A
+/// sync pauses by itself and asks (`asks`) when the copy there changed since
+/// the last sync ("changed"), when it would remove a lot there ("removals"),
+/// or when the folder there holds something else ("other-folder").
 struct SyncPause: Hashable {
-    let reason: String              // "released"
+    let reason: String              // "released" | "changed" | "removals" | "other-folder"
     let at: Date?
     let machine: String?            // the machine the copy is on
+    let changed: Int                // files changed there since the last sync
+    let new: Int                    // … new there
+    let removed: Int                // … gone there ("changed"), or to go there ("removals")
+    let history: Int                // conversations that went on there
+    let total: Int                  // the files in the copy there ("removals": 25 of the 34)
+    let files: [String]             // some of them by name (up to 50); "other-folder": theirs
+    let marker: String?             // "other-folder": that folder's own project id, if it has one
+
+    /// A pause that waits for an answer: what to do with the copy there.
+    var asks: Bool { SYNC_ASKS.contains(reason) }
 
     init(_ d: [String: Any]) {
         reason = d["reason"] as? String ?? ""
         at = moment(d["at"])
-        machine = d["remote"] as? String
+        machine = (d["remote"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        changed = tally(d["changed"]) ?? 0
+        new = tally(d["new"]) ?? 0
+        removed = tally(d["removed"]) ?? 0
+        history = tally(d["history"]) ?? 0
+        total = tally(d["total"]) ?? 0
+        files = ((d["files"] as? [Any]) ?? []).compactMap {
+            ($0 as? String) ?? (($0 as? [String: Any])?["path"] as? String)
+        }
+        marker = (d["marker"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+}
+
+/// The pauses a sync makes by itself, each waiting for an answer.
+let SYNC_ASKS = ["changed", "removals", "other-folder"]
+
+/// `projects --json`'s `copy_of`: this folder is a copy of a project on
+/// another machine (that machine's `~/.aht/remote/copies.json` here says so).
+struct CopyOf: Hashable {
+    let from: String                // the machine the project comes from, by its own name
+    let remote: String?             // … by this Mac's name for it, when the core knows one
+    let kind: String                // "sync" | "handover" | "brought" | "returned"
+    let at: Date?
+
+    init?(_ any: Any?) {
+        guard let d = any as? [String: Any],
+              let f = [d["remote"], d["from"]].compactMap({ $0 as? String }).first(where: { !$0.isEmpty })
+        else { return nil }
+        from = (d["from"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? f
+        remote = (d["remote"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        kind = d["kind"] as? String ?? "sync"
+        at = moment(d["at"] ?? d["since"])
     }
 }
 
@@ -492,6 +538,17 @@ func releaseText(_ d: [String: Any], _ there: String, away: Bool, sync: Bool = f
     return s
 }
 
+/// Turn Sync Back On's question: the next sync makes the copy there match this
+/// Mac, but a copy that was worked on there (since the Release, `released`)
+/// is not replaced: that sync pauses and asks, as any sync does.
+func resumeAsk(_ name: String, _ to: String, released: Bool) -> (title: String, body: String) {
+    ("Turn Keep in sync with \(to) back on?",
+     "The next sync makes the copy of \(name) on \(to) the same as the one here. If that copy was "
+        + "worked on " + (released ? "since you released it" : "there") + ", the sync pauses first and "
+        + "sends nothing, and asks you here what happens to that work: Bring Them Here, Replace Them "
+        + "(set aside on \(to) first, not deleted) or Stop Syncing.")
+}
+
 /// Turn Sync Back On's note, once `mirror <path> --on` has run: what aht said
 /// when it failed; else the project's row after it (`now`), so the note says
 /// the sync is on only when the row does.
@@ -507,6 +564,393 @@ func resumedText(_ to: String, ok: Bool, out: String, err: String, now: Project?
         return "The sync with \(to) did not come back on; see the log (Settings)."
     }
     return "Kept in sync with \(to) again; the next copy runs in the background."
+}
+
+// ---- Keep in sync that looks before it overwrites ----
+
+/// "1 file", "3 files".
+func fileCount(_ n: Int) -> String { n == 1 ? "1 file" : "\(n) files" }
+
+/// Up to `max` names as bullets, then "• …" for the rest.
+func bulletList(_ names: [String], max: Int = 6, total: Int = 0) -> String {
+    let more = Swift.max(total, names.count) > max
+    return names.prefix(max).map { "• " + $0 }.joined(separator: "\n") + (more ? "\n• …" : "")
+}
+
+/// What a pause found in the copy there, in a few words: "3 changed, 1 new and 2 removed".
+func pauseCounts(_ s: SyncPause) -> String {
+    var bits: [String] = []
+    if s.changed > 0 { bits.append("\(s.changed) changed") }
+    if s.new > 0 { bits.append("\(s.new) new") }
+    if s.removed > 0 { bits.append("\(s.removed) removed") }
+    if s.history > 0 { bits.append(s.history == 1 ? "1 conversation went on" : "\(s.history) conversations went on") }
+    return bits.count < 2 ? bits.joined() : bits.dropLast().joined(separator: ", ") + " and " + bits.last!
+}
+
+/// Some of the files a pause names: "src/a.py, b.md and 4 more".
+func someFiles(_ files: [String], total: Int, max: Int = 3) -> String {
+    guard !files.isEmpty else { return "" }
+    let more = Swift.max(total, files.count) - Swift.min(max, files.count)
+    return files.prefix(max).joined(separator: ", ") + (more > 0 ? " and \(more) more" : "")
+}
+
+/// The pause banner's line under its title: why the sync waits.
+func pauseText(_ s: SyncPause, _ to: String) -> String {
+    let at = clock(s.at)
+    switch s.reason {
+    case "released":
+        return "You released the project" + (at.isEmpty ? "" : " at \(at)") + ", so the copy on \(to) "
+            + "stays as it is. Turn sync back on to make it match this Mac again."
+    case "changed":
+        let what = pauseCounts(s), names = someFiles(s.files, total: s.changed + s.new + s.removed, max: 2)
+        return "The copy on \(to) was changed since the last sync"
+            + (what.isEmpty ? "" : " (\(what))") + (names.isEmpty ? "" : ": " + names)
+            + ". Nothing was sent; that work is still there."
+    case "removals":
+        return "This sync would remove " + removalsCount(s) + " in the copy on \(to)"
+            + (s.files.isEmpty ? "" : " (" + someFiles(s.files, total: s.removed, max: 2) + ")")
+            + ". That is a lot, so nothing was sent. Allow it if you removed them here on purpose."
+    case "other-folder":
+        let n = Swift.max(s.total, s.files.count)
+        let theirs = n == 0 ? "" : " (" + fileCount(n) + (s.files.isEmpty ? "" : ": "
+            + someFiles(s.files, total: n, max: 2)) + ")"
+        return (s.marker != nil ? "The folder on \(to) holds another project" + theirs
+                                : "The folder on \(to) already holds files aht did not put there" + theirs)
+            + ". Nothing was sent."
+    default:
+        return "The copy on \(to) stays as it is. Turn sync back on to make it match this Mac again."
+    }
+}
+
+/// The answers to a paused sync, in the banner's order.
+enum PauseAction: String, CaseIterable {
+    case bring = "Bring Them Here…", replace = "Replace Them…", allow = "Allow the Removals…"
+    case stop = "Stop Syncing", resume = "Turn Sync Back On…"
+
+    func help(_ to: String) -> String {
+        switch self {
+        case .bring: return "Take what changed on \(to) into this Mac's copy, as Take Back does: a file "
+            + "changed on both machines keeps both versions. Then the sync goes on."
+        case .replace: return "Set what is on \(to) aside there and send this Mac's copy, once"
+        case .allow: return "Remove those files on \(to) too, once; aht sets them aside there first"
+        case .stop: return "Turn Keep in sync off; the copy on \(to) stays as it is"
+        case .resume: return "Make the copy on \(to) match this Mac again"
+        }
+    }
+}
+
+func pauseActions(_ s: SyncPause) -> [PauseAction] {
+    switch s.reason {
+    case "changed": return [.bring, .replace, .stop]
+    case "removals": return [.allow, .stop]
+    case "other-folder": return [.replace, .stop]
+    default: return [.resume]
+    }
+}
+
+/// "25 of the 34 files", or "25 files" when the core did not count them all.
+func removalsCount(_ s: SyncPause) -> String {
+    if s.removed == 0 { return "many files" }
+    return s.total > s.removed ? "\(s.removed) of the \(s.total) files" : fileCount(s.removed)
+}
+
+/// What Replace Them's sync, or Bring Them Here, would remove (the dry run's
+/// `removals`: {removed, total, files (the first 50), over}); nil when nothing
+/// goes, or from an older core that does not say. `over`: more than aht
+/// removes without asking, so going ahead allows them (`--allow-removals`).
+struct Removals: Hashable {
+    let removed: Int
+    let total: Int                  // the files on the side they go from
+    let files: [String]
+    let over: Bool
+
+    init?(_ any: Any?) {
+        guard let d = any as? [String: Any], let n = tally(d["removed"]), n > 0 else { return nil }
+        removed = n
+        total = tally(d["total"]) ?? 0
+        files = ((d["files"] as? [Any]) ?? []).compactMap { $0 as? String }
+        over = d["over"] as? Bool ?? false
+    }
+
+    /// "25 of the 34 files", or "3 files".
+    var counted: String { total > removed ? "\(removed) of the \(total) files" : fileCount(removed) }
+    /// The flag going ahead adds: none unless they are over the limit.
+    var allow: [String] { over ? ["--allow-removals"] : [] }
+}
+
+/// A dry run whose removals are over the limit, without the blockers and
+/// warnings that allowing them lifts: those name --allow-removals, which the
+/// question then asks for. Any other blocker stays: a folder there that is
+/// missing or empty cannot be allowed.
+func pastRemovals(_ plan: [String: Any]) -> [String: Any] {
+    guard Removals(plan["removals"])?.over == true else { return plan }
+    var p = plan
+    for k in ["blockers", "warnings"] {
+        if let xs = plan[k] as? [String] { p[k] = xs.filter { !$0.contains("--allow-removals") } }
+    }
+    return p
+}
+
+/// Where a set-aside goes on the other machine (the dry run's `aside`), as
+/// the end of a sentence.
+func asideWhere(_ aside: String?, _ to: String) -> String {
+    guard let a = aside, !a.isEmpty else { return " on \(to)" }
+    return " in \(a) on \(to)"
+}
+
+/// Replace Them's question: what is set aside on the other machine, by name
+/// (`aside`: the folder there, from the dry run), and what the sync removes
+/// there (`removals`, from the dry run; over the limit, Replace Them allows them).
+func replaceAsk(_ s: SyncPause, _ name: String, _ to: String, aside: String? = nil,
+                removals: Removals? = nil) -> (title: String, body: String) {
+    var body: String
+    if s.reason == "other-folder" {
+        let n = Swift.max(s.total, s.files.count)
+        body = (n == 1 ? "The file in the folder on \(to) is" : (n > 1 ? "The \(n) files" : "The files")
+                + " in the folder on \(to) are") + " set aside there, not deleted, and this Mac's copy of "
+            + "\(name) is sent in " + (n == 1 ? "its" : "their") + " place."
+        if !s.files.isEmpty { body += "\n\n" + bulletList(s.files, total: n) }
+    } else {
+        let what = pauseCounts(s)
+        body = "What was changed on \(to)" + (what.isEmpty ? "" : " (\(what))") + " is set aside there, "
+            + "not deleted, and this Mac's copy of \(name) is sent in its place."
+        if s.removed > 0 { body += " Files removed on \(to) come back from this Mac." }
+        if !s.files.isEmpty {
+            body += "\n\nChanged on \(to):\n" + bulletList(s.files, total: s.changed + s.new + s.removed)
+        }
+    }
+    if let r = removals {
+        body += "\n\nOn \(to), this sync removes \(r.counted), set aside there first:\n"
+            + bulletList(r.files, total: r.removed)
+        if r.over {
+            body += "\n\nThat is more than aht removes without asking, so Replace Them allows "
+                + "these removals too, once."
+        }
+    }
+    body += "\n\nWhat is set aside is kept" + asideWhere(aside, to) + "."
+    if s.reason != "other-folder" { body += "\n\nTo keep that work instead, use Bring Them Here." }
+    return ("Replace the copy of “\(name)” on \(to)?", body)
+}
+
+/// Allow the Removals' question: how many go there, by name.
+func removalsAsk(_ s: SyncPause, _ name: String, _ to: String, aside: String? = nil) -> (title: String, body: String) {
+    var body = "They are gone from \(name) on this Mac, so the sync removes them from the copy on \(to) "
+        + "too. aht sets them aside there first, not deleted: they are kept" + asideWhere(aside, to) + "."
+    if !s.files.isEmpty { body += "\n\n" + bulletList(s.files, total: s.removed) }
+    body += "\n\nIf they went missing here by mistake, cancel and get them back first (Undo a Session, "
+        + "or a backup)."
+    return (s.removed > 0 ? "Remove \(removalsCount(s)) in the copy on \(to)?"
+                          : "Allow the removals in the copy on \(to)?", body)
+}
+
+/// Every pause in a piece of the core's JSON (`mirror_paused`, `paused`, a
+/// `mirror --json` row's or a dry run's): records with a reason that asks.
+func findPauses(_ any: Any?) -> [[String: Any]] {
+    if let d = any as? [String: Any] {
+        if let r = d["reason"] as? String, SYNC_ASKS.contains(r), d["at"] != nil || d["files"] != nil {
+            return [d]
+        }
+        return d.keys.sorted().flatMap { findPauses(d[$0]) }
+    }
+    return ((any as? [Any]) ?? []).flatMap { findPauses($0) }
+}
+
+/// After Replace Them or Allow the Removals: what the core did, and whether
+/// the row still waits (`now`: the project after it).
+func replacedText(_ d: [String: Any], _ name: String, _ to: String, removals: Bool, aside: String? = nil,
+                  now: Project?) -> String {
+    if let s = now?.syncPaused, now?.mirror != nil, s.asks {
+        return "Keep in sync with \(to) is still paused: " + pauseText(s, to)
+    }
+    // the sync's own row: how many it set aside (`replaced`) and removed there
+    let row = ((d["mirrored"] as? [[String: Any]]) ?? []).first ?? d
+    let swapped = tally(row["replaced"]) ?? 0, gone = tally(row["removed"]) ?? 0
+    var s = removals ? "The copy of \(name) on \(to) matches this Mac again"
+                     : "This Mac's copy of \(name) is on \(to) again"
+    var bits: [String] = []
+    if swapped > 0 { bits.append(fileCount(swapped) + " replaced") }
+    if gone > 0 { bits.append(fileCount(gone) + " removed") }
+    s += bits.isEmpty ? "." : ": " + bits.joined(separator: " and ") + " there, kept" + asideWhere(aside, to) + "."
+    if let a = d["set_aside"] as? String, !a.isEmpty, aside == nil { s += "\nSet aside in: " + a }
+    for w in (d["warnings"] as? [String]) ?? [] { s += "\n⚠ " + w }
+    return s
+}
+
+/// Stop Syncing's note, from what `mirror --off` answered and the row after it.
+func stoppedText(_ to: String, ok: Bool, err: String, now: Project?, changed: Bool) -> String {
+    guard ok, now?.mirror == nil else {
+        let said = err.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "The sync was not stopped" + (said.isEmpty ? "; see the log (Settings)." : ":\n\n" + said)
+    }
+    return "Keep in sync with \(to) is off. The copy on \(to) stays as it is"
+        + (changed ? ", with the work done there." : ".")
+}
+
+/// The line under a folder that is a copy of a project on another machine.
+func copyLine(_ c: CopyOf) -> String {
+    switch c.kind {
+    case "sync": return "Copy kept in sync from \(c.from): changes made here pause that sync"
+    case "handover": return "Handed over from \(c.from): it goes back when \(c.from) takes it back"
+    case "brought": return "Brought here from \(c.from)"
+    case "returned": return "A copy of a project that went back to \(c.from)"
+    default: return "A copy of a project on \(c.from)"
+    }
+}
+
+/// Keep in sync with `machine` is refused here: this folder is that machine's
+/// synced copy, so the two would overwrite each other.
+func syncRefused(_ p: Project, _ machine: String?) -> Bool {
+    guard let c = p.copyOf, c.kind == "sync", let mc = machine else { return false }
+    return c.remote == mc || c.from == mc
+}
+
+/// The projects kept in sync with `machine` whose sync is paused.
+func pausedWith(_ projects: [Project], _ machine: String) -> [Project] {
+    projects.filter { p in
+        guard let s = p.syncPaused, let to = p.mirror, p.away == nil else { return false }
+        return (s.machine ?? to) == machine
+    }
+}
+
+/// What "2 paused" in Machines says when the pointer rests on it.
+func pausedHelp(_ held: [Project], _ machine: String) -> String {
+    let names = held.prefix(4).map { $0.name }.joined(separator: ", ")
+    return "Keep in sync with \(machine) is paused for \(names)" + (held.count > 4 ? " and more" : "")
+        + ": show them in Projects"
+}
+
+/// The rows of a sample of `projects --json`: its `projects`, one row, or
+/// rows by name ({"paused": row, "copy": row}).
+func sampleRows(_ pj: [String: Any]) -> [[String: Any]] {
+    if let rows = pj["projects"] as? [[String: Any]] { return rows }
+    if pj["real_path"] != nil { return [pj] }
+    return pj.keys.sorted().compactMap { pj[$0] as? [String: Any] }.filter { $0["real_path"] != nil }
+}
+
+/// The end of Keep All Projects in Sync's question: the syncs with that
+/// machine that stay paused (`held`), and the folders here left out because
+/// they are copies of another machine's projects (`copies_skipped`).
+func syncAllNote(held: Int, copies: [String]) -> String {
+    var s = ""
+    if held > 0 {
+        s += "\n\n\(held) paused: " + (held == 1 ? "it stays paused until you answer it"
+                                              : "they stay paused until you answer them") + " in Projects."
+    }
+    if !copies.isEmpty {
+        let names = copies.prefix(3).map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+        s += "\n\n" + (copies.count == 1 ? "1 folder here is a copy" : "\(copies.count) folders here are copies")
+            + " of another machine's project and " + (copies.count == 1 ? "stays" : "stay") + " out: "
+            + names + (copies.count > 3 ? " and \(copies.count - 3) more" : "") + "."
+    }
+    return s
+}
+
+/// Sync Now's notice, from `mirror --run --json`'s rows.
+func syncSummary(_ rows: [[String: Any]]) -> String {
+    if rows.isEmpty { return "No project is kept in sync yet" }
+    let ok = rows.filter { $0["status"] as? String == "synced" }.count
+    let paused = rows.filter { $0["status"] as? String == "paused" }.count
+    let other = rows.count - ok - paused
+    return "\(ok) synced" + (paused > 0 ? ", \(paused) paused — see Projects" : "")
+        + (other > 0 ? ", \(other) skipped — see the log" : "")
+}
+
+/// Hand Over's dry run over a synced copy that was changed on the other
+/// machine since the last sync: what changed there (`copy_changed`: {changed,
+/// new, removed, history, files, conversations, since}), or only that it did
+/// (a blocker that names `--replace-there`, the way past it); nil when it did
+/// not block for that.
+func changedThere(_ plan: [String: Any]) -> SyncPause? {
+    if let d = plan["copy_changed"] as? [String: Any] {
+        return SyncPause(d.merging(["reason": d["reason"] ?? "changed", "at": d["at"] ?? d["since"] ?? NSNull()])
+                         { a, _ in a })
+    }
+    let named = ((plan["blockers"] as? [String]) ?? []).contains { $0.contains("--replace-there") }
+    return named ? SyncPause(["reason": "changed"]) : nil
+}
+
+/// The dry run's blockers that `--replace-there` does not lift.
+func otherBlockers(_ plan: [String: Any]) -> [String] {
+    let all = (plan["blockers"] as? [String]) ?? []
+    if all.contains(where: { $0.contains("--replace-there") }) {
+        return all.filter { !$0.contains("--replace-there") }
+    }
+    return plan["copy_changed"] is [String: Any] && all.count <= 1 ? [] : all
+}
+
+/// The question when Hand Over meets a changed copy there.
+func changedThereText(_ s: SyncPause, _ name: String, _ to: String) -> String {
+    let what = pauseCounts(s), at = clock(s.at)
+    var t = "The copy of \(name) on \(to) was changed since the two copies last matched"
+        + (at.isEmpty ? "" : " at \(at)") + (what.isEmpty ? "" : " (\(what))")
+        + ". Handing over now would replace that work."
+    if !s.files.isEmpty { t += "\n\n" + bulletList(s.files, total: s.changed + s.new + s.removed) }
+    return t + "\n\nBring Them Here takes it into this Mac's copy first; a file changed on both machines "
+        + "keeps both versions. Replace Them sets it aside on \(to) and hands this Mac's copy over."
+}
+
+/// The line Hand Over's sheet adds when it replaces a changed copy there.
+func replaceThereLine(_ s: SyncPause, _ to: String) -> String {
+    let what = pauseCounts(s)
+    return "⚠ What was changed on \(to)" + (what.isEmpty ? "" : " (\(what))")
+        + " is set aside there first, not deleted."
+        + (s.files.isEmpty ? "" : "\n" + bulletList(s.files, max: 4, total: s.changed + s.new + s.removed))
+}
+
+/// Take Back's question, and Bring Them Here's (`copy`: a copy changed there,
+/// with no handover): what comes from there, from `reclaim --json`'s plan.
+/// Bring Them Here names the removals here when they are over the limit
+/// (`removals.over`: going ahead allows them); `synced`: Keep in sync with
+/// that machine is on, so the sync goes on after it.
+func takeBackText(_ plan: [String: Any], _ remote: String, copy: Bool, synced: Bool) -> String {
+    let n = ((plan["plan"] as? [String: Any])?["project"] as? [String: Any]) ?? [:]
+    var body = "\(tally(n["take"]) ?? 0) file(s) changed there, \(tally(n["new"]) ?? 0) new, "
+        + "\(tally(n["delete"]) ?? 0) removed. Whatever they replace here is set aside, not deleted.\n"
+    if !copy && plan["would_stop"] as? Bool ?? false {
+        body += "\nThe idle session on \(remote) is ended first.\n"
+    }
+    if copy, let r = Removals(plan["removals"]), r.over {
+        body += "\nIt removes \(r.counted) here, because they are gone from the copy on \(remote): "
+            + "more than aht removes without asking, so going ahead allows it, once. They are set "
+            + "aside here first, not deleted:\n" + bulletList(r.files, total: r.removed)
+            + "\nIf they went missing on \(remote) by mistake, cancel.\n"
+    }
+    if copy && synced { body += "\nThen Keep in sync with \(remote) goes on from this Mac's copy.\n" }
+    return body
+}
+
+/// Bring Them Here's note: what came, and whether the sync goes on (`now`:
+/// the project after it).
+func broughtText(_ d: [String: Any], _ remote: String, now: Project?) -> String {
+    var s = "The changes from \(remote) are here."
+    // changed on both machines: theirs is next to ours (`done.project.conflicts`)
+    let both = (((d["done"] as? [String: Any])?["project"] as? [String: Any])?["conflicts"] as? [[String: Any]]) ?? []
+    let twins = both.compactMap { c -> String? in
+        guard let f = c["file"] as? String else { return nil }
+        return (c["their_version"] as? String).map { "\(f) (theirs: \(($0 as NSString).lastPathComponent))" } ?? f
+    }
+    if !twins.isEmpty {
+        s += "\nChanged on both machines, both kept: " + twins.prefix(3).joined(separator: ", ")
+            + (twins.count > 3 ? " and \(twins.count - 3) more" : "") + "."
+    }
+    if let aside = d["set_aside"] as? String { s += "\nReplaced files are kept in: " + aside }
+    // the sync that runs after it (`sync`), else the row as it is now
+    if let row = d["sync"] as? [String: Any], let st = row["status"] as? String {
+        if st == "synced" {
+            s += "\nKeep in sync with \(remote) ran: the copy there matches this Mac again."
+        } else if let p = findPauses(row).first.map(SyncPause.init) {
+            s += "\nKeep in sync with \(p.machine ?? remote) paused again: " + pauseText(p, p.machine ?? remote)
+        } else {
+            let why = (row["reason"] as? String).map { ": " + $0 } ?? ""
+            s += "\nThe sync with \(remote) did not run" + why + (why.hasSuffix(".") ? "" : ".")
+        }
+    } else if let p = now?.syncPaused, now?.mirror != nil {
+        s += "\nKeep in sync with \(p.machine ?? remote) is still paused: " + pauseText(p, p.machine ?? remote)
+    } else if now?.mirror != nil {
+        s += "\nKeep in sync with \(remote) goes on."
+    }
+    for w in (d["warnings"] as? [String]) ?? [] { s += "\n⚠ " + w }
+    return s
 }
 
 /// One computer's folder of backups on the machine that keeps them
@@ -873,6 +1317,7 @@ struct HandoverPlan: Identifiable {
     let remote: String
     let body: String
     var task = ""
+    var replaceThere = false        // the copy there changed: set it aside (--replace-there)
 }
 
 struct RulesView: Identifiable {
@@ -1939,12 +2384,27 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func handOver(_ p: Project) {
+    /// Hand Over: the dry run, then the sheet. Over a synced copy that was
+    /// changed on the other machine the dry run blocks; Bring Them Here takes
+    /// that work first, or Replace Them hands over with `--replace-there`
+    /// (`replacing`: what changed there, set aside there first).
+    func handOver(_ p: Project, replacing: SyncPause? = nil) {
         let to = machine.map { ["--to", $0] } ?? []
         note(p.path, nil)
         busy("checking \(p.name)…") {
-            let plan = ahtJSON(["handover", p.path, "--json"] + to) ?? [:]
+            let plan = ahtJSON(["handover", p.path, "--json"] + to
+                               + (replacing == nil ? [] : ["--replace-there"])) ?? [:]
             DispatchQueue.main.async {
+                let there = plan["remote"] as? String ?? self.machine ?? "the other machine"
+                if replacing == nil, let c = changedThere(plan), otherBlockers(plan).isEmpty,
+                   plan["error"] == nil {
+                    let pick = choose("The copy of “\(p.name)” on \(there) was changed there",
+                                      changedThereText(c, p.name, there),
+                                      ["Bring Them Here…", "Replace Them…", "Cancel"])
+                    if pick == 0 { self.takeBack(p, copy: true) }
+                    if pick == 1 { self.handOver(p, replacing: c) }
+                    return
+                }
                 if let why = self.problems(plan) {
                     self.note(p.path, "Cannot be handed over now:\n\n" + why)
                     return
@@ -1963,9 +2423,15 @@ final class AppModel: ObservableObject {
                         + stay.prefix(6).map { "• " + $0 }.joined(separator: "\n") + "\n"
                 }
                 for w in (plan["warnings"] as? [String]) ?? [] { body += "\n⚠ " + w + "\n" }
+                if let r = replacing,
+                   !((plan["warnings"] as? [String]) ?? []).contains(where: { $0.contains("aside") }) {
+                    // the core's warning says what is set aside there; an older one does not
+                    body += "\n" + replaceThereLine(changedThere(plan) ?? r, remote) + "\n"
+                }
                 body += "\nThe session is resumed there and this folder is marked as "
                     + "away until you take it back."
-                self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body)
+                self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body,
+                                                 replaceThere: replacing != nil)
             }
         }
     }
@@ -1979,6 +2445,7 @@ final class AppModel: ObservableObject {
                 self.busy("handing \(p.name) over…", follow: file) {
                     let d = ahtJSON(["handover", p.path, "--apply", "--json",
                                      "--status-file", file] + to
+                                    + (plan.replaceThere ? ["--replace-there"] : [])
                                     + (task.isEmpty ? [] : ["--task=" + task])) ?? [:]
                     if let why = self.problems(d) {
                         self.note(p.path, "The handover did not go through:\n\n" + why)
@@ -1994,45 +2461,61 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func takeBack(_ p: Project) {
+    /// Take Back from the machine a project was handed over to; with `copy`,
+    /// Bring Them Here: the same flow on a synced copy changed there (Take
+    /// Back's plan, "keep both" and set-aside; no session there to end), and
+    /// then the sync goes on.
+    func takeBack(_ p: Project, copy: Bool = false) {
+        let stop = copy ? [] : ["--stop"]
         note(p.path, nil)
         busy("checking \(p.name)…") {
-            let plan = ahtJSON(["reclaim", p.path, "--stop", "--json"]) ?? [:]
+            let asked = ahtJSON(["reclaim", p.path, "--json"] + stop) ?? [:]
+            // Bring Them Here that would remove many files here asks before it does
+            let plan = copy ? pastRemovals(asked) : asked
+            let allow = copy ? Removals(plan["removals"])?.allow ?? [] : []
             DispatchQueue.main.async {
                 if let why = self.problems(plan) {
-                    self.note(p.path, "Cannot be taken back now:\n\n" + why)
+                    self.note(p.path, (copy ? "Cannot bring them here now:\n\n"
+                                            : "Cannot be taken back now:\n\n") + why)
                     return
                 }
-                let remote = plan["remote"] as? String ?? "the other machine"
-                let n = ((plan["plan"] as? [String: Any])?["project"] as? [String: Int]) ?? [:]
-                var body = "\(n["take"] ?? 0) file(s) changed there, \(n["new"] ?? 0) new, "
-                    + "\(n["delete"] ?? 0) removed. Whatever they replace here is "
-                    + "set aside, not deleted.\n"
-                if plan["would_stop"] as? Bool ?? false {
-                    body += "\nThe idle session on \(remote) is ended first.\n"
-                }
+                let remote = plan["remote"] as? String ?? p.syncPaused?.machine ?? p.mirror
+                    ?? "the other machine"
+                // the sync goes on after it only when Keep in sync with that machine is on
+                var body = takeBackText(plan, remote, copy: copy, synced: p.mirror == remote)
+                let title = copy ? "Bring the changes from \(remote) into “\(p.name)”?"
+                                 : "Take “\(p.name)” back from \(remote)?"
                 let both = ((plan["conflicts"] as? [String: [String]]) ?? [:])
                     .values.flatMap { $0 }
                 var extra: [String] = []
                 if both.isEmpty {
-                    guard alert("Take “\(p.name)” back from \(remote)?", body,
-                                confirm: "Take Back") else { return }
+                    guard alert(title, body, confirm: copy ? "Bring Them Here" : "Take Back") else { return }
                 } else {
                     body += "\nChanged on BOTH machines:\n"
                         + both.prefix(6).map { "• " + $0 }.joined(separator: "\n")
                         + "\n\nKeep Both leaves your version in place and puts the one "
                         + "from \(remote) next to it."
-                    let pick = choose("Take “\(p.name)” back from \(remote)?", body,
+                    let pick = choose(title, body,
                                       ["Keep Both", "Use the Versions from \(remote)", "Cancel"])
                     if pick == 2 { return }
                     if pick == 1 { extra = ["--prefer", "there"] }
                 }
                 let file = self.stageFile(p.path)
-                self.busy("taking \(p.name) back…", follow: file) {
-                    let d = ahtJSON(["reclaim", p.path, "--stop", "--apply", "--json",
-                                     "--status-file", file] + extra) ?? [:]
+                self.busy(copy ? "bringing the changes from \(remote)…" : "taking \(p.name) back…",
+                          follow: file) {
+                    let d = ahtJSON(["reclaim", p.path, "--apply", "--json",
+                                     "--status-file", file] + stop + extra + allow) ?? [:]
                     if let why = self.problems(d) {
-                        self.note(p.path, "Taking it back did not go through:\n\n" + why)
+                        self.note(p.path, (copy ? "Bringing them here did not go through:\n\n"
+                                                : "Taking it back did not go through:\n\n") + why)
+                        return
+                    }
+                    if copy {
+                        // whether the sync goes on, as the registry has it now
+                        self.refresh {
+                            self.note(p.path, broughtText(d, remote,
+                                                          now: self.projects.first { $0.path == p.path }))
+                        }
                         return
                     }
                     var done = "Back on this Mac, files and history."
@@ -2123,14 +2606,12 @@ final class AppModel: ObservableObject {
     }
 
     /// Turn a paused Keep in sync back on: the next sync makes the copy there
-    /// match this Mac again; what it replaces there is set aside there first.
-    /// The note comes once the command has run, from its answer and the row.
+    /// match this Mac again, unless that copy was worked on: then the sync
+    /// pauses and asks (`resumeAsk`). The note comes once the command has run,
+    /// from its answer and the row.
     func resumeSync(_ p: Project, _ to: String) {
-        guard alert("Turn Keep in sync with \(to) back on?",
-                    "The next sync makes the copy of \(p.name) on \(to) the same as the one "
-                    + "here, so the work left there is replaced. aht keeps what it replaces "
-                    + "in a set-aside folder on \(to).",
-                    confirm: "Turn Sync Back On") else { return }
+        let ask = resumeAsk(p.name, to, released: p.syncPaused?.reason == "released")
+        guard alert(ask.title, ask.body, confirm: "Turn Sync Back On") else { return }
         note(p.path, nil)
         busy("turning the sync with \(to) back on…") {
             let r = shWithStderr(PY, [ahtScript(), "mirror", p.path, "--on", "--to", to])
@@ -2140,6 +2621,78 @@ final class AppModel: ObservableObject {
                 self.note(p.path, resumedText(to, ok: r.ok, out: r.out, err: r.err, now: now))
             }
         }
+    }
+
+    /// The answers to a paused sync (`SyncPausedBanner`).
+    func pauseAction(_ p: Project, _ a: PauseAction, _ to: String) {
+        switch a {
+        case .bring: takeBack(p, copy: true)
+        case .replace: replaceThem(p, to, removals: false)
+        case .allow: replaceThem(p, to, removals: true)
+        case .stop: stopSyncing(p, to)
+        case .resume: resumeSync(p, to)
+        }
+    }
+
+    /// Replace Them (`mirror --replace`) and Allow the Removals (`mirror
+    /// --allow-removals`), once each: the dry run first, then a question that
+    /// names what is set aside on the other machine, then the sync.
+    func replaceThem(_ p: Project, _ to: String, removals: Bool) {
+        guard let had = p.syncPaused else { return }
+        let flag = removals ? "--allow-removals" : "--replace"
+        note(p.path, nil)
+        busy("checking the copy on \(to)…") {
+            // removals over the limit ask here, before Replace Them allows them
+            let plan = pastRemovals(ahtJSON(["mirror", p.path, flag, "--json"]) ?? [:])
+            let gone = removals ? nil : Removals(plan["removals"])
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    self.note(p.path, (removals ? "The removals cannot be allowed now:\n\n"
+                                                : "Cannot replace them now:\n\n") + why)
+                    return
+                }
+                // the dry run's own view of the copy there, else the row's
+                let s = findPauses(plan).first.map(SyncPause.init) ?? had
+                let aside = plan["aside"] as? String
+                let ask = removals ? removalsAsk(s, p.name, to, aside: aside)
+                                   : replaceAsk(s, p.name, to, aside: aside, removals: gone)
+                guard alert(ask.title, ask.body,
+                            confirm: removals ? "Allow the Removals" : "Replace Them") else { return }
+                self.busy("sending \(p.name) to \(to)…") {
+                    let d = ahtJSON(["mirror", p.path, flag] + (gone?.allow ?? [])
+                                    + ["--apply", "--json"]) ?? [:]
+                    if let why = self.problems(d) {
+                        self.note(p.path, (removals ? "The sync did not go through:\n\n"
+                                                    : "Replacing them did not go through:\n\n") + why)
+                        return
+                    }
+                    self.refresh {
+                        self.note(p.path, replacedText(d, p.name, to, removals: removals, aside: aside,
+                                                       now: self.projects.first { $0.path == p.path }))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop Syncing: Keep in sync off; the copy there stays as it is.
+    func stopSyncing(_ p: Project, _ to: String) {
+        note(p.path, nil)
+        busy("stopping the sync with \(to)…") {
+            let r = shWithStderr(PY, [ahtScript(), "mirror", p.path, "--off"])
+            self.refresh {
+                self.note(p.path, stoppedText(to, ok: r.ok, err: r.err,
+                                              now: self.projects.first { $0.path == p.path },
+                                              changed: p.syncPaused?.reason == "changed"))
+            }
+        }
+    }
+
+    /// "2 paused" in Machines: the Projects tab, on the first of them.
+    func showPaused(_ held: [Project]) {
+        search = ""
+        tab = .projects
+        selection = held.first?.path
     }
 
     // ---- across agents ----
@@ -2378,13 +2931,15 @@ final class AppModel: ObservableObject {
                     return "• " + ((r["project"] as? String ?? "") as NSString).lastPathComponent
                         + (on ? String(format: " — %.0f MB", mb) : "")
                 }.joined(separator: "\n")
+                let held = pausedWith(self.projects, mc.name).count
+                let copies = (plan["copies_skipped"] as? [String]) ?? []
                 let body = on
                     ? "\(rows.count) project\(rows.count == 1 ? "" : "s") get a copy on \(mc.name), "
                       + String(format: "about %.1f GB the first time", gb) + " (it runs in the "
                       + "background and can take a while); after that only changes travel, "
                       + "every 30 minutes. The biggest:\n\n" + top + "\n\nProjects inside "
                       + "another project travel with it. Rebuilt folders such as node_modules "
-                      + "stay behind."
+                      + "stay behind." + syncAllNote(held: held, copies: copies)
                     : "\(rows.count) project\(rows.count == 1 ? "" : "s") stop being kept in sync. "
                       + "The copies on the other machine stay where they are."
                 guard alert(on ? "Keep every project in sync with \(mc.name)?"
@@ -3471,21 +4026,30 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.selectFile(p.path, inFileViewerRootedAtPath: "")
     }
 
+    /// The Keep in sync switch. When aht refuses (this folder is the other
+    /// machine's synced copy, say), the note says why.
     func keepInSync(_ p: Project, _ on: Bool) {
         let to = machine.map { ["--to", $0] } ?? []
         note(p.path, on ? "Kept in sync with \(machine ?? "the other machine"); the "
                           + "first copy runs in the background." : nil)
-        background { aht(["mirror", p.path] + (on ? ["--on"] + to : ["--off"])) }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript(), "mirror", p.path] + (on ? ["--on"] + to : ["--off"]))
+            self.refresh {
+                guard !r.ok else { return }
+                let said = [r.err, r.out].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }.joined(separator: "\n\n")
+                self.note(p.path, "Keep in sync was not turned \(on ? "on" : "off"):\n\n"
+                          + (said.isEmpty ? "aht gave no answer — see the log (Settings)." : said))
+            }
+        }
     }
 
     func syncNow() {
         busy("syncing…") {
             let rows = (ahtJSON(["mirror", "--run", "--json"])?["mirrored"]
                         as? [[String: Any]]) ?? []
-            let ok = rows.filter { $0["status"] as? String == "synced" }.count
-            notifyUser("Sync", rows.isEmpty ? "No project is kept in sync yet"
-                       : "\(ok) synced" + (ok < rows.count
-                                           ? ", \(rows.count - ok) skipped — see the log" : ""))
+            notifyUser("Sync", syncSummary(rows))
+            self.refresh()
         }
     }
 
@@ -3941,7 +4505,9 @@ struct ProjectsView: View {
                                                   : (p.exists ? .primary : .secondary))
                 }
                 .width(min: 100, ideal: 150)
-                TableColumn("In sync") { p in Text(p.sync) }
+                TableColumn("In sync") { p in
+                    Text(p.sync).foregroundColor(p.syncPaused?.asks == true && p.away == nil ? .orange : .primary)
+                }
                     .width(min: 80, ideal: 120)
                 TableColumn("Last used") { p in Text(ago(p.lastActivity)) }
                     .width(min: 90, ideal: 120)
@@ -3970,6 +4536,12 @@ struct DetailView: View {
                 }
                 Text(tilde(p.path)).font(.caption).foregroundColor(.secondary)
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                if let c = p.copyOf, p.away == nil {
+                    Label(copyLine(c), systemImage: c.kind == "sync" ? "arrow.triangle.2.circlepath"
+                                                                     : "laptopcomputer.and.arrow.down")
+                        .font(.callout).foregroundColor(.secondary).lineLimit(1)
+                        .help(c.at.map { "Since " + clock($0) } ?? "")
+                }
                 if let h = p.handing, h.state != "running" { HandingBanner(p: p, h: h) }
                 if let s = p.syncPaused, let to = p.mirror, p.away == nil, p.handing == nil {
                     SyncPausedBanner(p: p, s: s, to: s.machine ?? to)
@@ -3995,7 +4567,12 @@ struct DetailView: View {
                         Toggle("Keep in sync" + (p.mirror.map { " with \($0)" } ?? ""),
                                isOn: Binding(get: { p.mirror != nil },
                                              set: { m.keepInSync(p, $0) }))
-                            .disabled(m.machine == nil || !m.supported || p.handing != nil)
+                            .disabled(m.machine == nil || !m.supported || p.handing != nil
+                                      || (p.mirror == nil && syncRefused(p, m.machine)))
+                            .help(p.mirror == nil && syncRefused(p, m.machine)
+                                  ? "This folder is \(m.machine ?? "that machine")'s synced copy: syncing "
+                                    + "it back would overwrite one copy with the other"
+                                  : "")
                         HelpButton("Hand a project over")
                         Button("Continue Session") { m.continueHere(p) }
                             .disabled(p.sessions == 0 || p.handing != nil)
@@ -4137,33 +4714,33 @@ struct HandingBanner: View {
     }
 }
 
-/// Keep in sync that waits for the user: Release paused it so the copy left
-/// on the other machine is not overwritten. Turning it back on is the way on.
+/// Keep in sync that waits for the user. Release paused it so the copy left
+/// on the other machine is not overwritten: Turn Sync Back On. Or the sync
+/// paused by itself: the copy there was changed (Bring Them Here, Replace
+/// Them, Stop Syncing), it would remove a lot there (Allow the Removals), or
+/// the folder there holds something else (Replace Them, Stop Syncing).
 struct SyncPausedBanner: View {
     @EnvironmentObject var m: AppModel
     let p: Project
     let s: SyncPause
     let to: String
 
-    var why: String {
-        let at = clock(s.at)
-        let copy: String = s.reason == "released"
-            ? "You released the project" + (at.isEmpty ? "" : " at \(at)") + ", so the copy"
-            : "The copy"
-        return copy + " on \(to) stays as it is. Turn sync back on to make it match this Mac again."
-    }
-
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "pause.circle.fill").foregroundColor(.orange)
+            Image(systemName: s.asks ? "exclamationmark.triangle.fill" : "pause.circle.fill")
+                .foregroundColor(.orange)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Keep in sync with \(to) is paused").fontWeight(.semibold)
-                Text(why)
+                Text(pauseText(s, to))
                     .font(.caption).foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
-            Button("Turn Sync Back On…") { m.resumeSync(p, to) }.disabled(!m.supported)
+            ForEach(pauseActions(s), id: \.self) { a in
+                Button(a.rawValue) { m.pauseAction(p, a, to) }
+                    .disabled(!m.supported)
+                    .help(a.help(to))
+            }
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
@@ -6240,6 +6817,13 @@ struct MachinesView: View {
                                         .disabled(m.mirroredCount == 0)
                                 }
                                 .fixedSize()
+                                let held = pausedWith(m.projects, mc.name)
+                                if !held.isEmpty {
+                                    // syncs with this machine that wait for an answer
+                                    Button("\(held.count) paused") { m.showPaused(held) }
+                                        .buttonStyle(.borderless).foregroundColor(.orange)
+                                        .help(pausedHelp(held, mc.name))
+                                }
                                 Button("Check") { m.check(mc) }
                                 Button("Remove…") { m.remove(mc) }
                             }
@@ -8730,7 +9314,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
                 }
             } else if kind == "update" {
                 self.showUpdateFromMenu()
-            } else if ["limit", "handover", "incoming"].contains(kind),
+            } else if ["limit", "handover", "incoming", "sync-paused"].contains(kind),
                       let p = info["project"] as? String {
                 self.openWindow()
                 self.model.tab = .projects
@@ -9862,6 +10446,374 @@ if CommandLine.arguments.contains("--selftest") {
         print("PHASE 4 SAMPLES not checked (" + (dir4.isEmpty ? "AHT_FIXTURES_PHASE4 names no folder"
                                                        : "no samples in \(dir4) yet") + ")")
     }
+    // Keep in sync that looks before it overwrites (phase 5): the pauses a
+    // sync makes by itself (`mirror_paused`), their words and answers and the
+    // questions that name what is set aside; a copy synced from another
+    // machine (`copy_of`); "2 paused" in Machines; Hand Over over a changed
+    // copy (`copy_changed`, and the blocker naming --replace-there); Bring
+    // Them Here (`reclaim --json` in copy mode, and the sync after it);
+    // Replace Them's and Sync Now's notes
+    let p5pause = { (reason: String, c: Int, n: Int, r: Int, files: [String]) -> [String: Any] in
+        ["reason": reason, "at": iso(Date()), "remote": "box", "changed": c, "new": n, "removed": r,
+         "history": 0, "files": files, "total": 40]
+    }
+    let p5row = { (pause: [String: Any]) in
+        Project(["real_path": "/x/api", "exists": true, "mirror": "box", "mirror_synced_at": t - 3600,
+                 "mirror_status": "paused", "mirror_paused": pause])
+    }
+    let p5changed = p5row(p5pause("changed", 3, 1, 0, ["src/a.py", "src/b.py", "README.md", "notes/new.md"]))
+    let p5talked = p5row(p5pause("changed", 0, 0, 0, []).merging(["history": 2]) { $1 })
+    let p5removals = p5row(p5pause("removals", 0, 0, 25, ["old/1.txt", "old/2.txt"]))
+    let p5other = p5row(p5pause("other-folder", 0, 0, 0, ["notes.txt"]).merging(["total": 1, "marker": NSNull()]) { $1 })
+    let p5theirs = p5row(p5pause("other-folder", 0, 0, 0, []).merging(["total": 12, "marker": "07f3"]) { $1 })
+    let p5copy = Project(["real_path": "/home/me/code/api", "exists": true,
+                          "copy_of": ["from": "mac", "kind": "sync", "at": iso(Date())]])
+    let p5s = p5changed.syncPaused!, p5rm = p5removals.syncPaused!, p5of = p5other.syncPaused!
+    let p5ask = replaceAsk(p5s, "api", "box", aside: "/home/me/.aht/remote/replaced/07f3/")
+    let p5rmAsk = removalsAsk(p5rm, "api", "box")
+    let p5why = "the copy on box was changed since 18:10 (1 changed: src/a.py) — bring them here first "
+        + "(aht reclaim /x/api --apply), or pass --replace-there to set them aside there"
+    let p5blocked: [String: Any] = ["remote": "box", "blockers": [p5why]]
+    let p5counted: [String: Any] = ["blockers": [p5why], "copy_changed": [
+        "changed": 2, "new": 0, "removed": 1, "history": 1, "files": ["a", "b"], "conversations": [],
+        "since": iso(Date())]]
+    let p5open: [String: Any] = ["blockers": ["a session is open in it on box"]]
+    let p5two: [String: Any] = ["blockers": ["a session is open in it on box", p5why]]
+    let p5plan: [String: Any] = ["mode": "copy", "remote": "box", "conflicts": [String: Any](),
+                                 "plan": ["project": ["take": 3, "new": 1, "delete": 0, "conflict": 0]]]
+    let p5done: [String: Any] = ["applied": true, "mode": "copy", "remote": "box",
+        "done": ["project": ["conflicts": [["file": "README.md", "their_version": "README (from box 2026-10-27).md"]]]],
+        "sync": ["project": "/x/api", "remote": "box", "status": "synced", "files": 3]]
+    let p5again: [String: Any] = p5done.merging(["sync": ["project": "/x/api", "remote": "box", "status": "paused",
+        "reason": "paused: 1 changed", "paused": p5pause("changed", 1, 0, 0, ["src/c.py"])]]) { $1 }
+    let p5text = pauseText(p5s, "box")
+    let pause5OK = p5s.asks && p5s.changed == 3 && p5s.new == 1 && p5s.files.count == 4 && p5s.total == 40
+        && p5changed.sync == "paused" && p5s.machine == "box" && p5s.at != nil
+        && pauseActions(p5s) == [.bring, .replace, .stop]
+        && pauseActions(p5rm) == [.allow, .stop] && pauseActions(p5of) == [.replace, .stop]
+        && pauseActions(paused.syncPaused!) == [.resume] && !paused.syncPaused!.asks
+        && p5text.contains("(3 changed and 1 new): src/a.py, src/b.py and 2 more.")
+        && p5text.hasPrefix("The copy on box was changed since the last sync")
+        && p5text.hasSuffix("Nothing was sent; that work is still there.")
+        && pauseText(p5talked.syncPaused!, "box").contains("(2 conversations went on)")
+        && pauseText(paused.syncPaused!, "box").hasPrefix("You released the project at ")
+        && p5ask.title == "Replace the copy of “api” on box?"
+        && p5ask.body.contains("(3 changed and 1 new) is set aside there, not deleted")
+        && p5ask.body.contains("Changed on box:\n• src/a.py\n• src/b.py\n• README.md\n• notes/new.md")
+        && p5ask.body.contains("kept in /home/me/.aht/remote/replaced/07f3/ on box.")
+        && p5ask.body.hasSuffix("use Bring Them Here.")
+        && replaceAsk(p5of, "api", "box").body.hasPrefix("The file in the folder on box is set aside there, not deleted")
+        && replaceAsk(p5theirs.syncPaused!, "api", "box").body.hasPrefix("The 12 files in the folder on box are set aside")
+        && replaceAsk(p5of, "api", "box").body.contains("• notes.txt")
+        && !replaceAsk(p5of, "api", "box").body.contains("Bring Them Here")
+        && p5rmAsk.title == "Remove 25 of the 40 files in the copy on box?"
+        && p5rmAsk.body.contains("• old/1.txt\n• old/2.txt\n• …")
+        && pauseText(p5rm, "box").contains("remove 25 of the 40 files in the copy on box (old/1.txt, old/2.txt and 23 more)")
+        && pauseText(p5of, "box") == "The folder on box already holds files aht did not put there (1 file: notes.txt). Nothing was sent."
+        && pauseText(p5theirs.syncPaused!, "box") == "The folder on box holds another project (12 files). Nothing was sent."
+        && p5copy.copyOf?.from == "mac" && p5copy.copyOf?.kind == "sync" && p5copy.copyOf?.at != nil
+        && copyLine(p5copy.copyOf!) == "Copy kept in sync from mac: changes made here pause that sync"
+        && syncRefused(p5copy, "mac") && !syncRefused(p5copy, "box") && !syncRefused(p5changed, "box")
+        && p5changed.copyOf == nil && CopyOf(NSNull()) == nil
+        && pausedWith([p5changed, p5removals, p5other, paused, syncing, p5copy], "box").count == 4
+        && pausedWith([p5changed, paused], "studio").isEmpty
+        && changedThere(p5blocked) != nil && otherBlockers(p5blocked).isEmpty
+        && changedThere(p5counted)?.changed == 2 && changedThere(p5counted)?.removed == 1
+        && changedThere(p5counted)?.at != nil && otherBlockers(p5counted).isEmpty
+        && changedThere(p5open) == nil && otherBlockers(p5two) == ["a session is open in it on box"]
+        && changedThereText(changedThere(p5counted)!, "api", "box")
+            .contains("(2 changed, 1 removed and 1 conversation went on)")
+        && changedThereText(changedThere(p5counted)!, "api", "box").contains("last matched at ")
+        && replaceThereLine(changedThere(p5counted)!, "box").hasPrefix("⚠ What was changed on box (2 changed")
+        && takeBackText(p5plan, "box", copy: true, synced: true).hasPrefix("3 file(s) changed there, 1 new, 0 removed.")
+        && takeBackText(p5plan, "box", copy: true, synced: true).contains("Then Keep in sync with box goes on")
+        && !takeBackText(p5plan.merging(["would_stop": true]) { $1 }, "box", copy: true, synced: true).contains("ended first")
+        && takeBackText(p5plan.merging(["would_stop": true]) { $1 }, "box", copy: false, synced: false).contains("ended first")
+        && broughtText(p5done, "box", now: p5changed).hasSuffix("Keep in sync with box ran: the copy there matches this Mac again.")
+        && broughtText(p5done, "box", now: nil)
+            .contains("Changed on both machines, both kept: README.md (theirs: README (from box 2026-10-27).md).")
+        && broughtText(p5again, "box", now: nil).contains("Keep in sync with box paused again: The copy on box was changed")
+        && broughtText(["set_aside": "/x/.aht/aside/1"], "box", now: syncing).hasSuffix("Keep in sync with box goes on.")
+        && broughtText([:], "box", now: p5changed).contains("still paused")
+        && syncSummary([["status": "synced"], ["status": "paused"], ["status": "skipped"]])
+            == "1 synced, 1 paused — see Projects, 1 skipped — see the log"
+        && syncSummary([["status": "synced"]]) == "1 synced"
+        && syncAllNote(held: 2, copies: ["/home/me/code/api"])
+            == "\n\n2 paused: they stay paused until you answer them in Projects.\n\n1 folder here is a copy "
+               + "of another machine's project and stays out: api."
+        && syncAllNote(held: 0, copies: []).isEmpty
+        && findPauses(["mirrored": [["project": "/x/api", "status": "paused", "files": 3,
+                                      "reason": "paused: 1 changed", "paused": p5pause("changed", 1, 0, 0, [])]]]).count == 1
+        && findPauses(["mirror_paused": ["reason": "released", "at": iso(Date())]]).isEmpty
+        && stoppedText("box", ok: true, err: "", now: Project(["real_path": "/x/api", "exists": true]),
+                       changed: true).hasSuffix("stays as it is, with the work done there.")
+        && stoppedText("box", ok: false, err: "no such project\n", now: nil, changed: false)
+            == "The sync was not stopped:\n\nno such project"
+        && replacedText([:], "api", "box", removals: false, now: p5changed)
+            .hasPrefix("Keep in sync with box is still paused: The copy on box")
+        && replacedText(["applied": true, "mirrored": [["status": "synced", "ended_pause": "changed", "replaced": 4,
+                                                         "removed": 0]]], "api", "box", removals: false,
+                        aside: "/home/me/.aht/remote/replaced/07f3/", now: syncing)
+            == "This Mac's copy of api is on box again: 4 files replaced there, kept in /home/me/.aht/remote/replaced/07f3/ on box."
+        && replacedText(["applied": true, "mirrored": [["status": "synced", "replaced": 0, "removed": 25]]], "api", "box",
+                        removals: true, now: syncing)
+            == "The copy of api on box matches this Mac again: 25 files removed there, kept on box."
+    print("SYNC THAT LOOKS FIRST \(pause5OK ? "OK" : "FAIL — \(p5text) / \(p5ask.body) / \(pauseText(p5rm, "box"))")")
+    // P5 fix 1: Turn Sync Back On no longer says the work left there is
+    // replaced: the next sync pauses over it and asks
+    let back5 = resumeAsk("api", "box", released: true), back5b = resumeAsk("api", "box", released: false)
+    let fix51 = back5.title == "Turn Keep in sync with box back on?"
+        && !back5.body.contains("is replaced") && !back5b.body.contains("is replaced")
+        && back5.body.contains("If that copy was worked on since you released it, the sync pauses first and sends nothing")
+        && back5.body.contains("Bring Them Here, Replace Them (set aside on box first, not deleted) or Stop Syncing.")
+        && back5b.body.contains("worked on there, the sync pauses first")
+    print("P5 FIX 1 TURN SYNC BACK ON ASKS FIRST \(fix51 ? "OK" : "FAIL — \(back5.body)")")
+    // P5 fix 2: Replace Them names what the sync removes there (`removals`);
+    // over the limit the question says so and going ahead adds --allow-removals;
+    // an older core's dry run (no `removals`) asks as before
+    let rm52: [String: Any] = ["removed": 30, "total": 40, "over": true,
+                               "files": (0..<30).map { "old/\($0).txt" }]
+    let dry52: [String: Any] = ["mode": "replace", "applied": false, "removals": rm52, "warnings": [String](),
+        "blockers": ["this sync would remove 30 of the 40 files on box — pass --allow-removals as well"]]
+    let few52 = Removals(["removed": 2, "total": 40, "files": ["a.txt", "b.txt"], "over": false])
+    let ask52 = replaceAsk(p5s, "api", "box", aside: "/home/me/.aht/remote/replaced/07f3/",
+                           removals: Removals(pastRemovals(dry52)["removals"]))
+    let few52ask = replaceAsk(p5s, "api", "box", removals: few52)
+    let old52 = replaceAsk(p5s, "api", "box", removals: Removals(p5plan["removals"]))
+    let fix52 = Removals(rm52)?.over == true && Removals(rm52)?.allow == ["--allow-removals"]
+        && few52?.allow == [] && Removals(["removed": 0, "total": 3, "files": [String]()]) == nil
+        && Removals(nil) == nil && Removals(rm52)?.counted == "30 of the 40 files"
+        && (pastRemovals(dry52)["blockers"] as? [String]) == []
+        && (pastRemovals(dry52.merging(["blockers": ["the folder on box is missing or empty"]]) { $1 })["blockers"]
+            as? [String]) == ["the folder on box is missing or empty"]
+        && (pastRemovals(dry52.merging(["removals": ["removed": 30, "total": 40, "over": false]]) { $1 })["blockers"]
+            as? [String])?.count == 1
+        && ask52.body.contains("On box, this sync removes 30 of the 40 files, set aside there first:\n• old/0.txt\n• old/1.txt")
+        && ask52.body.contains("That is more than aht removes without asking, so Replace Them allows these removals too, once.")
+        && ask52.body.hasSuffix("use Bring Them Here.")
+        && few52ask.body.contains("On box, this sync removes 2 of the 40 files, set aside there first:\n• a.txt\n• b.txt")
+        && !few52ask.body.contains("more than aht removes")
+        && old52.body == replaceAsk(p5s, "api", "box").body && !old52.body.contains("this sync removes")
+        && replaceAsk(p5of, "api", "box", removals: Removals(["removed": 1, "total": 1, "files": ["notes.txt"]]))
+            .body.contains("On box, this sync removes 1 file, set aside there first:\n• notes.txt")
+    print("P5 FIX 2 REPLACE THEM NAMES THE REMOVALS \(fix52 ? "OK" : "FAIL — \(ask52.body)")")
+    // P5 fix 3: Bring Them Here with removals here over the limit: named, and
+    // going ahead allows them; a blocker the removals do not lift stays
+    let dry53: [String: Any] = ["mode": "copy", "remote": "box", "conflicts": [String: Any](),
+        "plan": ["project": ["take": 0, "new": 0, "delete": 34, "conflict": 0]],
+        "removals": ["removed": 34, "total": 40, "over": true, "files": (0..<34).map { "src/m\($0).py" }],
+        "blockers": ["bringing them here would remove 34 of the 40 files here — pass --allow-removals if they were removed there on purpose"]]
+    let empty53 = dry53.merging(["blockers": ["the folder on box is missing or empty: nothing is brought here"]]) { $1 }
+    let ask53 = takeBackText(pastRemovals(dry53), "box", copy: true, synced: true)
+    let fix53 = (pastRemovals(dry53)["blockers"] as? [String]) == []
+        && Removals(pastRemovals(dry53)["removals"])?.allow == ["--allow-removals"]
+        && (pastRemovals(empty53)["blockers"] as? [String])?.count == 1
+        && ask53.contains("It removes 34 of the 40 files here, because they are gone from the copy on box: more than aht removes without asking, so going ahead allows it, once.")
+        && ask53.contains("not deleted:\n• src/m0.py\n• src/m1.py") && ask53.contains("If they went missing on box by mistake, cancel.")
+        && !takeBackText(p5plan.merging(["removals": ["removed": 3, "total": 40, "over": false, "files": ["a"]]]) { $1 },
+                         "box", copy: true, synced: true).contains("It removes")
+        && !takeBackText(dry53, "box", copy: false, synced: false).contains("It removes")
+    print("P5 FIX 3 BRING THEM HERE GUARD \(fix53 ? "OK" : "FAIL — \(ask53)")")
+    // P5 fix 4: "Then Keep in sync with box goes on" only when the project is
+    // kept in sync with that machine (Hand Over's block reaches Bring Them Here
+    // for a copy that is not)
+    let fix54 = takeBackText(p5plan, "box", copy: true, synced: true).contains("Then Keep in sync with box goes on")
+        && !takeBackText(p5plan, "box", copy: true, synced: false).contains("Keep in sync")
+    print("P5 FIX 4 KEEP IN SYNC LINE ONLY WHEN SYNCED \(fix54 ? "OK" : "FAIL")")
+    // … and the core's phase-5 samples: AHT_FIXTURES_PHASE5
+    var phase5OK = true
+    let dir5 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE5"] ?? ""
+    let names5 = ((try? FileManager.default.contentsOfDirectory(atPath: dir5)) ?? [])
+        .filter { $0.hasSuffix(".json") }.sorted()
+    if !dir5.isEmpty && !names5.isEmpty {
+        var miss: [String] = []
+        func sample(_ n: String) -> Any? {
+            let f = URL(fileURLWithPath: dir5).appendingPathComponent(n)
+            guard let data = try? Data(contentsOf: f) else { miss.append(n + " (missing)"); return nil }
+            let d = try? JSONSerialization.jsonObject(with: data)
+            if d == nil { miss.append(n + " (not JSON)") }
+            return d
+        }
+        // every pause the core wrote: a reason that asks, when, what it found,
+        // the answers for that reason, and the files named in its question
+        let pauseFiles = names5.filter { $0.hasPrefix("mirror_paused") }
+        if pauseFiles.isEmpty { miss.append("mirror_paused*.json (missing)") }
+        for n in pauseFiles {
+            let d = sample(n)
+            let found = findPauses(d)
+            if found.isEmpty && d != nil { miss.append(n + " (no pause in it)") }
+            for g in found {
+                let s = SyncPause(g), to = s.machine ?? "box"
+                let acts = pauseActions(s)
+                let counted = ["changed", "new", "removed", "history", "total"]
+                    .allSatisfy { g[$0] == nil || tally(g[$0]) != nil }
+                var ok = s.at != nil && counted && (g["files"] == nil || g["files"] is [Any])
+                    && pauseText(s, to).contains(to) && acts.last == .stop && !acts.contains(.resume)
+                    && s.machine != nil
+                switch s.reason {
+                case "changed":
+                    ok = ok && s.changed + s.new + s.removed + s.history > 0 && acts.first == .bring
+                        && !pauseCounts(s).isEmpty
+                        && s.files.prefix(6).allSatisfy { replaceAsk(s, "p", to).body.contains($0) }
+                case "removals":
+                    ok = ok && s.removed > 0 && acts.first == .allow
+                        && removalsAsk(s, "p", to).title.contains(removalsCount(s))
+                        && (s.total == 0 || pauseText(s, to).contains("\(s.removed) of the \(s.total) files"))
+                        && s.files.prefix(6).allSatisfy { removalsAsk(s, "p", to).body.contains($0) }
+                default:
+                    ok = ok && acts.first == .replace && g.keys.contains("marker")
+                        && s.files.prefix(6).allSatisfy { replaceAsk(s, "p", to).body.contains($0) }
+                        && (Swift.max(s.total, s.files.count) == 0
+                            || pauseText(s, to).contains(fileCount(Swift.max(s.total, s.files.count))))
+                }
+                if !ok { miss.append(n) }
+            }
+            // a `mirror --run --json` answer: its paused rows count as paused, not as skipped
+            if let rows = (d as? [String: Any])?["mirrored"] as? [[String: Any]] {
+                let held = rows.filter { !findPauses($0).isEmpty }
+                if held.contains(where: { $0["status"] as? String != "paused" })
+                    || (!held.isEmpty && !syncSummary(rows).contains("\(held.count) paused")) {
+                    miss.append(n + " (mirrored rows)")
+                }
+            }
+        }
+        // Bring Them Here: reclaim in copy mode, with Take Back's plan and
+        // remote; the dry run (`reclaim_copy_dry.json`) and --apply, which adds
+        // the files changed on both (`done`) and the sync after it (`sync`)
+        for (n, applied) in [("reclaim_copy_dry.json", false), ("reclaim_copy.json", true)] {
+            guard let rc = sample(n) as? [String: Any] else { continue }
+            let pl = (rc["plan"] as? [String: Any])?["project"] as? [String: Any]
+            let there = rc["remote"] as? String ?? "?"
+            let both = ((rc["conflicts"] as? [String: Any])?["project"] as? [String]) ?? []
+            var ok = rc["mode"] as? String == "copy" && pl != nil && rc["remote"] is String
+                && rc["applied"] as? Bool == applied
+                && ["take", "new", "delete"].allSatisfy { tally(pl?[$0]) != nil }
+                && takeBackText(rc, there, copy: true, synced: true).hasPrefix("\(tally(pl?["take"]) ?? -1) file(s) changed there")
+                && (rc["conflicts"] == nil || rc["conflicts"] is [String: Any])
+                && ((rc["blockers"] as? [String]) ?? []).isEmpty
+            if applied {
+                let st = (rc["sync"] as? [String: Any])?["status"] as? String
+                let said = broughtText(rc, there, now: nil)
+                ok = ok && ["synced", "paused", "skipped"].contains(st ?? "")
+                    && (st != "synced" || said.contains("Keep in sync with \(there) ran"))
+                    && (st != "paused" || said.contains("paused again"))
+                    && both.allSatisfy { said.contains($0) }
+            }
+            if !ok { miss.append(n) }
+        }
+        // Hand Over over a changed copy: `copy_changed`, and the blocker that
+        // --replace-there lifts, so the question (not the note) comes up
+        if let hb = sample("handover_blocked.json") as? [String: Any] {
+            let g = (hb["copy_changed"] as? [String: Any]) ?? [:]
+            let c = changedThere(hb), there = hb["remote"] as? String ?? "box"
+            let asked = c.map { changedThereText($0, "api", there) } ?? ""
+            if c == nil || !otherBlockers(hb).isEmpty || c?.at == nil || hb["error"] != nil
+                || c?.changed != tally(g["changed"]) || c?.new != tally(g["new"])
+                || c?.removed != tally(g["removed"]) || c?.history != tally(g["history"])
+                || !(c?.files ?? []).prefix(6).allSatisfy({ asked.contains($0) })
+                || !(g["conversations"] is [Any]) || asked.isEmpty {
+                miss.append("handover_blocked.json")
+            }
+        }
+        // Replace Them and Allow the Removals: the dry run's pause and set-aside
+        // folder in the question; --apply's row in the note
+        for (n, removals) in [("mirror_replace", false), ("mirror_allow_removals", true)] {
+            let there = "box"
+            var aside: String?
+            if let dry = sample(n + "_dry.json") as? [String: Any] {
+                aside = dry["aside"] as? String
+                let p = findPauses(dry).first.map(SyncPause.init)
+                let ask = p.map { removals ? removalsAsk($0, "api", there, aside: aside)
+                                           : replaceAsk($0, "api", there, aside: aside) }
+                if p == nil || aside == nil || dry["applied"] as? Bool != false
+                    || !((dry["blockers"] as? [String]) ?? []).isEmpty || dry["error"] != nil
+                    || !(ask?.body.contains(aside ?? "\u{0}") ?? false)
+                    || !(p?.files ?? []).prefix(6).allSatisfy({ ask?.body.contains($0) ?? false })
+                    || (removals && !(ask?.title.contains(removalsCount(p!)) ?? false))
+                    || !(dry["would"] is [String: Any]) {
+                    miss.append(n + "_dry.json")
+                }
+            }
+            if let done = sample(n + "_apply.json") as? [String: Any] {
+                let row = ((done["mirrored"] as? [[String: Any]]) ?? []).first ?? [:]
+                let said = replacedText(done, "api", there, removals: removals, aside: aside, now: nil)
+                let swapped = tally(row["replaced"]) ?? -1, gone = tally(row["removed"]) ?? -1
+                if done["applied"] as? Bool != true || row["status"] as? String != "synced"
+                    || swapped < 0 || gone < 0 || !(row["ended_pause"] is String)
+                    || (swapped > 0 && !said.contains(fileCount(swapped) + " replaced"))
+                    || (gone > 0 && !said.contains(fileCount(gone) + " removed"))
+                    || said.contains("still paused") {
+                    miss.append(n + "_apply.json")
+                }
+            }
+        }
+        // the removals Replace Them and Bring Them Here name (`removals`), once
+        // the samples have it: its shape, and the question that names them
+        var withRemovals: [String] = []
+        for n in ["mirror_replace_dry.json", "mirror_allow_removals_dry.json", "reclaim_copy_dry.json"] {
+            guard let d = sample(n) as? [String: Any], let g = d["removals"] else { continue }
+            withRemovals.append(n)
+            let r = g as? [String: Any] ?? [:]
+            let gone = Removals(g)
+            var ok = tally(r["removed"]) != nil && tally(r["total"]) != nil && r["files"] is [Any]
+                && r["over"] is Bool && (tally(r["removed"]) == 0) == (gone == nil)
+            if let gone = gone, !n.hasPrefix("mirror_allow") {
+                // Bring Them Here names them only over the limit: as if they were
+                let text = n.hasPrefix("reclaim")
+                    ? takeBackText(d.merging(["removals": r.merging(["over": true]) { $1 }]) { $1 }, "box",
+                                   copy: true, synced: true)
+                    : replaceAsk(findPauses(d).first.map(SyncPause.init) ?? SyncPause(["reason": "changed"]), "api", "box",
+                                 removals: gone).body
+                ok = ok && gone.files.prefix(6).allSatisfy { text.contains($0) } && text.contains(gone.counted)
+            }
+            if !ok { miss.append(n + " (removals)") }
+        }
+        print("PHASE 5 REMOVALS KEY " + (withRemovals.isEmpty ? "not in the samples yet"
+                                          : "in " + withRemovals.joined(separator: ", ")))
+        // Keep All Projects in Sync: the copies of other machines' projects stay out
+        if let all = sample("mirror_all_on.json") as? [String: Any] {
+            let copies = all["copies_skipped"] as? [String]
+            let note = syncAllNote(held: 0, copies: copies ?? [])
+            if copies == nil || copies!.isEmpty
+                || !copies!.prefix(3).allSatisfy({ note.contains(($0 as NSString).lastPathComponent) })
+                || !(all["projects"] is [[String: Any]]) {
+                miss.append("mirror_all_on.json")
+            }
+        }
+        // projects: a copy from another machine names it; a pause that asks parses
+        if let pj = sample("projects.json") as? [String: Any] {
+            let rows = sampleRows(pj)
+            let copies = rows.filter { $0["copy_of"] is [String: Any] }
+            if copies.isEmpty { miss.append("projects.json (no row with copy_of)") }
+            if !rows.contains(where: { !findPauses($0["mirror_paused"]).isEmpty }) {
+                miss.append("projects.json (no row with mirror_paused)")
+            }
+            if rows.contains(where: { $0["mirror"] is [String: Any] }) {
+                miss.append("projects.json (mirror is a record, not the machine's name)")
+            }
+            for r in copies {
+                let g = r["copy_of"] as? [String: Any] ?? [:]
+                guard let c = Project(r).copyOf else { miss.append("projects.json (copy_of)"); continue }
+                if c.from != g["from"] as? String || !["sync", "handover", "brought", "returned"].contains(c.kind)
+                    || !copyLine(c).contains(c.from) {
+                    miss.append("projects.json (copy_of)")
+                }
+            }
+            for r in rows where !findPauses(r["mirror_paused"]).isEmpty {
+                let p = Project(r)
+                if p.syncPaused?.asks != true || p.sync != "paused" || p.mirror == nil
+                    || (p.away == nil && pausedWith([p], p.syncPaused?.machine ?? p.mirror ?? "").isEmpty) {
+                    miss.append("projects.json (mirror_paused)")
+                }
+            }
+        }
+        miss = miss.filter { !miss.contains($0 + " (missing)") && !miss.contains($0 + " (not JSON)") }
+        phase5OK = miss.isEmpty
+        print("PHASE 5 SAMPLES \(phase5OK ? "OK" : "FAIL \(miss)") — \(dir5)")
+    } else {
+        print("PHASE 5 SAMPLES not checked (" + (dir5.isEmpty ? "AHT_FIXTURES_PHASE5 names no folder"
+                                                       : "no samples in \(dir5) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -9898,7 +10850,8 @@ if CommandLine.arguments.contains("--selftest") {
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
          && releaseOK && pauseOK && backOnOK && offsiteOK && relayOK && dialogOK && samplesOK
          && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
-         && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK ? 0 : 1)
+         && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK
+         && pause5OK && phase5OK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -9977,7 +10930,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
 // layout without clicking through it (needs a login session; nothing changes)
 //   --snapshot DIR [--select-first] [--query WORDS]
 //              [--corner-only | --welcome-only | --handover-only | --machines-only
-//               | --pickup-only]
+//               | --pickup-only | --sync-only]
 /// --dark renders in the dark appearance; the window's own background is
 /// drawn under every snapshot, so the PNG is opaque (a transparent one is
 /// unreadable on a page of the other colour)
@@ -10121,6 +11074,106 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
             (demo.query, demo.searched) = ((se["query"] as? String) ?? "", se["query"] as? String)
             (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(se), searchMissed(se), searchAsked(se))
             snapshot(MainView().environmentObject(demo), dir + "/search-sample.png", NSSize(width: 900, height: 620))
+        }
+        exit(0)
+    }
+    if args.contains("--sync-only") {
+        // Keep in sync that looks first: the pause banner for each reason, a
+        // copy synced from another machine, "2 paused" in Machines, Hand Over
+        // over a changed copy (Replace Them); made-up rows in the shape of the
+        // core's JSON, then the core's own samples (AHT_FIXTURES_PHASE5) when
+        // there are some. Nothing asks the core or another machine.
+        let now = Date().timeIntervalSince1970
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 5", "tracked": 6, "hook_installed": true,
+                       "handover": ["supported": true, "can_reach": true, "default_remote": "box", "remotes": [
+                           "box": ["ssh": "me@box", "watch": true, "system": "Linux"],
+                           "studio": ["ssh": "me@studio.local", "watch": false, "system": "Darwin"]]]]
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+        let stamp5 = { (ago: Double) -> String in
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            return f.string(from: Date().addingTimeInterval(-ago))
+        }
+        let row = { (name: String, extra: [String: Any]) -> Project in
+            Project(["real_path": home + "/code/" + name, "exists": true, "sessions": 4, "bytes": 2_400_000,
+                     "agents": ["claude"], "last_activity": stamp5(600), "mirror": "box",
+                     "mirror_synced_at": now - 2400, "mirror_status": "ok"].merging(extra) { $1 })
+        }
+        let pause = { (reason: String, c: Int, n: Int, r: Int, files: [String]) -> [String: Any] in
+            ["reason": reason, "at": now - 600, "remote": "box", "changed": c, "new": n, "removed": r,
+             "files": files]
+        }
+        demo.projects = [
+            row("api", ["mirror_paused": pause("changed", 3, 1, 0, ["src/auth.py", "src/session.py",
+                                                                   "README.md", "notes/todo.md"])]),
+            row("site", ["mirror_paused": pause("removals", 0, 0, 412, ["assets/old/hero.png",
+                                                                        "assets/old/logo.svg"])]),
+            row("paper", ["mirror_paused": pause("other-folder", 0, 0, 0, [])]),
+            row("blog", ["mirror_paused": ["reason": "released", "at": now - 1800, "remote": "box"]]),
+            Project(["real_path": home + "/code/thesis", "exists": true, "sessions": 2, "bytes": 900_000,
+                     "agents": ["claude"], "last_activity": stamp5(7200),
+                     "copy_of": ["from": "studio", "kind": "sync", "at": now - 86400]])]
+        for (p, name) in zip(demo.projects, ["changed", "removals", "other-folder", "released", "copy-of"]) {
+            demo.selection = p.path
+            snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                     dir + "/detail-sync-\(name).png", NSSize(width: 900, height: 176))
+        }
+        demo.tab = .projects
+        demo.selection = demo.projects[0].path
+        snapshot(MainView().environmentObject(demo), dir + "/projects-sync-paused.png",
+                 NSSize(width: 900, height: 620))
+        demo.tab = .machines
+        snapshot(MainView().environmentObject(demo), dir + "/machines-paused.png", NSSize(width: 900, height: 420))
+        // Hand Over over the changed copy, after Replace Them
+        let api = demo.projects[0]
+        let body = "12 file(s) to send (1.2 MB), history 3.4 MB.\nSession: fix the login redirect\n\n"
+            + replaceThereLine(api.syncPaused!, "box") + "\n\nThe session is resumed there and this "
+            + "folder is marked as away until you take it back."
+        snapshot(HandoverSheet(plan: HandoverPlan(project: api, remote: "box", body: body, replaceThere: true))
+                    .environmentObject(demo), dir + "/sheet-handover-replace-there.png",
+                 NSSize(width: 520, height: 540))
+        // the notes after each answer
+        let notes = [
+            ("brought", broughtText(["set_aside": home + "/.aht/aside/api-20261027-1810"], "box",
+                                    now: row("api", [:]))),
+            ("replaced", replacedText(["set_aside": "/home/me/.aht/replaced/0f3a"], "api", "box",
+                                      removals: false, now: row("api", [:]))),
+            ("stopped", stoppedText("box", ok: true, err: "", now: Project(["real_path": api.path, "exists": true]),
+                                    changed: true))]
+        demo.projects[0] = row("api", [:])        // the answer went through: no pause any more
+        for (name, text) in notes {
+            demo.notes[api.path] = text
+            snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                     dir + "/detail-sync-note-\(name).png", NSSize(width: 900, height: 176))
+        }
+        demo.notes = [:]
+        // the core's samples, when it has written them: its rows, and each of
+        // its pauses on a row of its own
+        let dir5 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE5"] ?? ""
+        func sample(_ n: String) -> Any? {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir5).appendingPathComponent(n))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        }
+        let names5 = ((try? FileManager.default.contentsOfDirectory(atPath: dir5)) ?? []).sorted()
+        if !dir5.isEmpty && !names5.isEmpty {
+            var rows = sampleRows((sample("projects.json") as? [String: Any]) ?? [:]).map(Project.init)
+                .filter { $0.copyOf != nil || $0.syncPaused != nil }
+            for n in names5 where n.hasPrefix("mirror_paused") {
+                for (k, g) in findPauses(sample(n)).enumerated() {
+                    rows.append(row(((n as NSString).deletingPathExtension) + (k > 0 ? "-\(k + 1)" : ""),
+                                    ["mirror": g["remote"] as? String ?? "box", "mirror_paused": g]))
+                }
+            }
+            demo.projects = rows
+            for (k, p) in rows.prefix(8).enumerated() {
+                demo.selection = p.path
+                snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                         dir + "/detail-sync-sample-\(k + 1).png", NSSize(width: 900, height: 176))
+            }
         }
         exit(0)
     }

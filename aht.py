@@ -3330,6 +3330,15 @@ def cmd_status(args):
               f"copies={st['policies']['copies']}")
     return 0
 
+def _copy_row(path: str):
+    """`projects --json` "copy_of": {from, kind, at} when this machine notes
+    the folder as a copy of another machine's project; else None."""
+    try:
+        c = copy_of(path)
+    except Exception:
+        return None
+    return {"from": c.get("from"), "kind": c.get("kind"), "at": c.get("at")} if c else None
+
 def cmd_projects(args):
     reg = load_registry()
     out = []
@@ -3357,11 +3366,16 @@ def cmd_projects(args):
                if (e.get("mirror") or {}).get("enabled") else None,
                "mirror_synced_at": (e.get("mirror") or {}).get("synced_at"),
                "mirror_status": (e.get("mirror") or {}).get("status"),
-               # Keep in sync that sends nothing until it is turned on again:
-               # {reason: "released", at, remote}
+               # Keep in sync that sends nothing until it is answered: {at,
+               # reason ("released", "changed", "removals", "other-folder"),
+               # remote, and for the last three changed, new, removed,
+               # history, files, total, marker}
                "mirror_paused": (e.get("mirror") or {}).get("paused")
                if (e.get("mirror") or {}).get("enabled") else None,
                "handing": handing_row(e.get("handing"), uid),
+               # this folder is a copy of another machine's project
+               # (copies.json): {from, kind, at}
+               "copy_of": _copy_row(e["real_path"]),
                # an open hand-off to another agent: what Hand Back answers
                "relay": project_relay(e["real_path"], rels, opens) if rels else None,
                # work picked up here from another machine, open: what Hand
@@ -4294,6 +4308,117 @@ def _inside(path: str, root: str) -> bool:
 def handover_dir(uid: str) -> Path:
     return aht_home() / "handover" / uid
 
+# ~/.aht/handover/<uuid>/there/<machine>.json: both sides' file lists (the
+# shape of manifest.json) as they were right after the last sync, handover
+# or take back with that machine, one file per machine, and the checksums
+# of the files there then (`sums`).  The next sync compares the copy there
+# with its own list from then, so no clock matters.  An earlier version
+# kept one there.json for whichever machine came last: it still counts for
+# the machine it names, until that machine's own file is written.
+
+BASE_HASH_MAX = 64 << 20        # bigger files keep no checksum in the base
+
+def _there_file(uid: str, remote: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(remote)).lstrip(".") or "_"
+    return handover_dir(uid) / "there" / f"{safe}.json"
+
+def _read_base(p: Path):
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and isinstance(d.get("there"), dict) else None
+
+def read_there(uid: str, remote: str = None, rpath: str = None):
+    """The lists from the last time both copies agreed with `remote`, when its
+    folder was at `rpath`; without `remote`, the newest with any machine;
+    else None."""
+    old = handover_dir(uid) / "there.json"
+    if remote:
+        files = [_there_file(uid, remote), old]
+    else:
+        try:
+            files = sorted((handover_dir(uid) / "there").glob("*.json")) + [old]
+        except OSError:
+            files = [old]
+    found = [d for d in map(_read_base, files) if d
+             and (not remote or d.get("remote") == remote)
+             and (not rpath or d.get("remote_path") == rpath)]
+    if remote or not found:
+        return found[0] if found else None
+    return max(found, key=lambda d: str(d.get("at") or ""))
+
+def _tree_file(root: str, m: dict, k: str) -> str:
+    """Where the file `k` of a tree at `root` is (`m`: its manifest): a tree
+    of one file (an --include'd file) is that file."""
+    return root if m.get("file") else f"{root}/{(m.get('raw') or {}).get(k) or k}"
+
+def write_there(uid: str, real: str, rem, ours: dict, theirs: dict, how: str) -> None:
+    """`ours` / `theirs`: {"project": manifest, "history": manifest,
+    "extra:<path>": manifest …}.  The files there are hashed there (a file
+    whose size and time the last base had keeps its checksum from then), so
+    the next look tells a file that was only touched there from one that
+    was changed, whatever this side did to it since."""
+    prev = read_there(uid, rem.name, rem.path(real)) or {}
+    psums, pthere = prev.get("sums") or {}, prev.get("there") or {}
+    sums, ask = {}, []
+    far = {t: s["path"] for t, s in _far_trees(
+        rem, real, rem.info, [t[6:] for t in theirs if t.startswith("extra:")]).items()}
+    for t, m in theirs.items():
+        for k, v in (m.get("files") or {}).items():
+            if not (isinstance(v, list) and isinstance(v[0], int)) or v[0] > BASE_HASH_MAX \
+                    or t not in far:
+                continue
+            old = (psums.get(t) or {}).get(k)
+            if old and (pthere.get(t) or {}).get(k) == v:
+                sums.setdefault(t, {})[k] = old
+            else:
+                ask.append((t, k))
+    if ask:
+        try:
+            got = rem.agent("hash", timeout=1800, files=[
+                {"key": f"{t}:{k}", "path": _tree_file(far[t], theirs[t], k)}
+                for t, k in ask])["hashes"]
+        except HandoverError:
+            got = {}
+        for t, k in ask:
+            if got.get(f"{t}:{k}"):
+                sums.setdefault(t, {})[k] = got[f"{t}:{k}"]
+    _write_json(_there_file(uid, rem.name), {
+        "v": 2, "kind": how, "uuid": uid, "project": real, "remote": rem.name,
+        "remote_path": rem.path(real), "at": _now(),
+        "here": {t: m.get("files") or {} for t, m in ours.items()},
+        "there": {t: m.get("files") or {} for t, m in theirs.items()},
+        "dirs": {"here": {t: m.get("dirs") or [] for t, m in ours.items()},
+                 "there": {t: m.get("dirs") or [] for t, m in theirs.items()}},
+        "sums": sums})
+    old = _read_base(handover_dir(uid) / "there.json")
+    if old and old.get("remote") == rem.name:
+        try:                # an earlier version's file: this machine's own has it now
+            (handover_dir(uid) / "there.json").unlink()
+        except OSError:
+            pass
+
+def name_problems(manifest: dict, far: dict) -> list:
+    """Names in `manifest` (tree_manifest) the disk on the other side cannot
+    hold apart: [{kind, text, count, names: [[name, name], …]}] (up to 10
+    groups each).  `far`: that disk's facts, from the probe's `fs`."""
+    out = []
+    raw = manifest.get("raw") or {}
+    if far.get("case_sensitive") is False:
+        groups = {}
+        for k in list(manifest.get("files") or {}) + list(manifest.get("dirs") or []):
+            groups.setdefault(k.casefold(), []).append(raw.get(k) or k)
+        clash = sorted(sorted(set(g)) for g in groups.values() if len(set(g)) > 1)
+        if clash:
+            out.append({"kind": "case", "count": len(clash), "names": clash[:10],
+                        "text": "two files whose names differ only in capitals"})
+    twins = sorted(sorted(v) for v in (manifest.get("twins") or {}).values())
+    if twins:
+        out.append({"kind": "unicode", "count": len(twins), "names": twins[:10],
+                    "text": "two files with the same name in two Unicode forms"})
+    return out
+
 def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -4807,7 +4932,8 @@ class Remote:
     def _env(self) -> dict:
         e = {k: v for k, v in os.environ.items()
              if not k.startswith("AHT_") or k in ("AHT_CLAUDE", "AHT_ITERM_TABS",
-                                                   "AHT_AWAKE_EVERY", "AHT_SESSION_BUS")}
+                                                   "AHT_AWAKE_EVERY", "AHT_SESSION_BUS",
+                                                   "AHT_CASELESS")}
         e.update(_sandbox_env(self.root + "/home"))
         if os.name == "nt":
             e["USERPROFILE"] = e["HOME"]        # Windows' Path.home()
@@ -4917,9 +5043,10 @@ class Remote:
             raise HandoverError(f"{self.name}: {res.get('error') or op + ' failed'}")
         return res
 
-    def connect(self, path: str = None) -> dict:
+    def connect(self, path: str = None, fs: bool = False) -> dict:
+        """The probe there; `fs`: also how the disk under `path` treats names."""
         self.info = self.agent("probe", path=self.path(path) if path else None,
-                               claude=self.claude)
+                               claude=self.claude, **({"fs": True} if fs else {}))
         return self.info
 
     def rsync(self, src: str, dst: str, *, delete: bool = False,
@@ -5152,15 +5279,50 @@ def _agent_probe(req: dict) -> dict:
             info["free_bytes"] = shutil.disk_usage(str(anc)).free
         except OSError:
             pass
+        # which folder is there: its project id, how full it is, and whose
+        info["path_marker"] = read_marker(path) if info["path_exists"] else None
+        try:
+            info["path_entries"] = len(os.listdir(path)) if info["path_exists"] else 0
+        except OSError:
+            info["path_entries"] = None
+        info["path_owner"] = _path_owner(path, info["path_marker"])
+        if req.get("fs"):
+            # tried next to the folder, not read from settings
+            near = os.path.dirname(path) if info["path_exists"] else str(anc)
+            info["fs"] = {"case_sensitive": not _ignores_case(near)}
         info.update(activity_in(info["path_real"]) if info["path_exists"]
                     else {"sessions": [], "processes": []})
     return info
 
+def tree_of(path: str, skip=()) -> dict:
+    """tree_manifest of a folder; of a file (one --include'd), its one entry,
+    keyed by its name, with `file`; of nothing there, an empty one."""
+    if os.path.isdir(path):
+        return tree_manifest(path, list(skip))
+    m = tree_manifest(os.devnull, [])
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return m
+    name = os.path.basename(path)
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            m["files"][_nfc(name)] = ["l", os.readlink(path)]
+        except OSError:
+            return m
+    elif stat.S_ISREG(st.st_mode):
+        m["files"][_nfc(name)] = [st.st_size, int(st.st_mtime)]
+    else:
+        return m
+    if _nfc(name) != name:
+        m["raw"][_nfc(name)] = name
+    m["file"] = True
+    return m
+
 def _agent_manifest(req: dict) -> dict:
     out = {}
     for name, spec in (req.get("trees") or {}).items():
-        out[name] = tree_manifest(spec["path"], spec.get("skip") or []) \
-            if os.path.isdir(spec["path"]) else tree_manifest(os.devnull, [])
+        out[name] = tree_of(spec["path"], spec.get("skip") or [])
     return {"ok": True, "trees": out}
 
 def _agent_hash(req: dict) -> dict:
@@ -5228,6 +5390,9 @@ def _agent_prepare(req: dict) -> dict:
     notes = []
     for d in req.get("dirs") or []:
         os.makedirs(d, exist_ok=True)
+    cn = req.get("copy_note")           # the folder this sync or handover fills
+    if isinstance(cn, dict) and isinstance(cn.get("path"), str):
+        _note_copy(cn["path"], cn)
     their = req.get("their_home")
     mine = str(Path.home())
     if their and os.path.realpath(their) != os.path.realpath(mine):
@@ -5632,6 +5797,84 @@ def _agent_prune(req: dict) -> dict:
     return {"ok": True, "pruned": prune_set_asides(req["dir"],
                                                    int(req.get("keep") or ASIDE_KEEP))}
 
+# ---- folders here that are copies of another machine's projects ------------ #
+#
+# ~/.aht/remote/copies.json = {path: {uuid, from, from_id, kind, at, attempt}}
+# on any machine that holds such copies.  `kind`: "sync" (Keep in sync sends
+# it here), "handover" (handed over here), "brought" (Bring Here, phase 7),
+# "returned" (its project went home; this copy stayed).  One writer:
+# _note_copy, called by the ops `prepare` (its `copy_note`) and `uncopy`.
+
+COPY_KINDS = ("sync", "handover", "brought", "returned")
+
+def copies_path() -> Path:
+    return aht_home() / "remote" / "copies.json"
+
+def read_copies() -> dict:
+    try:
+        d = json.loads(copies_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, dict)} \
+        if isinstance(d, dict) else {}
+
+def copy_of(path: str):
+    """This machine's note on the folder at `path` (a copy of another
+    machine's project), or None."""
+    return next((dict(v, path=k) for k, v in read_copies().items()
+                 if _same_dir(k, path)), None)
+
+def _note_copy(path: str, rec) -> bool:
+    """The one writer of copies.json: note the folder at `path` as a copy
+    (`rec`: uuid, from, from_id, kind, attempt), or drop its note (None).
+    A note that says the same keeps its `at` (since when).  -> changed."""
+    if not _is_abs(path):
+        return False
+    if rec is not None:
+        rec = {k: rec.get(k) for k in ("uuid", "from", "from_id", "kind", "attempt")}
+        if rec["kind"] not in COPY_KINDS or not isinstance(rec["uuid"], str):
+            return False
+    with Lock():
+        d = read_copies()
+        key = next((k for k in d if _same_dir(k, path)), None)
+        old = d.pop(key, None) if key else None
+        if rec is None:
+            if old is None:
+                return False
+        else:
+            same = old and all(old.get(k) == rec[k] for k in ("uuid", "from", "from_id", "kind"))
+            rec["at"] = old.get("at") if same and old.get("at") else _now()
+            if old == rec and key == path:
+                return False
+            d[path] = rec
+        _write_json(copies_path(), d)
+    return True
+
+def _agent_uncopy(req: dict) -> dict:
+    """Drop this machine's note on a folder, when it names that project as a
+    copy kept in sync: Keep in sync was turned off at home.  A note of
+    another kind (a handover, a copy whose project went home) stays."""
+    c = copy_of(str(req.get("path") or ""))
+    if not c or c.get("kind") != "sync" \
+            or (req.get("uuid") and c.get("uuid") != req.get("uuid")):
+        return {"ok": True, "dropped": False}
+    return {"ok": True, "dropped": _note_copy(c["path"], None)}
+
+def _path_owner(path: str, marker) -> str:
+    """Whose the folder at `path` is, as this machine's aht sees it: "copy"
+    (copies.json lists it), "own" (a project of this machine's own, here),
+    or "none"."""
+    try:
+        if copy_of(path):
+            return "copy"
+        e = load_registry().get("projects", {}).get(marker) if marker else None
+        if e and not e.get("away") and _same_dir(str(e.get("real_path") or ""),
+                                                 os.path.realpath(path)):
+            return "own"
+    except Exception:
+        pass
+    return "none"
+
 AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "hash": _agent_hash, "prepare": _agent_prepare,
              "trust": _agent_trust, "install-claude": _agent_install_claude,
@@ -5645,7 +5888,8 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "offsite-adopt": lambda req: _agent_offsite_adopt(req),
              "search": lambda req: _agent_search(req),
              "relay-info": lambda req: _agent_relay_info(req),
-             "relay-note": lambda req: _agent_relay_note(req)}
+             "relay-note": lambda req: _agent_relay_note(req),
+             "uncopy": _agent_uncopy}
 
 def cmd_core(args):
     """`aht _core --id`: the id of the core this build carries (the name of
@@ -6171,11 +6415,12 @@ def _check_extra(p: str) -> str:
 RELAYS_REL = "/.aht/handover/"     # a project's relays: notes left there stay there
 
 def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
-                 dry: bool = False, sync: bool = False) -> dict:
+                 dry: bool = False, sync: bool = False, attempt: str = None) -> dict:
     """Make the remote copy of a project and of its history equal to what is
     here.  What the sync replaces or removes over there is set aside first.
     The project's .aht/handover is never removed there: a handover sends
-    what is here into it, and Keep in sync (`sync`) leaves it out."""
+    what is here into it, and Keep in sync (`sync`) leaves it out.  The
+    other machine notes the folder as a copy of this project (copies.json)."""
     real = os.path.realpath(entry["real_path"])
     rpath = rem.path(real)
     rhome, rclaude = rem.info["home"], rem.info["claude_home"]
@@ -6186,7 +6431,10 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
     if not dry:
         rem.agent("prepare", dirs=[rpath, f"{rclaude}/projects", f"{rclaude}/file-history",
                                    f"{rclaude}/plans", os.path.dirname(aside)],
-                  their_home=rem.path(str(Path.home())))
+                  their_home=rem.path(str(Path.home())),
+                  copy_note={"path": rpath, "uuid": uid, "from": _here(),
+                             "from_id": machine_id(create=True),
+                             "kind": "sync" if sync else "handover", "attempt": attempt})
     res["project"] = rem.rsync(real + "/", rem.spec(rpath + "/"), delete=True,
                                backup_dir=aside + "/project",
                                skip=handover_skip() + ([RELAYS_REL] if sync else []),
@@ -6248,7 +6496,8 @@ def _update_mirror(uid: str, **fields) -> None:
         e = reg["projects"].get(uid)
         if e is None:
             return
-        e["mirror"] = dict(e.get("mirror") or {}, **fields)
+        m = dict(e.get("mirror") or {}, **fields)
+        e["mirror"] = {k: v for k, v in m.items() if v is not None}    # None: dropped
         save_registry(reg)
 
 def _paused_with(entry: dict, remote: str):
@@ -6282,7 +6531,305 @@ def _mirror_check(entry: dict, real: str) -> None:
     if not os.path.isdir(real):
         raise HandoverError("the folder is missing")
 
-def mirror_project(uid: str, entry: dict, progress: bool = False) -> dict:
+# Look before a sync overwrites.  Before each sync the copy there is compared
+# with its own list from the last time both copies agreed with that machine
+# (there/<machine>.json); when it was worked on, when the sync would remove
+# many files there, or when a first sync would go into a folder that holds
+# another project (or that machine's own live project), the sync pauses and
+# sends nothing: `mirror.paused` = {at, reason, remote, changed, new,
+# removed, history, files, total, marker, owner} (reason "changed",
+# "removals" or "other-folder"; "released" is Release's own pause).  A first
+# sync (no list from an earlier one: a project synced before there were
+# such lists) pauses with "changed" only for files that differ and are
+# newer there.
+
+SYNC_REMOVALS_MAX = 200         # more removals than this in one sync pause it,
+SYNC_REMOVALS_SHARE = 0.25      # and so does more than this share of the files
+SYNC_REMOVALS_FROM = 20         # there, once there are at least this many
+PAUSE_FILES = 50                # the files a pause names
+
+def _many_removals(removed: int, total: int) -> bool:
+    """More removals than one sync, or one Bring Them Here, makes unasked."""
+    return removed > SYNC_REMOVALS_MAX or (
+        total >= SYNC_REMOVALS_FROM and removed > SYNC_REMOVALS_SHARE * total)
+
+def _removals(gone: list, total: int) -> dict:
+    """{removed, total, files, over}: `over` when they need Allow the Removals."""
+    return {"removed": len(gone), "total": total, "files": sorted(gone)[:PAUSE_FILES],
+            "over": _many_removals(len(gone), total)}
+
+def _sync_files(files) -> dict:
+    """A project's file list as Keep in sync compares it: without the
+    project's .aht/handover, which it leaves alone on both sides."""
+    return {k: v for k, v in (files or {}).items() if not k.startswith(RELAYS_REL[1:])}
+
+def _cut(t: str, files) -> dict:
+    return _sync_files(files) if t == "project" else dict(files or {})
+
+def _far_trees(rem: Remote, real: str, info: dict, extras=()) -> dict:
+    """The project, its Claude history and what --include carries along
+    (`extras`) on the other machine, as the `manifest` op lists them."""
+    rpath = rem.path(real)
+    out = {"project": {"path": rpath, "skip": handover_skip()},
+           "history": {"path": f"{info['claude_home']}/projects/{_key_claude(rpath)}",
+                       "skip": []}}
+    for p in extras:
+        out[f"extra:{p}"] = {"path": rem.path(p), "skip": handover_skip()}
+    return out
+
+def _our_trees(real: str, extras=()) -> tuple:
+    """({"project": manifest, "history": manifest, "extra:<path>": manifest …},
+    the history's folder)."""
+    store = _store_of(real) or (claude_backend().root() / _key_claude(real))
+    trees = {"project": tree_manifest(real),
+             "history": tree_manifest(str(store), []) if Path(store).is_dir()
+             else tree_manifest(os.devnull, [])}
+    for p in extras:
+        trees[f"extra:{p}"] = tree_of(p, handover_skip())
+    return trees, str(store)
+
+def _near_paths(real: str, store: str, trees) -> dict:
+    return {t: real if t == "project" else store if t == "history" else t[6:]
+            for t in trees}
+
+def _shown(t: str, k: str, m: dict) -> str:
+    """A file's name as a pause lists it: an --include'd one by its path."""
+    if not t.startswith("extra:"):
+        return k
+    return t[6:] if m.get("file") else f"{t[6:]}/{k}"
+
+def _counted(p: dict) -> str:
+    """"2 changed, 1 new and 1 removed", from a pause's (or a check's) counts."""
+    parts = [f"{p[k]} {k}" for k in ("changed", "new", "removed") if p.get(k)]
+    if p.get("history"):
+        parts.append(f"{p['history']} conversation{'s' if p['history'] != 1 else ''} "
+                     "gone on")
+    return ", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else \
+        (parts[0] if parts else "nothing")
+
+def _newer_there(rem: Remote, ours: dict, theirs: dict, far: dict, near: dict,
+                 trees) -> dict:
+    """{tree: [key]}: the files on both sides that differ and are newer there
+    (by their times): what a sync with no list from an earlier one would
+    overwrite of work done there.  Same-size files are hashed on both
+    sides."""
+    out, ask = {}, []
+    for t in trees:
+        mine, now = _cut(t, (ours.get(t) or {}).get("files")), _cut(t, theirs[t]["files"])
+        for k, n in now.items():
+            m = mine.get(k)
+            if not (isinstance(n, list) and isinstance(m, list) and isinstance(n[0], int)
+                    and isinstance(m[0], int)) or n == m or n[1] <= m[1]:
+                continue
+            if n[0] != m[0]:
+                out.setdefault(t, []).append(k)
+            else:
+                ask.append((t, k))
+    if ask:
+        got = rem.agent("hash", timeout=900, files=[
+            {"key": f"{t}:{k}", "path": _tree_file(far[t], theirs[t], k)}
+            for t, k in ask])["hashes"]
+        for t, k in ask:
+            try:
+                same = got.get(f"{t}:{k}") == file_sha256(_tree_file(near[t], ours[t], k))
+            except OSError:
+                same = False
+            if not same:
+                out.setdefault(t, []).append(k)
+    return {t: sorted(v) for t, v in out.items()}
+
+def _changes_of(found: dict) -> dict:
+    return {"changed": len(found["changed"]), "new": len(found["new"]),
+            "removed": len(found["removed"]), "history": len(found["history"]),
+            "files": sorted(found["changed"] + found["new"] + found["removed"])[:PAUSE_FILES],
+            "conversations": found["history"][:PAUSE_FILES]}
+
+def _newer_changes(newer: dict, theirs: dict) -> dict:
+    """_newer_there's files, counted as _copy_changes counts."""
+    found = {"changed": [], "new": [], "removed": [], "history": []}
+    for t, ks in newer.items():
+        found["history" if t == "history" else "changed"] += [_shown(t, k, theirs[t])
+                                                              for k in ks]
+    return _changes_of(found)
+
+def _copy_changes(rem: Remote, base: dict, ours: dict, theirs: dict, far: dict,
+                  near: dict) -> dict:
+    """What was done to the copy there since both copies agreed (`base`: the
+    list from then): {changed, new, removed, history, files, conversations}.
+    A changed file there whose size is the size it had then is hashed
+    there: one with the checksum it had then was only touched and drops
+    out, whatever this side did to it since.  One whose size is the size
+    here is compared with this side's: one that already is what this side
+    has (a sync that stopped halfway sent it) drops out too.  In the
+    history only a conversation that went on there counts: a sync leaves
+    new ones alone.  A tree the base lacks (an --include added since) is
+    looked at as a first sync looks: files that differ and are newer there.
+    `far` / `near`: each tree's folder there and here."""
+    bt, sums = base.get("there") or {}, base.get("sums") or {}
+    found = {"changed": [], "new": [], "removed": [], "history": []}
+    ask = []
+    fresh = [t for t in theirs if t not in bt]
+    for t in theirs:
+        if t in fresh:
+            continue
+        was, now = _cut(t, bt.get(t)), _cut(t, theirs[t]["files"])
+        mine = _cut(t, (ours.get(t) or {}).get("files"))
+        for k in sorted(set(was) | set(now)):
+            w, n, m = was.get(k), now.get(k), mine.get(k)
+            if w == n:
+                continue
+            if n is None:                       # removed there
+                if t != "history" and m is not None:
+                    found["removed"].append(_shown(t, k, theirs[t]))
+                continue
+            if n == m or (t == "history" and w is None):
+                continue
+            kind = "history" if t == "history" else "new" if w is None else "changed"
+            reg = isinstance(n[0], int)
+            old = (sums.get(t) or {}).get(k) \
+                if reg and isinstance(w, list) and w[0] == n[0] else None
+            here_too = reg and isinstance(m, list) and m[0] == n[0]
+            if old or here_too:
+                ask.append((t, k, kind, old, here_too))    # the content decides
+            else:
+                found[kind].append(_shown(t, k, theirs[t]))
+    if ask:
+        got = rem.agent("hash", timeout=900, files=[
+            {"key": f"{t}:{k}", "path": _tree_file(far[t], theirs[t], k)}
+            for t, k, *_ in ask])["hashes"]
+        for t, k, kind, old, here_too in ask:
+            h = got.get(f"{t}:{k}")
+            if h and h == old:
+                continue                        # only touched there
+            if h and here_too:
+                try:
+                    if h == file_sha256(_tree_file(near[t], ours[t], k)):
+                        continue                # already what this side has
+                except OSError:
+                    pass
+            found[kind].append(_shown(t, k, theirs[t]))
+    if fresh:
+        for t, ks in _newer_there(rem, ours, theirs, far, near, fresh).items():
+            found["changed"] += [_shown(t, k, theirs[t]) for k in ks]
+    return _changes_of(found)
+
+def _changed_count(c) -> int:
+    return sum(int((c or {}).get(k) or 0) for k in ("changed", "new", "removed", "history"))
+
+def _sync_check(rem: Remote, uid: str, real: str, info: dict, replace: bool = False,
+                allow_removals: bool = False, extras=()) -> dict:
+    """Everything a sync looks at before it sends: both sides' lists, what
+    was done to the copy there, what the sync would remove there, names the
+    disk there cannot hold apart, and the pause, if any (None: send).
+    `replace`: the copy there gives way (theirs are set aside there), but
+    many removals still need `allow_removals`: the removals may go ahead,
+    once.  `extras`: what --include carries along, looked at too."""
+    ours, store = _our_trees(real, extras)
+    specs = _far_trees(rem, real, info, extras)
+    theirs = rem.agent("manifest", timeout=900, trees=specs)["trees"]
+    far = {t: s["path"] for t, s in specs.items()}
+    near = _near_paths(real, store, theirs)
+    rpath = rem.path(real)
+    base = read_there(uid, rem.name, rpath)
+    there, here = _sync_files(theirs["project"]["files"]), _sync_files(ours["project"]["files"])
+    gone = sorted(set(there) - set(here))
+    out = {"ours": ours, "theirs": theirs, "base": bool(base), "pause": None,
+           "names": name_problems(ours["project"], info.get("fs") or {}),
+           "changes": _copy_changes(rem, base, ours, theirs, far, near) if base else None,
+           "removals": _removals(gone, len(there))}
+    owner = info.get("path_owner")
+    pause = None
+    if replace:
+        pass
+    elif base:
+        c = out["changes"]
+        if _changed_count(c):
+            pause = {"reason": "changed", "changed": c["changed"], "new": c["new"],
+                     "removed": c["removed"], "history": c["history"], "files": c["files"],
+                     "total": len(there)}
+    elif owner == "own" or (there and info.get("path_marker") != uid):
+        # a first sync into a folder that holds another project, files
+        # without a project id, or that machine's own live project (a copy
+        # whose project went home, synced back there)
+        pause = {"reason": "other-folder", "changed": 0, "new": 0, "removed": 0,
+                 "history": 0, "files": sorted(there)[:PAUSE_FILES], "total": len(there),
+                 "marker": info.get("path_marker"), "owner": owner}
+    elif there:
+        # no list from an earlier sync: only what differs and is newer there
+        # counts as work done there (a plain difference would pause every
+        # project synced before there were such lists)
+        newer = _newer_there(rem, ours, theirs, far, near, list(theirs))
+        if newer:
+            c = out["changes"] = _newer_changes(newer, theirs)
+            pause = {"reason": "changed", "changed": c["changed"], "new": 0, "removed": 0,
+                     "history": c["history"], "files": c["files"], "total": len(there)}
+    if not pause and out["removals"]["over"] and not allow_removals:
+        pause = {"reason": "removals", "changed": 0, "new": 0, "removed": len(gone),
+                 "history": 0, "files": gone[:PAUSE_FILES], "total": len(there)}
+    if pause:
+        # one shape for every reason: `marker` is the id of the folder there
+        # and `owner` whose it is there (other-folder; None otherwise)
+        out["pause"] = dict({"at": _now(), "remote": rem.name, "marker": None,
+                             "owner": None}, **pause)
+    return out
+
+def _pause_text(p: dict) -> str:
+    """Why a sync sends nothing, in a few words (a row's `reason`)."""
+    to, r = p.get("remote") or "the other machine", p.get("reason")
+    if r == "changed":
+        return (f"paused: {_counted(p)} in the copy on {to} — bring them here, replace "
+                "them, or stop syncing")
+    if r == "removals":
+        return (f"paused: this sync would remove {p.get('removed')} of the "
+                f"{_n(int(p.get('total') or 0), 'file')} on {to} — allow it once, or stop "
+                "syncing")
+    if r == "other-folder":
+        what = f"is a live project of {to}'s own" if p.get("owner") == "own" \
+            else "holds another folder"
+        return (f"paused: the folder on {to} {what} "
+                f"({_n(int(p.get('total') or 0), 'file')}) — replace it (it is set aside "
+                "there), or stop syncing")
+    return MIRROR_PAUSED
+
+def _pause_notice(p: dict, real: str) -> None:
+    to, r = p.get("remote") or "the other machine", p.get("reason")
+    msg = {"changed": f"Files were changed in the copy on {to} ({_counted(p)}). Nothing was "
+                      "sent. In aht: Bring Them Here, Replace Them or Stop Syncing.",
+           "removals": f"This sync would remove {p.get('removed')} of the "
+                       f"{_n(int(p.get('total') or 0), 'file')} on {to}. Nothing was sent. "
+                       "In aht: Allow the Removals or Stop Syncing.",
+           "other-folder": f"On {to}, the folder "
+                           + (f"is a live project of {to}'s own " if p.get("owner") == "own"
+                              else "holds another folder ")
+                           + f"({_n(int(p.get('total') or 0), 'file')}). Nothing was sent. "
+                           "In aht: Replace Them or Stop Syncing."
+           }.get(r)
+    if msg:
+        _notify(f"Keep in sync paused: {os.path.basename(real)}", msg,
+                {"kind": "sync-paused", "project": real, "remote": to, "reason": r})
+
+def _copy_refusal(real: str, c: dict = None):
+    """Why Keep in sync may not send the folder at `real` anywhere: it is
+    itself a live copy of another machine's project (copies.json).  A
+    copy whose project went home ("returned") may be."""
+    c = c or copy_of(real)
+    if not c or c.get("kind") == "returned":
+        return None
+    src = c.get("from") or "another machine"
+    if c.get("kind") == "sync":
+        return (f"this folder is a copy kept in sync from {src}: syncing it from here too "
+                f"would sync one folder both ways. Keep it in sync from {src} only, or turn "
+                f"Keep in sync off there first")
+    return (f"this folder holds a project handed over from {src}: it goes back to {src}, "
+            "not into Keep in sync from here")
+
+def mirror_project(uid: str, entry: dict, progress: bool = False, replace: bool = False,
+                   allow_removals: bool = False) -> dict:
+    """One sync of one project, after looking at the copy there.  `replace`
+    (Replace Them) and `allow_removals` (Allow the Removals) end the pause
+    they answer and send once despite it; Replace Them that would remove
+    many files there sends nothing without Allow the Removals too, and the
+    pause it answers stays."""
     real = os.path.realpath(entry["real_path"])
     m = {"tried_at": time.time()}
     row = {"project": real, "remote": (entry.get("mirror") or {}).get("remote")}
@@ -6294,28 +6841,72 @@ def mirror_project(uid: str, entry: dict, progress: bool = False) -> dict:
             # may have come in between (neither can while this lock is held)
             entry = load_registry().get("projects", {}).get(uid) or {}
             mm = entry.get("mirror") or {}
-            if mm.get("paused"):
-                return dict(row, status="paused", reason=MIRROR_PAUSED)
+            was = mm.get("paused")
+            if was and not (replace or (allow_removals and was.get("reason") == "removals")):
+                return dict(row, status="paused", reason=_pause_text(was), paused=was)
             if not mm.get("enabled"):
                 return dict(row, status="skipped", reason="Keep in sync is off for it now")
             real = os.path.realpath(entry["real_path"])
             row.update(project=real, remote=mm.get("remote"))
             _mirror_check(entry, real)
+            why = _copy_refusal(real)
+            if why:
+                raise HandoverError(why)
             rem = get_remote(mm.get("remote"))
-            rem.connect(real)
+            info = rem.connect(real, fs=True)
             row["remote"] = rem.name
-            if rem.info.get("sessions") or rem.info.get("processes"):
+            if info.get("sessions") or info.get("processes"):
                 raise HandoverError(f"something is running in it on {rem.name}")
-            if not rem.info.get("path_writable"):
-                raise HandoverError(f"{rem.info.get('path_base')} is not writable "
+            if not info.get("path_writable"):
+                raise HandoverError(f"{info.get('path_base')} is not writable "
                                     f"on {rem.name}")
+            extras = _extras(entry)
+            chk = _sync_check(rem, uid, real, info, replace=replace,
+                              allow_removals=allow_removals, extras=extras)
+            m["names"] = chk["names"] or None
+            if chk["names"]:
+                row["names"] = chk["names"]
+            if chk["pause"] and replace:
+                # only the removals guard stands under Replace Them: it asks
+                # for Allow the Removals too, and the pause it answers stays
+                rm = chk["removals"]
+                log(f"MIRROR {real} -> {rem.name}: Replace Them would remove "
+                    f"{rm['removed']} of {rm['total']} file(s) there; nothing was sent")
+                return dict(row, status="paused", paused=was, removals=rm,
+                            reason=f"this would also remove {rm['removed']} of the "
+                                   f"{_n(rm['total'], 'file')} on {rem.name} — replace "
+                                   "them only together with Allow the Removals "
+                                   "(--allow-removals)")
+            if chk["pause"]:
+                p = chk["pause"]
+                _update_mirror(uid, paused=p, status="paused", **m)
+                log(f"MIRROR {real} -> {rem.name}: paused ({p['reason']}, "
+                    f"{_counted(p)}); nothing was sent")
+                if not was or was.get("reason") != p["reason"]:
+                    _pause_notice(p, real)
+                return dict(row, status="paused", reason=_pause_text(p), paused=p)
             r = push_project(rem, uid, entry, progress=progress, sync=True)
+            # both lists as they are now: the next sync compares with these
+            theirs = rem.agent("manifest", timeout=900,
+                               trees=_far_trees(rem, real, info, extras))["trees"]
+            write_there(uid, real, rem, chk["ours"], theirs, "sync")
+            if was:
+                _update_mirror(uid, paused=None)
+                row["ended_pause"] = was.get("reason")
+            if replace or allow_removals:
+                # what this sync set aside there: their changes, or the whole
+                # other folder; and what it removed
+                row["replaced"] = 0 if not replace else _changed_count(chk["changes"]) \
+                    if chk["base"] else chk["removals"]["total"]
+                row["removed"] = chk["removals"]["removed"]
         sent = r["project"].get("bytes", 0) + r["history"].get("bytes", 0) \
             + sum(x.get("bytes", 0) for x in r["extras"])
         m.update(synced_at=time.time(), status="ok", bytes=sent, path=real)
         row.update(status="synced", bytes=sent,
                    files=r["project"].get("files", 0) + r["history"].get("files", 0))
-        log(f"MIRROR {real} -> {rem.name} ({row['files']} file(s), {_human(sent)})")
+        log(f"MIRROR {real} -> {rem.name} ({row['files']} file(s), {_human(sent)})"
+            + (" replacing the copy there" if replace else "")
+            + (" with its removals" if allow_removals else ""))
     except HandoverError as e:
         m["status"] = str(e)
         row.update(status="skipped", reason=str(e))
@@ -6334,9 +6925,10 @@ def mirror_pass(only_due: bool = False, only: str = None, progress: bool = False
             continue
         if only_due and not mirror_due(e):
             continue
-        if e["mirror"].get("paused"):       # Release paused it: nothing goes there
+        p = e["mirror"].get("paused")
+        if p:                               # nothing goes there until it is answered
             rows.append({"project": e["real_path"], "remote": e["mirror"].get("remote"),
-                         "status": "paused", "reason": MIRROR_PAUSED})
+                         "status": "paused", "reason": _pause_text(p), "paused": p})
             continue
         rows.append(mirror_project(uid, e, progress=progress))
     return rows
@@ -6371,18 +6963,22 @@ def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
     projects = load_registry().get("projects", {})
     tops = [e["real_path"] for e in projects.values() if os.path.isdir(e["real_path"])
             and os.path.realpath(e["real_path"]) != home]
+    copies = list(read_copies()) if on else []
     for uid, e in projects.items():
         real, m = e["real_path"], e.get("mirror") or {}
         if not os.path.isdir(real) or e.get("away") or e.get("handing") \
                 or os.path.realpath(real) == home:
             continue
+        if on and any(_same_dir(c, real) for c in copies):
+            res.setdefault("copies_skipped", []).append(real)
+            continue            # a copy of another machine's project: not sent from here
         if on and any(t != real and _inside(real, t) for t in tops):
             continue            # inside another project: that one's copy carries it
         if on and m.get("enabled") and m.get("remote") == rem.name:
             continue
         if not on and not m.get("enabled"):
             continue
-        row = {"uuid": uid, "project": real}
+        row = {"uuid": uid, "project": real, **({} if on else {"remote": m.get("remote")})}
         if on:
             files = tree_manifest(real)["files"]
             row.update(files=len(files),
@@ -6391,8 +6987,13 @@ def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
         res["projects"].append(row)
     res["projects"].sort(key=lambda r: -r.get("bytes", 0))
     if not res["projects"]:
-        res["blockers"].append("every project is in sync already" if on
-                               else "no project is kept in sync")
+        res["blockers"].append(
+            ("every project is in sync already"
+             + (f"; {_n(len(res['copies_skipped']), 'folder')} here "
+                f"{'is a copy' if len(res['copies_skipped']) == 1 else 'are copies'} of "
+                "another machine's projects, kept in sync from there"
+                if res.get("copies_skipped") else "")) if on
+            else "no project is kept in sync")
     if not apply or res["blockers"]:
         return res
     with Lock():
@@ -6410,10 +7011,107 @@ def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
         save_registry(reg)
     log(f"MIRROR all {'on' if on else 'off'}: {len(res['projects'])} project(s)"
         + (f" to {rem.name}" if rem else ""))
+    if not on:
+        for name in {r["remote"] for r in res["projects"] if r.get("remote")}:
+            _uncopy_there(name, [(r["project"], r["uuid"]) for r in res["projects"]
+                                 if r.get("remote") == name])
     if on:
         _spawn_mirror()
     res["applied"] = True
     return res
+
+PAUSE_WORDS = {"released": "it was released", "changed": "the copy there was changed",
+               "removals": "it would remove many files there",
+               "other-folder": "another folder is there"}
+
+def _uncopy_there(remote: str, items: list) -> None:
+    """Keep in sync was turned off: the other machine drops its notes that
+    these folders are copies of projects here (when it answers; a machine
+    that does not answer keeps them, which only stops it syncing them on)."""
+    try:
+        rem = get_remote(remote)
+        for real, uid in items:
+            rem.agent("uncopy", timeout=30, path=rem.path(real), uuid=uid)
+    except (HandoverError, OSError, ValueError) as e:
+        log(f"MIRROR off: {remote} keeps its note on the copy ({e})", "debug")
+
+def _mirror_answer(args, real: str) -> int:
+    """`aht mirror <path> --replace | --allow-removals [--apply]`: answer a
+    paused sync.  Replace Them sends this copy over the one there, once,
+    with theirs set aside there; Allow the Removals lets one sync remove
+    what was removed here.  The dry run says what each would do, and its
+    `removals` {removed, total, files, over} what the sync would remove
+    there: `over`, Replace Them needs --allow-removals too."""
+    out = {"command": "mirror", "mode": "replace" if args.replace else "allow-removals",
+           "project": real, "applied": False, "blockers": [], "warnings": []}
+    lines = []
+    uid, entry = _entry_for(load_registry(), real)
+    m = (entry or {}).get("mirror") or {}
+    if not m.get("enabled"):
+        out["blockers"].append("Keep in sync is off for this project")
+        return _emit(args, out, lines)
+    out.update(remote=m.get("remote"), paused=m.get("paused"))
+    try:
+        if args.apply:
+            row = mirror_project(uid, entry, replace=args.replace,
+                                 allow_removals=args.allow_removals,
+                                 progress=sys.stderr.isatty() and not args.json)
+            out["mirrored"] = [row]
+            out["applied"] = row.get("status") == "synced"
+            if out["applied"]:
+                out["paused"] = None
+                lines.append(f"synced:  {real}  →  {row['remote']}"
+                             + (f"; what it replaced or removed there is set aside in "
+                                f"~/.aht/remote/replaced/{uid}/ there" if args.replace
+                                or row.get("removed") else ""))
+            elif row.get("status") == "paused":
+                out["paused"] = row["paused"]
+                out["blockers"].append(row["reason"])
+                if row.get("removals"):
+                    out["removals"] = row["removals"]
+            else:
+                out["error"] = row.get("reason") or "the sync did not run"
+            return _emit(args, out, lines)
+        _mirror_check(entry, real)
+        rem = get_remote(m.get("remote"))
+        info = rem.connect(real, fs=True)
+        chk = _sync_check(rem, uid, real, info, extras=_extras(entry))
+        c, rm = chk["changes"] or {}, chk["removals"]
+        out["removals"] = rm
+        if args.replace and rm["over"] and not args.allow_removals:
+            out["blockers"].append(
+                f"this would also remove {rm['removed']} of the {_n(rm['total'], 'file')} "
+                f"on {rem.name} — replace them only together with Allow the Removals "
+                "(--allow-removals)")
+        out["check"] = {"changes": chk["changes"], "removals": rm, "names": chk["names"],
+                        "pause": chk["pause"]}
+        out["aside"] = f"{info.get('home')}/.aht/remote/replaced/{uid}/"
+        if args.replace:
+            out["would"] = {"replace": _changed_count(c) or (rm["total"] if not chk["base"]
+                                                             else 0),
+                            "remove": rm["removed"], "total": rm["total"]}
+            lines += [f"would replace the copy on {rem.name}:  {real}",
+                      f"   there     {_counted(c) if _changed_count(c) else 'nothing changed'}"
+                      + ("" if chk["base"] else f" (no list from an earlier sync: "
+                                                f"{rm['total']} file(s) there)"),
+                      f"   removes   {rm['removed']} of the {rm['total']} file(s) there",
+                      f"   aside     what it replaces or removes there is kept in "
+                      f"{out['aside']}"]
+        else:
+            out["would"] = {"remove": rm["removed"], "total": rm["total"]}
+            lines += [f"would remove on {rem.name}:  {rm['removed']} of the {rm['total']} "
+                      f"file(s) in {real}",
+                      f"   aside     kept in {out['aside']}"]
+            if chk["pause"] and chk["pause"]["reason"] != "removals":
+                out["warnings"].append("the sync would still pause: "
+                                       + _pause_text(chk["pause"]))
+        for p in chk["names"]:
+            out["warnings"].append(f"{p['count']} × {p['text']}, e.g. "
+                                   + " / ".join(p["names"][0]))
+        lines.append("(dry run — pass --apply to do it)")
+    except HandoverError as e:
+        out["error"] = str(e)
+    return _emit(args, out, lines)
 
 def cmd_mirror(args):
     if not handover_supported():
@@ -6440,11 +7138,20 @@ def cmd_mirror(args):
                 lines.append("(dry run — pass --apply to do it)")
         return _emit(args, res, lines)
     real = os.path.realpath(args.path) if args.path else None
+    if args.replace or args.allow_removals:
+        if not real or not os.path.isdir(real):
+            print("name the project folder whose sync paused", file=sys.stderr)
+            return 2
+        return _mirror_answer(args, real)
     if args.on or args.off:
         if not real or not os.path.isdir(real) \
                 or _inside(os.path.realpath(str(Path.home())), real):
             print("name the project folder to switch mirroring on or off", file=sys.stderr)
             return 2
+        why = _copy_refusal(real) if args.on else None
+        if why:
+            print(f"Keep in sync was not turned on: {why}", file=sys.stderr)
+            return 3
         try:
             rem = get_remote(args.to) if args.on else None
         except HandoverError as e:
@@ -6459,13 +7166,18 @@ def cmd_mirror(args):
                 _register(reg, uid, real)
                 entry = reg["projects"][uid]
             m = dict(entry.get("mirror") or {})
+            was = m.get("remote") if m.get("enabled") else None
             m["enabled"] = bool(args.on)
-            m.pop("paused", None)           # on again (or off): Release's pause ends
+            # on again (or off): the pause ends; a sync that finds the copy
+            # there changed, or too much to remove, pauses again
+            m.pop("paused", None)
             if rem:
                 m["remote"] = rem.name
             entry["mirror"] = m
             save_registry(reg)
         log(f"MIRROR {'on' if args.on else 'off'} {real}")
+        if args.off and was:
+            _uncopy_there(was, [(real, uid)])
         if args.off or not args.run:
             print(f"mirroring {'on' if args.on else 'off'}: {real}"
                   + (f"  (to {rem.name}; the first sync runs in the background)"
@@ -6512,7 +7224,8 @@ def cmd_mirror(args):
             print(f"   {r['project']}  → {r.get('remote')}   last sync {at}"
                   + ("" if r.get("status") in (None, "ok") else f"   ({r['status']})")
                   + ("   [handed over]" if r["away"] else "")
-                  + ("   [paused: it was released]" if r.get("paused") else ""))
+                  + (f"   [paused: {PAUSE_WORDS.get(r['paused'].get('reason'), 'see aht')}]"
+                     if r.get("paused") else ""))
     return 0
 
 # ---- handover ----------------------------------------------------------------- #
@@ -6814,6 +7527,31 @@ def cmd_handover(args):
             out["warnings"].append(f"{len(found)} thing(s) that look like a key, token or "
                                    "password are in this project's agent history and "
                                    "travel with it (aht secrets shows where)")
+        # (3b) the copy there: was it worked on since both copies last agreed
+        # (a sync, a handover or a take back)?  This handover would set that
+        # work aside there
+        base = read_there(uid, rem.name, rem.path(real)) if not out["blockers"] else None
+        if base:
+            say(f"looking at the copy on {rem.name} …")
+            ours0, store0 = _our_trees(real, _extras(entry))
+            specs = _far_trees(rem, real, info, _extras(entry))
+            theirs0 = rem.agent("manifest", timeout=900, trees=specs)["trees"]
+            ch = _copy_changes(rem, base, ours0, theirs0,
+                               {t: x["path"] for t, x in specs.items()},
+                               _near_paths(real, store0, theirs0))
+            if _changed_count(ch):
+                out["copy_changed"] = dict(ch, since=base.get("at"))
+                what = (f"the copy on {rem.name} was changed since {_clock(base.get('at'))} "
+                        f"({_counted(ch)}"
+                        + (": " + ", ".join(ch["files"][:5]) if ch["files"] else "") + ")")
+                if args.replace_there:
+                    out["warnings"].append(what + "; this handover sets those changes "
+                                           "aside there")
+                else:
+                    out["blockers"].append(
+                        what + f" — bring them here first (aht reclaim {shlex.quote(real)} "
+                        f"--from {shlex.quote(rem.name)} --apply), or pass --replace-there "
+                        "to set them aside there")
         if out["blockers"]:
             return _emit(args, out, lines)
         if not args.apply:
@@ -6895,7 +7633,8 @@ def cmd_handover(args):
                                           info.get("system"), carried, scratch, args.task)
                 out["brief"] = str(brief)
                 say(f"sending the project to {rem.name} …")
-                sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty())
+                sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty(),
+                                    attempt=attempt)
                 out["sent"] = {"files": sent["project"].get("files", 0),
                                "bytes": sent["project"].get("bytes", 0),
                                "history_bytes": sent["history"].get("bytes", 0),
@@ -6926,6 +7665,16 @@ def cmd_handover(args):
                              "there": {k: v.get("dirs") or [] for k, v in theirs.items()}},
                     "modes": {k: v.get("modes") or {} for k, v in ours.items()},
                     "transcripts": hashes})
+                # the copy there as it is now, with what --include carried:
+                # a sync, or the next handover, compares with this
+                ex = _extras(entry)
+                xs = {t: v for t, v in _far_trees(rem, real, info, ex).items()
+                      if t.startswith("extra:")}
+                write_there(uid, real, rem,
+                            dict(ours, **{f"extra:{p}": tree_of(p, handover_skip())
+                                          for p in ex}),
+                            dict(theirs, **(rem.agent("manifest", timeout=900, trees=xs)
+                                            ["trees"] if xs else {})), "handover")
                 handing = dict(handing, step="recorded", at=time.time())
                 _update_entry(uid, handing=handing)
 
@@ -7244,6 +7993,22 @@ def _release(args, out: dict, lines: list, real: str) -> int:
                      "there stays as it is.")
     return _emit(args, out, lines)
 
+def _copy_base(uid: str, entry: dict, want: str = None):
+    """Bring Them Here's base: the list from the last time this copy and the
+    one on a machine agreed — the machine `want`, else the one whose sync
+    paused, else the one Keep in sync goes to, else the newest list.  A
+    copy Keep in sync goes to that no sync has listed yet gets {first}."""
+    m = entry.get("mirror") or {}
+    name = want or (m.get("paused") or {}).get("remote") \
+        or (m.get("remote") if m.get("enabled") else None)
+    if not name:
+        return read_there(uid)
+    b = read_there(uid, name)
+    if b or not (m.get("enabled") and m.get("remote") == name):
+        return b
+    return {"first": True, "remote": name, "project": entry.get("real_path"),
+            "here": {}, "there": {}}
+
 def cmd_reclaim(args):
     out = {"command": "reclaim", "applied": False, "blockers": [], "warnings": []}
     lines = []
@@ -7268,32 +8033,56 @@ def cmd_reclaim(args):
             out["warnings"] += out["checked"]
             uid, entry = _entry_for(load_registry(), real)
         away = (entry or {}).get("away")
-        if not away:
+        # Bring Them Here: a copy that was synced, handed over or taken back
+        # before, and worked on there since; its base is the list from the
+        # last time it agreed with that machine (_copy_base)
+        copy = _copy_base(uid, entry, args.from_remote) \
+            if entry and not away and not entry.get("handing") else None
+        if not away and not copy:
             out["blockers"].append(_unfinished_text(entry["handing"], real)
                                    if (entry or {}).get("handing")
+                                   else f"aht has no list of the copy on {args.from_remote} "
+                                   "from an earlier sync, handover or take back"
+                                   if entry and not away and args.from_remote
                                    else "this project is not handed over")
             return _emit(args, out, lines)
-        if os.path.realpath(away.get("path") or real) != real:
-            out["blockers"].append(f"the folder was at {away['path']} when it was "
-                                   "handed over; move it back there first")
-            return _emit(args, out, lines)
+        out["mode"] = "copy" if copy else "away"
         hd = handover_dir(uid)
-        try:
-            base = json.loads((hd / "manifest.json").read_text())
-        except Exception as e:
-            raise HandoverError(f"the record of what left is unreadable ({e})")
-        if (base.get("attempt") or away.get("attempt")) \
-                and base.get("attempt") != away.get("attempt"):
-            # a list from another attempt would count the wrong files as changed
-            raise HandoverError(
-                "the record of what left belongs to another handover attempt "
-                f"({base.get('attempt') or 'none'}, not {away.get('attempt') or 'none'}), "
-                "so aht cannot tell what changed there. Release the project (aht reclaim "
-                f"{shlex.quote(real)} --release) and bring over what you need by hand")
-        rem = get_remote(away.get("remote"))
+        if copy:
+            if os.path.realpath(copy.get("project") or real) != real:
+                out["blockers"].append(f"the folder was at {copy['project']} when it was "
+                                       "last synced; move it back there first")
+                return _emit(args, out, lines)
+            base = copy
+            rem = get_remote(copy.get("remote"))
+            if not copy.get("first") and copy.get("remote_path") != rem.path(real):
+                out["blockers"].append(f"the copy on {rem.name} was at "
+                                       f"{copy.get('remote_path')}; it is not looked for "
+                                       "elsewhere")
+                return _emit(args, out, lines)
+            there = rem.name
+        else:
+            if os.path.realpath(away.get("path") or real) != real:
+                out["blockers"].append(f"the folder was at {away['path']} when it was "
+                                       "handed over; move it back there first")
+                return _emit(args, out, lines)
+            try:
+                base = json.loads((hd / "manifest.json").read_text())
+            except Exception as e:
+                raise HandoverError(f"the record of what left is unreadable ({e})")
+            if (base.get("attempt") or away.get("attempt")) \
+                    and base.get("attempt") != away.get("attempt"):
+                # a list from another attempt would count the wrong files as changed
+                raise HandoverError(
+                    "the record of what left belongs to another handover attempt "
+                    f"({base.get('attempt') or 'none'}, not "
+                    f"{away.get('attempt') or 'none'}), so aht cannot tell what changed "
+                    f"there. Release the project (aht reclaim {shlex.quote(real)} "
+                    "--release) and bring over what you need by hand")
+            rem = get_remote(away.get("remote"))
+            there = away.get("host") or rem.name
         rem.on_percent = prog.percent
         out["remote"] = rem.name
-        there = away.get("host") or rem.name
 
         act = activity_in(real)
         out["here"] = act
@@ -7301,10 +8090,10 @@ def cmd_reclaim(args):
 
         say(f"checking {rem.name} …")
         info = rem.connect(real)
-        if not info["sessions"] and away.get("window") and \
+        if not copy and not info["sessions"] and away.get("window") and \
                 rem.agent("close", path=rem.path(real), name=away["window"]).get("closed"):
             info = rem.connect(real)        # the window it ran in is closed now
-        if info["sessions"] and args.stop and \
+        if not copy and info["sessions"] and args.stop and \
                 all(s.get("status") == "idle" for s in info["sessions"]):
             if args.apply:
                 say(f"ending the idle session on {rem.name} …")
@@ -7326,7 +8115,7 @@ def cmd_reclaim(args):
                         "processes": info.get("processes"),
                         "claude_version": info.get("claude_version")}
         blocked = _activity_blockers(info, f"on {rem.name}")
-        if blocked and not args.stop and \
+        if blocked and not copy and not args.stop and \
                 all(s.get("status") == "idle" for s in info["sessions"]):
             blocked = [b + ", or pass --stop to end it from here" for b in blocked]
         out["blockers"] += blocked
@@ -7342,25 +8131,73 @@ def cmd_reclaim(args):
         store = _store_of(real) or (claude_backend().root() / _key_claude(real))
         rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
         say("comparing both sides …")
-        theirs = rem.agent("manifest", timeout=900, trees={
-            "project": {"path": rem.path(real), "skip": handover_skip()},
-            "history": {"path": rstore, "skip": []}})["trees"]
+        extras = _extras(entry)
+        theirs = rem.agent("manifest", timeout=900,
+                           trees=_far_trees(rem, real, info, extras))["trees"]
         ours = {"project": tree_manifest(real),
                 "history": tree_manifest(str(store), []) if Path(store).is_dir()
                 else tree_manifest(os.devnull, [])}
-        plans = {t: three_way(base["here"].get(t) or {}, base["there"].get(t) or {},
-                              ours[t]["files"], theirs[t]["files"])
+        # a folder there that is gone, or holds nothing but aht's own files,
+        # would empty this project: never, whatever is allowed
+        mine_p = [k for k in ours["project"]["files"] if not k.startswith(".aht/")]
+        if mine_p and (not info.get("path_exists") or not any(
+                not k.startswith(".aht/") for k in theirs["project"]["files"])):
+            out["blockers"].append(
+                f"the folder on {rem.name} ({rem.path(real)}) is "
+                + ("missing" if not info.get("path_exists") else "empty")
+                + f": bringing it here would empty this project, so nothing is taken from "
+                "it" + ("" if copy else f" — release the project instead (aht reclaim "
+                                        f"{shlex.quote(real)} --release)"))
+            return _emit(args, out, lines)
+        if copy and copy.get("first"):
+            # no list from an earlier sync (a project synced before there
+            # were such lists): the files that differ and are newer there
+            # come here next to ours, as if changed on both sides; a
+            # conversation that went on there comes back if it continues
+            # ours; every other file counts as agreed
+            newer = _newer_there(rem, ours, theirs, {"project": rem.path(real),
+                                                     "history": rstore},
+                                 {"project": real, "history": str(store)},
+                                 ("project", "history"))
+            np_, nh = set(newer.get("project") or []), set(newer.get("history") or [])
+            base = dict(copy, here={
+                "project": {k: v for k, v in ours["project"]["files"].items() if k not in np_},
+                "history": dict(ours["history"]["files"])}, there={
+                "project": {k: v for k, v in theirs["project"]["files"].items()
+                            if k not in np_},
+                "history": dict(theirs["history"]["files"],
+                                **{k: ours["history"]["files"][k] for k in nh})},
+                dirs={"here": {t: ours[t].get("dirs") or [] for t in ("project", "history")},
+                      "there": {t: theirs[t].get("dirs") or []
+                                for t in ("project", "history")}})
+        # a synced copy leaves the project's .aht/handover out on both sides
+        cut = _sync_files if copy else (lambda f: f or {})
+        plans = {t: three_way(cut(base["here"].get(t)) if t == "project"
+                              else base["here"].get(t) or {},
+                              cut(base["there"].get(t)) if t == "project"
+                              else base["there"].get(t) or {},
+                              cut(ours[t]["files"]) if t == "project" else ours[t]["files"],
+                              cut(theirs[t]["files"]) if t == "project"
+                              else theirs[t]["files"])
                  for t in ("project", "history")}
 
-        # a transcript must come back as a continuation of what left
+        # a transcript must come back as a continuation of what left (of
+        # what is here, for a synced copy: ours is what was sent there)
         hp = plans["history"]
-        check = [k for k in hp["take"] if k in (base.get("transcripts") or {})]
+        if copy:
+            mine = {k: [ours["history"]["files"][k][0],
+                        file_sha256(Path(store) / (ours["history"]["raw"].get(k) or k))]
+                    for k in hp["take"] if k.endswith(".jsonl")
+                    and isinstance((ours["history"]["files"].get(k) or ["l"])[0], int)}
+        else:
+            mine = base.get("transcripts") or {}
+        check = [k for k in hp["take"] if k in mine]
         if check:
             got = rem.agent("hash", timeout=600, files=[
                 {"key": k, "path": f"{rstore}/{theirs['history']['raw'].get(k) or k}",
-                 "limit": base["transcripts"][k][0]} for k in check])["hashes"]
+                 "limit": mine[k][0]} for k in check])["hashes"]
             for k in check:
-                if got.get(k) != base["transcripts"][k][1]:
+                if got.get(k) != mine[k][1]:
                     hp["take"].remove(k)
                     hp["conflict"].append(k)
         # the history that returns must be readable here: neither the CLI over
@@ -7386,6 +8223,36 @@ def cmd_reclaim(args):
                 out["blockers"].append(msg + " — update Claude Code here first "
                                        "(or pass --ignore-version)")
                 return _emit(args, out, lines)
+        if copy:
+            # as the sync's own look did: a file there that was only touched
+            # (the same bytes as here) is not fetched
+            same = [k for k in list(plans["project"]["take"]) if isinstance(theirs["project"]["files"][k][0], int)
+                    and (ours["project"]["files"].get(k) or [None])[0]
+                    == theirs["project"]["files"][k][0]]
+            if same:
+                got = rem.agent("hash", timeout=600, files=[
+                    {"key": k, "path": f"{rem.path(real)}/{theirs['project']['raw'].get(k) or k}"}
+                    for k in same])["hashes"]
+                for k in same:
+                    try:
+                        if got.get(k) == file_sha256(
+                                Path(real) / (ours["project"]["raw"].get(k) or k)):
+                            plans["project"]["take"].remove(k)
+                    except OSError:
+                        pass
+        # a take back never removes the project's id, nor anything else of
+        # aht's in .aht/
+        plans["project"]["delete"] = [k for k in plans["project"]["delete"]
+                                      if not k.startswith(".aht/")]
+        if copy:
+            # nor, unasked, many of the files here because they are gone
+            # from the copy there
+            rmv = out["removals"] = _removals(plans["project"]["delete"], len(mine_p))
+            if rmv["over"] and not args.allow_removals:
+                out["blockers"].append(
+                    f"this would remove {rmv['removed']} of the {_n(rmv['total'], 'file')} "
+                    f"here, as they are gone from the copy on {rem.name} — pass "
+                    "--allow-removals to let it (what it removes is set aside here)")
         out["conflicts"] = {t: list(p["conflict"]) for t, p in plans.items()
                             if p["conflict"]}
         if args.prefer == "there":          # theirs win; ours are set aside
@@ -7396,8 +8263,10 @@ def cmd_reclaim(args):
         changed = sum(len(p["take"]) + len(p["new"]) + len(p["delete"]) + len(p["conflict"])
                       for p in plans.values())
         pp = plans["project"]
-        lines += [f"{'taking back' if args.apply else 'would take back'}:  {real}"
-                  f"  ←  {rem.name}",
+        verb = ("bringing here" if args.apply else "would bring here") if copy else \
+            ("taking back" if args.apply else "would take back")
+        lines += [f"{verb}:  {real}  ←  {rem.name}"
+                  + ("  (the changes made in the copy there)" if copy else ""),
                   f"   project   {len(pp['take'])} changed, {len(pp['new'])} new, "
                   f"{len(pp['delete'])} removed there; {len(pp['kept'])} changed only here",
                   f"   history   {len(hp['take'])} continued, {len(hp['new'])} new file(s)"]
@@ -7414,6 +8283,8 @@ def cmd_reclaim(args):
                 lines.append(f"   the idle session on {rem.name} would be ended first")
             lines.append("(dry run — pass --apply to do it)")
             return _emit(args, out, lines)
+        if out["blockers"]:
+            return _emit(args, out, lines)
 
         with ProjectLock(uid):
             try:
@@ -7426,8 +8297,9 @@ def cmd_reclaim(args):
             def made_there(t):                  # folders new there (empty ones too)
                 was = set((bdirs.get("here") or {}).get(t) or []) \
                     | set((bdirs.get("there") or {}).get(t) or [])
-                return sorted(set(theirs[t].get("dirs") or []) - was
-                              - set(ours[t].get("dirs") or []))
+                return sorted(d for d in set(theirs[t].get("dirs") or []) - was
+                              - set(ours[t].get("dirs") or [])
+                              if not (copy and (d + "/").startswith(RELAYS_REL[1:])))
             done = {"project": _pull_tree(rem, pp, rem.path(real), real,
                                           theirs["project"]["raw"], aside / "project",
                                           there, False, handover_skip(),
@@ -7463,26 +8335,62 @@ def cmd_reclaim(args):
             pd = done["project"]
             # go on where the work stopped: that can be a branch, or a session
             # begun over there, not the one that was sent
-            latest = latest_session(store) or away.get("session")
-            handed = away.get("session") if away.get("session") != latest else None
-            back = {"from": there, "left": away.get("since"), "at": _now(),
-                    "session": latest, "handed_over": handed,
-                    "updated": pd["updated"],
+            was = away or {}
+            latest = latest_session(store) or was.get("session")
+            handed = was.get("session") if was.get("session") != latest else None
+            back = {"from": there, "left": was.get("since") or base.get("at"), "at": _now(),
+                    "mode": "copy" if copy else "away", "session": latest,
+                    "handed_over": handed, "updated": pd["updated"],
                     "new": pd["new"], "deleted": pd["deleted"],
                     "conflicts": [c["their_version"] for c in pd["conflicts"]]}
-            _update_entry(uid, away=None, returned=back)
-            _end_pause(uid, rem.name)       # the two copies agree again
-            _retire_manifest(hd)
+            # both copies as they stand now: the next sync, or handover,
+            # compares the one there with this list
+            write_there(uid, real, rem, _our_trees(real, extras)[0], theirs, "take-back")
+            if copy:
+                _update_entry(uid, returned=back)
+            else:
+                _update_entry(uid, away=None, returned=back)
+                _end_pause(uid, rem.name)   # the two copies agree again
+                _retire_manifest(hd)
             prune_set_asides(hd / "replaced")
+        mm = (load_registry().get("projects", {}).get(uid) or {}).get("mirror") or {}
+        synced = mm.get("enabled") and mm.get("remote") == rem.name
+        if not copy:
+            # the copy there is no longer the live one: it stays as a copy
+            # that Keep in sync keeps, or as one whose project went home
+            try:
+                rem.agent("prepare", dirs=[], copy_note={
+                    "path": rem.path(real), "uuid": uid, "from": _here(),
+                    "from_id": machine_id(create=True),
+                    "kind": "sync" if synced else "returned", "attempt": was.get("attempt")})
+            except HandoverError as e:
+                out["warnings"].append(f"{rem.name} still notes its copy as handed over ({e})")
+        elif synced:
+            # Bring Them Here answered the pause: the sync runs, and the
+            # copy there is the same as this one again
+            say(f"syncing with {rem.name} …")
+            _update_mirror(uid, paused=None)
+            e2 = load_registry().get("projects", {}).get(uid)
+            out["sync"] = mirror_project(uid, e2) if e2 else None
         out["applied"] = True
         out["session"] = latest
         out["session_title"] = session_title(store, latest)
         out["handed_over_session"] = handed
         out["handed_over_title"] = session_title(store, handed)
         log(f"RECLAIM {real} <- {rem.name} ({changed} change(s), "
-            f"{sum(len(d['conflicts']) for d in done.values())} conflict(s))")
+            f"{sum(len(d['conflicts']) for d in done.values())} conflict(s))"
+            + (" from the copy there" if copy else ""))
         apply_badge(real, desired_marks(real, True))
-        notify_user("Taken back", f"{os.path.basename(real)} is on this machine again")
+        if copy:
+            notify_user("Brought here", f"The changes made on {rem.name} are in "
+                        f"{os.path.basename(real)}")
+            row = out.get("sync") or {}
+            if row.get("status") == "synced":
+                lines.append(f"   synced    the copy on {rem.name} is the same as this one again")
+            elif row:
+                lines.append(f"   sync      {row.get('reason') or row.get('status')}")
+        else:
+            notify_user("Taken back", f"{os.path.basename(real)} is on this machine again")
         for t, d in done.items():
             for c in d["conflicts"]:
                 lines.append(f"   ! kept both ({t}): {c['file']}  +  {c['their_version']}")
@@ -8144,11 +9052,9 @@ def _copy_note(cwd: str) -> str:
     """When this folder is a copy aht keeps for another machine
     (~/.aht/remote/copies.json): one line about where it came from."""
     try:
-        copies = json.loads((aht_home() / "remote" / "copies.json").read_text())
-    except (OSError, ValueError):
+        c = copy_of(cwd)
+    except Exception:
         return ""
-    c = next((v for k, v in (copies.items() if isinstance(copies, dict) else [])
-              if isinstance(v, dict) and isinstance(k, str) and _same_dir(k, cwd)), None)
     if not c:
         return ""
     src = c.get("from") or "another machine"
@@ -8157,6 +9063,9 @@ def _copy_note(cwd: str) -> str:
                 "pause that sync.")
     if c.get("kind") in ("handover", "brought"):
         return f"[aht] This folder was handed over from “{src}”; send it back when done."
+    if c.get("kind") == "returned":
+        return (f"[aht] This folder is an old copy of a project that went back to “{src}”; "
+                f"work done here does not reach {src} by itself.")
     return ""
 
 def _handover_note(cwd: str) -> str:
@@ -8185,6 +9094,15 @@ def _handover_note(cwd: str) -> str:
             return (f"[aht] This project was handed over to “{b.get('from')}” on "
                     f"{b.get('left')} and released on {b.get('at')}: the work done "
                     "there since then did not come here.")
+        if b and not b.get("told") and b.get("mode") == "copy":
+            msg = (f"[aht] Changes made in this project's copy on “{b.get('from')}” were "
+                   f"brought here on {b.get('at')} ({b.get('updated', 0)} file(s) updated, "
+                   f"{b.get('new', 0)} new, {b.get('deleted', 0)} removed).")
+            if b.get("conflicts"):
+                msg += (" Changed in BOTH copies, so both versions were kept: "
+                        + ", ".join(b["conflicts"][:8]) + ".")
+            _update_entry(uid, returned=dict(b, told=True))
+            return msg
         if b and not b.get("told"):
             msg = (f"[aht] This project is back on “{_here()}”. It ran on "
                    f"“{b.get('from')}” from {b.get('left')} to {b.get('at')}; the "
@@ -17910,7 +18828,13 @@ def build_parser():
     s.add_argument("--off", action="store_true")
     s.add_argument("--all", action="store_true", help="with --on / --off: every tracked "
                    "project at once")
-    s.add_argument("--apply", action="store_true", help="with --all")
+    s.add_argument("--apply", action="store_true",
+                   help="with --all, --replace or --allow-removals")
+    s.add_argument("--replace", action="store_true",
+                   help="a paused sync: send this copy over the one there, once; what it "
+                        "replaces there is set aside there")
+    s.add_argument("--allow-removals", action="store_true", dest="allow_removals",
+                   help="a sync paused before removing many files there: let it, once")
     s.add_argument("--run", action="store_true", help="sync now")
     s.add_argument("--due", action="store_true",
                    help="with --run: only what the interval says is due")
@@ -17936,6 +18860,9 @@ def build_parser():
     s.add_argument("--allow-processes", action="store_true", dest="allow_processes",
                    help="leave other programs running in the folder behind "
                         "(an open agent session always blocks)")
+    s.add_argument("--replace-there", action="store_true", dest="replace_there",
+                   help="the copy there was changed since the last sync: set those "
+                        "changes aside there and hand over anyway")
     s.add_argument("--status-file", dest="status_file", metavar="FILE",
                    help="keep the current stage and percentage in FILE (front-ends)")
     s.add_argument("--apply", action="store_true")
@@ -17957,6 +18884,13 @@ def build_parser():
     s.add_argument("--release", action="store_true",
                    help="stop waiting for it: the files here stay as they are, the copy "
                         "there is left alone, and the work done there does not come here")
+    s.add_argument("--from", dest="from_remote", metavar="NAME",
+                   help="a copy kept in sync, or handed over before: the one on this "
+                        "machine (default: the one whose sync paused, else the one Keep "
+                        "in sync goes to)")
+    s.add_argument("--allow-removals", action="store_true", dest="allow_removals",
+                   help="a copy there whose files were removed: let it remove many of "
+                        "them here too (they are set aside here)")
     s.add_argument("--status-file", dest="status_file", metavar="FILE")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")

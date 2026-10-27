@@ -1,0 +1,82 @@
+{
+  "command": "reclaim",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/api",
+  "mode": "copy",
+  "remote": "box",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "there": {
+    "sessions": [],
+    "processes": [],
+    "claude_version": "9.9.9"
+  },
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9",
+    "wrote_the_history": "9.9.9"
+  },
+  "removals": {
+    "removed": 0,
+    "total": 31,
+    "files": [],
+    "over": false
+  },
+  "conflicts": {
+    "project": [
+      "README.md"
+    ]
+  },
+  "plan": {
+    "project": {
+      "take": 0,
+      "new": 1,
+      "delete": 0,
+      "conflict": 1,
+      "kept": 0
+    },
+    "history": {
+      "take": 0,
+      "new": 0,
+      "delete": 0,
+      "conflict": 0,
+      "kept": 0
+    }
+  },
+  "done": {
+    "project": {
+      "updated": 0,
+      "new": 1,
+      "deleted": 0,
+      "conflicts": [
+        {
+          "file": "README.md",
+          "their_version": "README (from box 2026-10-27).md"
+        }
+      ],
+      "kept": 0
+    },
+    "history": {
+      "updated": 0,
+      "new": 0,
+      "deleted": 0,
+      "conflicts": [],
+      "kept": 0
+    }
+  },
+  "sync": {
+    "project": "/Users/me/code/api",
+    "remote": "box",
+    "status": "synced",
+    "bytes": 48,
+    "files": 3
+  },
+  "session": null,
+  "session_title": "",
+  "handed_over_session": null,
+  "handed_over_title": ""
+}

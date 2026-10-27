@@ -49,7 +49,7 @@ if [ "$KEEP" = 1 ]; then echo "   it stays there: $D"; else trap "on 'rm -rf $D'
 SMOKE=""
 if [ "$SUITES" = 1 ]; then
   echo "== the test suites, natively"
-  SMOKE=$(on 'cd '"$D"' && bash tests/run_tests.sh > out-suites.log 2>&1; s=$?; echo "run_tests $s $(grep -E "RESULT|ALL AHT" out-suites.log | tr "\n" " ")"')
+  SMOKE=$(on 'cd '"$D"' && bash tests/run_tests.sh > out-suites.log 2>&1; s=$?; echo "run_tests $s $(grep -E "RESULT|ALL AHT|REDACT TESTS" out-suites.log | tr "\n" " ")"')
   echo "   $SMOKE"
 fi
 

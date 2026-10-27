@@ -425,64 +425,57 @@ secret (see *Known limits*).
   (`api.telegram.org/bot…`);
 - private keys: PEM (also encrypted, with `Proc-Type` and `DEK-Info`
   lines), PGP private-key blocks and PuTTY `.ppk` files, also inside JSON
-  (and JSON inside JSON) or in a Read tool's output with line numbers.  A
-  key is masked as its header, its lines of key and its END line, and
-  nothing else: a guide or code that names the BEGIN and END lines stays as
-  it is, and a header with no key under it is not a find.  A key cut off
-  before its END line is masked as far as its lines go.  A private key in
-  base64 (a kubeconfig's `client-key-data`, a Kubernetes `tls.key`, the
-  output of `base64`) is masked too;
+  (and JSON inside JSON), in a Read tool's output with line numbers, or
+  with `>`, `#` or `//` before each line.  A key is masked from its BEGIN
+  line to its END line, and nothing after it; a guide or code that names
+  the BEGIN and END lines with no key between them (32 characters of key
+  or more) stays as it is.  A key cut off before its END line is masked to
+  the end of the text that holds it.  A private key in base64 (a
+  kubeconfig's `client-key-data`, a Kubernetes `tls.key`, the output of
+  `base64`, also in lines of 76) is masked too;
 - `Bearer` tokens (16 characters or more), `Basic` credentials, and what
   follows `Authorization:` with any other scheme or none (16 characters or
   more);
 - the value given to a name that holds a password, a secret, a token or a
-  key: a name with a part (between `_`, `.` or `-`) that is password,
-  pass, passwd, passphrase, pwd, secret, token, auth, credential(s) or pat,
-  or api, access, private, secret, app, master, encryption, signing, hmac,
-  jwt, account or shared followed by key (`API_KEY`, `apiKey`,
-  `SECRETKEY`, `RAILS_MASTER_KEY`, `x-api-key`), client secret
-  (`client_secret`, `clientSecret`) and `PGPASSWORD`; in camelCase and
-  PascalCase also Password, Passwd, Passphrase, Pwd, Secret, Token, Auth
-  or Credential(s), or one of Api, Access, Private, App, Master,
-  Encryption, Signing, Hmac, Jwt, Account, Shared or Secret followed by
-  Key, after a small letter or a digit (`dbPassword`, `accessToken`,
-  `SessionToken`, `SecretAccessKey`, `SharedAccessKey`).  This also holds
-  in a `.env` file, an `export` line, YAML or JSON, on any line of a tool's
-  output and in JSON inside JSON.  Names whose last part says they hold
-  something else do not count, such as an id, a URL, a name, a type, a
-  hash, a count, a length, a path, a file, a digest or a fingerprint
-  (`TOKEN_URL`, `password_hash`, `token_type`, `max_tokens`,
-  `accessTokenUrl`, `token_sha256`), nor does a name next to `::`
-  (`test_auth.py::test_token`, `auth::verify`), nor a test runner's
-  `PASS:` line.  The value must have 8 or more characters and look
-  generated: not a placeholder or a reference to a secret store
-  (`${DB_PASSWORD}`, `<token>`, `changeme`, `%{X}`, `op://…`, `vault:…`),
-  code, a name (`MAX_RETRIES`, or a dotted name whose every part reads as
-  one, such as `spring.datasource.password`), a path or a web address
-  whose parts read as names, an ARN, a fingerprint or a hash, a port or
-  an image's tag, or words.  A value of capital letters and digits counts
-  as a name only when it has an `_`, reads as words, or has 12 characters
-  or fewer and no digit.  A value that starts with `~` or `.` counts as a
-  path only as `~/…`, `./…` or `../…` (or as a dotfile such as `.env`).
-  After a password, passwd, pwd or passphrase name, three or more words
-  joined by `-` are masked as a passphrase; after a secret or token name
-  they stay.  A value in quotes is masked to its closing quote, so `,` `;`
-  `'` `(` `)` `&` and escaped quotes in it are masked too (one with a space
-  in it is not masked at all).  A value without quotes ends at a space, a
-  quote, a backslash, `,`, `;`, `<` or `>`, at a closing bracket with
-  nothing of it after that, and at an `&` before another parameter
-  (`&page=2`);
+  key: a name with a word (its words are split at `_`, `.`, `-` and at
+  capitals: `dbPassword`, `SecretAccessKey`) that ends in password,
+  passwd, passphrase, pwd, secret, token or credential(s) (`PGPASSWORD`,
+  `GITHUB_TOKEN`, `clientSecret`), that is pass, auth or pat, or that is
+  key after api, access, private, secret, client, app, master,
+  encryption, signing, hmac, jwt, account or shared (`API_KEY`, `apiKey`,
+  `SECRETKEY`, `RAILS_MASTER_KEY`, `x-api-key`).  This also holds in a
+  `.env` file, an `export` line, YAML or JSON, on any line of a tool's
+  output and in JSON inside JSON.  A name does not count when a word after
+  that one says it holds something else, such as an id, a URL, a host, a
+  name, a type, a hash, a count, a length, a path, a file, a digest, a
+  fingerprint, a version or a scope (`TOKEN_URL`, `password_hash`,
+  `token_type`, `accessTokenUrl`, `token_sha256`), when a word before it
+  says it is a page's or a request's token (`NextToken`, `nextPageToken`,
+  `ContinuationToken`, `IdempotencyToken`), when it stands before `::`
+  (`test_auth.py::test_token`, `auth::verify`), or when it is a style
+  sheet's class (`.x-token:hover`).  The value must have 8 or more
+  characters and look generated: not a placeholder or a reference to a
+  secret store (`${DB_PASSWORD}`, `<token>`, `changeme`, `%{X}`, `op://…`,
+  `vault:…`), not code (a call, an index or a chain of names:
+  `tokenizer.encode(text)`, `req.body.password`), not a name made of words
+  (`MAX_RETRIES`, `refreshToken`, `my-app-secrets`), a version or an
+  image's tag, not a path or a web address with no generated part, and
+  not words of a language other than English.  A value of 16 characters or
+  fewer counts when it mixes three kinds of character (small letters,
+  capitals, digits, other signs); a longer one when it is random enough.
+  A value in quotes ends at the same quote, a space or a backslash; one
+  without quotes at a space, a quote, a backslash, `,`, `;`, `<`, `>`, a
+  backtick or `=` (base64's `=` at its end stays with it), and at an `&`
+  before another parameter (`&page=2`);
 - where no name stands before the value: `--password`, `--token`,
   `--secret`, `--with-token`, `--auth-token`, `--access-token` and
   `--api-key` (also `--pass` and `--passwd`) followed by a value;
   `mysql -pX` (also `mysqldump`, `mysqladmin`, `mariadb`); `-p` or
   `--password` after `docker login` or `twine`; `sshpass -p`;
-  `redis-cli -a`; the password in `curl -u user:password`; a cookie whose
-  name holds sess, sid, token or auth (`Cookie:`, `Set-Cookie:`); XML
-  `<password>…</password>` (also `pass`, `passwd`, `passphrase`, `pwd`,
-  `secret`, `token`); and settings written `key="…Password" value="…"`
-  (also a name that ends in Secret, Token or Key).  The value must look
-  generated, as above;
+  `redis-cli -a`; the password in `curl -u user:password`; XML
+  `<password>…</password>` (also `pass`, `passwd`, `secret`, `token`);
+  and settings written `key="…Password" value="…"` (also a name that ends
+  in Secret, Token or Key).  The value must look generated, as above;
 - the password in a web or database address (`postgres://app:…@db:5432`),
   whatever the host (a name, a container's name, an IPv4 or `[IPv6]`
   address), with or without a user name, also when percent-encoded or
@@ -496,25 +489,31 @@ keeps its kind and at most its first four and last two characters
 (`[Groq API key: gsk_…o8]`); a private key keeps only what kind it is
 (`BEGIN RSA PRIVATE KEY`, or `BEGIN RSA PRIVATE KEY (in base64)`).
 
-**Known limits.**  aht cannot recognise every secret.  These stay in
-clear: a value with no name and no form aht knows (a token of no known
-kind pasted alone into a message); a value under 8 characters after a
-name, or one that does not look random enough (small letters only; a short
-one of only two kinds of character, such as a short hex string; one with
-two or more letters outside A to Z); a value in quotes with a space in it
-(and a value without quotes is masked only up to where it ends, a space,
-`,` or `;` in it, say, and not at all when that leaves fewer than 8
-characters); a value after a camelCase name other than those above
-(`dbPass`, `stripeKey`, `tokenValue`) or after a key name other than those
-above (`STRIPE_KEY`); a private key seen only from its middle (its end, a
-part a Read tool showed from an offset or a diff showed), or as the lines
-a diff removes; a password in a base64 Docker config
-(`.dockerconfigjson`); a web address with a password, percent-encoded
-inside another web address; and a secret split across lines or messages.
-Secrets are best kept out of agent chats.  `aht secrets` lists what aht
-recognises in the histories, and `aht secrets --redact` takes it out (a
-private key as its header, its lines of key and its END line, and nothing
-around it).
+**Known limits.**  aht cannot recognise every secret, and it does not
+try to guess at every shape one could have.  These stay in clear: a value
+with no name and no form aht knows (a token of no known kind pasted alone
+into a message); a value after a name it does not know (`STRIPE_KEY`,
+`stripeKey`); a value under 8 characters, or one that does not look
+generated (small letters only, a word and digits such as `Summer2024`, a
+short one of only two kinds of character, words joined by `-` as a
+passphrase generator makes them); a password with a quote, a space or a
+backslash in it, which is masked only up to that character, and not at
+all when fewer than 8 characters come before it (a value without quotes
+likewise ends at `,`, `;` or `=`); a password that starts with a bracket, `=` or `:`,
+or with a word and a bracket (`Word(…`), which reads as code; a value
+that is a path or a file's name; in `aht secrets`, a value on the line
+after its name (what aht shows masks it); a cookie; a private key seen
+only from its middle (its end, a part a Read tool showed from an offset
+or a diff showed), or as the lines a diff removes; a password in a base64
+Docker config (`.dockerconfigjson`); a web address with a password,
+percent-encoded inside another web address; and a secret split across
+lines or messages.  Some code and names that look generated may be masked
+although they are none.  Secrets are best kept out of agent chats.
+`aht secrets` lists what aht recognises in the histories, and
+`aht secrets --redact` takes it out (a private key from its BEGIN line to
+its END line, and nothing around it); a place whose removal would leave a
+history's line, or the whole file, no longer valid JSON is left as it is,
+and aht says so.
 
 **Where.**  The search index (messages; what tool calls worked on: their
 commands, file paths and web addresses; session titles), handover and

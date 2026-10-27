@@ -4045,7 +4045,7 @@ ACROSS AGENTS (Claude Code, Kimi Code, Codex):
   aht secrets [folder]                  keys or passwords in the histories (masked)
   aht changes <folder> [--diff]         what the latest session changed in the files
   aht report [--since week] [--by agent]   time and sessions; --statement: AI-use text
-  aht share <folder> --format html      a session as a clean page to pass on
+  aht share <folder> --format html      a session as a page to share, keys masked
   aht tidy                              gone folders, histories without a folder
   aht notices --test                    how "waiting for you" notices arrive
 
@@ -8164,11 +8164,16 @@ def _when_text(t) -> str:
 def cmd_search(args):
     q = " ".join(args.words or []).strip()
     if args.rebuild:
-        for p in (search_db(), Path(str(search_db()) + "-wal")):
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        try:
+            for end in ("-journal", "-wal", "-shm", ""):          # the database last
+                Path(str(search_db()) + end).unlink(missing_ok=True)
+        except OSError:
+            # Windows, while a search reads it: an older format to the
+            # update below, which then empties the file
+            db = _open_search_db()
+            db.execute("pragma user_version = 0")
+            db.commit()
+            db.close()
     if args.update or args.rebuild or not args.no_update:
         talk = sys.stderr.isatty() and not args.json and not args.quiet
         def progress(i, n):
@@ -8227,98 +8232,56 @@ def _secret_patterns() -> list:
     needles, so gigabytes of history take seconds: an `at` one starts at its
     needle, any other near it (160 bytes before to 480 after), and a find
     runs on from there for up to 64 KB.  A generic one finds its needles in
-    the lower-cased text, keeps its value in a group whose name starts with
-    v and leaves it to _plausible.  Built from pieces, so this file does not
+    the lower-cased text and keeps its value in a group whose name starts
+    with v (its opening quote in q with the same ending, a name in n);
+    _plausible decides.  Each pattern reads a text one way only, so no line
+    makes it backtrack for long.  Built from pieces, so this file does not
     itself look like it holds a key."""
     k = lambda *parts: "".join(parts).encode()
     rx = lambda *parts: re.compile(k(*parts))
     pk = "PRIV" + "ATE KEY"
-    # between the lines of a key: a line break, escaped once or more (JSON
-    # inside JSON), and the line numbers of a Read tool's output; taken
-    # whole and never given back (a lookahead), so a long run costs one pass
-    arrow = r"(?:\xe2\x86\x92|\\+u2192)"
-    sep = r"(?:\s|\\+[nrt]|%s|\d+(?:\t|\\+t|%s))+" % (arrow, arrow)
-    once = lambda g, p: r"(?=(?P<%s>%s))(?P=%s)" % (g, p, g)
-    b64 = r"[A-Za-z0-9+/=]"
-    line = r"(?![A-Z]?[a-z]+(?!%s))%s{12,}" % (b64, b64)        # base64, not a word
-    ppk = r"(?:Encryption|Comment|Public-Lines|Private-Lines|Key-Derivation|Argon2-[A-Za-z]+)"
-    # a value: no space, quote, backslash, < or >; a bracket open, in a pair
-    # or closed with more of the value right after it (code never has that:
-    # f(pw=x) ends there), an & unless a parameter starts there (&page=2).
-    # In quotes, it runs to its closing quote (as many backslashes before
-    # it: JSON inside JSON) over anything but a space, a line break (in JSON
-    # an odd run of backslashes before n, r or t) or the end of a JSON
-    # string (a bare " before , } ] or :), and its closing quote ends a
-    # value (a , ; ) } or a space after it, not more code: "?k="],a:{id:"x"),
-    # nor does one that a + follows ("token="+t)
-    u = r"[^\s\"'\\,;(){}\[\]`<>&]"
-    val = (r"(?:%s|\(%s*\)|\{%s*\}|\[%s*\]|[(\[{]|[)\]}](?=[A-Za-z0-9!@#$%%^*~])"
-           r"|&(?![A-Za-z_][A-Za-z0-9_.\-]*=))" % (u, u, u, u))
+    # where a known kind of token starts: not inside a word, but after an
+    # escaped line break or tab (a history's raw line)
+    b = r"(?:(?<![A-Za-z0-9_])|(?<=\\[nrt]))"
+    # in a JSON string: anything but its closing quote (an escaped one too)
+    js = r"(?:[^\"\\]|\\[\s\S])"
+    # a value: in quotes (escaped ones too: JSON inside JSON), up to the same
+    # quote, a space or a backslash; without, up to a space, a quote, a
+    # backslash, , ; < > ` or =, or an & a parameter follows (&page=2)
     value = lambda x: (
-        r"(?P<bs{0}>\\+)?(?P<q{0}>[\"'])?(?P<v{0}>(?(q{0})(?!\+)"
-        r"(?:(?!(?<!\\)(?(bs{0})(?P=bs{0}))(?P=q{0}))(?:[^\s\\\"]|\"(?![,}}\]:])|(?<=\\)\""
-        r"|(?:\\\\)+(?!\\)|\\(?:\\\\)*(?![nrt\\])|(?(bs{0})(?!)|\\+))){{8,}}"
-        r"(?=(?<!\\)(?(bs{0})(?P=bs{0}))(?P=q{0})(?:[\s,;:.)\]}}>/\\&|+\"']|\Z)|\Z)"
-        r"|(?=[^\s\"'\\,;`<>]{{8}}){1}+))".format(x, val))
+        r"(?:\\*(?P<q{0}>[\"']))?(?P<v{0}>(?(q{0})(?:(?!(?P=q{0}))[^\s\\])+"
+        r"|(?:[^\s\"'\\,;<>`&=]|&(?![A-Za-z_][\w.\-]*=))+={{0,2}}))".format(x))
     op = r"\\*[\"']?\s*(?:=>|:=|=|:(?!:))\s*"                    # not ::
-    # a name with a part that says it holds a secret (DB_PASSWORD,
-    # aws_secret_access_key, x-api-key, GITHUB_TOKEN, PGPASSWORD, RAILS_
-    # MASTER_KEY), not right after a letter, digit, / @ or : (auth-service:
-    # 8080, Auth::attempt) but after an escaped line break; unless its last
-    # part says it holds something else (TOKEN_URL, password_hash).  It
-    # starts at its needle; a prefix before it is looked at behind it
-    at = r"(?:(?<![a-z0-9/@:])|(?<=\\[nrt]))"
-    pre = lambda *ps: "|".join(r"(?<=(?<![a-z0-9/@:])%s)|(?<=\\[nrt]%s)" % (p, p) for p in ps)
-    ends = "(?![a-z0-9])(?:[_.\\-][a-z0-9]{1,40}){0,8}(?![a-z0-9])" + "".join(
-        r"(?<![_.\-](?:%s))" % w for w in (
-            "id", "url|uri|dir|env|var|len|max|min|ttl|arn|md5|num|idx|sha",
-            "host|file|path|name|type|size|hash|used|lens|sha1", "count|limit|field|regex|usage",
-            "length|expiry|header|prefix|budget|digest|number|sha224|sha256|sha384|sha512",
-            "expires|pattern", "endpoint|checksum", "fingerprint"))
-    # …and in camelCase, a hump after a small letter or a digit (dbPassword,
-    # SecretAccessKey, SessionToken), its last hump not one of the same
-    humps = "(?![a-z])(?:[A-Z][a-z0-9]*){0,8}(?![A-Za-z0-9])" + "".join(r"(?<!%s)" % w for w in (
-        "Id", "ID", "Url", "URL", "Uri", "Dir", "Env", "Var", "Len", "Max", "Min", "Ttl", "TTL",
-        "Arn", "Num", "Idx", "Host", "File", "Path", "Name", "Type", "Size", "Hash", "Used",
-        "Lens", "Count", "Limit", "Field", "Regex", "Usage", "Length", "Expiry", "Header",
-        "Prefix", "Budget", "Digest", "Number", "Expires", "Pattern", "Endpoint", "Checksum",
-        "Fingerprint"))
-    word = r"pass(?:word|wd|phrase)?|pwd|secret|token"
-    words = (r"(?:(?i:(?:%s(?:%s|auth|credentials?)|(?=password)(?:%s)password"
-             r"|(?=secret)(?:%s)secret)%s)|(?<=[a-z0-9])(?:Pass(?:word|wd|phrase)|Pwd|Secret|Token"
-             r"|Auth|Credentials?)%s)" % (at, word, pre("pg"), pre("client", "client_", "client-"),
-                                          ends, humps))
-    keys = (r"(?<=[A-Za-z_\-])(?:(?i:(?:%s)key%s)|(?:%s)Key%s)"
-            % (pre(*[p + s for p in ("api", "access", "private", "app", "master", "encryption",
-                                     "signing", "hmac", "jwt", "account", "shared", "secret")
-                     for s in ("", "_", "-")]), ends,
-               "|".join(r"(?<=[a-z0-9]%s)" % p for p in (
-                   "Api", "Access", "Private", "App", "Master", "Encryption", "Signing", "Hmac",
-                   "Jwt", "Account", "Shared", "Secret")), humps))
-    # where no name=value stands: Authorization with any scheme, a flag
-    # and its value (--password X, --with-token X), an XML element or
-    # setting (<password>X</password>, key="…Password" value="X")
+    # a name with a word in it that may say it holds a secret; _secret_name
+    # reads the whole name (the part before the needle too)
+    name = (r"(?P<n>(?i:pass(?:word|wd|phrase)?|pwd|secret|token|credentials?|auth|pat|key)"
+            r"(?![a-z])[A-Za-z0-9_.\-]{0,60})")
+    # where no name=value stands: Authorization with any scheme, a flag and
+    # its value (--password X, --with-token X), an XML element or setting
+    # (<password>X</password>, key="…Password" value="X")
     authz = (r"(?i:authorization\\*[\"']?\s*[:=]\s*\\*[\"']?"
              r"(?:(?!bearer\s|basic\s)[a-z][\w\-]{0,20}\s+)?(?P<va>[a-z0-9\-._~+/=]{16,}))")
-    flag = lambda w: r"(?<=-)(?i:%s)\s+%s" % (w, value("f"))
-    xml = r"(?<=<)(?i:(?P<t>%s)>(?P<vx>[^<\s\"'\\]{8,})</(?P=t)>)" % word
-    setting = lambda w: r"(?i:(?:%s)\\*\"\s+value=\\*\"(?P<vs>[^\s\"\\]{8,}))" % w
+    flag = (r"(?:(?<=--)(?i:pass(?:word|wd)?|token|secret)|(?<=--with-|--auth-)token"
+            r"|(?<=--access-)token|(?<=--api-)key)\s+")
+    xml = r"(?<=<)(?i:(?P<t>pass(?:word|wd)?|secret|token)>(?P<vx>[^<\s\"'\\]{8,})</(?P=t)>)"
+    setting = (r"(?i:(?:pass(?:word|wd)?|secret|token|key)\\*\"\s+value=\\*\""
+               r"(?P<vs>[^\s\"\\]{8,}))")
     return [
         ("Anthropic API key", [k("sk-", "ant-")], rx("sk-", "ant-", r"[A-Za-z0-9_\-]{20,}"),
          False, True),
         ("OpenAI API key", [k("sk-")], rx(r"sk-(?!", "ant-", r")(?:proj-|svcacct-)?",
                                           r"[A-Za-z0-9_\-]{32,}"), False, True),
-        ("Groq API key", [k("gs", "k_")], rx(r"\bgs", r"k_[A-Za-z0-9]{40,}"), False, True),
+        ("Groq API key", [k("gs", "k_")], rx(b, r"gs", r"k_[A-Za-z0-9]{40,}"), False, True),
         # (a short needle: fewer passes over the text, each a few ms)
         ("GitHub token", [k("g", "h"), k("github_", "pat_")],
          rx(r"(?:gh", r"[pousr]_[A-Za-z0-9]{36,}|github_", r"pat_[A-Za-z0-9_]{50,})"),
          False, True),
         ("GitLab token", [k("g", "l")],
-         rx(r"\bgl(?:", r"pat|rt|dt|ptt)-[A-Za-z0-9_\-]{20,}"), False, True),
+         rx(b, r"gl(?:", r"pat|rt|dt|ptt)-[A-Za-z0-9_\-]{20,}"), False, True),
         ("AWS access key", [k("AK", "IA"), k("AS", "IA")],
-         rx(r"\b(?:AK", r"IA|AS", r"IA)[0-9A-Z]{16,}\b"), False, True),
+         rx(b, r"(?:AK", r"IA|AS", r"IA)[0-9A-Z]{16,}\b"), False, True),
         ("Google API key", [k("AI", "za")], rx("AI", r"za[0-9A-Za-z_\-]{35,}"), False, True),
-        ("Google OAuth token", [k("ya", "29.")], rx(r"\bya", r"29\.[0-9A-Za-z_\-]{20,}"),
+        ("Google OAuth token", [k("ya", "29.")], rx(b, r"ya", r"29\.[0-9A-Za-z_\-]{20,}"),
          False, True),
         ("Slack token", [k("xo", "x")], rx("xo", r"x[abprs]-[0-9A-Za-z\-]{10,}"), False, True),
         # a webhook's address names it; only its last part is the secret
@@ -8328,45 +8291,44 @@ def _secret_patterns() -> list:
         ("Stripe key", [k("sk_li", "ve_"), k("rk_li", "ve_")],
          rx(r"(?:sk|rk)_", r"live_[0-9A-Za-z]{20,}"), False, True),
         ("SendGrid key", [k("S", "G.")],
-         rx(r"\bS", r"G\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{40,}"), False, True),
-        ("Hugging Face token", [k("hf", "_")], rx(r"\bhf_", r"[A-Za-z0-9]{30,}"), False, True),
-        ("npm token", [k("npm", "_")], rx(r"\bnpm_", r"[A-Za-z0-9]{36,}\b"), False, True),
-        ("PyPI token", [k("pypi-", "AgEI")], rx(r"\bpypi-", r"AgEI[A-Za-z0-9_\-]{50,}"),
+         rx(b, r"S", r"G\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{40,}"), False, True),
+        ("Hugging Face token", [k("hf", "_")], rx(b, r"hf_", r"[A-Za-z0-9]{30,}"), False, True),
+        ("npm token", [k("npm", "_")], rx(b, r"npm_", r"[A-Za-z0-9]{36,}\b"), False, True),
+        ("PyPI token", [k("pypi-", "AgEI")], rx(b, r"pypi-", r"AgEI[A-Za-z0-9_\-]{50,}"),
          False, True),
         ("age key", [k("AGE-SEC", "RET-KEY-1")], rx(r"AGE-SEC", r"RET-KEY-1[0-9A-Z]{58}"),
          False, True),
-        ("Vault token", [k("hv", "s.")], rx(r"\bhv", r"s\.[A-Za-z0-9_\-]{24,}"), False, True),
-        ("DigitalOcean token", [k("dop", "_v1_")], rx(r"\bdop", r"_v1_[0-9a-f]{64}"),
+        ("Vault token", [k("hv", "s.")], rx(b, r"hv", r"s\.[A-Za-z0-9_\-]{24,}"), False, True),
+        ("DigitalOcean token", [k("dop", "_v1_")], rx(b, r"dop", r"_v1_[0-9a-f]{64}"),
          False, True),
-        ("Shopify token", [k("sh", "p")], rx(r"\bsh", r"p(?:at|ss|ca|pa)_[0-9a-fA-F]{32}"),
+        ("Shopify token", [k("sh", "p")], rx(b, r"sh", r"p(?:at|ss|ca|pa)_[0-9a-fA-F]{32}"),
          False, True),
-        ("Docker Hub token", [k("dckr", "_pat_")], rx(r"\bdckr", r"_pat_[A-Za-z0-9_\-]{27,}"),
+        ("Docker Hub token", [k("dckr", "_pat_")], rx(b, r"dckr", r"_pat_[A-Za-z0-9_\-]{27,}"),
          False, True),
-        ("Atlassian token", [k("ATA", "TT3")], rx(r"\bATA", r"TT3[A-Za-z0-9_\-=]{100,}"),
+        ("Atlassian token", [k("ATA", "TT3")], rx(b, r"ATA", r"TT3[A-Za-z0-9_\-=]{100,}"),
          False, True),
         ("Telegram bot token", [k("api.tele", "gram.org/bot")],
          rx(r"api\.tele", r"gram\.org/bot\d+:(?P<v>[A-Za-z0-9_\-]{35})"), False, True),
         ("Tailscale key", [k("tsk", "ey-")], rx("tskey", r"-[A-Za-z0-9\-]{20,}"), False, True),
-        # its header, the lines of key below it and its END line, nothing
-        # else (a guide that names BEGIN and END keeps its words); cut off
-        # before its END, as far as its lines go
+        # from its BEGIN line to its END line, whatever stands between (line
+        # numbers, > or # before each line), but never past the end of a
+        # JSON string; cut off before its END, to the end of the string
         ("private key", [k(pk)],
          rx(r"-*BEGIN (?P<t>(?:[A-Z0-9]+ ){0,3})", pk, r"(?P<b>(?: BLOCK)?)-----",
-            r"(?:%s[A-Za-z][A-Za-z0-9\-]*: [^\n\"\\]*)*" % once("s1", sep),
-            r"(?:%s%s)*" % (once("s2", sep), line),
-            r"(?:(?:%s%s{1,11})?(?:%s)?-----END (?P=t)" % (once("s3", sep), b64, once("s4", sep)),
-            pk, r"(?P=b)-----)?"), False, False),
+            r"(?:%s{0,%d}?-----END (?P=t)" % (js, _SPAN), pk, r"(?P=b)-----|%s*)" % js),
+         False, False),
         # a PuTTY key file, to its Private-MAC line (cut off: as far as it goes)
         ("private key", [k("PuTTY-User-", "Key-File-")],
-         rx(r"PuTTY-User-", r"Key-File-\d+: [^\s\"\\]+(?:",
-            r"(?:%s(?:%s: [^\n\"\\]*|[A-Za-z0-9+/=]{4,}))*?" % (sep, ppk),
-            r"%sPrivate-(?:MAC|Hash): [0-9A-Fa-f]+" % sep,
-            r"|(?:%s(?:%s: [^\n\"\\]*|[A-Za-z0-9+/=]{12,}))*)" % (sep, ppk)), False, True),
-        # a key in base64 (kubeconfig's client-key-data, a secret's tls.key):
+         rx(r"PuTTY-User-", r"Key-File-\d+: [^\s\"\\]+",
+            r"(?:%s{0,%d}?Private-(?:MAC|Hash): [0-9A-Fa-f]+|%s*)" % (js, _SPAN, js)),
+         False, True),
+        # a key in base64 (kubeconfig's client-key-data, a secret's tls.key),
+        # also wrapped (base64's lines of 76, each ending its line):
         # _plausible decodes its head
         ("private key", [k("LS0tLS1CRUdJ", "Ti")],
          rx(r"(?:(?<![A-Za-z0-9+/])|(?<=\\[nrt]))LS0tLS1CRUdJ", r"Ti[A-Za-z0-9+/]*={0,2}",
-            r"(?:(?:\n|\\+n)[A-Za-z0-9+/]{12,}={0,2})*"), False, True),
+            r"(?:(?:\r?\n|\\+n)[A-Za-z0-9+/]{12,}={0,2}(?=\r?\n|\\+[nr]|[\"']|\Z))*"),
+         False, True),
         # header and payload are enough: it runs on to its signature, if any
         ("JSON web token", [k("ey", "J")], rx(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ",
                                               r"[A-Za-z0-9_\-]{10,}(?:\.[A-Za-z0-9_\-]*)?"),
@@ -8377,23 +8339,18 @@ def _secret_patterns() -> list:
             r"(?i)(?<=[a-z0-9])://[^\s:/@\"'\\]{0,64}:(?P<v>[^\s:/\"'\\<>]{4,})@",
             r"(?:\[[0-9a-f:.]+\]|[a-z0-9_][a-z0-9_.\-]*)"), True, True),
         # Go's form of it: user:password@tcp(host:3306)/db
-        ("password in a web address", [k("@tc", "p(")], rx(
+        ("password in a web address", [k("@tc", "p("), k("@uni", "x(")], rx(
             r"(?i)(?:(?<![^\s\"'=:/\\])|(?<=\\[nrt]))[^\s:@/\"'\\]{1,64}:",
             r"(?P<v>[^\s\"'\\@]{4,})@(?:tcp|unix|udp)\("), True, False),
         ("password or token", [k("pa", "ss"), k("pw", "d"), k("sec", "ret"), k("tok", "en"),
-                               k("au", "th"), k("credent", "ial")],
-         rx(words, op, value(""), r"|", authz, r"|", xml, r"|", setting(word), r"|",
-            flag(r"(?<=--)(?:pass(?:word|wd)?|token|secret)|(?<=--with-|--auth-)token"
-                 r"|(?<=--access-)token"), r"|(?<=ssh)(?i:pass\s+-p)\s*", value("p")), True, True),
-        ("password or token", [k("ke", "y")],
-         rx(keys, op, value(""), r"|", setting("key"), r"|", flag(r"(?<=--api-)key")), True, True),
-        ("password or token", [k("pa", "t")],
-         rx(r"(?i:%spat%s)" % (at, ends), op, value("")), True, True),
+                               k("au", "th"), k("credent", "ial"), k("ke", "y"), k("pa", "t")],
+         rx(name, op, value(""), r"|", authz, r"|", xml, r"|", setting, r"|", flag, value("f"),
+            r"|(?<=ssh)(?i:pass\s+-p)\s*", value("p")), True, True),
         ("password or token", [k("bear", "er")],
-         rx(r"(?i)\bbear", r"er\s+(?P<v>[a-z0-9\-._~+/]{16,}=*)"), True, True),
+         rx(b, r"(?i:bear", r"er)\s+(?P<v>[A-Za-z0-9\-._~+/]{16,}=*)"), True, True),
         ("password or token", [k("bas", "ic")],
-         rx(r"(?i)\bbas", r"ic\s+(?P<v>(?:[a-z0-9+/]{4}){3,}(?:[a-z0-9+/]{2}==|[a-z0-9+/]{3}=)?)",
-            r"(?![a-z0-9+/=])"), True, True),
+         rx(b, r"(?i:bas", r"ic)\s+(?P<v>(?:[A-Za-z0-9+/]{4}){3,}",
+            r"(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)(?![A-Za-z0-9+/=])"), True, True),
         # a password on a command line: mysql -pX, docker login and twine -p X,
         # redis-cli -a X, and in curl's -u or --user the part after the colon
         # (sshpass -p X: with the names above)
@@ -8405,175 +8362,118 @@ def _secret_patterns() -> list:
         ("password or token", [k("cu", "rl")],
          rx(r"(?i)curl\b[^\n|;&]{0,300}?\s(?:-u\s*|--user(?:=|\s+))\\*[\"']?[^\s:\"'\\]{1,64}:",
             r"(?P<v>[^\s\"'\\]{4,})"), True, True),
-        # a cookie whose name says it holds a session or a token
-        ("password or token", [k("coo", "kie")],
-         rx(r"(?i)cookie\\*[\"']?\s*:\s*\\*[\"']?",
-            r"(?:[^\s=;\"'\\]{1,64}=[^\s;\"'\\]{0,4096};\s*){0,20}?",
-            r"[^\s=;\"'\\]{0,64}(?:sess|sid|token|auth)[^\s=;\"'\\]{0,64}=(?P<v>[^\s;\"'\\]{8,})"),
-         True, True),
     ]
 
 # a placeholder by its whole shape (${DB_PASSWORD}, $(cat f), %(pw)s,
 # %{DB_PASSWORD}, #{ENV[…]}, $env:X, $__file{…}, <token>, {{ secret }}), or
-# by a part no key has (xxxx, ..., a regular expression's [a-z] or (?:,
-# a %(name)s, <image>, your, example, os.environ)
+# by a part no key has (xxxx, ..., a %(name)s, your, example, os.environ)
 _PLACEHOLDER = re.compile(r"(?i)^\$\{?\w+\}?$|^\$[{(]|^%\(?\w*\)?[sdr]$|^%\w+%$|^%\{|^#\{"
-                          r"|^\$env:\w+$|^\$__\w+\{"
-                          r"|^<[^>]*>$|^\{\{.*\}\}$|^\{[\w.]*\}$|^\[.*\]$|x{4,}|\*{3,}|\.{3}|…"
-                          r"|\[\^?(?:a-z|0-9)|\[\^?[A-Za-z0-9]-[A-Za-z0-9]|\(\?[:=!<P]|%\(\w+\)[sdr]"
-                          r"|</?[A-Za-z][\w-]*>"
-                          r"|your|example|changeme|redacted|placeholder|dummy|sample"
+                          r"|^\$env:\w+$|^\$__\w+\{|^<[^>]*>$|^\{\{|x{4,}|\*{3,}|\.{3}|…"
+                          r"|%\(\w+\)[sdr]|your|example|changeme|redacted|placeholder|dummy|sample"
                           r"|process\.env|os\.environ|getenv|env\(|secrets\.")
-# CRAM-MD5, joined words, a port with a path after it (8080/api/v1), a
-# version or an image's tag (1.4.2-alpine3.18), an ARN, a fingerprint or
-# a file's hash (SHA256:…, sha512-…)
-_CODE_NAME = re.compile(r"^[A-Z]+[0-9]*(?:-[A-Z]*[0-9]*)+$|^[a-z]+[0-9]*(?:[-_][a-z0-9]+)+$"
-                        r"|^\d{2,5}(?:/[\w.\-~%]*)*$"
-                        r"|^v?\d+(?:\.\d+)+(?:[-+_.][0-9A-Za-z][0-9A-Za-z.\-]*)?$"
-                        r"|^arn:|^(?:SHA256|SHA1|MD5):|^sha(?:1|256|384|512)-[A-Za-z0-9+/]+=*$")
-# shaped like code: a name (or a number) with calls, indexes and parts
-# after it (tokenizer.encode(text), line[pos:].strip(, TokenElement(id=2),
-# SecretKey::from_slice(&b)?, this.map!.find(node, a+len(b), $req->pw,
-# :not(:empty):before, {elapsed_ms where a format string was cut), or a
-# name alone (Proxy-Authorization).  One way only to read each bracket,
-# so a long value cannot make it backtrack
-_CODE = re.compile(r"^(?:\[\]|[(\[{{&*!?#@\-])*(?:{n}|\d+(?:\.\d+)?)"
-                   r"(?:!?\({g}\)|!?\[[^\[\]]*\]|\?|!?(?:\.|::|->|\+|(?<=[)\]]):)(?:{n}|\d+))*"
-                   r"(?:!?\({g}|!?\[[^\[\]]*|\{{{g})*"            # …left open where it was cut
-                   r"(?:[)\]:=]|(?<=[)\]])!)*$"
-                   .format(n=r"[A-Za-z_$][\w$]*(?:-[A-Za-z_$][\w$]*)*",
-                           g=r"(?:[\w.=*&:+/{}\[\]$!>^-]|\([\w.=*&:+/{}\[\]$!>^-]*\))*"))
-# a name with digits at the end of a word (base64Decode, oauth2_client)
-_IDENT = re.compile(r"^_*(?:[A-Za-z][a-z]*|[A-Z]+)\d+(?:_?[A-Z]?[a-z]+)+$")
-# three words or more, as a password generator joins them
-_PASSPHRASE = re.compile(r"^[A-Za-z]+\d*(?:-[A-Za-z]+\d*){2,}$")
-# pairs of letters common in words and in code (Python's own source has
-# 86% of its pairs among them); what a generator makes has few of them
-_PAIRS = frozenset("ab ac ad ag ai al am an ap ar as at ba be bj bl bu ca ce ch ck cl co ct da"
-                   " de di do du ea ec ed ee ef el em en ep er es et ex fa fi fo fr ge gs ha he"
-                   " hi ho ic id if ig il im in io ir is it ke la le lf li ll lo ls lt lu ma me"
-                   " mo mp na nc nd ne ng ni no ns nt ob oc od of ol om on op or os ot ou ow pa"
-                   " pe pl po pp pr pt ra re rg ri rm rn ro rr rs rt ru ry se sh si so sp ss st"
-                   " su ta te th ti to tr ts tt tu ty ue ul um un up ur us ut va ve wi xc xt yp".split())
 _TRAIL = re.compile(rb"(?:\.{3,}|\xe2\x80\xa6)+$")         # "..." or "…" after a value
 _PEM64 = "LS0tLS1CRUdJ" + "Ti"                            # "-----BEGIN " in base64
+# a name's word that says its value is a secret, or a key's (api_key,
+# SecretAccessKey); words after it that say the value is something else
+# (TOKEN_URL, password_hash), and words before it that say the same of
+# a token (NextToken, nextPageToken, IdempotencyToken)
+_SECRET_WORD = re.compile(r"(?:password|passwd|passphrase|pwd|secret|token|credentials?|apikey"
+                          r"|(?:api|access|private|app|master|encryption|signing|hmac|jwt|account"
+                          r"|shared|secret|client)key)$|^(?:pass|auth|pat)$")
+_KEY_OF = {"api", "access", "private", "app", "master", "encryption", "signing", "hmac", "jwt",
+           "account", "shared", "secret", "client"}
+_NOT_AFTER = set("url uri urls endpoint host hostname server service provider issuer domain dir"
+                 " file files path name names type kind id ids size len length lens count limit"
+                 " max min ttl expiry expires expiration expire lifetime timeout age header"
+                 " headers prefix suffix field fields regex pattern format usage used budget hash"
+                 " hashed digest checksum fingerprint sha md5 number num idx index arn env var"
+                 " version required reset hint label note policy rule rules scope scopes method"
+                 " mode flow pool cache store manager callback redirect audience prompt".split())
+_NOT_BEFORE = set("next page continuation pagination cursor idempotency sync resume request max"
+                  " min num total input output completion reasoning".split())
+_ROOT = re.compile(r"/(?:Applications|Library|System|Users|Volumes|app|bin|boot|data|dev|etc"
+                   r"|home|lib|lib64|mnt|nix|opt|private|proc|root|run|sbin|snap|srv|sys|tmp"
+                   r"|usr|var|workspaces?)(?:/|$)")
+_CHAIN = re.compile(r"[!&*]*[A-Za-z_$][\w$]*(?:(?:\.|::|->|\?\.|!\.)[A-Za-z_$][\w$]*)+")
+_CALL = re.compile(r"[!&*]*([A-Za-z_$][\w$]*)[(\[]")
 
 def _entropy(s: str) -> float:
     import math
     n = len(s)
     return -sum(c / n * math.log2(c / n) for c in (s.count(x) for x in set(s)))
 
-def _words(s: str) -> list:
-    return re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", s)
+def _secret_name(name: str) -> bool:
+    """A name that says its value is a secret (DB_PASSWORD, x-api-key,
+    PGPASSWORD, SecretAccessKey, auth.pass), unless a word after that one
+    or before it says otherwise (password_hash, NextToken)."""
+    words = [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", name)]
+    last = -1
+    for i, w in enumerate(words):
+        if _SECRET_WORD.search(w) or (w == "key" and i and words[i - 1] in _KEY_OF):
+            last = i
+    return (last >= 0 and not _NOT_AFTER & set(words[last + 1:])
+            and not _NOT_BEFORE & set(words[:last]))
 
-def _wordy(s: str, need: float) -> bool:
-    """Most pairs of letters in `s` are pairs that words have."""
-    pairs = [w[i:i + 2].lower() for w in _words(s) for i in range(len(w) - 1)]
-    return len(pairs) >= 3 and sum(p in _PAIRS for p in pairs) >= need * len(pairs)
+def _a_name(v: str) -> bool:
+    """Reads as a name, not as something generated: its words three letters
+    long or more on average, two runs of digits at most (base64Decode,
+    MAX_RETRIES, oauth2-client; not x7Kp2QmZ9vB4nL8w)."""
+    words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", v)
+    return (bool(words) and sum(map(len, words)) >= 3 * len(words)
+            and len(re.findall(r"\d+", v)) <= 2)
 
-def _a_word(w: str) -> bool:
-    """A word of three letters or more, two thirds of its pairs common."""
-    pairs = [w[i:i + 2].lower() for i in range(len(w) - 1)]
-    return len(w) >= 3 and sum(p in _PAIRS for p in pairs) * 3 >= 2 * len(pairs)
+def _randomish(part: str) -> bool:
+    """A part that looks generated: 8 characters or more, letters and
+    digits, small and capital letters mixed or three digits or more."""
+    return (len(part) >= 8 and any(c.isdigit() for c in part) and any(c.isalpha() for c in part)
+            and ((any(c.islower() for c in part) and any(c.isupper() for c in part))
+                 or sum(c.isdigit() for c in part) >= 3))
 
-def _code(value: str) -> bool:
-    """Code, not a secret: a name with a call, an index or a part after it,
-    or one name made of words (TokenProvider, _allow_token_discovery)."""
-    if re.search(r"^(?:null|true|false|undefined|this)[^\w$]|[{}()\[\]](?:return|function|else|var"
-                 r"|let|const|if|for|while|this|new|null|true|false|throw|try|catch|switch|case"
-                 r"|break|continue|typeof|void|delete)\b", value):
-        return True                 # minified code: null}fetch(){return
-    if len(value) > 200 or not _CODE.match(value):
+def _named(v: str) -> bool:
+    """A name: a version or an image's tag (1.4.2-alpine3.18), or one name
+    made of words (MAX_RETRIES, refreshToken, my-app-secrets), with vowels
+    as words have them (not aiiLZXwsyyKeVkz); hex (a UUID) is not."""
+    if re.fullmatch(r"v?\d+(?:\.\d+)+(?:[-+_.][0-9A-Za-z][0-9A-Za-z.\-]*)?", v):
+        return True
+    letters = [c for c in v.lower() if c.isalpha()]
+    return (not re.fullmatch(r"[0-9a-fA-F\-]+", v)
+            and bool(re.fullmatch(r"[A-Za-z_$][\w$.\-]*", v)) and _a_name(v)
+            and sum(c in "aeiou" for c in letters) >= 0.3 * len(letters))
+
+def _path(v: str) -> bool:
+    """A path or a reference: from ~/, ./, ../ or a folder every system has
+    (/etc/ssl/private/server.key); or with a / or a scheme (op://vault/item,
+    vault:kv/db#password, config/service-account.json, a web address with
+    no password) when no part of it looks generated."""
+    if re.match(r"~/|\.\.?/", v) or _ROOT.match(v):
+        return True
+    if "/" not in v and not re.match(r"[a-z][a-z0-9+.\-]*:", v):
         return False
-    if re.search(r"[(\[.:>]", value.lstrip("[{&*!-")):
-        # a letter seldom turns into a digit, or a small one into a capital
-        flips, could = _flips(value)
-        return (flips * 6 <= could or
-                (_wordy(value, 0.55) and len(re.findall(r"[A-Za-z]\d+[a-z]", value)) <= 1))
-    inner = re.findall(r"[A-Za-z]\d+[A-Za-z]", value)
-    if len(inner) > 1 or not re.search(r"[A-Z_]", value):
-        return False                # digits inside words, or one word: as random
-    if inner and not (_IDENT.match(value) or sum(map(_a_word, _words(value))) >= 2):
-        return False                # NOS98u9Aix: digits between letters, no two words
-    words = _words(value)
-    long = sum(len(w) for w in words if len(w) >= 3)
-    return long >= 6 and long >= 0.8 * sum(map(len, words)) and _wordy(value, 0.6)
+    return not any(_randomish(p) for p in re.split(r"[/:#?&=.@,]+", v))
 
-def _flips(value: str) -> tuple:
-    """(how often a letter turns into a digit, or a small letter into a
-    capital, within the runs of letters and digits; how often it could)."""
-    runs = re.findall(r"[A-Za-z0-9]+", value)
-    return (sum(a.isdigit() != b.isdigit() or (a.islower() and b.isupper())
-                for r in runs for a, b in zip(r, r[1:])),
-            sum(len(r) - 1 for r in runs))
-
-def _a_name(run: str) -> bool:
-    """A run of letters and digits that reads as a name: short, a number,
-    words, or few turns between letters and digits (k8s, v2, us-east-1)."""
-    if len(run) <= 3 or run.isdigit() or _wordy(run, 0.55):
+def _code(v: str) -> bool:
+    """Code: a value that starts with a bracket or =; a chain of names
+    (req.body.password, SecretKey::from_slice) with no part that looks
+    generated; a name called or indexed (hash(pw), useAuth()!)."""
+    if v[0] in "([{)]}=:":
         return True
-    flips, could = _flips(run)
-    return len(run) <= 12 and flips * 4 <= could
-
-def _shaped(value: str) -> bool:
-    """A name, not a secret: a constant's (MAX_RETRIES, HMACSHA256; one of
-    capitals and digits only when it reads as words), one named for a
-    secret (isEndOfFileToken), a dotted one or a host's whose every part
-    reads as a name (spring.datasource.password), a dotfile (.env), an
-    Objective-C selector, joined words, a port, a version, an ARN, a hash."""
-    v = value.lstrip("{([")
-    if _CODE_NAME.match(v) or re.match(r"\.[A-Za-z][A-Za-z_\-]*$", v):
+    m = _CHAIN.match(v)
+    if m and not any(_randomish(p) for p in re.split(r"[^\w$]+", m.group())):
         return True
-    if re.fullmatch(r"[A-Za-z_$][\w$]*", v) and (
-            re.search(r"(?i)(?:pass(?:word|wd|phrase)|secret|token|credentials?|auth|key)$", v)
-            or (re.search(r"(?:Pass(?:word|wd|phrase)|Secret|Token|Credentials?|Auth|Key)"
-                          r"(?![a-z])", v) and len(re.findall(r"[A-Z]", v)) >= 3)):
-        return True                 # isEndOfFileToken, fromTokenIsInRange: a name
-    if re.fullmatch(r"(?:[A-Za-z_]\w*:)+", v):
-        return all(map(_a_name, re.findall(r"[A-Za-z0-9]+", v)))   # initWithToken:error:
-    if re.match(r"[A-Z][A-Z0-9_]+$", v):
-        return "_" in v or _wordy(v, 0.55) or (len(v) <= 12 and not re.search(r"\d", v))
-    if re.match(r"[\w-]+(?:\.[\w-]+)+$", v):
-        return all(map(_a_name, re.findall(r"[A-Za-z0-9]+", v)))
-    return False
+    m = _CALL.match(v)
+    return bool(m) and _a_name(m.group(1))
 
-# a web address, a reference (scheme:…) or a relative path: a path's
-# characters only, with a / or a scheme in small letters
-_REF = re.compile(r"[a-z][a-z0-9+.\-]*://[\w.\-~%@:+#/?&=]*$|[a-z][a-z0-9+.\-]*:[\w.\-~%@:+#/]*$"
-                  r"|[\w.\-~%@:+#]*/[\w.\-~%@:+#/]*$")
-_ROOT = re.compile(r"/(?:Applications|Library|System|Users|Volumes|app|bin|boot|data|dev|etc"
-                   r"|home|lib|lib64|mnt|nix|opt|private|proc|root|run|sbin|snap|srv|sys|tmp"
-                   r"|usr|var|workspaces?)(?:/|$)")
-
-def _path(value: str) -> bool:
-    """A path: from / (/etc/ssl/private/server.key, /tmp/ssh-Xq3…/agent.42),
-    not a random value that starts with a slash, as one base64 token in 64
-    does: it starts at a folder every system has, or it reads as names;
-    from ~/, ./ or ../; or relative, a web address without a password, a
-    reference (op://vault/item/field, vault:secret/db#password,
-    projects/1/secrets/db/versions/3) whose every run of letters and
-    digits reads as a name (config/<32 random>.json does not)."""
-    if re.match(r"~/|\.\.?/", value):
-        return True
-    if value.startswith("/"):
-        if _ROOT.match(value):
-            return True
-        flips, could = _flips(value)
-        return (flips * 6 <= could or _wordy(value, 0.55) or len(re.findall(
-            r"(?<![^/._\-])(?:[a-z]{3,}|[A-Z][a-z]{2,})(?![^/._\-])", value)) >= 2)
-    return bool(_REF.match(value)) and all(map(_a_name, re.findall(r"[A-Za-z0-9]+", value)))
-
-def _text(value: str) -> bool:
+def _text(v: str) -> bool:
     """Words, not a key: two letters or more of a language other than
     English (generated keys are ASCII), a tokenizer's piece of a word
-    (ĠInternational, ▁the), one word of small letters (ansibrightblue)."""
-    return (sum(ord(c) > 127 and c.isalpha() for c in value) >= 2
-            or bool(re.match(r"[ĠĊ▁][^\W\d_]", value))
-            or bool(re.fullmatch(r"[a-z]+", value)))
+    (ĠInternational, ▁the)."""
+    return (sum(ord(c) > 127 and c.isalpha() for c in v) >= 2
+            or bool(re.match(r"[ĠĊ▁][^\W\d_]", v)))
 
 def _material(value: str) -> bool:
-    """A private key's find holds key material, not only its header: a
-    line of base64 that is not a word, or, in base64 itself, a key."""
+    """A private key's find holds key material, not only its BEGIN and END
+    lines: 32 characters of base64 or more in a row, with a digit, + or /
+    among them; in base64 itself, a key."""
     if value.startswith(_PEM64):
         import base64
         head = re.sub(r"[^A-Za-z0-9+/]", "", value)[:96]
@@ -8583,43 +8483,46 @@ def _material(value: str) -> bool:
             return False
     body = value.lstrip("-").split("-----", 1)[-1] if value.lstrip("-").startswith("BEGIN ") \
         else re.split(r"[\s\\]", value, 1)[-1]
-    return bool(re.search(r"(?<![A-Za-z0-9+/=])(?![A-Z]?[a-z]+(?![A-Za-z0-9+/=]))"
-                          r"[A-Za-z0-9+/=]{12,}", body))
+    return any(re.search(r"[0-9+/]", r) for r in re.findall(r"[A-Za-z0-9+/=]{32,}", body))
 
-def _plausible(kind: str, value: str, name: str = "") -> bool:
-    """Whether a find is a secret.  A private key holds key material; a
-    value after a name, or a password in an address, is random: not a
-    placeholder, a name, a path, code or words.  `name` is the text from
-    the character before a name to its value."""
+def _plausible(kind: str, value: str, lead: str = None, rest: str = "") -> bool:
+    """Whether a find is a secret.  A private key holds key material.  A
+    value after a name: the name says it holds a secret, and the value is
+    random, not a placeholder, a name, a path, code or words.  `lead` is a
+    quote before the name (with its backslashes), `rest` the name up to the
+    value; None when no name stands before the value."""
     if kind == "private key":
         return _material(value)
     if kind not in ("password or token", "password in a web address"):
         return True
+    if lead is not None:
+        nm = re.match(r"[A-Za-z0-9_.\-]*", rest).group()
+        if nm.startswith(".") or not _secret_name(nm):
+            return False        # not a secret's name, or a CSS class (.x-token:hover)
+        if (lead and rest.endswith(lead) and not rest[:-len(lead)].endswith("\\")
+                and lead[-1] not in rest[:-len(lead)]):
+            return False        # "token="+t: that quote closes the string the name is in
     if "\\u" in value:                    # what JSON escapes (é in café) reads as itself
         value = re.sub(r"\\+u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), value)
-    if (re.match(r"[^_.\-]?PASS:", name) or re.match(r"[.#][\w-]*:$", name)
-            or re.match(r"(?:Test|Benchmark|Fuzz|Example)\w*/", value)):
-        return False            # a test runner's PASS: line, a CSS selector's :hover
-    if _PLACEHOLDER.search(value):
+    if len(set(value)) < 7 or _PLACEHOLDER.search(value):
         return False
-    if re.search(r"(?i)(?:pass(?:word|wd|phrase)|pwd)\W*$", name) and _PASSPHRASE.match(value):
-        return True             # words joined, after a name that says it is a password
-    if len(set(value)) < 7:
-        return False            # below every bar after this one: cheap to say first
-    if _shaped(value) or _path(value) or _code(value) or _text(value):
-        return False            # a name, a path, a reference, code, words
+    if kind == "password or token" and len(value) < 8:
+        return False            # (token = 1*tchar, a grammar's rule)
+    if kind == "password in a web address":
+        return _entropy(value) >= 2.8
+    if _named(value) or _path(value) or _code(value) or _text(value):
+        return False
     # what people and tools generate is random; words and dates are not.  A
     # short value is too short for its entropy to say (12 characters reach
     # 3.5 only when no two are the same), so three kinds of character do
-    if kind == "password or token" and len(value) <= 16:
-        classes = (any(c.islower() for c in value) + any(c.isupper() for c in value)
-                   + any(c.isdigit() for c in value) + any(not c.isalnum() for c in value))
-        if classes >= 3 and len(set(value)) >= 7:
-            return True
-    if kind == "password or token" and re.fullmatch(r"(?=.*\d)(?:(?=.*[a-f])[0-9a-f]{16,}"
-                                                    r"|(?=.*[A-F])[0-9A-F]{16,})", value):
-        return _entropy(value) >= 3.0   # hex: at most 4 bits a character, not 6
-    return _entropy(value) >= (3.5 if kind == "password or token" else 2.8)
+    if len(value) <= 16 and (any(c.islower() for c in value) + any(c.isupper() for c in value)
+                             + any(c.isdigit() for c in value)
+                             + any(not c.isalnum() and c not in "_-." for c in value)) >= 3:
+        return True
+    h = value.replace("-", "")
+    if re.fullmatch(r"(?=.*\d)(?:(?=.*[a-f])[0-9a-f]{16,}|(?=.*[A-F])[0-9A-F]{16,})", h):
+        return _entropy(h) >= 3.0       # hex (a UUID too): at most 4 bits a character, not 6
+    return _entropy(value) >= 3.5
 
 def _mask(value: str) -> str:
     if value.lstrip("-").startswith("BEGIN "):
@@ -8667,6 +8570,17 @@ def _where_in(line: bytes, agent: str) -> tuple:
             ev, "your message" if e.get("type") == "turn.prompt" else "history")
     return _when(e.get("timestamp")), "history"
 
+_NAME_CH = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+
+def _trimmed(v: bytes) -> bytes:
+    """A value without what ends the sentence or the code after it: "...",
+    "…", a full stop, a closing bracket it did not open (f(token=X))."""
+    v = _TRAIL.sub(b"", v)
+    pair = {b")": b"(", b"]": b"[", b"}": b"{"}
+    while v and (v[-1:] == b"." or (v[-1:] in pair and v.count(v[-1:]) > v.count(pair[v[-1:]]))):
+        v = v[:-1]
+    return v
+
 def _scan_bytes(data: bytes, pats: list):
     """(kind, start, end, value) of every plausible find in one history file.
     A find inside one found before (a generic one inside a known kind of
@@ -8701,18 +8615,33 @@ def _scan_bytes(data: bytes, pats: list):
                 if found:
                     done = max([done] + [m.end() for m in found])
                 for m in found:
-                    a0, b0 = next((m.span(g) for g in m.re.groupindex
-                                   if g[0] == "v" and m.start(g) >= 0), m.span())
-                    if generic and data[b0 - 1:b0] in (b".", b"\xa6"):
-                        b0 = a0 + len(_TRAIL.sub(b"", data[a0:b0]))
+                    g = next((g for g in m.re.groupindex if g[0] == "v" and m.start(g) >= 0),
+                             None)
+                    a0, b0 = m.span(g) if g else m.span()
+                    ctx = ()
+                    if generic:
+                        q = "q" + g[1:] if g else ""
+                        if not (q in m.re.groupindex and m.start(q) >= 0):
+                            b0 = a0 + len(_trimmed(data[a0:b0]))    # not in quotes
+                        if "n" in m.re.groupindex and m.start("n") >= 0:
+                            # the whole name: back over its letters, up to an
+                            # escaped line break or tab (\nDB_PASSWORD=); and a
+                            # quote before it, with the backslashes before that
+                            s = m.start("n")
+                            while (s > 0 and m.start("n") - s < 60 and data[s - 1:s] in _NAME_CH
+                                   and not (data[s - 2:s - 1] == b"\\" and data[s - 1:s] in b"nrt")):
+                                s -= 1
+                            c = s - 1 if data[s - 1:s] in (b'"', b"'") else s
+                            while 0 < c < s and data[c - 1:c] == b"\\":
+                                c -= 1
+                            ctx = (data[c:s].decode("utf-8", "replace"),
+                                   data[s:a0].decode("utf-8", "replace"))
                     span = (a0, b0)
                     if a0 == b0 or span in seen or inside(a0, b0):
                         continue
                     seen.add(span)
                     value = data[a0:b0].decode("utf-8", "replace")
-                    name = data[max(0, m.start() - 1):a0].decode("utf-8", "replace") \
-                        if generic else ""
-                    if _plausible(kind, value, name):
+                    if _plausible(kind, value, *ctx):
                         if not generic:
                             j = bisect.bisect_left(ends, a0)
                             k = bisect.bisect_right(starts, b0)
@@ -8806,10 +8735,13 @@ def cmd_secrets(args):
             for b in res["blockers"]:
                 print(f"  ✗ {b}")
             print(f"{'removed from' if res['applied'] else 'would remove from'} "
-                  f"{res['places']} place(s) in {res['files']} history file(s)"
+                  f"{res['places'] - res.get('left', 0)} place(s) in {res['files']} history file(s)"
                   + (f"; the originals are kept in {res['kept']}" if res.get("kept") else "")
                   + ("" if res["applied"] or res["blockers"] else
                      " (dry run — pass --apply to do it)"))
+            if res.get("left"):
+                print(f"{res['left']} place(s) left as they were: taking them out would have "
+                      f"broken the history file")
             if res["applied"]:
                 print("history backups and copies on other machines still hold it; "
                       "replace the key where it was issued")
@@ -11022,28 +10954,68 @@ def redact_in_histories(fingerprint: str, project: str = None, apply: bool = Fal
     if not apply or res["blockers"] or not hits:
         return res
     keep = aht_home() / "redacted" / _stamp()
-    marker = b"[removed by aht]"
+    res["left"] = 0
     for s, spans in hits:
         src = Path(s["file"])
+        data = src.read_bytes()
+        new, left = _take_out(data, spans, b"[removed by aht]")
+        res["left"] += left
+        if new == data:
+            continue
         dst = keep / src.relative_to(src.anchor)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
-        data = src.read_bytes()
-        out, pos = [], 0
-        for a0, b0 in sorted(spans):
-            if a0 < pos:
-                continue
-            out += [data[pos:a0], marker]
-            pos = b0
-        out.append(data[pos:])
         tmp = src.with_name(src.name + ".aht-new")
-        tmp.write_bytes(b"".join(out))
+        tmp.write_bytes(new)
         shutil.copystat(src, tmp)
         os.replace(tmp, src)
     res.update(applied=True, kept=str(keep))
-    log(f"REDACT {fingerprint}: {res['places']} place(s) in {res['files']} file(s); "
-        f"originals in {keep}")
+    log(f"REDACT {fingerprint}: {res['places'] - res['left']} place(s) in {res['files']} "
+        f"file(s), {res['left']} left as they were; originals in {keep}")
     return res
+
+def _json_ok(b: bytes) -> bool:
+    try:
+        json.loads(b)
+        return True
+    except ValueError:
+        return False
+
+def _take_out(data: bytes, spans: list, marker: bytes) -> tuple:
+    """`data` with every span replaced by `marker` -> (that, how many places
+    were left as they are).  Where a history's lines read as JSON, or the
+    whole file does, and would no longer, nothing there changes: taking a
+    secret out must never break the history."""
+    def eol(i):
+        e = data.find(b"\n", i)
+        return len(data) if e < 0 else e
+    groups = []                     # [first line's start, last line's end, spans]
+    for a0, b0 in sorted(spans):
+        if groups and a0 < groups[-1][1]:
+            if a0 >= groups[-1][2][-1][1]:          # not one that overlaps
+                groups[-1][2].append((a0, b0))
+                groups[-1][1] = max(groups[-1][1], eol(b0))
+        else:
+            groups.append([data.rfind(b"\n", 0, a0) + 1, eol(b0), [(a0, b0)]])
+    out, pos, left = [], 0, 0
+    for ls, le, sp in groups:
+        new, p = [], ls
+        for a0, b0 in sp:
+            new += [data[p:a0], marker]
+            p = b0
+        new = b"".join(new) + data[p:le]
+        lines = [l for l in data[ls:le].split(b"\n") if l.strip()]
+        if lines and all(map(_json_ok, lines)) and not all(
+                _json_ok(l) for l in new.split(b"\n") if l.strip()):
+            left += len(sp)
+            continue
+        out += [data[pos:ls], new]
+        pos = le
+    out.append(data[pos:])
+    new = b"".join(out)
+    if new != data and _json_ok(data) and not _json_ok(new):
+        return data, len(spans)
+    return new, left
 
 # --------------------------------------------------------------------------- #
 # Before and after a session: where the last session stopped, Claude's usage
@@ -13169,7 +13141,8 @@ def sync_all_plan(rows: list) -> list:
         taken.add(name.casefold())
         if name != r.get("name") or r.get("origin") in ("aht", "yours") or r.get("pending"):
             plan.append({"session": r["session"], "project": r["project"],
-                         "from": r.get("name"), "to": name})
+                         "from": r.get("name"), "to": name,
+                         "tab": " ".join(str(r.get("tab") or "").split())})
     for r in sorted(rows, key=lambda r: r["pid"]):
         if r.get("tab") or r.get("origin") != "tab" or r["session"] in done \
                 or str(r.get("name") or "").casefold() not in taken:
@@ -13180,6 +13153,19 @@ def sync_all_plan(rows: list) -> list:
         plan.append({"session": r["session"], "project": r["project"],
                      "from": r.get("name"), "to": name})
     return plan
+
+def _plan_shown(plan: list) -> list:
+    """The sync plan as it is shown: its names masked, and a tab's title,
+    which a name takes cut at 80, masked whole before that cut, so no part
+    of a key the cut split shows."""
+    out = []
+    for x in plan:
+        x = dict(x, **{k: redact(x[k]) for k in ("from", "to") if x[k]})
+        full = x.pop("tab", "")
+        if full and x["to"].startswith(redact(full[:80])) and redact(full) != full:
+            x["to"] = _masked(full, 80) + x["to"][len(redact(full[:80])):]
+        out.append(x)
+    return out
 
 def cmd_tab_names(args):
     if args.rename:
@@ -13204,7 +13190,7 @@ def cmd_tab_names(args):
         if args.apply:
             for x in plan:
                 rename_session(x["session"], x["to"], pin=False)
-        plan = [dict(x, **{k: redact(x[k]) for k in ("from", "to") if x[k]}) for x in plan]
+        plan = _plan_shown(plan)
         if args.json:
             print(json.dumps({"plan": plan, "applied": bool(args.apply)}, indent=2))
             return 0

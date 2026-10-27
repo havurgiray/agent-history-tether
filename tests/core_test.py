@@ -2703,6 +2703,15 @@ left = [f"{kind} in {where}" for where, text in shown.items()
         for kind, _k, secret in lkeys if kept_runs(text, secret)]
 unmasked = [where for where, text in shown.items()
             if not any(f"[{kind}: " in text for kind, _k, _s in lkeys)]
+# a tab's title over 80 characters, a key across character 80: the sync
+# plan shows the name it gives (the title cut at 80) masked whole
+tkey = "gh" + "p_" + rk(36)
+title = "deploy the release candidate to staging with token " + tkey
+tplan = core._plan_shown([{"session": "s", "project": projL, "from": None,
+                           "to": title[:80], "tab": title}])
+if kept_runs(json.dumps(tplan), tkey) or "[GitHub token: " not in tplan[0]["to"] \
+        or "tab" in tplan[0]:
+    left.append(f"GitHub token in the sync plan's long tab title ({tplan})")
 ck(not left and not unmasked and lq and "[private key: " in lq[0]["text"],
    f"nothing of a long key is left in a title, a session's name or a question shown "
    f"anywhere ({left[:4]}; no key masked in: {unmasked}; question: {lq})")
@@ -2818,6 +2827,29 @@ for how in ("free", "busy"):
        "search: the rebuild " + ("takes the old file away" if how == "free" else
                                  "drops and vacuums a file that cannot go")
        + f", nothing of the old rows is left, and it counts as updated at once ({got})")
+# `aht search --rebuild` by hand, an index of the current format whose file
+# cannot go: emptied the same way, nothing of the old rows is left
+oleak()
+db = sqlite3.connect(str(odb))
+db.execute(f"pragma user_version = {core.SEARCH_FORMAT}")
+db.commit()
+db.close()
+was = kept_runs(odb.read_bytes().decode("latin-1"), osecret)
+by_hand = ("import pathlib, sys, aht\n"
+           "old = open(str(aht.search_db()), 'rb')\n"
+           "real = pathlib.Path.unlink\n"
+           "def unlink(self, *a, **k):\n"
+           "    if self.name == 'search.db':\n"
+           "        raise PermissionError(13, 'in use', str(self))\n"
+           "    return real(self, *a, **k)\n"
+           "pathlib.Path.unlink = unlink\n"
+           "sys.exit(aht.main(['search', '--rebuild', '--quiet', 'okapi', '--json']))\n")
+r = subprocess.run([PY, "-c", by_hand], env=dict(oe, PYTHONPATH=str(HERE.parent)),
+                   capture_output=True, text=True)
+ck(was and r.returncode == 0 and not kept_runs(odb.read_bytes().decode("latin-1"), osecret)
+   and oindex()[0] == core.SEARCH_FORMAT,
+   f"search --rebuild: a file that cannot go is emptied, nothing of the old rows is left "
+   f"({r.returncode}, {r.stderr[-200:]!r})")
 # …and while an update holds the index, the watcher and the hook start no
 # other one (it would only wait for the lock)
 spawn = ("import fcntl, json, aht\n"

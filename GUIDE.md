@@ -1035,19 +1035,20 @@ histories. Values are only ever shown masked.
   `GITHUB_TOKEN=`, `x-api-key:`, `RAILS_MASTER_KEY=`, camelCase names such
   as `dbPassword`, `accessToken` and `SecretAccessKey`, in a `.env` file or
   an `export` line too, on any line of a tool's output) when the value looks
-  generated, a value in quotes to its closing quote; passwords on a command
-  line (`--password X`, `--token X`, `mysql -pX`, `docker login -p X`,
-  `curl -u user:X`), in a cookie whose name holds sess, sid, token or auth,
-  and in XML (`<password>X</password>`); and the password in a web or
+  generated; passwords on a command line (`--password X`, `--token X`,
+  `mysql -pX`, `docker login -p X`, `curl -u user:X`) and in XML
+  (`<password>X</password>`); and the password in a web or
   database address, whatever the host (`@localhost`, an IP address, a
   container's name such as `@db`, `[::1]`), also with an `@` in it or in
   Go's form (`user:…@tcp(host:3306)/db`), with the rest of the address left
   readable. Names that say they hold something else do not count:
   `TOKEN_URL`, `password_hash`, `token_type`, `max_tokens`,
-  `accessTokenUrl`, `token_sha256`.
-- **Private keys** are listed, masked and taken out as their header, their
-  lines of key and their END line, also inside JSON (and JSON inside
-  JSON), in a Read tool's output with line numbers, encrypted ones, PGP
+  `accessTokenUrl`, `token_sha256`, and a page's or a request's token
+  (`NextToken`, `nextPageToken`).
+- **Private keys** are listed, masked and taken out from their BEGIN line
+  to their END line, also inside JSON (and JSON inside JSON), in a Read
+  tool's output with line numbers or with `>` or `#` before each line,
+  encrypted ones, PGP
   private-key blocks and PuTTY `.ppk` files, and private keys in base64 (a
   kubeconfig's `client-key-data`, a Kubernetes `tls.key`), shown as
   *BEGIN RSA PRIVATE KEY (in base64)*. A guide or code that only names
@@ -1061,12 +1062,16 @@ histories. Values are only ever shown masked.
   (`MAX_RETRIES`, `spring.datasource.password`), paths and web addresses,
   ARNs, fingerprints and hashes, test names (`test_auth.py::test_token`,
   `--- PASS:`) and plain words.
-- **Not every secret:** masking is best effort, and aht cannot recognise
-  all of them. A value with no name or form it knows stays in clear, and
-  so can a short one, one after a camelCase name it does not know
-  (`dbPass`, `tokenValue`), one in quotes with a space in it, or one that
-  does not look random enough (small letters only, say). The privacy
-  policy lists the known limits. Keep secrets out of agent chats.
+- **Not every secret:** masking is best effort, and aht does not try to
+  guess at every shape a secret could have. A value with no name or form
+  it knows stays in clear, and so can a short one, one after a name it
+  does not know (`STRIPE_KEY`), a password with a quote or a space in it
+  (masked only up to there), or one that does not look generated (small
+  letters only, a word and digits, say). The privacy policy lists the
+  known limits. Keep secrets out of agent chats.
+- **`--redact` never breaks a history:** a place whose removal would leave
+  a line of the history no longer valid JSON is left as it is, and aht
+  says how many.
 - aht never changes the agents' histories on its own. In everything it
   copies out of them it masks what it recognises, whole (a key of any
   length, up to 64 KB): the search index, journals, summaries, notices and

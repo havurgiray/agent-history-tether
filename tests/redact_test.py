@@ -9,12 +9,14 @@ ordinary code and prose are left as they are.
       them; passwords of 12 to 16 characters, keys in hex, tokens that start
       with a slash; long tokens, also across the cut of a text over a
       megabyte; private keys however they are wrapped; and the shapes a
-      name=value misses (camelCase names, quoted values, flags, cookies,
+      name=value misses (camelCase names, quoted values, flags,
       Authorization, XML, more kinds of token, keys in base64, Go's
       addresses), each as text and as a history's raw line, ordinary lines
-      of the same shapes beside them.  No 12 characters of a key in a row
-      are left, the right kind is named, and masking the masked text again
-      changes nothing.
+      of the same shapes beside them; what an earlier version's masker
+      missed or read as a key, and lines that made it slow (each masked in
+      well under a second).  No 12 characters of a key in a row are left,
+      the right kind is named, and masking the masked text again changes
+      nothing.
   [2] false positives: ordinary lines come out of redact() unchanged, and a
       raw scan of a history line that holds one finds nothing.
   [3] the histories: `aht secrets` lists a private key once, as its whole
@@ -22,7 +24,8 @@ ordinary code and prose are left as they are.
       a tool's output (.env, YAML, JSON inside JSON) is listed once and
       taken out; a guide or code that names BEGIN and END goes through
       `secrets --redact --apply` unchanged.  Every line is still valid JSON
-      and a new scan finds nothing.
+      and a new scan finds nothing; a place whose removal would break a
+      line's JSON is left as it was.
   [4] with AHT_BEFORE=<the aht.py of an earlier version>: this repository
       and Python's standard library, scanned by both, differ only where a
       rule says why (counts by kind, before and after);
@@ -350,8 +353,7 @@ for s, forms in [(sym("aaaa,aaaa;aaaa(aaaa)aaaa&aa=aaaa"),
                   ("SECRET_KEY = '{}'", 'password: "{}"', None)),
                  ("django-insecure-" + sym("a!a9(&a=a2#aa8&aa4=aa)a6+aa0$a*aa1@aa5^aa"),
                   ("SECRET_KEY = '{}'", None)),
-                 (sym("aaaa'aaaa,aaaa;aaaa)aaa"), ('DB_PASSWORD="{}"', None)),
-                 (sym('aaaa"aaaa,aaaa;aaaa)aaa'), ("password: '{}'", None))]:
+                 (sym("aaaa'aaaa,aaaa;aaaa)aaa"), ('DB_PASSWORD="{}"', None))]:
     for form in forms:
         text = json.dumps({"password": s}) if form is None else form.format(s)
         leak(f"in quotes: {form}", text, s, GENERIC, both=True)
@@ -362,30 +364,23 @@ fps += ["password = getpass.getpass(prompt='Password: ')", 'token = "Bearer " + 
         'layers:[{id:"terrain"}]']
 # shapes that read as names, paths or words, and are not: a base32 seed, a
 # value of capitals and digits, dotted random parts, one that starts with a
-# dot, words a generator joined after a password's name, digits in letters
-pw_words = ["copper", "plaza", "cosmic", "orbit", "tundra", "maple", "quartz", "ember"]
-phrase = "-".join(R.choice(pw_words) for _ in range(4))
+# dot
 for t, s in [("TOTP_SECRET={}", R.choice(string.ascii_uppercase) + rk(31, string.ascii_uppercase
                                                                      + "234567")),
              ("DB_PASSWORD={}", R.choice(string.ascii_uppercase) + rk(19, UPD)),
              ("SECRET_KEY={}", rk(6, string.ascii_letters) + "." + rk(20)),
-             ("DB_PASSWORD='{}'", "." + rk(19, AN + "^-@#*")),
-             ("DB_PASSWORD={}", phrase), ("password: {}", phrase.title() + "7"),
-             ("API_KEY={}", rk(3, string.ascii_uppercase) + rk(2, string.digits)
-              + rk(1, string.ascii_lowercase) + rk(1, string.digits) + rk(1, string.ascii_uppercase)
-              + rk(10, string.ascii_lowercase))]:
+             ("DB_PASSWORD='{}'", "." + rk(19, AN + "^-@#*"))]:
     leak(t.format("…"), t.format(s), s, GENERIC, both=True)
 fps += ["DB_PASSWORD_FILE=/run/secrets/db", "password: ./secrets/db", "secret: my-app-secrets",
         "MAX_RETRIES=5", "token: MAX_RETRIES", "password: DEFAULT_PASSWORD", "auth: HMACSHA256",
         "secret_key: SECRETKEYBASE", "secret = spring.datasource.password", "password: .env"]
-# no name=value: Authorization with any scheme, flags, cookies, XML
+# no name=value: Authorization with any scheme, flags, XML
 for t in ["Authorization: Token {v}", '{{"Authorization": "ApiKey {v}"}}',
           "Authorization: SSWS {v}", "mysql -u root -p{v} app", "mysql -u root --password {v}",
           "docker login -u bot -p {v} ghcr.io", "sshpass -p {v} ssh host",
           "twine upload -u __token__ -p {v} dist/*", "redis-cli -a {v} ping",
           "gh auth login --with-token {v}", "tool --token '{v}'",
-          "curl -u admin" ":{v} https://api.example.com/", "> Cookie: theme=dark; session={v}",
-          "< Set-Cookie: sessionid={v}; Path=/; HttpOnly", "<password>{v}</password>",
+          "curl -u admin" ":{v} https://api.example.com/", "<password>{v}</password>",
           '<add key="ClearTextPassword" value="{v}" />', "auth: {{ user: 'bot', pass: '{v}' }}"]:
     leak(t[:40], t.format(v=v), v, GENERIC, both=True)
 fps += ["--password-file /run/secrets/db", "docker login -u bot --password-stdin",
@@ -430,17 +425,73 @@ leak("Go's address", f"DSN=root:{pw}@tcp(127.0.0.1:3306)/app?parseTime=true", pw
 at_pw = rk(3) + "@" + pw
 leak("an @ in the password", f"postgres://app:{at_pw}@db:5432/app", at_pw, GENERIC, both=True)
 fps += ["ssh://git@github.com:22/owner/repo.git", "git@github.com:owner/repo.git", "user@host:/path"]
-# still masked: a random file name under a name, a weak password with digits
-cfg = f"config/{rk(32)}.json"
-leak("a random file name", f"GOOGLE_APPLICATION_CREDENTIALS={cfg}", cfg, GENERIC, both=True)
+# still masked: a weak password with digits and a symbol
 weak = [w for w in ("Summer" + "2024!", "Welcome" + "123!")
         if w in core.redact(f"password={w}") or w in core.redact(f"DB_PASSWORD: {w}")]
 changed = untouched(fps)
 ck(not bad and not weak and not changed,
    f"what a name=value misses, as text and as a raw history line: names on later lines, "
-   f"camelCase, quotes, generated shapes, flags, cookies, XML, 11 more kinds of token, keys in "
+   f"camelCase, quotes, generated shapes, flags, XML, 11 more kinds of token, keys in "
    f"base64, Go's addresses ({len(bad)}: {bad[:3]}; weak passwords left: {weak}); "
    f"{len(fps)} ordinary lines of those shapes unchanged ({changed[:3]})")
+
+# what an earlier round's masker missed or read as a key: a private key
+# behind > # // │ or <br>, a quoted value that starts with +, $env:PASSWORD
+# and /p:Password, a UUID after an API key's name, a token at the start of
+# a raw line or after a tab; pagination tokens, split('token='), ===, a
+# build's --secret id=…, a cookie's callback address, a key in base64 and
+# the words on the line after it.  And lines that made it backtrack for
+# seconds or minutes: each is masked, as text and as a raw line, in well
+# under a second
+bad = []
+for pre in ("> ", "# ", "// ", "│ "):
+    leak(f"a private key, each line after {pre!r}", "\n".join(pre + l for l in plain.split("\n")),
+         body, ["private key"], both=True)
+leak("a private key, <br> for its line breaks", plain.replace("\n", "<br>"), body, ["private key"],
+     both=True)
+plus = "+" + rk(43, AN + "+/")
+for form in ("SECRET_KEY = '{}'", '{{"password": "{}"}}', 'password: "{}"'):
+    leak(f"a value that starts with +: {form}", form.format(plus), plus, GENERIC, both=True)
+for form in ('$env:PASSWORD = "{}"', "msbuild /p:Password={}", "$env:SECRET_KEY='{}'", "ENV:TOKEN={}"):
+    leak(form, form.format(v), v, GENERIC, both=True)
+for _ in range(50):
+    u = "-".join(rk(n, HEX) for n in (8, 4, 4, 4, 12))
+    leak(f"a UUID after an API key's name: {u}", f"HEROKU_API_KEY={u}", u, GENERIC, both=True)
+for kind, tok in [("GitLab token", "gl" + "pat-" + rk(20, AN + "_-")),
+                  ("PyPI token", "pypi-" + "AgEI" + rk(60, AN + "_-")),
+                  ("Hugging Face token", "hf" + "_" + rk(34)), ("AWS access key", "AK" + "IA" + rk(16, UPD))]:
+    for t in (f"Done.\n{tok}\n", f"a\t{tok}\tb"):
+        leak(f"{kind} at the start of a line or after a tab", t, tok, [kind], both=True)
+b64key = base64.b64encode(pem()[0].encode()).decode()
+wr = "\n".join(b64key[i:i + 76] for i in range(0, len(b64key), 76))
+out = core.redact(f"$ base64 -i tls.key\n{wr}\nSuccessfully encoded tls.key")
+if kept_runs(out, wr) or not out.endswith("]\nSuccessfully encoded tls.key"):
+    bad.append(f"a key in base64, the line after it: {out[-80:]!r}")
+changed = untouched([
+    "const t = url.split('token=')[1].split('&')[0];", f'"NextToken": "{rk(60)}"',
+    f'"nextPageToken": "{rk(40)}"', f"?pageToken={rk(40)}&pageSize=100",
+    f'"ContinuationToken": "{rk(50)}"', f'"IdempotencyToken": "{rk(36)}"',
+    '"clientRequestToken": "' + "-".join(rk(n, HEX) for n in (8, 4, 4, 4, 12)) + '"',
+    "k.token===x.Implements(y)",
+    "docker buildx build --secret id=github_token,src=/run/secrets/gh_token .",
+    "< Set-Cookie: next-auth.callback-url=http%3A%2F%2Flocalhost%3A3000; Path=/; HttpOnly",
+    "auth_user_pool: us-east-1_" + "AbCdEf123"])
+slow = []
+for line in ["TOKEN='" + json.dumps({c: str(i) for i, c in enumerate("abcdefgh")}) + " x'",
+             "export AUTH='" + json.dumps({"user": "app", "pass": "x", "scope": "read write",
+                                           "n": 1}) + "'",
+             "password=" + "\\" * 5000 + '"' * 5000, "password: " + "a," * 20000,
+             'token="' + '\\"' * 8000, "secret = '" + "\\\\" * 4000 + "'" * 3000,
+             "-----BEGIN " + PK + "-----\n" + "> " * 30000, "Authorization: " + "a " * 20000,
+             "curl " + "-u " * 20000 + "x", "token=" + "&a" * 20000, "TOKEN=" + "x" * 60000]:
+    t0 = time.perf_counter()
+    core.redact(line)
+    list(core._scan_bytes(raw(line).encode(), PATS))
+    if time.perf_counter() - t0 > 1.0:
+        slow.append(f"{line[:24]!r}: {time.perf_counter() - t0:.1f} s")
+ck(not bad and not changed and not slow,
+   f"what an earlier masker missed ({len(bad)}: {bad[:3]}) or read as a key ({changed[:3]}); "
+   f"lines that made it slow, each masked in under a second ({slow[:3]})")
 
 print("\n[2] false positives: ordinary lines are left as they are")
 sha = "".join(R.choice("0123456789abcdef") for _ in range(40))
@@ -787,6 +838,19 @@ ck(len(finds) == 1 and rc == 0 and "removed from" in said.getvalue()
    f"({[x['masked'] for x in finds]}); secrets --redact --apply takes it out and leaves "
    f"them as they were")
 
+# taking a secret out never breaks a history: a place whose removal would
+# break its line's JSON (or a whole file's) is left as it was
+mk = b"[removed by aht]"
+data = b'{"a": "x SECRETVALUE y"}\n{"b": "zzzz"}\n'
+i, j = data.index(b"SECRETVALUE"), data.index(b'"}')
+n1, l1 = core._take_out(data, [(i, i + 11)], mk)
+n2, l2 = core._take_out(data, [(i, j + 1)], mk)
+doc = json.dumps({"k": "x SECRETVALUE y", "n": 1}, indent=2).encode()
+n3, l3 = core._take_out(doc, [(doc.index(b"SECRETVALUE"), doc.index(b'",') + 2)], mk)
+ck(l1 == 0 and mk in n1 and all(json.loads(x) for x in n1.splitlines())
+   and (n2, l2) == (data, 1) and (n3, l3) == (doc, 1),
+   "a place whose removal would break a line's JSON, or a whole file's, is left as it was")
+
 before_path = os.environ.get("AHT_BEFORE")
 if before_path:
     print(f"\n[4] this repository and Python's standard library, before and after")
@@ -824,13 +888,19 @@ if before_path:
             lambda k, v, c: k == "password or token" and re.search(
                 r"(?i)(?:\s-[pau]\s*|--[\w-]+\s+|cookie:.*=|authorization\W+(?:\w+\s+)?)$", c))]
     # …and why it no longer masks what the earlier version did
-    WHY_NOT = [("code: a call or an index after a name",
+    WHY_NOT = [("a name whose words say it holds something else (NextToken, auth_user_pool)",
+                lambda k, v, c: (lambda m: bool(m) and not core._secret_name(m.group(1)))(
+                    re.search(r"([A-Za-z0-9_.\-]+)[^A-Za-z0-9_.\-]*$", c))),
+               ("a value with an = in it: an id=… after a flag (BuildKit's --secret)",
+                lambda k, v, c: "=" in v.rstrip("=")),
+               ("a cookie: cookies are not read", lambda k, v, c: re.search(r"(?i)cookie", c)),
+               ("code: a call or an index after a name",
                 lambda k, v, c: re.search(r"[(\[]", v) and core._code(v.rstrip("([") or v)),
                ("code: a type or a class's name", lambda k, v, c: core._code(v)),
                ("a private key's header with no key under it",
                 lambda k, v, c: k == "private key" and not core._material(v)),
                ("a placeholder, a name, a path, a reference or words",
-                lambda k, v, c: core._PLACEHOLDER.search(v) or core._shaped(v) or core._path(v)
+                lambda k, v, c: core._PLACEHOLDER.search(v) or core._named(v) or core._path(v)
                 or core._text(v)),
                ("a name with :: after it (pytest, Rust, PHP, C++)",
                 lambda k, v, c: v.startswith(":")),

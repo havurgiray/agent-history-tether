@@ -390,10 +390,10 @@ behave the same.
     part of a Slack webhook address and the token in a Telegram bot
     address;
   - private keys (PEM, also encrypted, PGP and PuTTY `.ppk`), also inside
-    JSON or in a Read tool's numbered output, as their header, their lines
-    of key and their END line (a guide or code that only names the BEGIN
-    and END lines is left alone), and private keys in base64 (a
-    kubeconfig's `client-key-data`, a Kubernetes `tls.key`);
+    JSON, in a Read tool's numbered output or with `>` or `#` before each
+    line, from their BEGIN line to their END line (a guide or code that
+    only names the BEGIN and END lines is left alone), and private keys in
+    base64 (a kubeconfig's `client-key-data`, a Kubernetes `tls.key`);
   - `Bearer` tokens, `Basic` credentials, and what follows
     `Authorization:` with any other scheme or none (16 characters or
     more);
@@ -402,15 +402,14 @@ behave the same.
     `export GITHUB_TOKEN=`, `x-api-key:`, `RAILS_MASTER_KEY=`, `*_PAT=`,
     and camelCase names such as `dbPassword`, `accessToken` and
     `SecretAccessKey`), in a `.env` file, YAML or JSON, on any line of a
-    tool's output and in JSON inside JSON, when the value looks generated;
-    a value in quotes is masked to its closing quote.  Not after a name
-    whose last part says it holds something else (`TOKEN_URL`,
-    `password_hash`, `token_type`, `max_tokens`, `accessTokenUrl`,
-    `token_sha256`);
+    tool's output and in JSON inside JSON, when the value looks generated.
+    Not after a name with a word that says it holds something else
+    (`TOKEN_URL`, `password_hash`, `token_type`, `max_tokens`,
+    `accessTokenUrl`, `token_sha256`) or a page's or a request's token
+    (`NextToken`, `nextPageToken`);
   - a password on a command line (`--password X`, `--token X`,
     `--with-token X`, `--api-key X`, `mysql -pX`, `docker login -p X`,
-    `sshpass -p X`, `redis-cli -a X`, `curl -u user:X`), in a cookie whose
-    name holds sess, sid, token or auth, and in XML
+    `sshpass -p X`, `redis-cli -a X`, `curl -u user:X`) and in XML
     (`<password>X</password>`, `key="…Password" value="X"`);
   - the password in a web or database address, whatever the host
     (`postgres://app:…@db:5432`, also with an `@` in the password, and
@@ -424,12 +423,12 @@ behave the same.
   and web addresses (`/etc/ssl/private/…`, `config/service-account.json`),
   ARNs, fingerprints and hashes, a port or an image's tag, test names
   (`test_auth.py::test_token`, `--- PASS:`) and words.  Masking is best
-  effort and cannot recognise every secret: a value with no name or form
-  it knows stays in clear, and so can a value under 8 characters after a
-  name, one after a camelCase name other than those it knows (`dbPass`,
-  `tokenValue`), one in quotes with a space in it, or one that does not
-  look random enough (small letters only, or short with only two kinds of
-  character, such as a short hex string).  PRIVACY.md lists the rules and
+  effort, and aht does not try to guess at every shape a secret could
+  have: a value with no name or form it knows stays in clear, and so can a
+  value under 8 characters, one after a name it does not know
+  (`STRIPE_KEY`), a password with a quote or a space in it (masked only up
+  to there), or one that does not look generated (small letters only, a
+  word and digits, words joined by `-`).  PRIVACY.md lists the rules and
   the known limits.  So keep secrets out of agent chats.
 
   Wherever aht copies text out of a history, it masks what it recognises
@@ -676,18 +675,20 @@ linux/tests/vm_check.sh HOST [--out DIR] [--no-suites] [--keep]   # a real Linux
 `tests/redact_test.py` checks the masker: every kind of key it knows, at
 its usual length and longer, in the places keys stand, masked whole; the
 shapes a name=value misses (names on later lines, camelCase, quotes,
-flags, cookies, XML, keys in base64, Go's addresses), as text and as a
-history's raw line, with 39 ordinary lines of the same shapes beside them;
-90 ordinary lines of code and prose and 71 lines the masker once read as
-keys (among them a guide and code that name a private key's BEGIN and END
-lines), all left as they are; and in histories, that
-`aht secrets` lists each find once and `--redact --apply` takes out only
-the find.  Its keys are made up at run time, in pieces.  With
+flags, XML, keys in base64, Go's addresses), as text and as a history's
+raw line, with 39 ordinary lines of the same shapes beside them; what an
+earlier masker missed or read as a key, and lines that once made it slow
+(each masked in under a second); 90 ordinary lines of code and prose and
+71 lines the masker once read as keys (among them a guide and code that
+name a private key's BEGIN and END lines), all left as they are; and in
+histories, that `aht secrets` lists each find once, `--redact --apply`
+takes out only the find, and a place whose removal would break the
+history's JSON is left as it was.  Its keys are made up at run time, in pieces.  With
 `AHT_BEFORE=<an older aht.py>` it also compares what both versions find in
 this repository and in Python's standard library (every difference must
 match a rule that says why), and how long they take: it fails when masking
 takes more than 1.5 times as long.  (Measured on a Mac: on a 50 MB history
-this version takes about 1.4 times as long as 0.13.0, on prose less.)
+this version takes about 1.5 times as long as 0.13.0, on prose about the same.)
 
 `windows/build.sh` and the Windows CI job run three smoke scripts against
 the exes (`windows/tests/wine_smoke.sh`, `wine_watch_smoke.sh`,

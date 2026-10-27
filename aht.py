@@ -38,12 +38,14 @@ SAFETY invariants (inherited, kept):
 
 from __future__ import annotations   # 3.9-safe
 
+import errno
 import fnmatch
 import hashlib
 import os
 import re
 import shlex
 import stat
+import struct
 import sys
 import json
 import uuid as _uuid
@@ -53,7 +55,9 @@ import time
 import argparse
 import platform
 import subprocess
+import threading
 import unicodedata
+import zlib
 from pathlib import Path
 
 VERSION = "0.13.0"
@@ -177,7 +181,10 @@ CONFIG_DEFAULTS = {
     "default_remote":   None,
     "mirror_interval_minutes": 30,   # background sync of mirrored projects
     "handover_excludes": [],         # extra names that never travel
-    "handover_compress": True,       # rsync -z: histories and code are text
+    "handover_compress": True,       # compress what travels: histories and code are text
+    "handover_transfer": "auto",     # auto | rsync | aht: what copies the files (auto:
+                                     #   rsync where both sides have it and neither
+                                     #   is Windows, else aht's own copy)
     "handover_remote_control": True, # reachable from the Claude app
     "handover_carry_trust": True,    # a folder trusted here is trusted there
     "handover_claude_args": [],      # extra arguments for the resumed session
@@ -262,6 +269,11 @@ def _coerce(key: str, raw: str):
         v = raw.strip().lower()
         if v not in LOG_LEVELS:
             raise ValueError(f"log_level expects one of {sorted(LOG_LEVELS)}")
+        return v
+    if key == "handover_transfer":
+        v = raw.strip().lower()
+        if v not in TRANSFERS:
+            raise ValueError(f"handover_transfer expects one of {list(TRANSFERS)}")
         return v
     if key == "limit_switch_to":
         v = raw.strip().lower()
@@ -3647,9 +3659,11 @@ def cmd_doctor(args):
                     pass
         ck("folder badge tool runs", ok, detail)
     if handover_supported() and remotes_config():
-        rs = find_rsync()
-        ck("handover: rsync 3 on this machine", bool(rs),
-           rs.get("version") or "missing — on macOS:  brew install rsync")
+        rs, forced = find_rsync(), transfer_setting() == "rsync"
+        ck("handover: rsync 3 on this machine" + ("" if forced else " (optional)"),
+           bool(rs) or not forced,
+           rs.get("version") or ("missing — on macOS:  brew install rsync" if forced
+                                 else "missing — aht's own copy moves the files"))
     nprob = recent_log_problems()
     ck("no warnings/errors logged in the last 24h", nprob == 0,
        f"{nprob} — inspect with:  aht logs --errors")
@@ -3684,6 +3698,7 @@ def cmd_backup(args):
             return 1
         if args.json:
             print(json.dumps(st, indent=2))
+            return 1 if st.get("problems") else 0
         elif args.quiet:
             pass
         elif args.offsite_list:
@@ -3699,13 +3714,15 @@ def cmd_backup(args):
                   f"{st['files']} backup(s), {_human(st['bytes'])}")
             for k in st["renamed"]:
                 print(f"   kept next to ours (another size): {k}")
+            for p in st.get("problems") or []:
+                print(f"   not fetched: {p['name']} — {p['error']}")
         else:
             print(f"copied to {st['machine']}: {st['files']} backup(s), {_human(st['bytes'])}"
                   + (f"; {st['removed']} older one(s) removed there" if st["removed"] else ""))
             if st["legacy"]:
                 print("   left alone there (an older aht's, not all of them are here): "
                       + ", ".join(st["legacy"]))
-        return 0
+        return 1 if st.get("problems") else 0
     if args.list:
         reg = load_registry()
         rows = []
@@ -4234,7 +4251,7 @@ def cmd_icons(args):
 HANDOVER_SKIP = (
     # this machine's own metadata
     "Icon\r", ".DS_Store", "._*", ".Spotlight-V100", ".Trashes", ".fseventsd",
-    ".aht-rsync-partial",
+    ".aht-rsync-partial", ".aht-partial",
     # rebuilt per machine: one OS's binaries are useless on the other
     "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
     ".pytest_cache", ".next", "DerivedData", ".gradle",
@@ -4715,17 +4732,27 @@ def tree_manifest(root: str, skip=None) -> dict:
     return {"files": files, "raw": raw, "dirs": sorted(dirs), "modes": modes,
             "twins": twins}
 
-def file_sha256(path, limit: int = None) -> str:
+def file_sha256(path, limit: int = None, norm: bool = False) -> str:
+    """The sha256 of a file, or of its first `limit` bytes.  `norm`: CRLF is
+    read as LF, so a file whose only change is its line endings hashes the
+    same."""
     h = hashlib.sha256()
-    left = limit
+    left, cr = limit, False
     with open(path, "rb") as fh:
         while left is None or left > 0:
             chunk = fh.read(1 << 20 if left is None else min(1 << 20, left))
             if not chunk:
                 break
-            h.update(chunk)
             if left is not None:
                 left -= len(chunk)
+            if norm:
+                # a CR at the end of a piece may begin a CRLF in the next one
+                chunk = (b"\r" if cr else b"") + chunk
+                cr = chunk.endswith(b"\r")
+                chunk = (chunk[:-1] if cr else chunk).replace(b"\r\n", b"\n")
+            h.update(chunk)
+    if cr:
+        h.update(b"\r")
     return h.hexdigest()
 
 def three_way(left_here: dict, left_there: dict, here: dict, there: dict) -> dict:
@@ -5149,6 +5176,1044 @@ class Remote:
             or f"rsync exit {p.returncode}")
         return res
 
+    # ---- moving files: one interface, two movers (see "moving files") ---- #
+
+    def transfer(self) -> str:
+        """What copies files to and from this machine: "rsync" or "aht" (aht's
+        own copy).  handover_transfer "auto": rsync when this side has rsync 3,
+        the other side has rsync, and neither side is Windows."""
+        want = transfer_setting()
+        if want != "auto":
+            return want
+        if not self.info:
+            self.connect()
+        theirs = self.info.get("system") or self.system
+        there = (self.info.get("tools") or {}).get("rsync")
+        return "rsync" if (os.name != "nt" and theirs != "Windows" and there
+                           and find_rsync()) else "aht"
+
+    def send(self, local_root: str, remote_root: str, *, delete: bool = False,
+             aside: str = None, skip=(), protect=(), only=None, update: bool = False,
+             add_only: bool = False, dry: bool = False, progress: bool = False) -> dict:
+        """Make the folder `remote_root` there like `local_root` here.
+        `delete`: remove there what is not here, except what `protect` names
+        (keys, or folders ending in "/").  `aside`: a folder there that gets
+        whatever is replaced or removed first.  `skip`: rsync's exclude
+        patterns (a name anywhere, or "/a/path/" from the top).  `only`: just
+        these keys, or folders ending in "/".  `update`: never over a newer
+        file there.  `add_only`: never over any file there.  Stats keep
+        rsync's keys: files, bytes, sent, deleted, ok, error."""
+        if self.transfer() == "rsync":
+            src, dst = local_root.rstrip("/") + "/", self.spec(remote_root.rstrip("/") + "/")
+            if only is not None and not only:
+                return _no_stats("rsync")
+            r = self.rsync(src, dst, delete=delete, backup_dir=aside, skip=list(skip),
+                           dry=dry, update=update, add_only=add_only, progress=progress,
+                           protect=[_rsync_pat(p) for p in protect], **_rsync_only(only))
+            return dict(r, transfer="rsync", problems=[])
+        names, anchored = _skip_split(skip)
+        if only is not None and not only:
+            return _no_stats("aht")
+        plan = _plan_copy(_local_tree(local_root, names, only),
+                          self._far_tree(remote_root, names, only), delete=delete,
+                          anchored=anchored, protect=protect, only=only, update=update,
+                          add_only=add_only, keep_raw=self._same_system())
+        stats = _plan_stats(plan)
+        if dry or not any(plan.values()):
+            return stats
+        for e in plan["files"]:
+            if os.name != "nt":
+                try:
+                    e["mode"] = stat.S_IMODE(os.stat(os.path.join(local_root, e["src"])).st_mode)
+                except OSError:
+                    pass
+            if add_only:
+                e["add"] = True
+        # a file there that is a shorter copy of ours (a transcript that went on
+        # here): only the tail goes
+        tails = [e for e in plan["files"] if isinstance(e["expect"], list)
+                 and e["expect"][0] != "l" and TAIL_MIN <= e["expect"][0] < e["size"]]
+        if tails:
+            got = self.agent("hash", timeout=600, files=[
+                {"key": e["key"], "path": _far_join(remote_root, e["name"]),
+                 "limit": e["expect"][0]} for e in tails])["hashes"]
+            for e in tails:
+                try:
+                    if got.get(e["key"]) and got[e["key"]] == file_sha256(
+                            os.path.join(local_root, e["src"]), e["expect"][0]):
+                        e["append_from"] = e["expect"][0]
+                except OSError:
+                    pass
+        comp = bool(cfg_get("handover_compress", True))
+        ents = plan["files"] + plan["links"]
+        meter = self._meter(sum(e["size"] - (e.get("append_from") or 0)
+                                for e in plan["files"]), progress)
+        def frames():
+            for i, e in enumerate(ents):
+                if e.get("link") is None:
+                    yield from _file_frames(i, os.path.join(local_root, e["src"]),
+                                            e.get("append_from") or 0, e["size"], comp, meter)
+            yield b"Z"
+        req = {"root": remote_root, "aside": aside, "compress": comp,
+               "entries": [{k: v for k, v in e.items() if k != "src"} for e in ents],
+               "deletes": plan["deletes"], "rmdirs": plan["rmdirs"], "dirs": plan["dirs"]}
+        res, wire = self.stream("unpack", req, frames=frames)
+        meter(None)
+        return _placed_stats(res, wire)
+
+    def fetch(self, remote_root: str, local_root: str, *, entries=None, deletes=(),
+              aside: str = None, only=None, update: bool = False, skip=(),
+              add_only: bool = False, progress: bool = False) -> dict:
+        """Bring files from `remote_root` there into `local_root` here: the keys
+        in `entries` (a list, or {key: its name there}); without `entries`,
+        whatever differs there (`only` narrows to keys or folders ending in
+        "/", `update`: never over a newer file here).  What it replaces, and
+        the keys in `deletes` (removed here first), go to `aside` here.
+        `add_only`: a file here is never written.  Stats as send's."""
+        if entries is not None and not isinstance(entries, dict):
+            entries = {k: k for k in entries}
+        dels = []
+        for k in deletes:
+            p = Path(local_root) / k
+            if p.exists() or p.is_symlink():
+                if aside:
+                    _set_aside(p, Path(aside), k)
+                else:
+                    p.unlink()
+                dels.append(k)
+        if self.transfer() == "rsync":
+            if (entries is not None and not entries) or (only is not None and not only):
+                return dict(_no_stats("rsync"), deleted=len(dels))
+            sel = {"files_from": list(entries.values())} if entries is not None \
+                else _rsync_only(only)
+            r = self.rsync(self.spec(remote_root.rstrip("/") + "/"),
+                           local_root.rstrip("/") + "/", backup_dir=aside, skip=list(skip),
+                           update=update, add_only=add_only, progress=progress, **sel)
+            return dict(r, transfer="rsync", problems=[], deleted=len(dels))
+        names, anchored = _skip_split(skip)
+        if entries is None:
+            if only is not None and not only:
+                return dict(_no_stats("aht"), deleted=len(dels))
+            plan = _plan_copy(self._far_tree(remote_root, names, only),
+                              _local_tree(local_root, names, only), anchored=anchored,
+                              only=only, update=update, add_only=add_only,
+                              keep_raw=self._same_system())
+            ents, dirs = plan["files"] + plan["links"], plan["dirs"]
+        else:
+            same = self._same_system()      # a new file: named as rsync would
+            ents = [{"key": k, "src": v or k, "name": (v if same and v else k)}
+                    for k, v in entries.items()]
+            dirs = []
+        if not ents and not dirs:
+            return dict(_no_stats("aht"), deleted=len(dels))
+        os.makedirs(local_root, exist_ok=True)
+        real = os.path.realpath(local_root)
+        in_way = []
+        for e in ents:
+            # what is here now: the guard against a change meanwhile, and maybe
+            # the beginning of what comes (then only the tail travels)
+            try:
+                p = _dest_path(local_root, real, e["name"])
+                cur = _state(p)
+                if cur in ("dir", "other"):
+                    # a file or link comes where a folder is: the folder stays,
+                    # as a send leaves one there (add only: what is here stays)
+                    e["in_way"] = True
+                    if not add_only:
+                        in_way.append({"name": e["key"], "error": "a folder is in the way"
+                                       if cur == "dir" else "something else is in the way"})
+                    continue
+                e["expect"] = cur
+                if add_only:
+                    e["add"] = True
+                if isinstance(cur, list) and cur[0] != "l" and cur[0] >= TAIL_MIN \
+                        and e.get("size", cur[0] + 1) > cur[0]:
+                    e["prefix"] = [cur[0], file_sha256(p)]
+            except (ValueError, OSError):
+                e["expect"] = None          # refused when it is placed
+        ents = [e for e in ents if not e.get("in_way")]
+        if not ents and not dirs:
+            return _placed_stats({"problems": in_way, "deleted": len(dels)},
+                                 {"sent": 0, "received": 0})
+        comp = bool(cfg_get("handover_compress", True))
+        meter = self._meter(sum(e.get("size") or 0 for e in ents)
+                            if all("size" in e for e in ents) else None, progress)
+        placed = {}
+        def sink(rd):
+            placed.update(_place_entries(local_root, {"entries": ents, "dirs": dirs,
+                                                      "aside": aside, "compress": comp},
+                                         rd, tick=meter))
+        req = {"root": remote_root, "compress": comp,
+               "entries": [dict({"src": e["src"]}, **({"prefix": e["prefix"]}
+                                                     if e.get("prefix") else {}))
+                           for e in ents]}
+        _res, wire = self.stream("pack", req, sink=sink)
+        meter(None)
+        return _placed_stats(dict(placed, deleted=placed.get("deleted", 0) + len(dels),
+                                  problems=in_way + list(placed.get("problems") or [])), wire)
+
+    def _same_system(self) -> bool:
+        return (self.info.get("system") or self.system) == platform.system()
+
+    def _far_tree(self, root: str, names: list, only=None) -> dict:
+        """The manifest of the folder `root` there (with `only` all at the top,
+        of just those)."""
+        if not _top_only(only):
+            return self.agent("manifest", timeout=900, trees={
+                "t": {"path": root, "skip": names}})["trees"]["t"]
+        return _merge_trees(self.agent("manifest", timeout=900, trees={
+            o: {"path": _far_join(root, o.rstrip("/")), "skip": names}
+            for o in only})["trees"])
+
+    def _meter(self, total, progress: bool):
+        """A counter of the bytes that went: on_percent (when `total` is known)
+        and, with `progress`, a line on the terminal.  None ends it."""
+        st = {"done": 0, "shown": -1, "at": 0.0}
+        def tick(n):
+            if n is None:
+                if progress and st["shown"] >= 0:
+                    sys.stderr.write("\n")
+                return
+            st["done"] += n
+            pct = min(100, st["done"] * 100 // total) if total else None
+            if pct is not None and pct != st["shown"] and self.on_percent:
+                self.on_percent(pct)
+            if progress and (pct != st["shown"] or time.time() - st["at"] > 0.5):
+                st["at"] = time.time()
+                sys.stderr.write(f"\r  {'' if pct is None else f'{pct:3d}%  '}"
+                                 f"{_human(st['done'])}"
+                                 + (f" of {_human(total)}" if total else "") + "   ")
+                sys.stderr.flush()
+            st["shown"] = pct if pct is not None else 0
+        return tick
+
+    def _stream_argv(self) -> list:
+        if self.local:
+            return _aht_argv() + ["_agent"]
+        if self.system == "Windows":
+            raise HandoverError(WINDOWS_FAR)
+        line = f'exec python3 "$HOME/.aht/remote/aht-{core_id()}.py" _agent'
+        if self.sandbox:
+            line = self._sandboxed(line)
+        return [_ssh()] + self.ssh_opts() + [self.dest, line]
+
+    def stream(self, op: str, req: dict, frames=None, sink=None) -> tuple:
+        """One streamed operation there (pack, unpack): the request as one JSON
+        line, then what `frames()` yields, into its stdin; with `sink`, what it
+        sends after the BIN mark is handed to sink(reader).  (answer, {sent,
+        received}).  A watchdog ends it after STREAM_STALL s without a byte
+        either way."""
+        for first in (True, False):
+            res, wire, missing = self._stream_once(op, req, frames, sink)
+            if not missing:
+                _test_drop(op, self.name)
+                if not res.get("ok"):
+                    raise HandoverError(f"{self.name}: {res.get('error') or op + ' failed'}")
+                return res, wire
+            if not first:
+                break
+            self.push_agent()               # aht's copy is not there yet
+        raise HandoverError(f"{self.name} has no copy of aht to run")
+
+    def _stream_once(self, op, req, frames, sink):
+        kw = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
+              "stderr": subprocess.PIPE, "cwd": "/", **_NO_WINDOW}
+        argv = self._stream_argv()
+        if self.local:
+            Path(self.root + "/home").mkdir(parents=True, exist_ok=True)
+            kw["env"] = self._env()
+        try:
+            p = subprocess.Popen(argv, **kw)
+        except FileNotFoundError:
+            raise HandoverError(NO_SSH)
+        st = {"at": time.time(), "stalled": False, "sent": 0, "werr": None}
+        def alive():
+            st["at"] = time.time()
+        err = []
+        def read_err():
+            for b in iter(lambda: p.stderr.read(4096), b""):
+                err.append(b)
+                del err[:-4]
+                alive()
+        def write():
+            # never hang: on any failure stdin is closed; when it failed here
+            # (reading the files), the far end would wait for the rest until
+            # the watchdog, so it is ended now and the error is ours.  When
+            # the pipe failed, the far end stopped reading: it is ending, and
+            # why is on its way
+            try:
+                head = json.dumps(dict(req, op=op)).encode("utf-8") + b"\n"
+                src = iter([head] if frames is None else _chain([head], frames()))
+                while True:
+                    try:
+                        c = next(src)
+                    except StopIteration:
+                        break
+                    except BaseException as e:      # noqa: BLE001
+                        st["werr"] = e
+                        break
+                    p.stdin.write(c)
+                    st["sent"] += len(c)
+                    alive()
+            except (OSError, ValueError):           # the pipe: the far end is gone
+                pass
+            except BaseException as e:              # noqa: BLE001
+                st["werr"] = e
+            try:
+                p.stdin.close()
+            except (OSError, ValueError):
+                pass
+            if st["werr"] is not None:
+                p.kill()
+        def watch():
+            while p.poll() is None:
+                if time.time() - st["at"] > STREAM_STALL:
+                    st["stalled"] = True
+                    p.kill()
+                    return
+                time.sleep(0.5)
+        threads = [threading.Thread(target=f, daemon=True) for f in (read_err, write, watch)]
+        for t in threads:
+            t.start()
+        out = _Pipe(p.stdout, alive)
+        cut = None
+        try:
+            if sink is not None and out.until(BIN_MARK) is not None:
+                sink(out)
+            rest = out.rest()
+        except (StreamCut, ValueError, zlib.error) as e:     # cut off, or not aht's
+            cut, rest = e, b""
+            p.kill()
+        except BaseException:
+            p.kill()
+            p.wait()
+            raise
+        p.wait()
+        for t in threads:
+            t.join(5)
+        wire = {"sent": st["sent"], "received": out.n}
+        text = rest.decode("utf-8", "replace")
+        i = text.rfind(AGENT_MARK + "{")
+        res = None
+        if i >= 0 and cut is None:
+            try:
+                res = json.loads(text[i + len(AGENT_MARK):].strip())
+            except ValueError:
+                res = None
+        if st["werr"] is not None:
+            e = st["werr"]
+            raise HandoverError(f"the copy to {self.name} stopped here: "
+                                + (_why(e) if isinstance(e, OSError) else
+                                   f"{type(e).__name__}: {e}"))
+        if res is not None:
+            return res, wire, False
+        stderr = b"".join(err).decode("utf-8", "replace")
+        if p.returncode == 2 and "can't open file" in stderr and not self.local and not out.n:
+            return None, wire, True
+        if st["stalled"]:
+            raise LinkError(f"{self.name} went quiet for {STREAM_STALL} s; the copy "
+                            "was ended (what arrived is kept, the rest goes next time)")
+        if cut is not None or (not self.local and p.returncode == 255):
+            # what came was not aht's (a frame over its size, say): say so
+            why = str(cut) if isinstance(cut, (ValueError, zlib.error)) else \
+                (stderr.strip().splitlines() or [str(cut or 'no answer')])[-1]
+            raise LinkError(f"the link to {self.name} dropped during the copy (what "
+                            "arrived is kept, the rest goes next time): " + why)
+        raise HandoverError(f"{self.name} gave no usable answer to “{op}”: "
+                            + ((stderr or text).strip()[-300:] or "python3 missing?"))
+
+# ---- moving files: rsync, or aht's own copy ---------------------------------- #
+#
+# Two movers behind one interface, Remote.send and Remote.fetch.  rsync stays
+# where it works (both sides have it, neither is Windows); aht's own copy
+# works everywhere aht runs, with nothing but Python on either side.
+#
+# The wire: the ops pack and unpack run inside the usual _agent call.  The
+# request is one JSON line; then frames, binary, through stdin and stdout:
+#   M <index u32> <length u32> <json>   what a file is there (pack): size,
+#                                       mtime, mode, link, append_from
+#   F <index u32> <length u64> <bytes>  a piece of a file or of its tail, at
+#                                       most 1 MB before zlib (level 1, when
+#                                       handover_compress is on)
+#   E <index u32> <sha256: 32 bytes>    the file is complete
+#   X <index u32> <length u32> <text>   the sender could not read it
+#   S <index u32> <length u32> <text>   the sender skipped it: gone, or
+#                                       shorter, since the plan (rsync's
+#                                       "vanished", which is no failure)
+#   Z                                   the end
+# A frame over its size (M 64 KB, X and S 2 KB, F 64 MB, a piece unpacked
+# 1 MB) and output of more than 16 MB around the frames are refused as a
+# broken link: neither end holds more than that in memory.
+# pack writes "\n@@AHT@@BIN\n" before its frames; both end with the usual
+# @@AHT@@{json} trailer.  A file travels in pieces, so neither end holds a
+# whole file in memory.
+#
+# Placing (_place_entries) is the same on both ends: a lock in
+# <root>/.aht-partial; deletes first, each only if the file is still as
+# planned (`expect`); folders; each file written to .aht-partial/<n>, its
+# digest checked, what it replaces set aside, then os.replace; links last.
+# Names are checked before anything is written (relative, no "..", no
+# drive, no link on the way out of the folder): no tarfile, no extractall.
+
+TRANSFERS = ("auto", "rsync", "aht")
+STREAM_STALL = 120          # s without a byte either way: the transfer ends
+TAIL_MIN = 256 * 1024       # a shorter copy there at least this big may be a prefix
+PIECE = 1 << 20
+PIECE_MAX = 64 << 20        # a frame bigger than this is not aht's
+FRAME_META_MAX = 64 << 10   # an M frame bigger than this is not aht's
+FRAME_NOTE_MAX = 2 << 10    # nor an X or S frame bigger than this
+TRAILER_MAX = 16 << 20      # what comes around the frames (the answer)
+PARTIAL = ".aht-partial"
+BIN_MARK = ("\n" + AGENT_MARK + "BIN\n").encode("utf-8")
+
+def transfer_setting() -> str:
+    """handover_transfer, or AHT_TRANSFER (tests): auto, rsync or aht."""
+    v = str(os.environ.get("AHT_TRANSFER") or cfg_get("handover_transfer", "auto")).lower()
+    return v if v in TRANSFERS else "auto"
+
+class StreamCut(LinkError):
+    """A stream ended before its end mark."""
+
+class _Pipe:
+    """A stream's output, read with a count of its bytes (the watchdog's sign
+    of life)."""
+    def __init__(self, fh, alive=None):
+        self.fh, self.alive, self.buf, self.n = fh, alive, b"", 0
+
+    def _more(self) -> bytes:
+        b = self.fh.read1(1 << 16) if hasattr(self.fh, "read1") else self.fh.read(1 << 16)
+        if b:
+            self.n += len(b)
+            if self.alive:
+                self.alive()
+        return b
+
+    def read(self, n: int) -> bytes:
+        if not self.buf:
+            self.buf = self._more()
+        b, self.buf = self.buf[:n], self.buf[n:]
+        return b
+
+    def until(self, mark: bytes):
+        """What comes before `mark`, which is passed; None when the output ends
+        first (all of it is then left for rest()).  ValueError past
+        TRAILER_MAX bytes."""
+        data = self.buf
+        self.buf = b""
+        while True:
+            i = data.find(mark)
+            if i >= 0:
+                self.buf = data[i + len(mark):]
+                return data[:i]
+            if len(data) > TRAILER_MAX:
+                raise ValueError(f"this is not aht's copy (more than {_human(TRAILER_MAX)} "
+                                 "before its frames)")
+            b = self._more()
+            if not b:
+                self.buf = data
+                return None
+            data += b
+
+    def rest(self) -> bytes:
+        """All that is left; ValueError past TRAILER_MAX bytes."""
+        parts, self.buf = [self.buf], b""
+        n = len(parts[0])
+        while True:
+            if n > TRAILER_MAX:
+                raise ValueError(f"this is not aht's copy (an answer of more than "
+                                 f"{_human(TRAILER_MAX)})")
+            b = self._more()
+            if not b:
+                return b"".join(parts)
+            parts.append(b)
+            n += len(b)
+
+def _chain(*its):
+    for it in its:
+        yield from it
+
+def _read_exact(fh, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        b = fh.read(n - len(buf))
+        if not b:
+            raise StreamCut("the copy was cut off")
+        buf += b
+    return bytes(buf)
+
+def _skip_split(skip) -> tuple:
+    """rsync's exclude patterns as aht's copy reads them: (names, which match
+    in any folder; paths from the top, which begin with "/")."""
+    names, anchored = [], []
+    for p in skip or ():
+        p = str(p)
+        if p.startswith("/"):
+            anchored.append(p.strip("/"))
+        elif p.rstrip("/"):
+            names.append(p.rstrip("/"))
+    return names, anchored
+
+def _under(key: str, prefixes) -> bool:
+    return any(p and (key == p or key.startswith(p + "/")) for p in prefixes)
+
+def _only_match(key: str, only) -> bool:
+    """`only`: keys, or folders ending in "/" (the folder and all in it)."""
+    return any(key.startswith(o) or key == o[:-1] if o.endswith("/") else key == o
+               for o in only)
+
+def _rsync_pat(p: str) -> str:
+    """A key, or a folder ending in "/", as an rsync pattern from the top."""
+    return "/" + p.strip("/") + ("/***" if p.endswith("/") else "")
+
+def _rsync_only(only) -> dict:
+    """`only` for rsync: patterns where every entry is at the top (a missing
+    one is no error), else a list of names."""
+    if only is None:
+        return {}
+    if all("/" not in o.rstrip("/") for o in only):
+        return {"include": [_rsync_pat(o) for o in only]}
+    return {"files_from": [o.rstrip("/") for o in only]}
+
+def _no_stats(mover: str) -> dict:
+    return {"files": 0, "bytes": 0, "sent": 0, "received": 0, "deleted": 0, "ok": True,
+            "error": "", "transfer": mover, "problems": [], "skipped": []}
+
+def _plan_stats(plan: dict) -> dict:
+    """A plan counted the way rsync counts a dry run."""
+    return dict(_no_stats("aht"), files=len(plan["files"]),
+                bytes=sum(e["size"] for e in plan["files"]), deleted=len(plan["deletes"]))
+
+def _problems_text(problems: list) -> str:
+    return (f"{_n(len(problems), 'file')} could not be placed: "
+            + "; ".join(f"{p['name']} ({p['error']})" for p in problems[:5])
+            + (" …" if len(problems) > 5 else ""))
+
+def _placed_stats(res: dict, wire: dict) -> dict:
+    """`skipped`: files the sender found gone, or shorter, since the plan
+    (rsync's exit 24): no failure."""
+    probs = list(res.get("problems") or [])
+    return dict(_no_stats("aht"), files=res.get("files", 0), bytes=res.get("bytes", 0),
+                deleted=res.get("deleted", 0), set_aside=res.get("set_aside", 0),
+                sent=wire["sent"], received=wire["received"], problems=probs,
+                skipped=list(res.get("skipped") or []),
+                ok=not probs, error=_problems_text(probs) if probs else "")
+
+def _far_join(root: str, name: str) -> str:
+    return root.rstrip("/\\") + "/" + name
+
+def _top_only(only) -> bool:
+    return only is not None and all("/" not in o.rstrip("/") for o in only)
+
+def _merge_trees(parts: dict) -> dict:
+    """Manifests of some files and folders at the top of one folder ({name:
+    manifest}), as one manifest of that folder: a send of a few sessions'
+    file-history never lists all of it."""
+    m = {"files": {}, "raw": {}, "dirs": [], "modes": {}, "twins": {}}
+    for o, t in parts.items():
+        if t.get("file"):
+            for k in ("files", "raw", "modes"):
+                m[k].update(t.get(k) or {})
+            continue
+        pre = _nfc(o.rstrip("/")) + "/"
+        if t.get("files") or t.get("dirs"):
+            m["dirs"].append(pre[:-1])
+        m["files"].update({pre + k: v for k, v in (t.get("files") or {}).items()})
+        m["raw"].update({pre + k: pre + v for k, v in (t.get("raw") or {}).items()})
+        m["modes"].update({pre + k: v for k, v in (t.get("modes") or {}).items()})
+        m["dirs"] += [pre + d for d in t.get("dirs") or []]
+    return m
+
+def _local_tree(root: str, names: list, only=None) -> dict:
+    """tree_of `root`; with `only` all at the top, of just those."""
+    if not _top_only(only):
+        return tree_of(root, names)
+    return _merge_trees({o: tree_of(os.path.join(root, o.rstrip("/")), names) for o in only})
+
+def _plan_copy(src: dict, dst: dict, *, delete: bool = False, anchored=(), protect=(),
+               only=None, update: bool = False, add_only: bool = False,
+               keep_raw: bool = False) -> dict:
+    """What makes the folder of manifest `dst` like that of `src`: files and
+    links to write, each with what is there now (`expect`) and under the name
+    it already has there (a Mac's NFD); folders to make; with `delete`, what
+    to remove, never what `protect` names.  A new file gets the NFC name,
+    or with `keep_raw` (both sides one system) the sender's own, as rsync
+    does."""
+    only = [_nfc(o) for o in only] if only is not None else None
+    prot = [str(p).strip("/") for p in protect]
+    def wanted(k):
+        if k == PARTIAL or k.startswith(PARTIAL + "/") or _under(k, anchored):
+            return False
+        return only is None or _only_match(k, only)
+    sf, df = src.get("files") or {}, dst.get("files") or {}
+    sraw, draw = src.get("raw") or {}, dst.get("raw") or {}
+    files, links = [], []
+    for k in sorted(sf):
+        v, t = list(sf[k]), df.get(k)
+        t = list(t) if t is not None else None
+        if not wanted(k) or t == v:
+            continue
+        if t is not None and (add_only or (update and "l" not in (t[0], v[0])
+                                           and t[1] > v[1])):
+            continue
+        e = {"key": k, "src": sraw.get(k) or k, "expect": t,
+             "name": draw.get(k) or (sraw.get(k) if keep_raw else None) or k}
+        if v[0] == "l":
+            links.append(dict(e, link=v[1]))
+        else:
+            files.append(dict(e, size=v[0], mtime=v[1]))
+    sdirs, ddirs = set(src.get("dirs") or []), set(dst.get("dirs") or [])
+    deletes, rmdirs = [], []
+    if delete:
+        deletes = [{"key": k, "name": draw.get(k) or k, "expect": list(df[k])}
+                   for k in sorted(df) if k not in sf and wanted(k) and not _under(k, prot)]
+        rmdirs = sorted((d for d in ddirs - sdirs if wanted(d) and not _under(d, prot)
+                         and not any(_under(p, [d]) for p in prot)), reverse=True)
+    return {"files": files, "links": links,
+            "dirs": sorted(d for d in sdirs - ddirs if wanted(d)),
+            "deletes": deletes, "rmdirs": rmdirs}
+
+def _frame_meta(i: int, meta: dict) -> bytes:
+    b = json.dumps(meta).encode("utf-8")
+    return b"M" + struct.pack(">II", i, len(b)) + b
+
+def _frame_err(i: int, text: str, kind: bytes = b"X") -> bytes:
+    b = str(text).encode("utf-8")[:2000]
+    return kind + struct.pack(">II", i, len(b)) + b
+
+def _frame_skip(i: int, text: str) -> bytes:
+    """S: the file is gone, or shorter, since the plan: skipped, as rsync
+    skips a file that vanished."""
+    return _frame_err(i, text, b"S")
+
+FRAME_GONE = "it is not there any more"
+
+def _vanished(e: OSError) -> bool:
+    return isinstance(e, (FileNotFoundError, NotADirectoryError))
+
+def _file_frames(i: int, path: str, start: int, size: int, compress: bool, tick=None):
+    """One file from `start` to `size` as frames: F pieces, then E; S when it
+    is gone or got shorter; X when it cannot be read, also partway."""
+    h, left = hashlib.sha256(), size - start
+    try:
+        fh = open(path, "rb")
+    except OSError as e:
+        yield _frame_skip(i, FRAME_GONE) if _vanished(e) else \
+            _frame_err(i, f"cannot be read: {e.strerror or e}")
+        return
+    with fh:
+        while left > 0:
+            try:
+                if start:
+                    fh.seek(start)
+                    start = 0
+                chunk = fh.read(min(PIECE, left))
+            except OSError as e:
+                yield _frame_err(i, f"cannot be read: {e.strerror or e}")
+                return
+            if not chunk:
+                break
+            h.update(chunk)
+            left -= len(chunk)
+            data = zlib.compress(chunk, 1) if compress else chunk
+            yield b"F" + struct.pack(">IQ", i, len(data)) + data
+            if tick:
+                tick(len(chunk))
+    if left > 0:
+        yield _frame_skip(i, "it got shorter while it was read")
+        return
+    yield b"E" + struct.pack(">I", i) + h.digest()
+
+def _state(p: str):
+    """What is at `p` now, as a manifest has it: None, [size, mtime], ["l",
+    target]; "dir" or "other"."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            return ["l", os.readlink(p)]
+        except OSError:
+            return "other"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    return [st.st_size, int(st.st_mtime)] if stat.S_ISREG(st.st_mode) else "other"
+
+def _same_name(folder: str, part: str):
+    """The name in `folder` that is `part` in another Unicode form."""
+    want = _nfc(part)
+    try:
+        return next((n for n in os.listdir(folder) if _nfc(n) == want), None)
+    except OSError:
+        return None
+
+def _dest_path(root: str, real_root: str, name: str) -> str:
+    """Where `name` goes below `root`.  ValueError for an absolute name, a
+    drive, "..", and a name with a link, or a file, on its way, or whose
+    folder is not inside `root`.  A part that is there under another Unicode
+    form (a Mac's NFD) is used as it is there, so no twin appears."""
+    bad = ValueError(f"{name!r} is not a name inside the folder")
+    if not isinstance(name, str) or not name or "\0" in name or name[0] == "/":
+        raise bad
+    # a drive and a leading \ mean something only where Windows places it:
+    # elsewhere "c:notes.md" and "\x" are names like any other
+    if os.name == "nt" and (_is_abs(name) or name[0] == "\\"
+                            or re.match(r"[A-Za-z]:", name)):
+        raise bad
+    parts = re.split(r"[\\/]", name) if os.name == "nt" else name.split("/")
+    if any(x in ("", ".", "..") or (os.name == "nt" and ":" in x) for x in parts):
+        raise bad
+    cur = root
+    for j, x in enumerate(parts):
+        q = os.path.join(cur, x)
+        if not x.isascii() and not os.path.lexists(q):
+            q = os.path.join(cur, _same_name(cur, x) or x)
+        if j < len(parts) - 1:
+            if os.path.islink(q):
+                raise ValueError(f"the folder {x} on its way is a link")
+            if os.path.lexists(q) and not os.path.isdir(q):
+                raise ValueError(f"{x} on its way is not a folder")
+        cur = q
+    par = os.path.dirname(cur)
+    if os.path.isdir(par) and not _inside(os.path.realpath(par), real_root):
+        raise ValueError("its folder is outside the folder copied into")
+    return cur
+
+def _retry(fn, *a):
+    """fn(*a); on Windows a file another program holds open (or Defender
+    reads) is tried 5 more times, 0.2 s apart."""
+    for n in range(6):
+        try:
+            return fn(*a)
+        except PermissionError as e:
+            if os.name != "nt" or n == 5:
+                raise
+            log(f"COPY {a[-1] if a else ''} is in use ({e.strerror or e}); "
+                f"trying again ({n + 1}/5)")
+            time.sleep(0.2)
+
+def _move(src: str, dst: str) -> None:
+    try:
+        os.replace(src, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        shutil.move(src, dst)               # set aside on another disk
+
+def _put_aside(p: str, aside: str, name: str) -> str:
+    dst = os.path.join(aside, *name.replace("\\", "/").split("/"))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.lexists(dst):
+        stem, ext = os.path.splitext(dst)
+        n = 2
+        while os.path.lexists(f"{stem} {n}{ext}"):
+            n += 1
+        dst = f"{stem} {n}{ext}"
+    _retry(_move, p, dst)
+    return dst
+
+def _why(e) -> str:
+    if isinstance(e, PermissionError):
+        return f"in use or not allowed: {e.strerror or e}"
+    if isinstance(e, OSError):
+        return e.strerror or str(e)
+    return str(e)
+
+class _Partial:
+    """<root>/.aht-partial: the lock of one copy into `root`, and where its
+    files arrive before they are placed.  What a copy that was cut off left
+    there goes; the folder goes at the end."""
+    def __init__(self, root: str):
+        self.dir = os.path.join(root, PARTIAL)
+        self.lock = os.path.join(self.dir, ".lock")
+
+    def __enter__(self) -> str:
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        for _ in range(3):
+            try:
+                fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                try:
+                    pid = int(Path(self.lock).read_text().strip() or 0)
+                except (OSError, ValueError):
+                    pid = 0
+                if pid and pid != os.getpid() and _pid_alive(pid):
+                    raise HandoverError(f"another copy into {os.path.dirname(self.dir)} "
+                                        f"is running (pid {pid})")
+                try:
+                    os.unlink(self.lock)    # that copy was cut off
+                except OSError:
+                    pass
+                continue
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            break
+        else:
+            raise HandoverError(f"could not lock {self.dir}")
+        for n in os.listdir(self.dir):
+            if n != ".lock":
+                p = os.path.join(self.dir, n)
+                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.unlink(p)
+        return self.dir
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+def _place_entries(root: str, req: dict, inp=None, tick=None) -> dict:
+    """Place what a copy brings into `root` — the same on both ends.  `req`:
+    entries [{name, expect, size, mtime, mode, link, append_from, add}],
+    deletes [{name, expect}], rmdirs, dirs, aside, compress; `inp` the frames
+    (none: links and deletes only).  A file only replaces what the plan saw
+    there (`expect`), and what it replaces goes to `aside` first; an append
+    only goes onto a file of the planned size.  Problems are reported per
+    file, the rest goes on."""
+    root = os.path.abspath(str(root))
+    os.makedirs(root, exist_ok=True)
+    real = os.path.realpath(root)
+    aside = req.get("aside")
+    ents = list(req.get("entries") or [])
+    out = {"files": 0, "bytes": 0, "deleted": 0, "set_aside": 0, "problems": [],
+           "skipped": []}
+    settled = set()
+    def problem(i, e, why):
+        settled.add(i)
+        out["problems"].append({"name": e.get("key") or e.get("name"), "error": why})
+    with _Partial(root) as part:
+        for d in req.get("deletes") or []:
+            try:
+                p = _dest_path(root, real, d["name"])
+                cur = _state(p)
+                if cur is None:
+                    continue
+                if cur != d.get("expect"):
+                    raise ValueError("it changed since the copy was planned, so it stays")
+                if aside:
+                    _put_aside(p, aside, d["name"])
+                    out["set_aside"] += 1
+                else:
+                    _retry(os.unlink, p)
+                out["deleted"] += 1
+            except (ValueError, OSError) as e:
+                problem(None, d, _why(e))
+        for d in req.get("rmdirs") or []:
+            try:
+                os.rmdir(_dest_path(root, real, d))    # only an empty one
+            except (ValueError, OSError):
+                pass
+        for d in req.get("dirs") or []:
+            try:
+                os.makedirs(_dest_path(root, real, d), exist_ok=True)
+            except (ValueError, OSError) as e:
+                problem(None, {"name": d}, _why(e))
+        if inp is not None:
+            _receive(inp, ents, root, real, part, aside, bool(req.get("compress")),
+                     out, problem, settled, tick)
+        for i, e in enumerate(ents):        # links last
+            if i in settled:
+                continue
+            if e.get("link") is None:
+                problem(i, e, "it did not arrive")
+                continue
+            try:
+                _place_one(root, real, e, None, aside, out)
+                settled.add(i)
+            except (ValueError, OSError) as x:
+                problem(i, e, _why(x))
+    return out
+
+def _receive(inp, ents, root, real, part, aside, compress, out, problem, settled, tick):
+    """Read frames until Z, placing each file as it is complete."""
+    open_ = {}                              # index -> (file, sha256, path)
+    def slot(i):
+        if i not in open_:
+            tmp = os.path.join(part, str(i))
+            open_[i] = (open(tmp, "wb"), hashlib.sha256(), tmp)
+        return open_[i]
+    def drop(i):
+        fh, _h, tmp = open_.pop(i, (None, None, None))
+        if fh:
+            fh.close()
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    def index(i):
+        if i >= len(ents):
+            raise ValueError("this is not aht's copy (an unknown file)")
+        return i
+    def sized(kind, n, most):
+        if n > most:
+            raise ValueError(f"this is not aht's copy (an {kind.decode()} frame of "
+                             f"{n:,} bytes, where {most:,} is the most)")
+        return n
+    try:
+        while True:
+            kind = _read_exact(inp, 1)
+            if kind == b"Z":
+                return
+            if kind == b"M":
+                i, n = struct.unpack(">II", _read_exact(inp, 8))
+                meta = json.loads(_read_exact(inp, sized(kind, n, FRAME_META_MAX)).decode("utf-8"))
+                ents[index(i)].update({k: meta[k] for k in
+                                       ("size", "mtime", "mode", "link", "append_from")
+                                       if k in meta})
+            elif kind == b"F":
+                i, n = struct.unpack(">IQ", _read_exact(inp, 12))
+                if n > PIECE_MAX:
+                    raise ValueError("this is not aht's copy (a piece too big)")
+                data = _read_exact(inp, n)
+                if compress:
+                    # never more than a piece in memory, however well it packs
+                    z = zlib.decompressobj()
+                    data = z.decompress(data, PIECE + 1)
+                    if z.unconsumed_tail or len(data) > PIECE:
+                        raise ValueError("this is not aht's copy (a piece that unpacks to "
+                                         f"more than {_human(PIECE)})")
+                    if not z.eof:
+                        raise ValueError("this is not aht's copy (a piece cut short)")
+                fh, h, _tmp = slot(index(i))
+                fh.write(data)
+                h.update(data)
+                if tick:
+                    tick(len(data))
+            elif kind == b"E":
+                (i,) = struct.unpack(">I", _read_exact(inp, 4))
+                digest = _read_exact(inp, 32)
+                fh, h, tmp = slot(index(i))
+                fh.close()
+                del open_[i]
+                e = ents[i]
+                if h.digest() != digest:
+                    problem(i, e, "it arrived damaged")
+                else:
+                    try:
+                        _place_one(root, real, e, tmp, aside, out)
+                        settled.add(i)
+                    except (ValueError, OSError) as x:
+                        problem(i, e, _why(x))
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            elif kind in (b"X", b"S"):
+                i, n = struct.unpack(">II", _read_exact(inp, 8))
+                why = _read_exact(inp, sized(kind, n, FRAME_NOTE_MAX)).decode("utf-8", "replace")
+                drop(index(i))
+                if kind == b"X":
+                    problem(i, ents[i], why)
+                else:                       # gone, or shorter, there: no failure
+                    settled.add(i)
+                    out["skipped"].append(ents[i].get("key") or ents[i].get("name"))
+            else:
+                raise ValueError("this is not aht's copy (an unknown frame)")
+    finally:
+        for i in list(open_):
+            drop(i)
+
+def _place_one(root, real, e, tmp, aside, out) -> None:
+    """One file (from `tmp`) or link into place, guarded by `expect`."""
+    p = _dest_path(root, real, e["name"])
+    cur = _state(p)
+    if e.get("add") and cur is not None:
+        return                              # add only: what is here stays
+    if e.get("append_from") is not None:
+        a = int(e["append_from"])
+        if not (isinstance(cur, list) and cur[0] != "l" and cur[0] == a
+                and (e.get("expect") is None or cur == e["expect"])):
+            raise ValueError("it changed since the copy was planned, so it stays")
+        with open(tmp, "rb") as src:
+            with _retry(open, p, "ab") as dst:
+                shutil.copyfileobj(src, dst)
+    else:
+        if cur != e.get("expect"):
+            raise ValueError("a folder is in the way" if cur == "dir" else
+                             "it changed since the copy was planned, so it stays")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        if not _inside(os.path.realpath(os.path.dirname(p)), real):
+            raise ValueError("its folder is outside the folder copied into")
+        mode, old = e.get("mode"), None
+        if e.get("link") is not None:
+            tmp = os.path.join(root, PARTIAL, f"link-{os.urandom(4).hex()}")
+            os.symlink(e["link"], tmp)
+        if cur is not None:
+            if mode is None and cur[0] != "l":
+                try:
+                    mode = stat.S_IMODE(os.stat(p).st_mode)
+                except OSError:
+                    pass
+            if aside:
+                old = _put_aside(p, aside, e["name"])
+        try:
+            _retry(os.replace, tmp, p)
+        except OSError:
+            if old:                         # the old one goes back where it was
+                try:
+                    _move(old, p)
+                except OSError:
+                    pass
+            raise
+        if old:
+            out["set_aside"] += 1
+        if e.get("link") is not None:
+            return
+        if mode is not None and os.name != "nt":
+            os.chmod(p, mode & 0o7777)
+    if e.get("mtime") is not None:
+        os.utime(p, (e["mtime"], e["mtime"]))
+    out["files"] += 1
+    out["bytes"] += int(e.get("size") or 0)
+
+def _agent_pack(req: dict, inp, out) -> dict:
+    """aht's own copy, the sending end on this machine: the files named in
+    `entries` ({src, prefix}) below `root`, as frames after the BIN mark.
+    With `prefix` [size, sha256]: when this file begins with those bytes,
+    only the rest goes."""
+    root = str(req.get("root") or "")
+    real = os.path.realpath(root)
+    comp = bool(req.get("compress"))
+    out.write(BIN_MARK)
+    for i, e in enumerate(req.get("entries") or []):
+        try:
+            p = _dest_path(root, real, e.get("src") or "")
+            st = os.lstat(p)
+        except (ValueError, OSError) as x:
+            out.write(_frame_skip(i, FRAME_GONE) if isinstance(x, OSError) and _vanished(x)
+                      else _frame_err(i, _why(x)))
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                out.write(_frame_meta(i, {"link": os.readlink(p)}))
+            except OSError as x:
+                out.write(_frame_skip(i, FRAME_GONE) if _vanished(x) else _frame_err(i, _why(x)))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            out.write(_frame_err(i, "it is not a file"))
+            continue
+        meta = {"size": st.st_size, "mtime": int(st.st_mtime)}
+        if os.name != "nt":
+            meta["mode"] = stat.S_IMODE(st.st_mode)
+        pre = e.get("prefix")
+        try:
+            if pre and 0 < int(pre[0]) < st.st_size and file_sha256(p, int(pre[0])) == pre[1]:
+                meta["append_from"] = int(pre[0])
+        except OSError:
+            pass
+        out.write(_frame_meta(i, meta))
+        for fr in _file_frames(i, p, meta.get("append_from") or 0, st.st_size, comp):
+            out.write(fr)
+    out.write(b"Z")
+    out.flush()
+    return {"ok": True}
+
+def _agent_unpack(req: dict, inp, out) -> dict:
+    """aht's own copy, the receiving end on this machine (_place_entries)."""
+    root = str(req.get("root") or "")
+    if not _is_abs(root):
+        return {"ok": False, "error": "no folder to copy into"}
+    return dict(_place_entries(root, req, inp), ok=True)
+
+STREAM_OPS = {"pack": _agent_pack, "unpack": _agent_unpack}
+
 def remotes_config() -> dict:
     r = cfg_get("remotes") or {}
     return r if isinstance(r, dict) else {}
@@ -5250,7 +6315,7 @@ def _agent_probe(req: dict) -> dict:
             "logged_in": (claude_home() / ".credentials.json").is_file()
             if not IS_MAC else None,     # macOS keeps the login in the keychain
             "sessions_open": len(running_sessions()),
-            "protocol": AGENT_PROTOCOL, "ops": sorted(AGENT_OPS),
+            "protocol": AGENT_PROTOCOL, "ops": sorted(set(AGENT_OPS) | set(STREAM_OPS)),
             "core_id": _quiet_value(core_id),
             "machine_id": machine_id(create=False),
             "aht_there": _aht_there(),
@@ -5326,10 +6391,13 @@ def _agent_manifest(req: dict) -> dict:
     return {"ok": True, "trees": out}
 
 def _agent_hash(req: dict) -> dict:
+    """sha256 of files here; `limit`: of their first bytes; `norm` (for all,
+    or per file): CRLF read as LF."""
     out = {}
     for f in req.get("files") or []:
         try:
-            out[f["key"]] = file_sha256(f["path"], f.get("limit"))
+            out[f["key"]] = file_sha256(f["path"], f.get("limit"),
+                                        bool(f.get("norm", req.get("norm"))))
         except OSError:
             out[f["key"]] = None
     return {"ok": True, "hashes": out}
@@ -5902,15 +6970,28 @@ def cmd_core(args):
     return 0
 
 def cmd_agent(args):
+    """The far end of every question: a request as JSON on stdin, the answer
+    after AGENT_MARK on stdout.  pack and unpack (aht's own copy) read the
+    request's first line and then frames, as bytes."""
+    inp, out = sys.stdin.buffer, sys.stdout.buffer
     try:
-        req = json.loads(sys.stdin.read() or "{}")
-        fn = AGENT_OPS.get(req.get("op"))
-        res = fn(req) if fn else {"ok": False,
-                                  "error": f"unknown operation {req.get('op')!r}"}
+        line = inp.readline()
+        try:
+            req = json.loads(line.decode("utf-8") or "{}")
+        except ValueError:
+            req = json.loads((line + inp.read()).decode("utf-8") or "{}")
+        op = req.get("op")
+        if op in STREAM_OPS:
+            res = STREAM_OPS[op](req, inp, out)
+        else:
+            fn = AGENT_OPS.get(op)
+            res = fn(req) if fn else {"ok": False, "error": f"unknown operation {op!r}"}
     except Exception as e:
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         error(f"AGENT {e}")
-    sys.stdout.write("\n" + AGENT_MARK + json.dumps(res) + "\n")
+    sys.stdout.flush()
+    out.write(("\n" + AGENT_MARK + json.dumps(res) + "\n").encode("utf-8"))
+    out.flush()
     return 0
 
 # ---- what a session knew: carried in a readable form ------------------------ #
@@ -6384,7 +7465,7 @@ def session_title(store, sid) -> str:
 _SLUG_RE = re.compile(rb'"slug"\s*:\s*"([A-Za-z0-9._-]{1,120})"')
 
 def _plans_of(store) -> list:
-    """rsync patterns for the plan files this project's sessions wrote."""
+    """The names of the plan files this project's sessions wrote."""
     slugs = set()
     for f in Path(store).glob("*.jsonl") if store else []:
         try:
@@ -6394,7 +7475,7 @@ def _plans_of(store) -> list:
                         slugs.update(m.decode() for m in _SLUG_RE.findall(line))
         except OSError:
             continue
-    return [f"/{s}.md" for s in sorted(slugs)]
+    return [f"{s}.md" for s in sorted(slugs)]
 
 def _extras(entry: dict) -> list:
     return [p for p in (entry.get("extras") or []) if os.path.exists(p)]
@@ -6435,38 +7516,39 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
                   copy_note={"path": rpath, "uuid": uid, "from": _here(),
                              "from_id": machine_id(create=True),
                              "kind": "sync" if sync else "handover", "attempt": attempt})
-    res["project"] = rem.rsync(real + "/", rem.spec(rpath + "/"), delete=True,
-                               backup_dir=aside + "/project",
-                               skip=handover_skip() + ([RELAYS_REL] if sync else []),
-                               protect=() if sync else (RELAYS_REL + "***",),
-                               dry=dry, progress=progress)
+    res["project"] = rem.send(real, rpath, delete=True, aside=aside + "/project",
+                              skip=handover_skip() + ([RELAYS_REL] if sync else []),
+                              protect=() if sync else (RELAYS_REL[1:],),
+                              dry=dry, progress=progress)
     if not res["project"]["ok"]:
         raise HandoverError("sending the project failed: " + res["project"]["error"])
     if store:
         rkey = _key_claude(rpath)
-        res["history"] = rem.rsync(str(store) + "/",
-                                   rem.spec(f"{rclaude}/projects/{rkey}/"),
-                                   backup_dir=aside + "/history", dry=dry)
+        res["history"] = rem.send(str(store), f"{rclaude}/projects/{rkey}",
+                                  aside=aside + "/history", dry=dry)
         if not res["history"]["ok"]:
             raise HandoverError("sending the history failed: " + res["history"]["error"])
         side = [(claude_home() / "file-history", "file-history",
-                 [f"/{s}/***" for s in sids
+                 [f"{s}/" for s in sids
                   if (claude_home() / "file-history" / s).is_dir()]),
                 (claude_home() / "plans", "plans",
                  _plans_of(store) if (claude_home() / "plans").is_dir() else [])]
         for src, sub, inc in side:
             if inc:
-                r = rem.rsync(str(src) + "/", rem.spec(f"{rclaude}/{sub}/"),
-                              include=inc, backup_dir=f"{aside}/{sub}", dry=dry)
+                r = rem.send(str(src), f"{rclaude}/{sub}", only=inc,
+                             aside=f"{aside}/{sub}", dry=dry)
                 res["history"]["bytes"] = res["history"].get("bytes", 0) + r.get("bytes", 0)
     for p in _extras(entry):
         isdir = os.path.isdir(p)
         if not dry:
             rem.agent("prepare", dirs=[rem.path(p) if isdir
                                        else os.path.dirname(rem.path(p))])
-        r = rem.rsync(p + ("/" if isdir else ""), rem.spec(rem.path(p) + ("/" if isdir else "")),
-                      backup_dir=aside + "/extras", skip=handover_skip(),
-                      dry=dry, progress=progress)
+        # a file goes as the one name of its folder
+        here, there = (p, rem.path(p)) if isdir else \
+            (os.path.dirname(p), os.path.dirname(rem.path(p)))
+        r = rem.send(here, there, only=None if isdir else [os.path.basename(p)],
+                     aside=aside + "/extras", skip=handover_skip(), dry=dry,
+                     progress=progress)
         res["extras"].append({"path": p, **r})
     if not dry:
         try:
@@ -7482,9 +8564,13 @@ def cmd_handover(args):
             out["blockers"].append(f"something is running in this folder on {rem.name}: "
                                    + ", ".join(sorted({p["name"] for p in info["processes"]})))
         tools = info.get("tools") or {}
-        for t in ("rsync", "tmux"):
+        mover = rem.transfer()
+        out["transfer"] = mover
+        for t in (("rsync",) if mover == "rsync" else ()) + ("tmux",):
             if not tools.get(t) and not (t == "tmux" and args.no_start):
-                out["blockers"].append(f"{t} is missing on {rem.name}")
+                out["blockers"].append(f"{t} is missing on {rem.name}"
+                                       + (" (handover_transfer is rsync)" if t == "rsync"
+                                          else ""))
         mine = find_claude()
         here_ver = claude_version(mine) if mine else None
         out["claude"] = {"here": here_ver, "there": info.get("claude_version")}
@@ -7601,7 +8687,7 @@ def cmd_handover(args):
                 "driven_by": "here", "path": real, "remote_path": rem.path(real),
                 "since": _now(), "agent": "claude", "session": sid,
                 "window": _mux_name(real, uid), "mux": "byobu" if tools.get("byobu") else "tmux",
-                "relay": None, "task": args.task, "claude": here_ver, "transfer": "rsync"}
+                "relay": None, "task": args.task, "claude": here_ver, "transfer": mover}
         if rem.sandbox:
             away["mux"] = "tmux"            # a tmux server of its own
         with ProjectLock(uid):
@@ -7830,8 +8916,8 @@ def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
     fetch = [k for k in incoming if k not in clash]
     if fetch:
         aside.mkdir(parents=True, exist_ok=True)
-        r = rem.rsync(rem.spec(src + "/"), dst + "/", files_from=[name(k) for k in fetch],
-                      backup_dir=str(aside), skip=skip, progress=progress)
+        r = rem.fetch(src, dst, entries={k: name(k) for k in fetch}, aside=str(aside),
+                      skip=skip, progress=progress)
         if not r["ok"]:
             raise HandoverError("fetching the changes failed: " + r["error"])
         done["updated"] = len([k for k in plan["take"] if k not in clash])
@@ -7850,8 +8936,7 @@ def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
         for i, keys in enumerate(groups):
             box = inc / str(i)
             box.mkdir(parents=True, exist_ok=True)
-            r = rem.rsync(rem.spec(src + "/"), str(box) + "/",
-                          files_from=[name(k) for k in keys], skip=skip)
+            r = rem.fetch(src, str(box), entries={k: name(k) for k in keys}, skip=skip)
             if not r["ok"]:
                 raise HandoverError("fetching the conflicting files failed: " + r["error"])
             for k in keys:
@@ -7879,7 +8964,7 @@ def _changed_there(uid: str, entry: dict) -> dict:
     away, real = entry.get("away") or {}, entry["real_path"]
     store = _store_of(real)
     sids = _sessions_of(store)
-    plans = [p[1:] for p in _plans_of(store)]
+    plans = _plans_of(store)
     try:
         base = json.loads((handover_dir(uid) / "manifest.json").read_text())
         if base.get("attempt") != away.get("attempt"):
@@ -8311,19 +9396,22 @@ def cmd_reclaim(args):
                                          there, True, [], False,
                                          ours["history"]["files"], made_there("history"))
             sids = _sessions_of(store)
-            for sub, inc in (("file-history", [f"/{s}/***" for s in sids]),
+            for sub, inc in (("file-history", [f"{s}/" for s in sids]),
                              ("plans", _plans_of(store))):
                 if inc:
                     (claude_home() / sub).mkdir(parents=True, exist_ok=True)
-                    rem.rsync(rem.spec(f"{info['claude_home']}/{sub}/"),
-                              str(claude_home() / sub) + "/", include=inc, update=True,
-                              backup_dir=str(aside / sub))
+                    r = rem.fetch(f"{info['claude_home']}/{sub}", str(claude_home() / sub),
+                                  only=inc, update=True, aside=str(aside / sub))
+                    if not r["ok"]:
+                        out["warnings"].append(f"{sub} did not all come back: {r['error']}")
             for p in _extras(entry):
                 isdir = os.path.isdir(p)
-                r = rem.rsync(rem.spec(rem.path(p) + ("/" if isdir else "")),
-                              p + ("/" if isdir else ""), update=True,
-                              backup_dir=str(aside / "extras" / os.path.basename(p)),
-                              skip=handover_skip())
+                # (not `there`: that names the machine, in `returned` below)
+                far_dir, near_dir = (rem.path(p), p) if isdir else \
+                    (os.path.dirname(rem.path(p)), os.path.dirname(p))
+                r = rem.fetch(far_dir, near_dir, only=None if isdir else [os.path.basename(p)],
+                              update=True, skip=handover_skip(),
+                              aside=str(aside / "extras" / os.path.basename(p)))
                 if not r["ok"]:
                     out["warnings"].append(f"{p} did not come back: {r['error']}")
             out["done"] = done
@@ -8531,11 +9619,22 @@ def remote_checks(rem: Remote, info: dict) -> list:
         rows.append({"check": name, "ok": bool(ok), "detail": str(detail),
                      "needed": needed and sends, "group": "handover",
                      **({"fix": fix} if fix and not ok else {})})
-    if os.name != "nt":                 # aht's own copy comes for Windows later
+    # what copies the files: rsync where both sides have it (and neither is
+    # Windows), else aht's own copy, which needs nothing more.  rsync is then
+    # optional: it makes big changes faster
+    mover, forced = rem.transfer(), transfer_setting() == "rsync"
+    rows.append({"check": "copies files with", "key": "transfer", "transfer": mover,
+                 "ok": True, "needed": False, "group": "handover",
+                 "detail": f"rsync {rs.get('version')}" if mover == "rsync"
+                 else "aht's own copy" + ("" if os.name == "nt" or forced else
+                                          " (with rsync 3 here and any rsync there, "
+                                          "rsync moves big changes faster)")})
+    if os.name != "nt":                 # Windows has no rsync: aht's own copy
         ck("rsync on this machine", rs, rs.get("version") or "missing",
-           "here:  brew install rsync" if IS_MAC else "here:  install rsync 3")
-    ck("rsync there", tools.get("rsync"), tools.get("rsync") or "missing",
-       f"{get} rsync")
+           "here:  brew install rsync" if IS_MAC else "here:  install rsync 3",
+           needed=forced)
+        ck("rsync there", tools.get("rsync"), tools.get("rsync") or "missing",
+           f"{get} rsync", needed=forced)
     ck("tmux there", tools.get("tmux"), tools.get("byobu") or tools.get("tmux")
        or "missing", f"{get} tmux")
     there = rem.agent("probe", path=None if os.name == "nt" else rem.path(home),
@@ -8749,11 +9848,11 @@ def cmd_remote(args):
                 info = rem.connect()
                 rows = remote_checks(rem, info)
                 results.append({"remote": rem.name, "target": rem.target, "checks": rows,
-                                "system": info.get("system"),
+                                "system": info.get("system"), "transfer": rem.transfer(),
                                 "ok": all(c["ok"] for c in rows if c["needed"])})
                 _remember_system(rem.name, info.get("system"))
             except HandoverError as e:
-                results.append({"remote": n, "ok": False, "error": str(e),
+                results.append({"remote": n, "ok": False, "error": str(e), "transfer": None,
                                 "target": rem.target if rem else None,
                                 "checks": _reach_rows(rem, err=str(e)) if rem else [],
                                 "system": rem.system if rem else None})
@@ -14642,13 +15741,12 @@ def offsite_push() -> dict:
     there = f"{rem.info['home']}/.aht/offsite/{mid}/backups"
     missing = sorted(k for k in mine if k not in theirs)
     res = {"machine": rem.name, "folder": mid, "files": 0, "bytes": 0, "pulled": False,
-           "adopted": len(adopted), "removed": 0,
+           "adopted": len(adopted), "removed": 0, "transfer": rem.transfer(),
            "differs": sorted(k for k in mine if k in theirs and theirs[k] != mine[k]),
            "legacy": [f["folder"] for f in got["folders"] if f["legacy"]
                       and (f["files"] or f["bytes"]) and not (take_over and f["folder"] == me)]}
     if missing:
-        r = rem.rsync(str(here) + "/", rem.spec(there + "/"), files_from=missing,
-                      add_only=True)
+        r = rem.send(str(here), there, only=missing, add_only=True)
         if not r["ok"]:
             raise HandoverError("copying the backups failed: " + r["error"])
         sent.update({k: mine[k] for k in missing})
@@ -14739,19 +15837,24 @@ def offsite_fetch(source: str = None) -> dict:
     other = sorted(k for k in theirs if k in mine and mine[k] != theirs[k])
     there = f"{info['home']}/.aht/offsite/{folder}/backups"
     res = {"machine": rem.name, "from": {"id": src["id"], "name": src["name"]},
-           "files": 0, "bytes": 0, "pulled": True, "renamed": []}
+           "files": 0, "bytes": 0, "pulled": True, "renamed": [], "problems": [],
+           "transfer": rem.transfer()}
     if new:
-        r = rem.rsync(rem.spec(there + "/"), str(here) + "/", files_from=new, add_only=True)
-        if not r["ok"]:
+        r = rem.fetch(there, str(here), entries=new, add_only=True)
+        if not r["ok"] and not r.get("problems"):
             raise HandoverError("fetching the backups failed: " + r["error"])
+        res["problems"] += r.get("problems") or []
+        new = [k for k in new if k not in {p["name"] for p in r.get("problems") or []}
+               and k not in set(r.get("skipped") or [])]      # gone there meanwhile
     if other:
         # the same name, another size: both are kept, theirs under its own name
         inc = aht_home() / "run" / f"offsite-in-{os.urandom(3).hex()}"
         inc.mkdir(parents=True)
         try:
-            r = rem.rsync(rem.spec(there + "/"), str(inc) + "/", files_from=other)
-            if not r["ok"]:
+            r = rem.fetch(there, str(inc), entries=other)
+            if not r["ok"] and not r.get("problems"):
                 raise HandoverError("fetching the backups failed: " + r["error"])
+            res["problems"] += r.get("problems") or []
             tag = re.sub(r"[^A-Za-z0-9._-]+", "-", src["name"]).strip("-") or "elsewhere"
             for k in other:
                 proj, fname = k.split("/", 1)
@@ -14776,8 +15879,9 @@ def offsite_fetch(source: str = None) -> dict:
 
 def _spawn_offsite() -> None:
     try:
+        # aht's own copy moves files from every system: a PC copies too
         if os.environ.get("AHT_NO_MIRROR") or not cfg_get("offsite_backup") \
-                or not can_send_projects():
+                or not can_reach_machines():
             return
         _spawn_aht(["backup", "--offsite", "--quiet"])
     except Exception:

@@ -1,0 +1,21 @@
+{
+  "machine": "box",
+  "from": {
+    "id": "8e2c1d71d05b",
+    "name": "pc"
+  },
+  "files": 1,
+  "bytes": 13,
+  "pulled": true,
+  "renamed": [
+    "0f3a9c2e5b7d4e1f8a6b2c3d4e5f6a7b/20260105-000000-from-pc.zip"
+  ],
+  "problems": [
+    {
+      "name": "0f3a9c2e5b7d4e1f8a6b2c3d4e5f6a7b/20260104-000000.zip",
+      "error": "in use or not allowed: The process cannot access the file because it is being used by another process"
+    }
+  ],
+  "transfer": "aht",
+  "at": 1793031337.3
+}

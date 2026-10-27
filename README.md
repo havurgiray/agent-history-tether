@@ -100,7 +100,8 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Ask your other machines: add and check them, Watch, their sessions and notices, search everywhere | ✓ | ✓ | ✓ (asks Mac and Linux machines, over Windows' own ssh) |
 | Pick Up and Leave a Note: a project's context moves between machines, git moves the files | ✓ | ✓ | ✓ (the PC starts every exchange, with Mac and Linux machines) |
 | Be asked by your other machines | ✓ | ✓ | — (a PC is never asked, so it needs no ssh server) |
-| Handover, keep in sync, backups on another machine, night shift | ✓ | ✓ | — (not from Windows yet) |
+| Backups on another machine: copy them there, fetch them back | ✓ | ✓ | ✓ (to and from Mac and Linux machines) |
+| Handover, keep in sync, night shift | ✓ | ✓ | — (not from Windows yet) |
 | Stay awake while a handed-over agent works there (a closed lid still sleeps) | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or the GNOME desktop's own inhibitor (`gnome-session-inhibit`) where ssh sessions may not use it) | — |
 | Notices (waiting for you, done, usage limit, new version) | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
@@ -109,16 +110,17 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 
 A Windows PC asks; it is never asked.  From a PC, aht adds and checks
 your Mac and Linux machines, watches them, shows their sessions, searches
-them, picks up their work and leaves notes on them; it cannot hand a
-project over yet.  The guide's *A Windows
-PC with your other machines* says how to set up the keys.
+them, picks up their work, leaves notes on them and keeps a copy of its
+backups on one of them; it cannot hand a project over yet.  The guide's
+*A Windows PC with your other machines* says how to set up the keys.
 
 CI runs the whole test suite on Linux and macOS for every push, including
 aht's window (its doors, its page and a command through it), and on real
 Windows it smoke-tests the exe: moves and relinks, the watcher, backups,
 search, journal, report, share, secrets, rules, loose ends, undo, tidy,
-setup and the window.  The window's pages were tried in a browser on a
-Mac and on Windows 11; on Linux, `linux/tests/vm_check.sh` checks its server
+setup and the window; it also runs aht's own file copy there, from source
+and with the exe as the far end, on x64 and ARM64.  The window's pages
+were tried in a browser on a Mac and on Windows 11; on Linux, `linux/tests/vm_check.sh` checks its server
 on a real machine.
 
 ## Install
@@ -245,10 +247,11 @@ folder (delete it yourself — a running exe can't remove itself).
 Hand a project to another machine of yours — say an always-on box at home —
 keep working on it there over ssh or from your phone, and take it back later.
 The files, the agent's history and the session itself move; nothing is
-installed on the other machine but what it needs anyway (python3, rsync 3,
-tmux or byobu, the agent CLI).  macOS and Linux, Claude Code sessions for now;
-aht cannot ask a Windows PC yet (`aht remote add` and `aht remote check` stop
-after one harmless `echo` there, and make nothing on it).
+installed on the other machine but what it needs anyway (python3, tmux or
+byobu, the agent CLI); rsync 3 is optional: it makes big changes faster.
+macOS and Linux, Claude Code sessions for now; aht cannot ask a Windows
+PC yet (`aht remote add` and `aht remote check` stop after one harmless
+`echo` there, and make nothing on it).
 
 ```sh
 aht remote discover                      # machines of your network that qualify
@@ -286,7 +289,8 @@ session is open in it, and a transfer shows its progress.
   `reclaim --stop` ends a session there only if it is idle.
 - **Keep in Sync** copies a project in the background (every
   `mirror_interval_minutes`) while the connection is good, so the handover
-  itself only sends the last changes.  Transfers are compressed (`rsync -z`).
+  itself only sends the last changes.  Transfers are compressed
+  (`handover_compress`).
   It looks before it overwrites: it compares the copy there with its list
   from the last sync, and pauses, sending nothing, when that copy was
   worked on (a file only touched does not count), when it would remove
@@ -324,6 +328,16 @@ session is open in it, and a transfer shows its progress.
   as a Mac's usually does, with the old one set aside; two names that
   differ only in case are both kept, one under the conflict name; and empty
   folders made there (a packed git repo's `refs`) come back too.
+- **What copies the files** (`handover_transfer`): rsync when this machine
+  has rsync 3, the other has rsync, and neither is Windows; otherwise
+  aht's own copy, which runs over the same ssh with nothing but python3
+  on the other machine.  It
+  sends each file in pieces of at most 1 MB, checks it on arrival and only
+  then puts it in place (a failed replace puts the old file back); a file
+  that only grew sends just its new end; what it replaces or removes is
+  set aside as above.  Against rsync it gives up the delta inside a big
+  changed file and resuming a half-sent one.  `aht remote check` says
+  which one each machine gets; `rsync` or `aht` forces one.
 - **A handover cut off halfway** (the link drops, this computer sleeps):
   aht notes the attempt before anything travels, and at its next check asks
   the other machine what happened — *Handover of api to box finished: the
@@ -646,8 +660,8 @@ Locations* page), `move_policy`, `copy_policy`,
 `backup_dir`, `linux_emblem_method` / `linux_agent_emblem` / `linux_git_emblem`;
 for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `mirror_interval_minutes`, `handover_excludes`, `handover_compress`,
-`handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
-`handover_mosh`, `handover_keep_awake`, `rsync_path`, `terminal_app`;
+`handover_transfer`, `handover_remote_control`, `handover_carry_trust`,
+`handover_claude_args`, `handover_mosh`, `handover_keep_awake`, `rsync_path`, `terminal_app`;
 notices and reports:
 `notify_waiting`, `notify_finished`, `notify_finished_minutes`,
 `notify_phone`, `notify_limit`, `session_corner`, `chimes` /
@@ -816,7 +830,11 @@ bus), so nothing it started is left running.
 The suites fake every agent's store via `AHT_ROOT_*` env overrides, so they
 never touch real agent data; the handover tests use a folder that stands in
 for the other machine, and a stand-in `ssh` (`tests/fake_ssh.py`) that can
-also answer like a Windows PC (they need rsync 3 and are skipped without it).
+also answer like a Windows PC.  The handover suite runs once with rsync and
+once with aht's own copy (only the latter where rsync 3 is missing);
+`tests/core_test.py --transport` runs just aht's own copy, also on Windows,
+and `windows/tests/agent_smoke.py` feeds aht's far end (`aht _agent`, from
+source or the exe) its copy requests on stdin, with no ssh.
 Switching agents runs against stand-in agents (`AHT_CLI_<AGENT>`):
 `tests/fake_codex.py` and `tests/fake_kimi.py` write sessions the way the
 real CLIs do, Claude Code, Antigravity and Mistral Vibe are stubs that only

@@ -1011,20 +1011,36 @@ func firstPick(_ folders: [OffsiteFolder]) -> String? {
 }
 
 /// How a fetch went, from `backup --fetch-offsite --from ID --json` (or what
-/// aht said instead of its JSON).
+/// aht said instead of its JSON). Files that could not come are in its
+/// `problems`, and the run then ends with 1: what did arrive still counts.
 func fetchedText(_ d: [String: Any]?, _ f: OffsiteFolder, said: String) -> String {
     guard let d = d, !(d["error"] is String) else {
         let why = (d?["error"] as? String ?? said).trimmingCharacters(in: .whitespacesAndNewlines)
         return "Nothing was fetched" + (why.isEmpty ? "; see the log (Settings)." : ": " + why)
     }
     let n = d["files"] as? Int ?? 0
+    let probs = (d["problems"] as? [[String: Any]]) ?? []
+    var notCame = ""
+    if !probs.isEmpty {
+        notCame = "\n\n" + (probs.count == 1 ? "This file" : "These \(probs.count) files")
+            + " could not come:\n" + probs.prefix(10).map {
+                "• \($0["name"] as? String ?? "?") — \($0["error"] as? String ?? "no reason given")"
+            }.joined(separator: "\n") + (probs.count > 10 ? "\n… and \(probs.count - 10) more" : "")
+    }
+    if n == 0 && !probs.isEmpty { return "Nothing was fetched from \(f.name)'s folder." + notCame }
     if n == 0 { return "Nothing to fetch: every backup in \(f.name)'s folder is here already." }
     let renamed = ((d["renamed"] as? [String]) ?? []).filter { $0.hasSuffix(".zip") }.count
     return "Fetched \(n) backup(s), \(byteText(d["bytes"])), from \(f.name)'s folder. Nothing "
         + "here was replaced" + (renamed == 0 ? "." : "; \(renamed) differed from a backup of "
         + "the same name here and " + (renamed == 1 ? "sits" : "sit") + " next to it under a "
         + "new name.") + " Search finds the "
-        + "sessions in them, and Restore… on a result brings one back."
+        + "sessions in them, and Restore… on a result brings one back." + notCame
+}
+
+/// Whether a fetch that ended with 1 still answered with what it did: its
+/// JSON lists the files that could not come.
+func fetchAnswered(_ ok: Bool, _ d: [String: Any]?) -> Bool {
+    ok || d?["error"] is String || ((d?["problems"] as? [Any])?.isEmpty == false && d?["files"] != nil)
 }
 
 /// The adopt question's note on folders the user told aht to forget: the
@@ -1120,6 +1136,55 @@ func checkGroups(_ rows: [Check]) -> [(title: String, rows: [Check])] {
     guard rows.contains(where: { $0.group != nil }) else { return rows.isEmpty ? [] : [("", rows)] }
     let ask = rows.filter { $0.group == "ask" }, rest = rows.filter { $0.group != "ask" }
     return [("For asking", ask), ("For handing over", rest)].filter { !$0.1.isEmpty }
+}
+
+/// What copies files to and from another machine (`handover_transfer`):
+/// "auto" picks rsync where both machines have it and neither is Windows,
+/// else aht's own copy.
+let TRANSFER_CHOICES: [(String, String)] = [
+    ("auto", "rsync where both machines have it, else aht's own copy"),
+    ("rsync", "rsync"), ("aht", "aht's own copy")]
+func moverLabel(_ t: String) -> String { t == "aht" ? "aht's own copy" : t }
+
+/// What a check said copies files to and from a machine, under the setting
+/// it was asked with.
+struct Mover: Hashable {
+    let mode: String
+    let transfer: String
+}
+
+/// `remote check --json`'s `transfer` ("rsync" or "aht") for each machine
+/// that answered; none from an older core.
+func checkTransfers(_ d: [String: Any]) -> [String: String] {
+    var out: [String: String] = [:]
+    for r in (d["machines"] as? [[String: Any]]) ?? [] {
+        if let n = r["remote"] as? String, let t = r["transfer"] as? String, t == "rsync" || t == "aht" {
+            out[n] = t
+        }
+    }
+    return out
+}
+
+/// A row of the check that says it already (a core may give it as a row).
+func saysTransfer(_ c: Check) -> Bool { c.name.lowercased().hasPrefix("copies files") }
+
+/// The mover a machine gets: what its check said while the setting is the
+/// one it was asked under; else what is known here (Windows there, or no
+/// rsync 3 on this Mac, is aht's own copy). nil: rsync if the machine has
+/// it, which only asking it tells.
+func moverFor(_ mc: Machine, mode: String, hereRsync: String?, known: Mover?) -> String? {
+    if let k = known, k.mode == mode { return k.transfer }
+    if mode == "rsync" || mode == "aht" { return mode }
+    let major = Int((hereRsync ?? "").split(separator: ".").first ?? "") ?? 0
+    return mc.system == "Windows" || major < 3 ? "aht" : nil
+}
+
+/// "box: rsync · pc: aht's own copy", for every machine set up.
+func moversText(_ ms: [Machine], mode: String, hereRsync: String?, known: [String: Mover]) -> String {
+    ms.map { mc in
+        "\(mc.name): " + (moverFor(mc, mode: mode, hereRsync: hereRsync, known: known[mc.name])
+            .map(moverLabel) ?? "rsync if it has it, else aht's own copy")
+    }.joined(separator: " · ")
 }
 
 struct Backend: Identifiable, Hashable {
@@ -2128,6 +2193,7 @@ final class AppModel: ObservableObject {
     @Published var notes: [String: String] = [:]    // per project: how the last action went
     @Published var summaries: [String: String] = [:] // … and the summary a switch wrote
     @Published var checks: [String: [Check]] = [:]  // per machine
+    @Published var movers: [String: Mover] = [:]    // what each machine's check said copies files
     @Published var checkError: [String: String] = [:]
     @Published var adding: NewMachine?
     @Published var loginItem = FileManager.default.fileExists(atPath: TRAY_PLIST)
@@ -2278,6 +2344,20 @@ final class AppModel: ObservableObject {
     var canSearchEverywhere: Bool { canReach && !machines.isEmpty }
     /// The machine "Hand Over" and "Keep in Sync" go to.
     var machine: String? { handover["default_remote"] as? String }
+    /// handover_transfer: auto, rsync or aht.
+    var transferMode: String {
+        let t = text("handover_transfer", "auto")
+        return TRANSFER_CHOICES.contains { $0.0 == t } ? t : "auto"
+    }
+    /// Which mover each machine gets, as Settings says it.
+    var moversLine: String {
+        moversText(machines, mode: transferMode, hereRsync: handover["rsync"] as? String, known: movers)
+    }
+    /// What the machine's check said copies its files, while the setting is
+    /// still the one it was asked under.
+    func checkedMover(_ name: String) -> String? {
+        movers[name].flatMap { $0.mode == transferMode ? $0.transfer : nil }
+    }
     var backends: [Backend] {
         ((status["backends"] as? [[String: Any]]) ?? []).map {
             Backend(name: $0["name"] as? String ?? "?",
@@ -4003,8 +4083,9 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 guard self.offsite?.id == v.id else { return }
                 self.offsite?.fetching = false
-                // a failed run's JSON counts only when it says what went wrong
-                self.offsite?.result = fetchedText(r.ok || d?["error"] is String ? d : nil, f,
+                // a failed run's JSON counts only when it says what went wrong:
+                // its error, or the files that could not come (the rest came)
+                self.offsite?.result = fetchedText(fetchAnswered(r.ok, d) ? d : nil, f,
                                                    said: r.err)
             }
         }
@@ -4089,11 +4170,26 @@ final class AppModel: ObservableObject {
     }
 
     func check(_ m: Machine) {
+        let mode = transferMode
         busy("checking \(m.name)…") {
-            let (rows, error) = checkRows(ahtJSON(["remote", "check", m.name, "--json"]) ?? [:])
+            let d = ahtJSON(["remote", "check", m.name, "--json"]) ?? [:]
+            let (rows, error) = checkRows(d)
             DispatchQueue.main.async {
                 self.checks[m.name] = rows
                 self.checkError[m.name] = error
+                for (n, t) in checkTransfers(d) { self.movers[n] = Mover(mode: mode, transfer: t) }
+            }
+        }
+    }
+
+    /// Settings' Ask the Machines: each machine's check, for what copies its
+    /// files (rsync where it has it, under "auto").
+    func askMovers() {
+        let mode = transferMode
+        busy("asking the machines…") {
+            let d = ahtJSON(["remote", "check", "all", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                for (n, t) in checkTransfers(d) { self.movers[n] = Mover(mode: mode, transfer: t) }
             }
         }
     }
@@ -6852,6 +6948,12 @@ struct MachinesView: View {
                                 }
                                 ForEach(g.rows) { c in CheckRow(c: c) }
                             }
+                            // `transfer`: what copies files to and from it, unless a row says so
+                            if let t = m.checkedMover(mc.name),
+                               !(m.checks[mc.name] ?? []).contains(where: saysTransfer) {
+                                Text("Copies files with \(moverLabel(t)). Settings → Handover chooses which.")
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
                         }
                         .padding(6)
                     }
@@ -8074,6 +8176,28 @@ struct SettingsView: View {
                                "handover_mosh")
                         toggle("A folder trusted here is trusted on the other machine",
                                "handover_carry_trust")
+                        HStack {
+                            Text("Copies files with")
+                            Picker("", selection: Binding(get: { m.transferMode },
+                                                          set: { m.set("handover_transfer", $0) })) {
+                                ForEach(TRANSFER_CHOICES, id: \.0) { Text($0.1).tag($0.0) }
+                            }
+                            .labelsHidden().fixedSize()
+                            Spacer()
+                            if !m.machines.isEmpty {
+                                Button("Ask the Machines") { m.askMovers() }
+                                    .disabled(!m.canReach || m.working != nil)
+                                    .help("Ask each machine whether it has rsync")
+                            }
+                        }
+                        if !m.machines.isEmpty {
+                            Text(m.moversLine).font(.caption).foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text("rsync sends only the changed parts of a big file. aht's own copy "
+                             + "needs nothing installed and also copies to and from Windows.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -9700,7 +9824,22 @@ if CommandLine.arguments.contains("--selftest") {
         && fetched.hasPrefix("Fetched 5 backup(s)") && fetched.contains("; 1 differed")
         && fetchedText(nil, listed[1], said: "box did not answer\n")
             == "Nothing was fetched: box did not answer"
+    // a fetch that ends with 1 over some files: what came counts, each file that
+    // did not is named; none came: nothing was fetched
+    let fetchBad = ["name": "p1/20261019-0900.zip", "error": "in use or not allowed"]
+    let fetchPartial: [String: Any] = ["machine": "box", "files": 2, "bytes": 4096, "pulled": true,
+                                  "renamed": [String](), "problems": [fetchBad]]
+    let fetchPartly = fetchedText(fetchAnswered(false, fetchPartial) ? fetchPartial : nil, listed[1], said: "")
+    let fetchNone: [String: Any] = ["machine": "box", "files": 0, "bytes": 0, "pulled": true,
+                                   "renamed": [String](), "problems": [fetchBad, fetchBad]]
+    let fetchNoneText = fetchedText(fetchAnswered(false, fetchNone) ? fetchNone : nil, listed[1], said: "")
+    let fetchPartialOK = fetchPartly.hasPrefix("Fetched 2 backup(s)")
+        && fetchPartly.hasSuffix("\n\nThis file could not come:\n• p1/20261019-0900.zip — in use or not allowed")
+        && fetchNoneText.hasPrefix("Nothing was fetched from old-mac's folder.\n\nThese 2 files could not come:\n• p1/")
+        && !fetchAnswered(false, ["machine": "box", "files": 1, "problems": [Any]()])
+        && !fetchAnswered(false, nil) && fetchAnswered(true, nil)
     print("BACKUPS FROM ANOTHER MACHINE \(offsiteOK ? "OK" : "FAIL")")
+    print("SOME BACKUPS NOT FETCHED \(fetchPartialOK ? "OK" : "FAIL — \(fetchPartly) / \(fetchNoneText)")")
     // agents on one machine: agy in the menu (`status --json`'s `agent_clis`),
     // an open relay (`projects --json`'s `relay`) as the line under the
     // project with Hand Back first, the switch dialog from `switch --json`
@@ -10814,6 +10953,80 @@ if CommandLine.arguments.contains("--selftest") {
         print("PHASE 5 SAMPLES not checked (" + (dir5.isEmpty ? "AHT_FIXTURES_PHASE5 names no folder"
                                                        : "no samples in \(dir5) yet") + ")")
     }
+    // Phase 6: what copies files to and from each machine (`handover_transfer`,
+    // and `remote check --json`'s `transfer`), as Settings and Machines say it
+    let ms6 = machinesFrom(["box": ["ssh": "me@box", "system": "Linux"], "pc": ["ssh": "me@pc", "system": "Windows"],
+                            "studio": ["ssh": "me@studio", "system": "Darwin"]])
+    let said6 = checkTransfers(["machines": [["remote": "box", "transfer": "rsync", "checks": [Any]()],
+                                             ["remote": "studio", "transfer": "aht"],
+                                             ["remote": "mini", "error": "cannot reach mini"],
+                                             ["remote": "odd", "transfer": "scp"]]])
+    let known6 = said6.mapValues { Mover(mode: "auto", transfer: $0) }
+    let unasked6 = moversText(ms6, mode: "auto", hereRsync: "3.2.7", known: [:])
+    let asked6 = moversText(ms6, mode: "auto", hereRsync: "3.2.7", known: known6)
+    let aht6 = moversText(ms6, mode: "aht", hereRsync: "3.2.7", known: known6)
+    let rsync6 = moversText(ms6, mode: "rsync", hereRsync: "3.2.7", known: known6)
+    let none6 = moversText(ms6, mode: "auto", hereRsync: nil, known: [:])
+    let am6 = AppModel()
+    am6.demo = true
+    am6.status = ["handover": ["supported": true, "rsync": "3.2.7",
+                               "remotes": ["box": ["ssh": "me@box", "system": "Linux"]]]]
+    am6.movers = ["box": Mover(mode: "auto", transfer: "aht")]
+    am6.config = ["handover_transfer": "rsync"]
+    let forced6 = (am6.transferMode, am6.checkedMover("box"), am6.moversLine)
+    am6.config = ["handover_transfer": "zip"]
+    let odd6 = (am6.transferMode, am6.checkedMover("box"), am6.moversLine)
+    let transferOK = said6 == ["box": "rsync", "studio": "aht"]
+        && unasked6 == "box: rsync if it has it, else aht's own copy · pc: aht's own copy · studio: rsync if it has it, else aht's own copy"
+        && asked6 == "box: rsync · pc: aht's own copy · studio: aht's own copy"
+        && aht6 == "box: aht's own copy · pc: aht's own copy · studio: aht's own copy"
+        && rsync6 == "box: rsync · pc: rsync · studio: rsync"
+        && none6 == aht6 && moversText(ms6, mode: "auto", hereRsync: "2.6.9", known: [:]) == aht6
+        && saysTransfer(Check(name: "copies files with", ok: true, needed: false, detail: "rsync", fix: nil))
+        && TRANSFER_CHOICES.map { $0.0 } == ["auto", "rsync", "aht"]
+        && forced6.0 == "rsync" && forced6.1 == nil && forced6.2 == "box: rsync"
+        && odd6.0 == "auto" && odd6.1 == "aht" && odd6.2 == "box: aht's own copy"
+    print("COPIES FILES WITH \(transferOK ? "OK" : "FAIL — \(said6) / \(unasked6) / \(asked6) / \(rsync6) / \(forced6) / \(odd6)")")
+    // … and the core's phase-6 samples: AHT_FIXTURES_PHASE6 (remote_check*.json)
+    var phase6OK = true
+    let dir6 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE6"] ?? ""
+    let checks6 = ((try? FileManager.default.contentsOfDirectory(atPath: dir6)) ?? [])
+        .filter { $0.hasPrefix("remote_check") && $0.hasSuffix(".json") }.sorted()
+    if !dir6.isEmpty && !checks6.isEmpty {
+        var miss: [String] = []
+        for n in checks6 {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir6).appendingPathComponent(n))
+            guard let d = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] else {
+                miss.append(n + " (not JSON)")
+                continue
+            }
+            // every machine that answered says what copies its files
+            let answered = ((d["machines"] as? [[String: Any]]) ?? [])
+                .filter { $0["error"] == nil || $0["error"] is NSNull }.compactMap { $0["remote"] as? String }
+            let got = checkTransfers(d)
+            if answered.isEmpty || answered.contains(where: { got[$0] == nil }) { miss.append(n + " (transfer)") }
+            if checkRows(d).rows.isEmpty { miss.append(n + " (checks)") }
+        }
+        // a fetch that ended with 1 over some files (`problems`): the rest came
+        let fetch6 = URL(fileURLWithPath: dir6).appendingPathComponent("backup_fetch_offsite.json")
+        if let data = try? Data(contentsOf: fetch6) {
+            let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let n = d?["files"] as? Int ?? 0
+            let probs = (d?["problems"] as? [[String: Any]]) ?? []
+            let f = OffsiteFolder(id: "x", name: "pc", system: "Windows", updated: nil, projects: 1,
+                                  files: 1, bytes: 1, mine: false, legacy: false)
+            let said = fetchedText(fetchAnswered(false, d) ? d : nil, f, said: "")
+            if probs.isEmpty || !said.hasPrefix(n == 0 ? "Nothing was fetched from" : "Fetched \(n) backup(s)")
+                || probs.prefix(10).contains(where: { !said.contains("• \($0["name"] as? String ?? "?") — ") }) {
+                miss.append("backup_fetch_offsite.json")
+            }
+        }
+        phase6OK = miss.isEmpty
+        print("PHASE 6 SAMPLES \(phase6OK ? "OK" : "FAIL \(miss)") — \(dir6)")
+    } else {
+        print("PHASE 6 SAMPLES not checked (" + (dir6.isEmpty ? "AHT_FIXTURES_PHASE6 names no folder"
+                                                       : "no remote_check samples in \(dir6) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -10848,10 +11061,10 @@ if CommandLine.arguments.contains("--selftest") {
     try? FileManager.default.removeItem(atPath: tmp)
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
-         && releaseOK && pauseOK && backOnOK && offsiteOK && relayOK && dialogOK && samplesOK
+         && releaseOK && pauseOK && backOnOK && offsiteOK && fetchPartialOK && relayOK && dialogOK && samplesOK
          && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
          && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK
-         && pause5OK && phase5OK ? 0 : 1)
+         && pause5OK && phase5OK && transferOK && phase6OK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -11075,6 +11288,31 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
             (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(se), searchMissed(se), searchAsked(se))
             snapshot(MainView().environmentObject(demo), dir + "/search-sample.png", NSSize(width: 900, height: 620))
         }
+        exit(0)
+    }
+    if args.contains("--transfer-only") {
+        // aht's own file copy: Settings' "Copies files with" with each
+        // machine's mover, and a machine's check that says it; made-up rows in
+        // the shape of the core's JSON. Nothing asks the core or another machine.
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 6", "tracked": 6, "hook_installed": true,
+                       "handover": ["supported": true, "can_reach": true, "default_remote": "box", "rsync": "3.2.7",
+                                    "remotes": ["box": ["ssh": "me@box", "system": "Linux"],
+                                                "pc": ["ssh": "me@pc", "system": "Windows"],
+                                                "studio": ["ssh": "me@studio.local", "system": "Darwin"]]]]
+        demo.config = ["handover_transfer": "auto", "offsite_backup": "box"]
+        let rc: [String: Any] = ["ok": true, "machines": [["remote": "box", "target": "me@box", "system": "Linux",
+            "ok": true, "transfer": "rsync", "checks": [
+                ["check": "reachable", "ok": true, "detail": "box (Linux)", "needed": true, "group": "ask"],
+                ["check": "rsync there", "ok": true, "detail": "3.2.7", "needed": false, "group": "handover"]]]]]
+        (demo.checks["box"], demo.checkError["box"]) = checkRows(rc)
+        for (n, t) in checkTransfers(rc) { demo.movers[n] = Mover(mode: "auto", transfer: t) }
+        snapshot(SettingsView().environmentObject(demo), dir + "/settings-transfer.png",
+                 NSSize(width: 900, height: 2300))
+        demo.tab = .machines
+        snapshot(MainView().environmentObject(demo), dir + "/machines-transfer.png", NSSize(width: 900, height: 520))
         exit(0)
     }
     if args.contains("--sync-only") {

@@ -348,7 +348,7 @@ const helpBtn = (topic) => h("button", { class: "help icon", text: "?", title: `
 // ---- state ----------------------------------------------------------------------
 
 const S = { tab: "projects", status: {}, config: {}, projects: [], selection: null, filter: "",
-  board: null, boardAt: null, query: "", hits: null, notes: {}, loaded: false };
+  board: null, boardAt: null, query: "", hits: null, notes: {}, loaded: false, movers: {} };
 const ON_WINDOWS = () => (S.status.platform || "").startsWith("win");
 const CAN_HAND_OVER = () => !!(S.status.handover || {}).supported;
 // asking other machines (ssh alone); an older core says only "supported"
@@ -360,6 +360,32 @@ const FROM_WINDOWS_NONE = "Add your Mac or Linux machines in the Machines tab: t
 // …and at the top of the Machines tab
 const PC_MACHINES = "From this PC you can see, search and watch your other machines, pick up a project's work from them and leave a note on them. Handing projects over from Windows comes in a later version.";
 const flag = (k, d = true) => (k in S.config ? !!S.config[k] : d);
+/** What copies files to and from another machine (`handover_transfer`):
+ * "auto" picks rsync where both machines have it and neither is Windows,
+ * else aht's own copy. */
+const TRANSFER = { auto: "rsync where both machines have it, else aht's own copy", rsync: "rsync", aht: "aht's own copy" };
+const MOVER = { rsync: "rsync", aht: "aht's own copy" };
+const transferMode = () => (TRANSFER[S.config.handover_transfer] ? S.config.handover_transfer : "auto");
+/** The mover a machine gets: what `remote check --json` said (`transfer`)
+ * while the setting is still the one it was asked under; else what is known
+ * here: Windows on either side, or no rsync 3 on this machine, is aht's own
+ * copy.  null: rsync if the machine has it, which only asking it tells. */
+function moverFor(name, r) {
+  const mode = transferMode(), said = S.movers[name];
+  if (said && said.mode === mode) return said.transfer;
+  if (mode !== "auto") return mode;
+  const rs = parseInt(String((S.status.handover || {}).rsync || ""), 10);
+  return ON_WINDOWS() || (r || {}).system === "Windows" || !(rs >= 3) ? "aht" : null;
+}
+/** "box: rsync · pc: aht's own copy", for every machine set up. */
+function moversLine() {
+  return Object.entries((S.status.handover || {}).remotes || {}).sort(([a], [b]) => a.localeCompare(b))
+    .map(([n, r]) => { const t = moverFor(n, r); return `${n}: ${t ? MOVER[t] || t : "rsync if it has it, else aht's own copy"}`; }).join(" · ");
+}
+/** Remember what `remote check --json` said each machine gets. */
+function noteMovers(d) {
+  for (const x of (d && d.machines) || []) if (x.remote && MOVER[x.transfer]) S.movers[x.remote] = { mode: transferMode(), transfer: x.transfer };
+}
 /** Keep in sync, paused (`mirror_paused`: {reason, at, remote}): Release
  * pauses it, so no sync replaces the copy left on that machine until the
  * user turns it back on.  null while it runs. */
@@ -2045,7 +2071,7 @@ function drawMachines(m) {
     m.append(h("div", { class: "box" }, h("h2", { text: "Your other machines", style: "margin-top:0" }),
       h("p", { text: ON_WINDOWS() && "can_reach" in ho
         ? "aht asks your other machines over ssh, and this PC has no ssh client. Add Windows' own in Settings → System → Optional features → OpenSSH Client, then open this tab again."
-        : "Handing a project over, keeping it in sync and backups on another machine need ssh and rsync, which aht uses on macOS and Linux; on Windows they are not there yet." }),
+        : "Handing a project over, keeping it in sync and backups on another machine need an ssh client, and aht finds none on this computer." }),
       helpBtn(ON_WINDOWS() ? "A Windows PC with your other machines" : "Hand a project over")));
     return;
   }
@@ -2181,7 +2207,12 @@ async function checkMachine(name) {
   const d = a.json || {};
   const r = (d.machines || []).find((x) => x.remote === name) || (d.machines || [])[0];
   if (!r) return box.append(h("p", { class: "warn", style: "white-space:pre-wrap", text: problems(d) || (a.err + a.out).trim() || `${name} did not answer.` }));
+  noteMovers(d);
   const rows = r.checks || [];
+  // `transfer`: what copies files to and from it, unless a row says so already
+  const mover = MOVER[r.transfer] && !rows.some((c) => c.key === "transfer" || /^copies files/i.test(c.check || ""))
+    ? h("p", { class: "small" }, "Copies files with ", h("strong", { text: MOVER[r.transfer] }), "."
+      + (send ? " Settings → Handover chooses which." : "")) : null;
   const lacks = (g) => rows.filter((c) => c.group === g && c.needed !== false && !c.ok).length;
   const steps = (list) => h("div", { class: "steps" }, list.map((c) => h("div", { class: "step" },
     h("span", { class: "mark " + (c.ok ? "okc" : c.needed === false ? "dim" : "warn"), text: c.ok ? "✓" : c.needed === false ? "·" : "✗" }),
@@ -2195,6 +2226,7 @@ async function checkMachine(name) {
       : !send ? `aht can ask ${name}: its sessions, Search and Watch work from here.`
       : lacks("handover") ? `aht can ask ${name}; handing a project over to it needs what is marked ✗.` : `${name} is ready: aht can ask it and hand projects over to it.` }));
   }
+  if (mover) box.append(mover);
   if (rows.some((c) => c.group)) {
     const ask = rows.filter((c) => c.group === "ask"), hand = rows.filter((c) => c.group !== "ask");
     if (ask.length) box.append(h("h3", { text: "For asking" }), h("div", { class: "dim small", text: "What aht needs to see the sessions there, search them and watch the machine." }), steps(ask));
@@ -2296,8 +2328,8 @@ function drawSettings(m) {
     tok("Second opinion: one task, two agents, compared", "second_opinion", "both agents work"),
     CAN_HAND_OVER() ? tok("Night shift: hand a project over with a task, on a timer", "night_shift", "the agent works while you are away") : null,
     h("div", { class: "dim small", text: "Each of these makes an agent read or work, which counts against your plan or API bill. aht's own work — watching, search, backups, reports, loose ends — never uses tokens." })));
-  // Windows gets it with aht's own file copy, later
-  if (CAN_HAND_OVER() && !ON_WINDOWS()) {
+  // a PC too, with ssh: aht's own copy moves the backups there
+  if (CAN_HAND_OVER() || CAN_REACH()) {
     const off = S.config.offsite_backup || "";
     const names = Object.keys((st.handover || {}).remotes || {}).sort();
     if (off && !names.includes(off)) names.push(off);
@@ -2324,9 +2356,23 @@ function drawSettings(m) {
       });
     } }))));
   if (CAN_HAND_OVER()) {
+    // the select keeps the focus, so refresh() draws nothing: the line below follows it here
+    const movers = h("div", { class: "dim small", id: "movers", text: moversLine() });
+    const machines = Object.keys((st.handover || {}).remotes || {}).length;
     m.append(group("Handover", "Hand a project over",
       check("Reachable from the Claude app (Remote Control)", "handover_remote_control"), check("Compress what is sent", "handover_compress"),
-      check("Use mosh to open a session when it gets through", "handover_mosh"), check("A folder trusted here is trusted on the other machine", "handover_carry_trust")));
+      check("Use mosh to open a session when it gets through", "handover_mosh"), check("A folder trusted here is trusted on the other machine", "handover_carry_trust"),
+      h("div", { class: "row" }, h("span", { text: "Copies files with" }),
+        h("select", { id: "transfer", onchange: (e) => { setConfig("handover_transfer", e.target.value); movers.textContent = moversLine(); } },
+          Object.entries(TRANSFER).map(([v, l]) => h("option", { value: v, text: l, selected: transferMode() === v }))),
+        h("span", { class: "grow" }),
+        machines && CAN_REACH() ? h("button", { class: "small", text: "Ask the Machines", title: "Ask each machine whether it has rsync", onclick: async () => {
+          const a = await busy("asking the machines…", () => run(["remote", "check", "all", "--json"]));
+          noteMovers(a.json);
+          movers.textContent = moversLine();
+        } }) : null),
+      machines ? movers : null,
+      h("div", { class: "dim small", text: "rsync sends only the changed parts of a big file. aht's own copy needs nothing installed and also copies to and from Windows." })));
   }
   const be = h("div", { class: "stack" });
   for (const b of st.backends || []) {
@@ -2400,14 +2446,23 @@ async function fetchFrom(machine, f) {
   const who = f.name || f.id;
   const a = await busy(`fetching ${who}'s backups…`, () => job(["backup", "--fetch-offsite", "--from=" + (f.id || f.folder || f.name), "--json"], "fetching the backups"));
   const d = a.json || {};
-  if (!a.ok) return tell("The backups were not fetched", (a.err + a.out).trim() || "aht gave no answer.");
+  // files that could not come are in `problems`, and the run then ends with 1:
+  // what did arrive still counts
+  const probs = Array.isArray(d.problems) ? d.problems : [];
+  const notCame = probs.length ? `\n\n${probs.length === 1 ? "This file" : `These ${probs.length} files`} could not come:\n`
+    + probs.slice(0, 10).map((p) => `• ${p.name || "?"} — ${p.error || "no reason given"}`).join("\n")
+    + (probs.length > 10 ? `\n… and ${probs.length - 10} more` : "") : "";
+  if (!a.ok && !(probs.length && d.files)) {
+    return tell("The backups were not fetched", probs.length ? `Nothing came from ${who}'s folder on ${machine}.${notCame}`
+      : (a.err + a.out).trim() || "aht gave no answer.");
+  }
   // a backup is a .zip with its .meta.json: each counts once
   const renamed = Array.isArray(d.renamed) ? d.renamed.filter((x) => /\.zip$/i.test(x)).length : d.renamed || 0;
-  tell(d.files ? "Backups fetched" : "Nothing to fetch", (d.files
+  tell(probs.length ? "Some backups were not fetched" : d.files ? "Backups fetched" : "Nothing to fetch", (d.files
     ? `${plural(d.files, "backup")} (${bytes(d.bytes)}) came from ${who}'s folder on ${machine}.`
     : `Every backup in ${who}'s folder on ${machine} is here already.`)
     + (renamed ? ` ${plural(renamed, "backup")} had the name of a different one here, so ${renamed === 1 ? "it was" : "they were"} kept under a new name.` : "")
-    + (d.files ? " Search finds the sessions in them, and Restore brings one back." : ""));
+    + (d.files ? " Search finds the sessions in them, and Restore brings one back." : "") + notCame);
 }
 async function adopt() {
   const d = await busy("looking for projects…", () => J("adopt", "--json"));

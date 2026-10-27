@@ -227,10 +227,10 @@ Getting started.
   one opens the window.
 - **Your other machines from Windows:** a PC asks your Mac and Linux
   machines what runs there, watches them, searches them, picks up their
-  work and leaves notes on them (see *A Windows PC with your other
-  machines*). Handover, keeping in sync,
-  backups on another machine and the night shift do not work from Windows
-  yet; the Machines tab says so.
+  work and leaves notes on them, and keeps a copy of its backups on one
+  of them (see *A Windows PC with your other machines*). Handover,
+  keeping in sync and the night shift do not work from Windows yet; the
+  Machines tab says so.
 - **Start at login:** Settings → This computer → *Start aht's tray at
   login* (on Windows the tray then also keeps the watcher running). On
   Linux the switch can be turned on only when the tray can run there: it
@@ -325,7 +325,8 @@ and press **Check…**. Its rows come in two groups:
   PC does not know that machine yet, and *Turn on Remote Login on the Mac*
   when a Mac refuses the connection.
 - **For handing over:** folded away on a PC. It lists what a handover will
-  need, for a later version.
+  need, for a later version, and what copies the files (*copies files
+  with — aht's own copy*, always on a PC).
 
 **What a PC can do today:**
 
@@ -341,12 +342,35 @@ and press **Check…**. Its rows come in two groups:
   before you leave the PC (**Machines** under the project; see *Pick up on
   another machine*). Since no machine can ask the PC, the PC starts every
   exchange: Pick Up from the Mac when you sit down, and Leave a Note (or
-  Hand Back) on the Mac before you go.
+  Hand Back) on the Mac before you go;
+- keep a copy of its backups on one of them, and fetch backups from it
+  (see below).
+
+**Backups from a PC.** **Settings → Backups on another machine**: pick
+one of your Mac or Linux machines. After each daily backup, aht adds the
+new backups to a folder of this PC's own there, as on a Mac (see
+*Backups, and bringing a session back*); **Copy Now** copies at once.
+**Fetch Backups From…** lists every computer's folder of backups on that
+machine, also those of your Macs and Linux machines, and **Fetch** adds
+what is missing on the PC and replaces nothing. aht's own copy moves the
+files, so the PC needs no rsync; the other machine needs only python3, as
+for asking it.
+
+> **Example.** Your office PC broke, and it kept its backups on homebox.
+> On the new PC, add homebox, pick it under **Settings → Backups on
+> another machine** and press **Fetch Backups From…**. The list shows
+> *office-pc*, with its system, its last update, its projects and
+> backups; **Fetch** brings them to the new PC. **Search** then finds the
+> old sessions, and **Restore…** brings one back.
+
+- A file another program holds open on the PC (or that Windows Security
+  is reading) is tried again 5 times, 0.2 s apart. If it is still held,
+  that one file is named as not fetched; the rest arrive.
 
 **What it cannot do yet:**
 
-- hand a project over, take it back, keep it in sync, keep backups on
-  another machine or plan a night shift;
+- hand a project over, take it back, keep it in sync or plan a night
+  shift;
 - be asked by another machine. Adding a PC as a machine on a Mac or on
   Linux stops with *aht cannot ask a Windows machine yet*, and makes
   nothing on the PC. So a Mac cannot pick up work from the PC or leave a
@@ -367,6 +391,11 @@ and press **Check…**. Its rows come in two groups:
   --apply` writes the summary and opens Codex with it.
 - `aht leave-note $HOME\Desktop\paper --on homebox --apply` — leave a
   summary of the work here in paper's folder on homebox.
+- `aht config --set offsite_backup=homebox` — keep a copy of the backups
+  on homebox; `aht backup --offsite` copies now.
+- `aht backup --offsite-list` — list every computer's folder of backups on
+  homebox; `aht backup --fetch-offsite --from office-pc` fetches that
+  computer's backups to this PC.
 
 ## New versions
 
@@ -544,14 +573,19 @@ Every day aht zips each project's histories, of all agents, into
   and copies made before a rewrite) and replaces nothing: a backup that
   differs from one of the same name here arrives next to it
   under a new name (`<stamp>-from-<name>.zip`). Search then finds the
-  sessions in them, and **Restore…** on a result brings one back.
+  sessions in them, and **Restore…** on a result brings one back. When a
+  backup cannot be put in place, the others still arrive; `aht backup
+  --fetch-offsite` names it with why (*not fetched: …*) and ends with exit
+  code 1.
 - **An older aht's folder** there (named after this computer, from before
   each computer got an id) becomes this computer's own only when every
   backup in it, and every copy made before a rewrite, is here too; one with
   nothing left in it is removed. Otherwise it stays as it is, listed as
   *older aht*, and **Copy Now** says so: **Fetch Backups From…** can bring
   its backups here.
-- On Windows, aht's window has no *Backups on another machine* yet.
+- **On Windows too.** aht's own copy moves the backups, so a PC needs no
+  rsync; it copies to and fetches from your Mac and Linux machines (see
+  *A Windows PC with your other machines*).
 
 **In the terminal:**
 
@@ -1507,6 +1541,24 @@ the laptop or your phone.
   `~/.aht/remote/replaced/` on the other machine (Claude's checkpoints and
   plans too). The newest 5 of those folders and every one younger than 30
   days are kept.
+- **What copies the files:** rsync, when this machine has rsync 3, the
+  other machine has rsync, and neither is Windows; otherwise aht's own
+  copy, which needs nothing on the other machine beyond python3. rsync is optional: it makes big changes
+  faster. aht's own copy sends each file in pieces of at most 1 MB, checks
+  it when it has arrived, and only then puts it in place; if that fails,
+  the old file goes back. A file that only grew, such as a conversation
+  that went on, sends just its new end. What it replaces or removes is set
+  aside first, as above, on the machine that receives. It gives up two
+  things against rsync: a big file changed in the middle is sent whole,
+  where rsync sends only the changed parts; and a big file cut off halfway
+  starts again next time, where rsync goes on from where it stopped. When
+  the link drops, or nothing moves either way for 2 minutes, the copy
+  ends: the files that arrived whole stay, and the next sync or handover
+  sends the rest. While it copies, aht keeps the pieces in a
+  folder `.aht-partial` inside the folder it copies into, and removes it
+  at the end. **Check** says which one each machine gets (*copies files
+  with — aht's own copy*); **Settings → Handover → Copies files with**
+  chooses (`handover_transfer`).
 - **Names whose case changed** there (`readme.md` → `README.md`) come back
   as renamed on a Mac, whose disk takes both for one name; the old one is
   set aside. Two names that differ only in case are both kept, one under
@@ -2181,7 +2233,9 @@ a part opens its section; the **?** at the top opens the whole guide.
   of another agent at the usage limit, second opinions, the night shift.
 - **Folder badges:** on or off, per kind; **Refresh All**, **Clear All…**
 - **Handover:** reachable from the Claude app, compression, mosh, trust
-  carried over.
+  carried over; **Copies files with** (*rsync where both machines have it,
+  else aht's own copy*, *rsync* or *aht's own copy*), with **Ask the
+  Machines** and a line that says which one each machine gets.
 - **Backups on another machine:** which machine keeps a copy; **Copy Now**;
   **Fetch Backups From…** (see *Backups, and bringing a session back*).
 - **Where each agent keeps its history:** **Choose…** when aht did not find
@@ -2269,6 +2323,11 @@ all of them can be set with `aht config --set name=value` and put back with
 - `handover_excludes` (none) — more names that never travel (besides
   `node_modules`, `.venv` and the like).
 - `handover_compress` (on) — compress what is sent.
+- `handover_transfer` (auto) — what copies the files to and from your
+  other machines: `auto` (rsync when this machine has rsync 3, the other
+  has rsync, and neither is Windows; else aht's own copy), `rsync` or
+  `aht` (aht's own copy). See *What copies the files* under *Hand a project over to
+  another machine*.
 - `handover_remote_control` (on) — a handed-over session is reachable from
   the Claude app; Antigravity, when you switch to it, starts with
   `--remote-control` too.
@@ -2278,7 +2337,8 @@ all of them can be set with `aht config --set name=value` and put back with
   through.
 - `handover_keep_awake` (on) — the other machine does not sleep while the
   agent works there (a closed lid still does).
-- `rsync_path` (the newest rsync found) — which rsync to use.
+- `rsync_path` (the newest rsync found) — which rsync to use, when rsync
+  copies the files.
 - `terminal_app` (automatic: iTerm when installed, wherever it is, else
   Terminal) — the app that opens session windows; Settings → This Mac →
   *Open session windows in*. Another app name works only if that app runs

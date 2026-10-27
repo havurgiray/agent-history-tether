@@ -168,7 +168,16 @@ switch agents off (`backends`) or point aht at other folders
 - during a take-back that brings files back, aht briefly makes and removes
   a `.aht-case-…` file in the project folder (and in its Claude Code
   history folder), to learn whether the disk takes `readme.md` and
-  `README.md` for one name.
+  `README.md` for one name;
+- while aht's own copy (`handover_transfer`; used where rsync is not)
+  brings files into a folder, on this computer or on your other machine
+  (a project folder, Claude Code's history, checkpoints and plans for it,
+  the folder of a file taken along with `--include`, the backups), it
+  keeps the pieces of the files under way in a `.aht-partial`
+  folder inside that folder, with a small lock file that holds the
+  number of its process.  aht removes that folder when the copy ends;
+  one left behind by a copy that was stopped is emptied by the next copy
+  into that folder and removed at its end.  It never travels.
 
 **Elsewhere on your computer:**
 
@@ -286,7 +295,9 @@ features below send data, and only after you set them up.
    session list, notices, Watch and search for those machines).  This
    works from macOS, Windows and Linux.  A Windows PC only asks your other
    machines (their sessions, notices, Watch and search, Pick Up and Leave
-   a Note) and hands no project over yet; it is never asked itself.  aht
+   a Note), copies its backups to one of them and fetches backups from it
+   (`offsite_backup`), and hands no project over yet; it is never asked
+   itself.  aht
    connects over SSH, or mosh if both machines have it, to the machines
    you add with `aht remote add`.
    Before its first command to a new machine, `aht remote add` and `aht
@@ -432,6 +443,17 @@ features below send data, and only after you set them up.
      touched does not count as changed, and, for a take-back, the
      conversation files that went on there, to check that each continues
      the one that left.
+   - *For aht's own copy* (where rsync does not copy the files, see
+     `handover_transfer`): before it sends files there, that machine
+     sends the list of the folder they go into (names, sizes,
+     modification times, link targets and which files are executable),
+     so that only what differs travels; a take-back reads the same of the
+     project's Claude Code checkpoints and plans there.  For a file of at
+     least 256 KB that is shorter on one side, such as a conversation
+     that went on, the side that has the shorter one gives a SHA-256
+     checksum of it, and the other side checks whether its own file
+     begins with the same bytes; then only the new end travels.  Nothing
+     of this is kept.  rsync compares the same over its own connection.
    - aht keeps only the last session list of each machine, and when that
      machine last answered, in `~/.aht/run/board.json` (see
      [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)),

@@ -28,6 +28,31 @@ jobs:
       - name: run the suites
         run: AHT_PY="$(command -v python)" tests/run_tests.sh
 
+  windows-transfer:
+    # aht's own copy on Windows itself, from source: the copy between this
+    # machine and a folder that stands in for another (test mode: the far
+    # end runs here, no ssh, no sh), and the far end fed on stdin
+    name: aht's own copy on Windows (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.arch }}
+      - name: the handover suite's copy, in test mode
+        shell: bash
+        run: python tests/core_test.py --transport
+      - name: the far end, asked on stdin (probe, manifest, pack, unpack, a file held open)
+        shell: bash
+        run: python windows/tests/agent_smoke.py
+
   macos-app:
     name: macOS app bundle
     runs-on: macos-latest
@@ -66,6 +91,9 @@ jobs:
           sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht/aht.exe"
           sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht/aht.exe"
           sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht/aht.exe"
+      - name: the exe as the far end of aht's own copy (probe, manifest, pack, unpack)
+        shell: bash
+        run: python windows/tests/agent_smoke.py "$PWD/windows/dist/aht/aht.exe"
       - name: the badge cache, a drawn badge replaced on the next refresh, and the entry point
         shell: bash
         run: |

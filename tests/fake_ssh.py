@@ -15,9 +15,13 @@ FAKE_SSH_DIR holds one folder per host name:
   <host>/refuse       present: ssh itself fails there (exit 255) with the
                       file's line, such as "Permission denied (publickey)."
                       or "Host key verification failed."
+  <host>/die-after    N: a call of aht's agent is cut off once N bytes went
+                      either way (its input ends there, then ssh exits 255
+                      and passes nothing more on)
+  <host>/hang-after   N: as die-after, but the link goes quiet instead
 Every command it is given is noted in <host>/commands.log, one JSON string a
 line.  A host without a folder cannot be reached (exit 255, as ssh)."""
-import json, os, sys
+import json, os, subprocess, sys, threading, time
 from pathlib import Path
 
 # the options of OpenSSH's ssh that take a value
@@ -82,7 +86,61 @@ def main(argv):
             if k:
                 env[k] = v
     os.chdir(home)
+    for kind in ("die-after", "hang-after"):
+        if "_agent" in cmd and (machine / kind).is_file():
+            return relay(cmd, env, int((machine / kind).read_text()), kind == "hang-after")
     os.execve("/bin/sh", ["sh", "-c", cmd], env)
+
+def relay(cmd, env, limit, hang):
+    """The command with its input and output passed on, until `limit` bytes
+    went either way: then the link is cut (or goes quiet)."""
+    p = subprocess.Popen(["/bin/sh", "-c", cmd], env=env, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE)
+    st = {"n": 0, "dead": False}
+    lock = threading.Lock()
+    def over(n):
+        with lock:
+            st["n"] += n
+            if st["n"] > limit and not st["dead"]:
+                st["dead"] = True
+                return True
+            return st["dead"]
+    def cut():
+        if hang:
+            time.sleep(3600)
+        try:
+            p.stdin.close()             # the far end's input ends mid-way
+        except OSError:
+            pass
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        os._exit(255)
+    def up():
+        while True:
+            b = sys.stdin.buffer.read1(1 << 16)
+            if not b:
+                break
+            if over(len(b)):
+                cut()
+            p.stdin.write(b)
+            p.stdin.flush()
+        p.stdin.close()
+    threading.Thread(target=up, daemon=True).start()
+    while True:
+        b = p.stdout.read1(1 << 16)
+        if not b:
+            break
+        if over(len(b)):
+            cut()
+        sys.stdout.buffer.write(b)
+        sys.stdout.buffer.flush()
+    with lock:
+        dead = st["dead"]
+    if dead:
+        time.sleep(3600)                # the cutting thread ends this process
+    return p.wait()
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

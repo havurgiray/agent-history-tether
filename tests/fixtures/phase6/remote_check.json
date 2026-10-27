@@ -1,0 +1,112 @@
+{
+  "ok": true,
+  "machines": [
+    {
+      "remote": "box",
+      "target": "me@box",
+      "checks": [
+        {
+          "check": "reachable",
+          "ok": true,
+          "detail": "box (Linux)",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "key login without a prompt",
+          "ok": true,
+          "detail": "yes",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "python3 there",
+          "ok": true,
+          "detail": "3.12.3",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "copies files with",
+          "key": "transfer",
+          "transfer": "aht",
+          "ok": true,
+          "needed": false,
+          "group": "handover",
+          "detail": "aht's own copy (with rsync 3 here and any rsync there, rsync moves big changes faster)"
+        },
+        {
+          "check": "rsync on this machine",
+          "ok": false,
+          "detail": "missing",
+          "needed": false,
+          "group": "handover",
+          "fix": "here:  brew install rsync"
+        },
+        {
+          "check": "rsync there",
+          "ok": true,
+          "detail": "/usr/bin/rsync",
+          "needed": false,
+          "group": "handover"
+        },
+        {
+          "check": "tmux there",
+          "ok": true,
+          "detail": "/usr/bin/tmux",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "/Users/me exists there",
+          "ok": true,
+          "detail": "projects keep their path",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "Claude Code there",
+          "ok": true,
+          "detail": "2.1.310 (here: 2.1.310)",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "stays awake while the agent works there",
+          "ok": true,
+          "detail": "systemd-inhibit (a closed lid still sleeps)",
+          "needed": false,
+          "group": "handover"
+        }
+      ],
+      "system": "Linux",
+      "transfer": "aht",
+      "ok": true
+    },
+    {
+      "remote": "studio",
+      "target": "me@studio",
+      "checks": [
+        {
+          "check": "reachable",
+          "ok": true,
+          "detail": "studio (Darwin)",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "copies files with",
+          "key": "transfer",
+          "transfer": "rsync",
+          "ok": true,
+          "needed": false,
+          "group": "handover",
+          "detail": "rsync 3.4.1"
+        }
+      ],
+      "system": "Darwin",
+      "transfer": "rsync",
+      "ok": true
+    }
+  ]
+}

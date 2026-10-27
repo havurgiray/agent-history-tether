@@ -52,6 +52,7 @@ your user profile):
 | GitHub Copilot CLI | `~/.copilot/history-session-state/` |
 | Kimi Code | in `~/.kimi-code/` (or `$KIMI_CODE_HOME`): `sessions/`, and for each project its prompt history (`user-history/`), `file-history/`, `workspaces.json` and `session_index.jsonl`; for the older Kimi CLI 1.x, `~/.kimi/sessions/` and `~/.kimi/user-history/` |
 | Antigravity (`agy`) | in its data folder (`~/.gemini/antigravity-cli/`): a copy of `conversation_summaries.db`, taken into `~/.aht/run/` (aht opens only the copy) and deleted right after, to find the conversations in your projects; for such a conversation its transcript (what you asked, its replies and its tool calls, never the agent's thinking) and its plan files (`task.md`, `implementation_plan.md`, `walkthrough.md`).  aht also starts the `agy` command when you switch a project to it.  aht never reads `cli.log` (it names the account signed in), `history.jsonl` (the prompts you typed), `implicit/` or `settings.json` |
+| Mistral Vibe (`vibe`) | in its data folder (`~/.vibe/`, or `$VIBE_HOME`), only the sessions in `logs/session/unified/`.  For each session: its `meta.json`, of which aht uses the session's id, folder, title, last time and whether a subagent made it (the file also holds your user name and the model's name, which aht does not use), and `CURRENT`, which names the session's latest generation; then that generation's `manifest.json`, its `projection-state.json` and the files in `chunks/` that this names, and the session's journal (`journal/<number>.jsonl`): what you asked, its replies and its tool calls (for the secrets check also their output), never the agent's reasoning.  Of the journal aht takes only the records that change that history: for each other record (such as what was sent to the model) it looks only at the type at the end of the line and passes over it.  aht also starts the `vibe` command when you switch a project to it.  aht never reads `checkpoint.json` (the model's own context), `runtime-state.json`, `scheduled-loops.json`, the sessions an earlier Vibe left (`logs/session/session_*`), or the data folder's other files: `config.toml`, `.env`, `whoami_cache.json`, `vibehistory` (the prompts you typed), `trusted_folders.toml`, its caches (connectors, experiments, managed settings, models) and its logs (`logs/vibe.log`, `logs/vibe-rs.log`) |
 
 These histories can contain anything you or an agent wrote: code, file
 contents, command output, and personal information or secrets.  You can
@@ -72,7 +73,7 @@ switch agents off (`backends`) or point aht at other folders
   (`ps`), to find the agents among them, and the folder each agent runs in
   (`lsof` or `/proc`); on Windows, before a switch, the names of the
   running programs (`tasklist`), of which aht keeps only whether Codex,
-  Kimi Code or Antigravity is among them;
+  Kimi Code, Antigravity or Mistral Vibe is among them;
 - Claude Code's settings file `~/.claude/settings.json`, to add and remove
   aht's hooks, and to show whether Remote Control and going on after the
   usage limit are on;
@@ -345,15 +346,16 @@ features below send data, and only after you set them up.
 3. **Features that start an AI agent**, all off until you turn them on or
    ask for them: informed sessions, going on in another agent at Claude's
    usage limit, second opinion, night shift, switching agents and handing
-   the work back (to Claude Code, Codex, Kimi Code or Antigravity), and a
-   handover with a task.  aht hands the agent a summary of earlier sessions
-   or a catch-up of what happened since (with keys masked as under
-   [Security](#security)), or your task, and the agent sends it to its
-   provider under your account, as it does with anything you type into it.
-   Codex, Kimi Code and Antigravity read it as their first turn (aht runs
-   Kimi's itself, `kimi -p`); a Claude Code session handed the work back,
-   or switched to as Claude Code's own session, gets its catch-up through
-   aht's hook, at most 2,000 characters, once.
+   the work back (to Claude Code, Codex, Kimi Code, Antigravity or Mistral
+   Vibe), and a handover with a task.  aht hands the agent a summary of
+   earlier sessions or a catch-up of what happened since (with keys masked
+   as under [Security](#security)), or your task, and the agent sends it to
+   its provider under your account, as it does with anything you type into
+   it.
+   Codex, Kimi Code, Antigravity and Mistral Vibe read it as their first
+   turn (aht runs Kimi's itself, `kimi -p`); a Claude Code session handed
+   the work back, or switched to as Claude Code's own session, gets its
+   catch-up through aht's hook, at most 2,000 characters, once.
    After a switch, the hook also adds one line to the Claude session that
    handed the work on, when you resume it yourself: which agent worked on
    the project since, when, and where the summary is; the catch-up itself
@@ -553,7 +555,9 @@ although they are none.  Secrets are best kept out of agent chats.
 `aht secrets --redact` takes it out (a private key from its BEGIN line to
 its END line, and nothing around it); a place whose removal would leave a
 history's line, or the whole file, no longer valid JSON is left as it is,
-and aht says so.
+and aht says so.  So is a find in a Mistral Vibe session: Vibe checks every
+record of a session's store, and would no longer open one with a byte
+changed.
 
 **Where.**  The search index (messages; what tool calls worked on: their
 commands, file paths and web addresses; session titles), handover, switch

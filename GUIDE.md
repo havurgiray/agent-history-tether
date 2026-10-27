@@ -331,12 +331,12 @@ Uses tokens**, or when you first use them:
 
 Some spend tokens only when you ask for them, each time: **Switch Agent**
 (the agent that goes on reads a summary, or a catch-up in its own session:
-one turn), **Hand Back** to Codex, Kimi Code or Antigravity (one turn of
-that agent) and **Hand Over** with a task (the session starts on it). Hand
-Back to Claude Code runs no turn: the catch-up is in the session when it
-opens, and Claude reads it with your next message. Writing a summary,
-**Summary Only** and `aht relays` spend nothing (see *Continue in another
-agent*).
+one turn), **Hand Back** to Codex, Kimi Code, Antigravity or Mistral Vibe
+(one turn of that agent) and **Hand Over** with a task (the session starts
+on it). Hand Back to Claude Code runs no turn: the catch-up is in the
+session when it opens, and Claude reads it with your next message. Writing
+a summary, **Summary Only** and `aht relays` spend nothing (see *Continue
+in another agent*).
 
 A handed-over project also puts one sentence into a new Claude session in
 its folder, so the session knows the project is away, that a handover of it
@@ -843,9 +843,9 @@ what the session's commands changed.
 ## Continue in another agent
 
 Hand a project's work from one agent to another without losing the thread,
-and hand it back later. Claude Code, Codex, Kimi Code and Antigravity (the
-`agy` command) can each take over; **Switch Agent** lists the ones
-installed on this computer.
+and hand it back later. Claude Code, Codex, Kimi Code, Antigravity (the
+`agy` command) and Mistral Vibe (the `vibe` command) can each take over;
+**Switch Agent** lists the ones installed on this computer.
 
 > **Example.** Claude Code tells you that you have reached your usage limit
 > in the middle of a task. Select the project → **Switch Agent** →
@@ -896,16 +896,16 @@ installed on this computer.
   catch-up of both.
 - **What it costs.** Writing a summary or a catch-up costs nothing: aht
   reads the histories itself. A new session reads the summary as its first
-  turn; Codex, Kimi Code and Antigravity read the catch-up in their own
-  session the same way: one turn of that agent. Kimi reads it in a run of
-  its own before its window opens, so the dialog waits a moment; when Kimi
-  does not take the catch-up into its own session, a new Kimi session reads
-  the full summary instead, and aht says so. **Hand Back to Claude Code,
-  or Claude Code's own session, costs nothing until you type:** aht's
-  Claude hook gives the session its catch-up (at most 2,000 characters) as
-  it opens, once, and Claude reads it with your next message. Without
-  aht's hook, reading it is Claude's first turn. Summary Only spends
-  nothing.
+  turn; Codex, Kimi Code, Antigravity and Mistral Vibe read the catch-up in
+  their own session the same way: one turn of that agent. Kimi reads it in
+  a run of its own before its window opens, so the dialog waits a moment;
+  when Kimi does not take the catch-up into its own session, a new Kimi
+  session reads the full summary instead, and aht says so. **Hand Back to
+  Claude Code, or Claude Code's own session, costs nothing until you
+  type:** aht's Claude hook gives the session its catch-up (at most 2,000
+  characters) as it opens, once, and Claude reads it with your next
+  message. Without aht's hook, reading it is Claude's first turn. Summary
+  Only spends nothing.
 - **If you go back by hand.** When you resume the Claude session yourself
   instead of pressing Hand Back, aht's hook gives it one line: *[aht] Codex
   worked on this project after this session's last turn (14:10–16:40). The
@@ -920,15 +920,22 @@ installed on this computer.
   `handover_remote_control` is on. aht checks first that the conversation
   still exists: for an id it does not know, agy only warns and starts a
   new one.
+- **Mistral Vibe** opens in a new session (`vibe "<what to read first>"`)
+  or continues its own (`vibe --resume <id> "<what to read first>"`); aht
+  checks first that the session is still in Vibe's data folder (`~/.vibe`,
+  or `$VIBE_HOME`). aht reads the sessions of Vibe 3, not those an earlier
+  Vibe left. Vibe reads a project's `AGENTS.md` only in a folder you
+  trust in Vibe, and asks about a folder with such files the first time.
 - **Checks first.** Not possible while a Claude session in the project is
   working or waiting for you. A Claude session open there but idle, or
   another agent open in the folder, gives a warning: don't type into both.
-  On Windows aht can only tell that Codex, Kimi Code or Antigravity runs on
-  the PC, not in which folder, and says so. Codex's and Antigravity's
-  background services are not counted as open. Hand Back waits while the
-  Claude session it goes back to is still open in its window: exit that
-  session and press Hand Back again (in a terminal, `aht switch <path>
-  --back --brief-only` writes the catch-up for it to read; see below).
+  On Windows aht can only tell that Codex, Kimi Code, Antigravity or
+  Mistral Vibe runs on the PC, not in which folder, and says so. Codex's,
+  Antigravity's and Mistral Vibe's background services are not counted as
+  open. Hand Back waits while the Claude session it goes back to is still
+  open in its window: exit that session and press Hand Back again (in a
+  terminal, `aht switch <path> --back --brief-only` writes the catch-up for
+  it to read; see below).
 - When copies to undo a session are on (*Undo a whole session*), aht makes
   one before the other agent starts.
 - When no terminal window can be opened, the summary is written all the
@@ -942,9 +949,9 @@ installed on this computer.
 - **At Claude's usage limit:** the project shows *Claude stopped at its
   usage limit; it resets 6:20pm*. With Settings → Uses tokens → *When
   Claude stops at its limit, offer to go on in* turned on (you pick Kimi
-  Code, Codex or Antigravity), a **Continue in Kimi Code…** button sits
-  right next to it, and the notice says so too. aht spots the limit in the
-  session's history; that costs nothing.
+  Code, Codex, Antigravity or Mistral Vibe), a **Continue in Kimi Code…**
+  button sits right next to it, and the notice says so too. aht spots the
+  limit in the session's history; that costs nothing.
 
 **In the terminal:**
 
@@ -953,8 +960,8 @@ installed on this computer.
 - `aht switch ~/Desktop/paper --to codex` — say which session Codex would
   continue, and how, without starting anything.
 - `aht switch ~/Desktop/paper --to codex --apply` — do it: write the summary
-  and open a new Codex session on it (`--to claude`, `--to kimi` and
-  `--to agy` work the same way).
+  and open a new Codex session on it (`--to claude`, `--to kimi`, `--to agy`
+  and `--to vibe` work the same way).
 - `aht switch ~/Desktop/paper --to codex --resume --apply` — Codex's own
   latest session in the project goes on, and reads only what happened
   since.
@@ -1172,7 +1179,9 @@ histories. Values are only ever shown masked.
   known limits. Keep secrets out of agent chats.
 - **`--redact` never breaks a history:** a place whose removal would leave
   a line of the history no longer valid JSON is left as it is, and aht
-  says how many.
+  says how many. So is a key in a Mistral Vibe session: Vibe checks every
+  record of a session's store, and would no longer open one with a byte
+  changed.
 - aht never changes the agents' histories on its own. In everything it
   copies out of them it masks what it recognises, whole (a key of any
   length, up to 64 KB): the search index, journals, summaries, notices and
@@ -1889,7 +1898,7 @@ all of them can be set with `aht config --set name=value` and put back with
   with `aht limits --auto-continue on|off`) — a session goes on by itself
   when the usage limit resets.
 - `limit_switch`, `limit_switch_to` (kimi) — at Claude's usage limit, offer
-  to go on in that agent (`kimi`, `codex` or `agy`).
+  to go on in that agent (`kimi`, `codex`, `agy` or `vibe`).
 - `second_opinion` — the same task by two agents.
 - `night_shift` — a handover with a task, on a timer.
 

@@ -639,11 +639,11 @@ struct TextSheet: Identifiable {
 }
 
 let AGENT_LABEL = ["claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex",
-                   "agy": "Antigravity", "gemini": "Gemini", "opencode": "OpenCode",
-                   "cursor": "Cursor", "copilot": "Copilot"]
+                   "agy": "Antigravity", "vibe": "Mistral Vibe", "gemini": "Gemini",
+                   "opencode": "OpenCode", "cursor": "Cursor", "copilot": "Copilot"]
 
 /// The agents a project can be switched to, in the menu's order.
-let SWITCH_AGENTS = ["claude", "kimi", "codex", "agy"]
+let SWITCH_AGENTS = ["claude", "kimi", "codex", "agy", "vibe"]
 
 /// Those of them installed here (`status --json`'s `agent_clis` names their CLI).
 func switchAgents(_ status: [String: Any]) -> [String] {
@@ -6241,6 +6241,7 @@ struct SettingsView: View {
                                 Text("Kimi Code").tag("kimi")
                                 Text("Codex").tag("codex")
                                 Text("Antigravity").tag("agy")
+                                Text("Mistral Vibe").tag("vibe")
                             }
                             .labelsHidden().fixedSize()
                             Text("that agent reads a summary").font(.caption).foregroundColor(.secondary)
@@ -7939,7 +7940,7 @@ if CommandLine.arguments.contains("--selftest") {
     // an open relay (`projects --json`'s `relay`) as the line under the
     // project with Hand Back first, the switch dialog from `switch --json`
     let clis = switchAgents(["agent_clis": ["claude": "/x/claude", "codex": NSNull(), "agy": "/x/agy",
-                                            "kimi": "/x/kimi"]])
+                                            "kimi": "/x/kimi", "vibe": "/x/vibe"]])
     let since = Calendar.current.date(bySettingHour: 0, minute: 10, second: 0, of: Date())!
     let relayRow = { (extra: [String: Any]) in
         Project(["real_path": "/x/api", "exists": true, "sessions": 3, "agents": ["claude", "codex"],
@@ -7950,10 +7951,10 @@ if CommandLine.arguments.contains("--selftest") {
     let taken = relayRow([:]), arrived = relayRow(["incoming": true])
     let menu = switchItems(taken, clis), plainMenu = switchItems(arrived, clis)
     let line = taken.handBack.map(relayLine) ?? ""
-    let relayOK = clis == ["claude", "kimi", "agy"]
+    let relayOK = clis == ["claude", "kimi", "agy", "vibe"]
         && menu.map { $0.title } == ["Hand Back to Claude Code (its own session)…",
                                      "Continue in Claude Code…", "Continue in Kimi Code…",
-                                     "Continue in Antigravity…"]
+                                     "Continue in Antigravity…", "Continue in Mistral Vibe…"]
         && menu[0].back && menu[0].to == "claude" && !plainMenu[0].back && arrived.handBack == nil
         && line == "Codex has had this project since \(clock(since)), taken over from Claude Code"
         && Project(["real_path": "/x/api", "relay": NSNull()]).relay == nil
@@ -8094,13 +8095,16 @@ if CommandLine.arguments.contains("--selftest") {
             return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] ?? [:]
         }
         var miss: [String] = []
-        // the status: agy is among the agents, and the menu has each one installed
+        // the status: agy and vibe are among the agents, and the menu has each one installed
         let st = sample("status.json")
         let named = (st["agent_clis"] as? [String: Any]) ?? [:]
         let installed = switchAgents(st)
-        if named["agy"] == nil || installed != SWITCH_AGENTS.filter({ named[$0] is String })
+        if named["agy"] == nil || named["vibe"] == nil
+            || installed != SWITCH_AGENTS.filter({ named[$0] is String })
             || (named["agy"] is String && !switchItems(Project([:]), installed)
-                .contains { $0.title == "Continue in Antigravity…" }) {
+                .contains { $0.title == "Continue in Antigravity…" })
+            || (named["vibe"] is String && !switchItems(Project([:]), installed)
+                .contains { $0.title == "Continue in Mistral Vibe…" }) {
             miss.append("status.json")
         }
         // the projects: a row with an open relay gets the line and Hand Back first

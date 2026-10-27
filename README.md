@@ -346,9 +346,9 @@ session is open in it, and a transfer shows its progress.
 
 ## Across agents
 
-aht reads the sessions of Claude Code, Kimi Code, Codex and Antigravity
-(`agy`), so it can work across them.  On macOS all of this is in the app's window;
-the commands behave the same.
+aht reads the sessions of Claude Code, Kimi Code, Codex, Antigravity
+(`agy`) and Mistral Vibe (`vibe`), so it can work across them.  On macOS
+all of this is in the app's window; the commands behave the same.
 
 - **Search everything** — `aht search <words>` (the window's *Search* tab)
   looks through every session of every agent and project, including
@@ -363,7 +363,7 @@ the commands behave the same.
   working, waiting for you (and for what), or idle.  The menu bar counts
   the sessions waiting for you.
 - **Switch agent and hand back** — `aht switch <folder> --to
-  claude|codex|kimi|agy --apply` continues a project's work in another
+  claude|codex|kimi|agy|vibe --apply` continues a project's work in another
   agent: aht writes a summary of the latest session of another agent into
   `.aht/handover/` (where things stood, the latest exchanges, open to-dos,
   files changed, git), and a new session of that agent reads it first, in a
@@ -528,8 +528,8 @@ the commands behave the same.
   in its transcript (no tokens), says so in a notice with the reset time
   (`notify_limit`), and marks the project.  `aht limits` lists them.  With
   `limit_switch = true` it also offers to go on in `limit_switch_to` (Kimi
-  Code by default; Codex or Antigravity) — that agent's tokens are used
-  when you accept.
+  Code by default; Codex, Antigravity or Mistral Vibe) — that agent's
+  tokens are used when you accept.
 - **Informed sessions** — with `informed_sessions = true`, a new Claude Code
   session learns in a few lines where the last session in its folder
   stopped, whichever agent ran it (last request and answer, open to-dos,
@@ -589,7 +589,7 @@ features that make an agent read or work:
 | Second opinion (`second_opinion`) | both agents work on the task | off, and only when you press Start |
 | Night shift (`night_shift`) | the agent on the other machine works on the task | off, and only the shifts you plan |
 | Switch agent | the agent that goes on reads the summary (a new session) or the catch-up (its own session): one turn; Claude Code's own session gets its catch-up as with Hand back to Claude Code | only when you ask |
-| Hand back to Codex, Kimi Code or Antigravity | that agent reads the catch-up: one turn | only when you ask |
+| Hand back to Codex, Kimi Code, Antigravity or Mistral Vibe | that agent reads the catch-up: one turn | only when you ask |
 | Hand back to Claude Code | no turn: aht's hook puts the catch-up (at most 2,000 characters) into the session as it opens, and it goes with your next message; without the hook, reading it is the first turn | only when you ask |
 | Hand over with a task | the resumed session starts on the task | only when you give a task |
 | Handover note | one sentence in a new Claude session while its project is away, half handed over, or just came back or was released | part of handover |
@@ -789,10 +789,10 @@ for the other machine, and a stand-in `ssh` (`tests/fake_ssh.py`) that can
 also answer like a Windows PC (they need rsync 3 and are skipped without it).
 Switching agents runs against stand-in agents (`AHT_CLI_<AGENT>`):
 `tests/fake_codex.py` and `tests/fake_kimi.py` write sessions the way the
-real CLIs do, Claude Code and Antigravity are stubs that only note their
-calls, terminals go to a log (`AHT_TERMINAL_LOG`), and `tests/fake_agy.py`
-builds a stand-in Antigravity store, so no test opens a window or spends a
-token.  GitHub Actions runs the core suites (Linux and
+real CLIs do, Claude Code, Antigravity and Mistral Vibe are stubs that only
+note their calls, terminals go to a log (`AHT_TERMINAL_LOG`), and
+`tests/fake_agy.py` and `tests/fake_vibe.py` build stand-in Antigravity and
+Vibe stores, so no test opens a window or spends a token.  GitHub Actions runs the core suites (Linux and
 macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
 smoke-tests the Windows exes, the badge cache and the installer (x64 and ARM64) natively on every push; tagging `vX.Y.Z` builds
 the release artifacts (Windows installers and zips for x64 and ARM64, the universal
@@ -800,7 +800,9 @@ macOS app) and publishes them with checksums.  Honest limits: the
 Cursor/OpenCode/Copilot layouts are implemented from best-effort knowledge and
 self-verify at runtime (they no-op rather than guess); Antigravity's reader
 was checked against one short real conversation (its tool calls and plan
-files follow agy's documented format); the Linux tray needs a real desktop for full exercise.
+files follow agy's documented format), Mistral Vibe's against one short real
+session of two turns (its tool calls and to-dos follow Vibe's own source);
+the Linux tray needs a real desktop for full exercise.
 
 ## Privacy
 

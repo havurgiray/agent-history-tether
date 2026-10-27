@@ -36,10 +36,10 @@ const base = (p) => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 const parent = (p) => { const s = (p || "").replace(/[\\/]+$/, ""); const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\")); return i > 0 ? s.slice(0, i) : s; };
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const AGENTS = { claude: "Claude Code", kimi: "Kimi Code", codex: "Codex", agy: "Antigravity",
-  gemini: "Gemini CLI", cursor: "Cursor", opencode: "OpenCode", copilot: "Copilot" };
+  vibe: "Mistral Vibe", gemini: "Gemini CLI", cursor: "Cursor", opencode: "OpenCode", copilot: "Copilot" };
 // the agents a project can be switched to (the core's SWITCH_TARGETS), as
 // many as are installed (status.agent_clis)
-const SWITCH_TO = ["claude", "kimi", "codex", "agy"];
+const SWITCH_TO = ["claude", "kimi", "codex", "agy", "vibe"];
 // a computer's system as the core names it (Python's platform.system())
 const SYSTEMS = { Darwin: "macOS", Linux: "Linux", Windows: "Windows" };
 
@@ -1383,7 +1383,7 @@ function drawSettings(m) {
   m.append(group("Uses tokens — off until you turn it on", "What uses tokens",
     tok("A new Claude session learns where the last one in its folder stopped", "informed_sessions", "a few hundred tokens per new session"),
     h("div", { class: "row" }, tok("When Claude stops at its limit, offer to go on in", "limit_switch", null),
-      h("select", { onchange: (e) => setConfig("limit_switch_to", e.target.value) }, ["kimi", "codex", "agy"].filter((a) => a !== "agy" || (S.status.agent_clis || {}).agy)
+      h("select", { onchange: (e) => setConfig("limit_switch_to", e.target.value) }, ["kimi", "codex", "agy", "vibe"].filter((a) => !["agy", "vibe"].includes(a) || (S.status.agent_clis || {})[a])
         .map((v) => h("option", { value: v, text: AGENTS[v], selected: S.config.limit_switch_to === v })))),
     tok("Second opinion: one task, two agents, compared", "second_opinion", "both agents work"),
     CAN_HAND_OVER() ? tok("Night shift: hand a project over with a task, on a timer", "night_shift", "the agent works while you are away") : null,

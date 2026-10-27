@@ -143,7 +143,8 @@
     "claude": "/opt/homebrew/bin/claude",
     "kimi": "/opt/homebrew/bin/kimi",
     "codex": "/opt/homebrew/bin/codex",
-    "agy": "/opt/homebrew/bin/agy"
+    "agy": "/opt/homebrew/bin/agy",
+    "vibe": "/Users/me/.local/bin/vibe"
   },
   "log": {
     "path": "/Users/me/.aht/aht.log",

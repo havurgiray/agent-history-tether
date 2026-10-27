@@ -293,7 +293,7 @@ def _coerce(key: str, raw: str):
         except Exception as e:
             raise ValueError(f"{key}: {e} — prefer `aht backends --set-root "
                              f"name=/path`")
-        bad = [k for k in obj if k not in BACKEND_NAMES + [AGY_STORE.name]]
+        bad = [k for k in obj if k not in BACKEND_NAMES + READER_STORES]
         if bad:
             raise ValueError(f"unknown backend(s) {bad}")
         return {k: _expand(str(v)) for k, v in obj.items()}
@@ -3899,9 +3899,9 @@ def cmd_backends(args):
                     return 2
                 name, path = kv.split("=", 1)
                 name = name.strip()
-                if name not in BACKEND_NAMES + [AGY_STORE.name]:     # agy: its data folder
+                if name not in BACKEND_NAMES + READER_STORES:   # agy, vibe: their data folder
                     print(f"unknown backend {name!r}; known: "
-                          f"{', '.join(BACKEND_NAMES + [AGY_STORE.name])}", file=sys.stderr)
+                          f"{', '.join(BACKEND_NAMES + READER_STORES)}", file=sys.stderr)
                     return 2
                 roots_cfg[name] = _expand(path)
                 changed.append(name)
@@ -4039,7 +4039,7 @@ COMMANDS:
   aht encode <path>               claude's dirname encoding for a path
   aht install | uninstall         set up / remove the watcher, hook and command
 
-ACROSS AGENTS (Claude Code, Codex, Kimi Code, Antigravity):
+ACROSS AGENTS (Claude Code, Codex, Kimi Code, Antigravity, Mistral Vibe):
   aht search <words>                    every session, also deleted ones in backups
   aht board                             open sessions here and on other machines
   aht switch <folder> --to kimi         continue the work in another agent
@@ -7777,12 +7777,13 @@ def _handover_note(cwd: str) -> str:
 # --------------------------------------------------------------------------- #
 # Across agents: every agent's sessions, read one way.  Search, the secrets
 # check, the journal, switching agent and the session board build on it.
-# Readable: Claude Code, Kimi Code 2.x, Codex and Antigravity (agy, behind
-# AGY_READER); the other agents keep formats aht does not know yet.
+# Readable: Claude Code, Kimi Code 2.x, Codex, Antigravity (agy, behind
+# AGY_READER) and Mistral Vibe (behind VIBE_READER); the other agents keep
+# formats aht does not know yet.
 # --------------------------------------------------------------------------- #
 
 AGENT_NAMES = {"claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex",
-               "agy": "Antigravity"}
+               "agy": "Antigravity", "vibe": "Mistral Vibe"}
 
 def _when(v):
     """Seconds since 1970 from an ISO text or a (milli)second number."""
@@ -8122,13 +8123,217 @@ def agy_plans(cid: str) -> tuple:
                      for m in _TASK_LINE.finditer(text)]
     return ("\n\n".join(parts) or None), todos
 
+# ---- Mistral Vibe ------------------------------------------------------------ #
+# Vibe 3 keeps each session in a store of its own in its data folder
+# ($VIBE_HOME, else ~/.vibe): logs/session/unified/<id>/.  meta.json names
+# the session's folder, title and times.  CURRENT names its latest
+# generation, whose manifest.json names projection-state.json: what the
+# session showed, as history entries (what was typed, the replies, the tool
+# calls, the reasoning), or the chunks/<sha256>.json that hold them.  What
+# came after that generation is in its journal (journal/<n>.jsonl), whose
+# projection records add, replace and remove entries.  A real session (Vibe
+# 3.0.3, on a Mac) confirmed the layout, meta.json, the messages and a
+# journal's changes; tool calls and to-dos follow the program's source.
+# Never read: a reasoning entry, checkpoint.json (the model's own context),
+# runtime-state.json, the journal's other records, Vibe 2's sessions
+# (logs/session/session_*), and the data folder's other files (config.toml,
+# .env, vibehistory, trusted_folders.toml, the caches, the logs).
+# VIBE_READER turns the reader off again if a later Vibe changes the format.
+# As a target of a switch Vibe works either way.
+
+VIBE_READER = True
+_VIBE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")     # a session's id: uuid-shaped
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+VIBE_STORE = Backend("vibe", "Mistral Vibe", "high",
+                     lambda: Path(os.environ.get("VIBE_HOME") or Path.home() / ".vibe"))
+READER_STORES = [AGY_STORE.name, VIBE_STORE.name]     # backend_roots: data folders aht only reads
+
+def vibe_reader_on() -> bool:
+    """Whether aht reads Vibe's own store: VIBE_READER, or in the tests a
+    stand-in store (AHT_TEST_VIBE_READER)."""
+    return VIBE_READER or os.environ.get("AHT_TEST_VIBE_READER") == "1"
+
+def _vibe_dir(sid: str = None) -> Path:
+    d = VIBE_STORE.root() / "logs" / "session" / "unified"
+    return d / sid if sid else d
+
+def _vibe_journal(d: Path):
+    """The journal a Vibe session writes to now: the one after the snapshot
+    its CURRENT names.  None when there is none."""
+    try:
+        n = int(json.loads((d / "CURRENT").read_bytes())["snapshot_sequence"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    f = d / "journal" / f"{n + 1:016d}.jsonl"
+    return f if f.is_file() else None
+
+def vibe_sessions(real: str = None) -> list:
+    """Vibe's sessions (in the folder `real`) the way list_sessions gives
+    sessions, from each one's meta.json; a subagent's is left out.  A
+    session's file is the journal it writes to now: a new generation starts
+    another, so its rows say `rewrites` and the index reads it again whole."""
+    if not vibe_reader_on():
+        return []
+    base = _vibe_dir()
+    out = []
+    for d in sorted(base.iterdir()) if base.is_dir() else []:
+        if not _VIBE_ID.fullmatch(d.name) or d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            meta = json.loads((d / "meta.json").read_bytes())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict) or meta.get("session_id") != d.name \
+                or meta.get("parent_session_id"):
+            continue
+        env = meta.get("environment") if isinstance(meta.get("environment"), dict) else {}
+        # where it works now, and where it began (it may have moved since)
+        folders = [p for p in (env.get("working_directory"), meta.get("origin_directory"))
+                   if isinstance(p, str) and p]
+        if real and not any(_same_dir(p, real) for p in folders):
+            continue
+        f = _vibe_journal(d)
+        st = _stat(f) if f else None
+        if st is None:
+            continue
+        title = meta.get("title")
+        out.append({"agent": "vibe", "id": d.name, "project": folders[0] if folders else None,
+                    "file": str(f), "title": redact(str(title)) if title else None,
+                    "updated": max(_when(meta.get("end_time")) or 0, st.st_mtime),
+                    "rewrites": True})
+    return out
+
+def vibe_session_exists(sid: str) -> bool:
+    """Whether Vibe has a session `sid`: aht checks before it opens
+    `vibe --resume`."""
+    return bool(vibe_reader_on() and _VIBE_ID.fullmatch(sid or "")
+                and (_vibe_dir(sid) / "CURRENT").is_file())
+
+def _vibe_ops(entries: list, ops) -> list:
+    """A journal record's changes to the history entries, applied."""
+    for op in ops if isinstance(ops, list) else []:
+        if not isinstance(op, dict):
+            continue
+        kind, new = op.get("op"), op.get("entry")
+        if kind == "append_entry" and isinstance(new, dict):
+            entries.append(new)
+        elif kind == "replace_entry" and isinstance(new, dict):
+            i = next((i for i, e in enumerate(entries) if e.get("id") == op.get("id")), None)
+            if i is not None:
+                entries[i] = new
+        elif kind == "remove_entry":
+            entries = [e for e in entries if e.get("id") != op.get("id")]
+        elif kind == "set_history_entries" and isinstance(op.get("entries"), list):
+            entries = [e for e in op["entries"] if isinstance(e, dict)]
+    return entries
+
+# a journal record that changes the history: its type closes the line
+_VIBE_HISTORY = re.compile(rb'"type":"(?:projection_advanced|projection_delta|session_relocated)"')
+
+def vibe_entries(d: Path) -> list:
+    """The history entries of the Vibe session in the folder `d`, oldest
+    first: its generation's (whole, or from the chunks it names), then what
+    the journal changed since.  [] when they cannot be read."""
+    for _try in range(2):           # Vibe may have moved on to a new generation meanwhile
+        try:
+            gen = str(json.loads((d / "CURRENT").read_bytes())["generation"])
+            if not re.fullmatch(r"[0-9]{16}", gen):
+                return []
+            g = d / "generations" / gen
+            man = json.loads((g / "manifest.json").read_bytes())
+            desc = man["projection_state"]
+            state = json.loads((g / Path(str(desc["path"])).name).read_bytes())
+            entries = list(state["snapshot"]["history"]["entries"])
+            for h in desc.get("chunks") or []:
+                if not _SHA256.fullmatch(str(h)):
+                    return []
+                entries += json.loads((d / "chunks" / f"{h}.json").read_bytes())
+            seg = str(man["recovery_journal_segment"]["path"])
+            if not re.fullmatch(r"journal/[0-9]{16}\.jsonl", seg):
+                return []
+            data = (d / seg).read_bytes()
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        entries = [e for e in entries if isinstance(e, dict)]
+        for raw in data.split(b"\n")[:-1]:          # the last is still being written
+            if not _VIBE_HISTORY.search(raw[-400:]):
+                continue                            # never parsed: not the history
+            try:
+                e = json.loads(raw)
+                p = e["payload"]
+                if e.get("type") == "projection_advanced":
+                    entries = [x for x in p["snapshot"]["history"]["entries"]
+                               if isinstance(x, dict)]
+                elif e.get("type") in ("projection_delta", "session_relocated"):
+                    entries = _vibe_ops(entries, p.get("delta"))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return entries
+    return []
+
+def _vibe_events(e: dict):
+    """One history entry of a Vibe session: what the user typed, the agent's
+    reply or a tool call.  Never its reasoning; what Vibe itself put on the
+    user's side (source "harness") and a reply not complete or thrown away
+    are left out.  A tool's name loses its group: file_system.edit is edit,
+    vibe.todo is todo."""
+    typ, t = e.get("type"), _seconds(e.get("createdAt"))
+    if typ == "message":
+        out = e.get("outcome")
+        if e.get("generationStatus", "completed") != "completed" \
+                or (isinstance(out, dict) and out.get("type") == "discarded"):
+            return
+        txt = "\n".join(str(c.get("text") or "") for c in e.get("content") or []
+                        if isinstance(c, dict) and c.get("type") == "text").strip()
+        if not txt:
+            return
+        if e.get("role") == "user" and e.get("source", "turn_start") in ("turn_start",
+                                                                         "turn_steer"):
+            yield {"t": t, "role": "user", "text": txt}
+        elif e.get("role") == "assistant":
+            yield {"t": t, "role": "agent", "text": txt}
+    elif typ == "effect":
+        det = e.get("detail") if isinstance(e.get("detail"), dict) else {}
+        name = str(det.get("toolName") or e.get("title") or "")
+        if name.startswith(("file_system.", "vibe.")):
+            name = name.split(".", 1)[1]
+        inp = det.get("input") if isinstance(det.get("input"), dict) else {}
+        yield {"t": t, "role": "tool", "tool": name, "target": _target(inp), "input": inp}
+
+_VIBE_FILE_TOOLS = ("write_file", "edit", "read_file")
+
+def vibe_events(src):
+    """(end, event) for each message of the Vibe session whose journal is
+    `src`, read from its whole store; `end` is the journal's size.  A file
+    a tool names relative to the session's folder is named whole."""
+    if not vibe_reader_on():
+        return
+    f = Path(src)
+    d = f.parent.parent
+    st = _stat(f)
+    try:
+        cwd = json.loads((d / "meta.json").read_bytes())["environment"]["working_directory"]
+    except (OSError, ValueError, KeyError, TypeError):
+        cwd = None
+    for e in vibe_entries(d):
+        for ev in _vibe_events(e):
+            tgt = ev.get("target")
+            if ev["role"] == "tool" and ev["tool"] in _VIBE_FILE_TOOLS and tgt \
+                    and not _is_abs(tgt) and isinstance(cwd, str) and _is_abs(cwd):
+                ev["target"] = os.path.join(cwd, tgt)
+            yield (st.st_size if st else 0), ev
+
 _EVENTS = {"claude": _claude_events, "kimi": _kimi_events, "codex": _codex_events,
-           "agy": _agy_events}
+           "agy": _agy_events, "vibe": _vibe_events}
 
 def session_events(agent: str, src, start: int = 0):
     """(end, event) for each message of one session from byte `start` on;
     `src` is a path or an open binary file.  `end` is where the next read
-    starts, so an index can pick up what was appended since."""
+    starts, so an index can pick up what was appended since.  Vibe's
+    session is a store, not a file of lines: it is read whole."""
+    if agent == "vibe":
+        yield from vibe_events(src)
+        return
     parse = _EVENTS[agent]
     fh = open(src, "rb") if isinstance(src, (str, Path)) else src
     try:
@@ -8225,6 +8430,8 @@ def list_sessions(project: str = None, agents=None) -> list:
                         "project": meta.get("cwd"), "file": str(f), "updated": st.st_mtime})
     if "agy" in want:
         out += agy_conversations(real)
+    if "vibe" in want:
+        out += vibe_sessions(real)
     out.sort(key=lambda s: s["updated"] or 0, reverse=True)
     return out
 
@@ -8243,7 +8450,7 @@ def resume_command(agent: str, sid: str, project: str = None) -> str:
     first), or with no project the line to run in the session's folder."""
     exe = agent_cli(agent) or agent
     args = {"claude": ["--resume", sid], "kimi": ["-S", sid], "codex": ["resume", sid],
-            "agy": ["--conversation", sid]}[agent]
+            "agy": ["--conversation", sid], "vibe": ["--resume", sid]}[agent]
     return (cd_then(project) if project else "") + " ".join(shell_quote(a) for a in [exe] + args)
 
 # ---- search -------------------------------------------------------------------- #
@@ -8363,7 +8570,14 @@ def update_search_index(progress=None) -> dict:
             k = known.get(s["file"])
             start = k[2] if k and st.st_size >= k[0] and k[2] <= st.st_size \
                 and not s.get("rewrites") else 0           # agy may rewrite its file
-            if start == 0 and k:
+            if s.get("rewrites"):
+                # read again whole: what it gave before goes, also from an
+                # earlier file of it (Vibe starts a new one now and then)
+                db.execute("delete from msgs where agent = ? and session = ?",
+                           (s["agent"], s["id"]))
+                db.execute("delete from files where agent = ? and session = ? and path != ?",
+                           (s["agent"], s["id"], s["file"]))
+            elif start == 0 and k:
                 db.execute("delete from msgs where file = ?", (s["file"],))
             end, title, first, last = _index_events(
                 db, s["agent"], s["id"], s.get("project"), s["file"],
@@ -8954,6 +9168,10 @@ def _where_in(line: bytes, agent: str) -> tuple:
                                       "tool.result": "tool output",
                                       "content.part": "agent reply"}.get(
             ev, "your message" if e.get("type") == "turn.prompt" else "history")
+    if agent == "vibe":                         # a line of history_bytes
+        return _seconds(e.get("createdAt")), {
+            "effect": "command or file the agent wrote", "output": "tool output"}.get(
+            e.get("type"), "your message" if e.get("role") == "user" else "agent reply")
     return _when(e.get("timestamp")), "history"
 
 _NAME_CH = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
@@ -9082,6 +9300,23 @@ def _masked(text: str, n: int) -> str:
     """_clip(text, n), every key in it masked first."""
     return _clip(_redact_head(text, n), n)
 
+def history_bytes(s: dict) -> bytes:
+    """A session's history as the secrets check reads it: its file.  Vibe's
+    is a store, not a file: each entry aht reads of it on a line of its own
+    (what was typed, the replies, the tool calls, their output apart; never
+    the reasoning)."""
+    if s["agent"] != "vibe":
+        return Path(s["file"]).read_bytes()
+    lines = []
+    for e in vibe_entries(Path(s["file"]).parent.parent):
+        if e.get("type") == "message":
+            lines.append(e)
+        elif e.get("type") == "effect":
+            t = e.get("createdAt")
+            lines += [{"type": "effect", "createdAt": t, "detail": e.get("detail")},
+                      {"type": "output", "createdAt": t, "state": e.get("state")}]
+    return b"".join(json.dumps(x).encode() + b"\n" for x in lines)
+
 def scan_secrets(project: str = None, sessions: list = None) -> list:
     """Everything in the agents' histories that looks like a key, a token or
     a password.  Values are only ever returned masked."""
@@ -9089,7 +9324,7 @@ def scan_secrets(project: str = None, sessions: list = None) -> list:
     finds = {}
     for s in sessions if sessions is not None else list_sessions(project):
         try:
-            data = Path(s["file"]).read_bytes()
+            data = history_bytes(s)
         except OSError:
             continue
         for kind, a0, b0, value in _scan_bytes(data, pats):
@@ -9161,7 +9396,7 @@ def cmd_secrets(args):
 
 _CHANGE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "StrReplaceFile",
                  "WriteFile", "apply_patch", "write_to_file", "replace_file_content",
-                 "multi_replace_file_content"}
+                 "multi_replace_file_content", "write_file", "edit"}
 
 def build_journal(project: str, days: int = None) -> dict:
     """A dated diary of a project from every agent's sessions: what was
@@ -9197,7 +9432,7 @@ def build_journal(project: str, days: int = None) -> dict:
                     rel = os.path.relpath(tgt, real)
                     if rel not in d["changed"]:
                         d["changed"].append(rel)
-                elif ev.get("tool") in ("Bash", "Shell", "shell", "exec_command"):
+                elif ev.get("tool") in ("Bash", "Shell", "shell", "exec_command", "bash"):
                     d["commands"] += 1
         for day in per_day.values():
             if (s["agent"], s["id"]) in day:
@@ -9257,7 +9492,8 @@ RULES_READERS = {        # which instruction file each agent reads in a project
               "none of those exists",
     "kimi": "AGENTS.md", "codex": "AGENTS.md", "opencode": "AGENTS.md",
     "cursor": "AGENTS.md", "copilot": "AGENTS.md", "gemini": "GEMINI.md",
-    "agy": "AGENTS.md and GEMINI.md, also .agents/rules/"}
+    "agy": "AGENTS.md and GEMINI.md, also .agents/rules/",
+    "vibe": "AGENTS.md, once you trust the folder in Vibe"}
 
 def _imports_agents(text: str) -> bool:
     return any(l.strip() in (RULES_IMPORT, "@./AGENTS.md") for l in text.splitlines())
@@ -9389,7 +9625,7 @@ def cmd_rules(args):
 
 # ---- switch agent ---------------------------------------------------------------- #
 
-SWITCH_TARGETS = ("claude", "kimi", "codex", "agy")
+SWITCH_TARGETS = ("claude", "kimi", "codex", "agy", "vibe")
 
 def agent_cli(agent: str):
     if os.environ.get(f"AHT_CLI_{agent.upper()}"):     # tests: a stand-in CLI
@@ -9399,7 +9635,7 @@ def agent_cli(agent: str):
     if agent == "kimi":
         own = Path.home() / ".kimi-code/bin/kimi"
         return find_tool("kimi") or (str(own) if own.exists() else None)
-    return find_tool(agent) if agent in ("codex", "agy") else None
+    return find_tool(agent) if agent in ("codex", "agy", "vibe") else None
 
 def _note_file(seen: list, p: str) -> None:
     """Each file once, the most recent last."""
@@ -9435,11 +9671,11 @@ def events_digest(s: dict, project: str, turns: int = 8, tail: int = None,
             d["last_t"] = ev.get("t") or d["last_t"]
         elif ev["role"] == "tool":
             inp = ev.get("input") or {}
-            if ev.get("tool") in ("TodoList", "TodoWrite"):
+            if ev.get("tool") in ("TodoList", "TodoWrite", "todo"):    # todo: Vibe's
                 todos = inp.get("todos")
                 if isinstance(todos, list):
                     d["todos"] = [x for x in todos if isinstance(x, dict)
-                                  and x.get("status") not in ("completed", "done")]
+                                  and x.get("status") not in ("completed", "done", "cancelled")]
             elif ev.get("tool") == "update_plan" and isinstance(inp.get("plan"), list):
                 d["todos"] = [{"content": x.get("step"), "status": x.get("status")}
                               for x in inp["plan"] if isinstance(x, dict) and x.get("step")
@@ -9813,6 +10049,8 @@ def session_file(real: str, agent: str, sid: str):
                          if s["id"] == sid), None)
     elif agent == "agy" and agy_conversation_exists(sid):
         f = AGY_STORE.root() / "brain" / sid / ".system_generated" / "logs" / "transcript.jsonl"
+    elif agent == "vibe" and vibe_session_exists(sid):
+        f = _vibe_journal(_vibe_dir(sid))
     return f if f and f.is_file() else None
 
 def _session_after(real: str, agent: str, since: float):
@@ -10117,6 +10355,8 @@ def agent_start_line(agent: str, mode: str, sid=None, ask: str = None) -> str:
         rc = " --remote-control" if cfg_get("handover_remote_control", True) else ""
         return f"{exe}{rc} --conversation {q(sid)} -i {q(ask)}" if resume \
             else f"{exe}{rc} -i {q(ask)}"
+    if agent == "vibe":
+        return f"{exe} --resume {q(sid)} {q(ask)}" if resume else f"{exe} {q(ask)}"
     raise ValueError(f"no start line for {agent}")
 
 def _ask(frm: str, rel: str, catchup: bool) -> str:
@@ -10177,7 +10417,8 @@ def agents_running_nt() -> set:
     except Exception:
         return set()
     names = {line.split(",")[0].strip('"').lower() for line in r.stdout.splitlines() if line}
-    return {a for a in ("codex", "kimi", "agy") if f"{a}.exe" in names}
+    found = {a for a in ("codex", "kimi", "agy", "vibe") if f"{a}.exe" in names}
+    return found | ({"vibe"} if "vibe-rs.exe" in names else set())     # vibe runs vibe-rs
 
 def _switch_checks(out: dict, real: str, origin=None, brief_only: bool = False,
                    back: bool = False) -> None:
@@ -10239,7 +10480,7 @@ def cmd_switch(args):
         return _switch_back(args, out, lines, real)
     target = args.to
     if not target:
-        out["blockers"].append("say which agent goes on: --to claude, codex, kimi or agy "
+        out["blockers"].append("say which agent goes on: --to claude, codex, kimi, agy or vibe "
                                "(or --back to hand the work back)")
         return _emit(args, out, lines)
     mode = "brief-only" if args.brief_only else "resume" if args.resume else "new"
@@ -10529,7 +10770,8 @@ def cmd_relays(args):
 
 # ---- the session board ----------------------------------------------------------- #
 
-_AGENT_PROC = re.compile(r"(?:^|/)(kimi|codex|agy|gemini|opencode|cursor-agent|copilot)(?:\s|$)")
+_AGENT_PROC = re.compile(r"(?:^|/)(kimi|codex|agy|vibe|vibe-rs|gemini|opencode|cursor-agent|"
+                         r"copilot)(?:\s|$)")
 # agy's subcommands that hold no conversation: its daemons and its tools
 AGY_NOT_SESSIONS = {"agent", "agents", "changelog", "help", "install", "mcp", "mic-serve",
                     "models", "plugin", "plugins", "remote-control", "update"}
@@ -10538,7 +10780,12 @@ AGY_NOT_SESSIONS = {"agent", "agents", "changelog", "help", "install", "mcp", "m
 CODEX_NOT_SESSIONS = {"app-server", "apply", "cloud", "completion", "debug", "features",
                       "generate-ts", "help", "login", "logout", "mcp", "mcp-server",
                       "responses-api-proxy", "sandbox", "stdio-to-uds"}
-NOT_SESSIONS = {"agy": AGY_NOT_SESSIONS, "codex": CODEX_NOT_SESSIONS}
+# … and Vibe's (the `vibe` command runs vibe-rs; its servers, vibe-acp and
+# vibe-app-server, are programs of their own the pattern does not take)
+VIBE_NOT_SESSIONS = {"mcp", "config", "help", "update", "--setup", "--check-upgrade", "-v",
+                     "--version", "-h", "--help"}
+NOT_SESSIONS = {"agy": AGY_NOT_SESSIONS, "codex": CODEX_NOT_SESSIONS, "vibe": VIBE_NOT_SESSIONS,
+                "vibe-rs": VIBE_NOT_SESSIONS}
 
 def agent_processes() -> list:
     """Agent CLIs other than Claude Code that run right now, with their folder
@@ -10562,7 +10809,7 @@ def agent_processes() -> list:
                        if re.search(rf"(?:^|/){m.group(1)}$", w)), 0)
             if (words[at + 1:at + 2] or [""])[0] in NOT_SESSIONS[m.group(1)]:
                 continue
-        pids[int(parts[0])] = m.group(1)
+        pids[int(parts[0])] = "vibe" if m.group(1) == "vibe-rs" else m.group(1)
     if not pids:
         return []
     cwd = {}
@@ -12288,7 +12535,7 @@ def redact_in_histories(fingerprint: str, project: str = None, apply: bool = Fal
     hits = []
     for s in list_sessions(project):
         try:
-            data = Path(s["file"]).read_bytes()
+            data = history_bytes(s)
         except OSError:
             continue
         spans = [(a0, b0) for _k, a0, b0, v in _scan_bytes(data, pats)
@@ -12297,6 +12544,11 @@ def redact_in_histories(fingerprint: str, project: str = None, apply: bool = Fal
             hits.append((s, spans))
     res = {"fingerprint": fingerprint, "files": len(hits),
            "places": sum(len(sp) for _s, sp in hits), "applied": False, "blockers": []}
+    # Vibe checks each record of a session's store: a changed byte would lose
+    # the whole session, so a find there stays as it is
+    vibe_left = sum(len(sp) for s, sp in hits if s["agent"] == "vibe")
+    if vibe_left:
+        res["left"] = vibe_left
     for s, _sp in hits:
         for o in running_sessions(inside=s.get("project") or "/nonexistent"):
             res["blockers"].append(f"an agent session is open in {s.get('project')} "
@@ -12305,8 +12557,10 @@ def redact_in_histories(fingerprint: str, project: str = None, apply: bool = Fal
     if not apply or res["blockers"] or not hits:
         return res
     keep = aht_home() / "redacted" / _stamp()
-    res["left"] = 0
+    res["left"] = vibe_left
     for s, spans in hits:
+        if s["agent"] == "vibe":
+            continue
         src = Path(s["file"])
         data = src.read_bytes()
         new, left = _take_out(data, spans, b"[removed by aht]")

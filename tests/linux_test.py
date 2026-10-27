@@ -83,7 +83,7 @@ env.update({"HOME": str(sb / "home"),        # nothing here may touch the real h
             # sandbox after it is removed
             "AHT_NO_SEARCH_INDEX": "1"})
 for b in ("GEMINI", "CURSOR", "OPENCODE", "CODEX", "COPILOT", "KIMI",
-          "KIMI_CODE"):
+          "KIMI_CODE", "VIBE"):
     env[f"AHT_ROOT_{b}"] = str(sb / "nope")
 
 enc = lambda p: re.sub(r"[^a-zA-Z0-9]", "-", p)

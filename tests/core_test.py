@@ -46,7 +46,7 @@ sb = Path(tempfile.mkdtemp(prefix="aht_core_", dir=_tmp))
 roots = sb / "roots"
 tools = sb / "tools"
 for d in ("claude", "gemini", "cursor", "opencode", "codex", "copilot",
-          "kimi/sessions", "kimi/user-history", "kimi-code/sessions"):
+          "kimi/sessions", "kimi/user-history", "kimi-code/sessions", "vibe"):
     (tools / d).mkdir(parents=True)
 (roots / "projA").mkdir(parents=True)
 
@@ -62,6 +62,7 @@ env.update({
     "AHT_ROOT_COPILOT": str(tools / "copilot"),
     "AHT_ROOT_KIMI": str(tools / "kimi" / "sessions"),
     "AHT_ROOT_KIMI_CODE": str(tools / "kimi-code" / "sessions"),
+    "AHT_ROOT_VIBE": str(tools / "vibe"),       # never $VIBE_HOME, never ~/.vibe
     "AHT_NO_ICONS": "1", "AHT_NO_NOTIFY": "1", "AHT_NO_BACKUP": "1",
     "AHT_NO_CHECKPOINT": "1",       # the checkpoint test turns it back on
 })
@@ -2352,13 +2353,13 @@ finally:
 ck(wq == ['"C:\\Users\\me\\R&D"', '"ab|c"', 'cd /d "C:\\x^y (1)" && '],
    f"Windows: a word for cmd.exe is always in double quotes ({wq})")
 
-print("\n[17b] agents on one machine: switch, hand back, relays, Antigravity")
+print("\n[17b] agents on one machine: switch, hand back, relays, Antigravity, Mistral Vibe")
 # a sandbox of its own: every agent a stand-in that only notes its calls
 # (Codex and Kimi also write sessions the way the real ones do), terminals
 # noted in a log, no window opens and no agent spends a token
 import sqlite3
 sys.path.insert(0, str(HERE))
-import fake_agy
+import fake_agy, fake_vibe
 ae = iso_env("agents")
 abase = Path(ae["HOME"]).parent
 ae["AHT_ROOT_AGY"] = str(abase / "tools" / "agy")
@@ -2366,14 +2367,15 @@ astub = abase / "stubs"
 astub.mkdir()
 clog, cxlog, kxlog, atlog = (abase / n for n in ("calls.log", "codex.log", "kimi.log",
                                                   "terminal.log"))
-for name in ("claude", "agy"):
+for name in ("claude", "agy", "vibe"):
     (astub / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "{clog}"\n')
 for name in ("codex", "kimi"):
     (astub / name).write_text(f'#!/bin/sh\nexec "{PY}" "{HERE / f"fake_{name}.py"}" "$@"\n')
 for f in astub.iterdir():
     f.chmod(0o755)
 (abase / "no-tabs.json").write_text("{}")
-ae.update({f"AHT_CLI_{n.upper()}": str(astub / n) for n in ("claude", "codex", "kimi", "agy")})
+ae.update({f"AHT_CLI_{n.upper()}": str(astub / n) for n in ("claude", "codex", "kimi", "agy",
+                                                             "vibe")})
 ae.update(AHT_CLAUDE=str(astub / "claude"), AHT_TERMINAL_LOG=str(atlog),
           AHT_FAKE_CODEX_LOG=str(cxlog), AHT_FAKE_KIMI_LOG=str(kxlog),
           AHT_CORE_DIR=str(HERE.parent), AHT_ITERM_TABS=str(abase / "no-tabs.json"),
@@ -2698,7 +2700,9 @@ d = A("switch", paper, "--to", "agy", "--json")
 ck(" --remote-control" not in d.get("start_line", "x"), "agy: --remote-control follows the setting")
 iso_run(ae, "config", "--unset", "handover_remote_control")
 st = A("status", "--json")
-ck((st.get("agent_clis") or {}).get("agy") == str(astub / "agy"), "status: agy's CLI is listed")
+ck((st.get("agent_clis") or {}).get("agy") == str(astub / "agy")
+   and st["agent_clis"].get("vibe") == str(astub / "vibe"),
+   "status: agy's CLI and Vibe's are listed")
 fx2_misses += fixture_ok(st, "status.json", FIXTURES2, keys=("agent_clis", "hook_installed"))
 probe = ("import sys, json; sys.path.insert(0, sys.argv[1]); import aht; "
          "s = [x for x in aht.list_sessions(sys.argv[2]) if x['agent'] == 'agy']; "
@@ -2765,27 +2769,172 @@ ck(not Path(ae["AHT_ROOT_AGY"], "conversation_summaries.db-wal").exists()
    and gone.get("ids") == [fake_agy.NEW, fake_agy.OLD],
    f"agy: its database is read when agy left no -wal beside it ({gone})")
 
+# Mistral Vibe as a target; its own store is read only while VIBE_READER is on.
+# A folder of its own: Claude's session S7 there, and Vibe's stand-in store
+vmark = "VIBE-" + "PRIVATE-" + "MARKER-57"
+vroot = Path(ae["AHT_ROOT_VIBE"])
+vpaper = os.path.realpath(str(Path(ae["HOME"]) / "code" / "vpaper"))
+vother = os.path.realpath(str(Path(ae["HOME"]) / "code" / "vother"))
+for f in (vpaper + "/src", vother):
+    os.makedirs(f)
+Path(vpaper, "src", "app.py").write_text("old\n")
+S7 = "7a7a7a7a-1111-4222-8333-444455556666"
+vstore = Path(ae["AHT_ROOT_CLAUDE"]) / enc(vpaper)
+vstore.mkdir(parents=True)
+(vstore / f"{S7}.jsonl").write_text("".join(json.dumps(dict(
+    {"cwd": vpaper, "entrypoint": "cli", "sessionId": S7}, **kw)) + "\n" for kw in (
+        dict(type="user", timestamp=iso(T0), message={"role": "user", "content": "start the app"}),
+        dict(type="assistant", timestamp=iso(T0 + 60), message={"role": "assistant", "content": [
+            {"type": "text", "text": "The app has a start."}]}))))
+os.utime(vstore / f"{S7}.jsonl", (T0 + 60, T0 + 60))
+iso_run(ae, "tag", vpaper, "--apply")
+fake_vibe.build(vroot, vpaper, vother, vmark)
+vfiles = lambda: {str(p.relative_to(vroot)): hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in vroot.rglob("*") if p.is_file()}
+vbefore = vfiles()
+d = A("switch", vpaper, "--to", "vibe", "--json")
+dr = A("switch", vpaper, "--to", "vibe", "--resume", "--json", AHT_TEST_VIBE_READER="1")
+ck(d.get("start_line", "").startswith(f"{core.shell_quote(astub / 'vibe')} 'You are taking over "
+                                      "this project from Claude Code. Read .aht/handover/relay-")
+   and dr.get("mode") == "resume" and dr.get("start_line", "").startswith(
+       f"{core.shell_quote(astub / 'vibe')} --resume {fake_vibe.NEW} 'While you were away"),
+   f"vibe: a new session with the summary to read, or its own with the catch-up "
+   f"({d.get('start_line')}, {dr.get('start_line')})")
+vprobe = ("import sys, json; sys.path.insert(0, sys.argv[1]); import aht; "
+          "s = [x for x in aht.list_sessions(sys.argv[2]) if x['agent'] == 'vibe']; "
+          "d = aht.events_digest(s[0], sys.argv[2]) if s else {}; "
+          "ev = [e for x in s for _n, e in aht.session_events('vibe', x['file'])]; "
+          "f = aht.session_file(sys.argv[2], 'vibe', s[0]['id']) if s else None; "
+          "print(json.dumps({'ids': [x['id'] for x in s], 'rew': [x.get('rewrites') for x in s], "
+          "'titles': [x.get('title') for x in s], 'upd': [x.get('updated') for x in s], "
+          "'all': sorted(x['id'] for x in aht.list_sessions(agents=['vibe'])), 'dig': d, "
+          "'ev': ev, 'file': f and str(f), "
+          "'gone': str(aht.session_file(sys.argv[2], 'vibe', 'f0f0f0f0-0000-4000-8000-0000f0'))"
+          ", 'res': aht.resume_command('vibe', s[0]['id']) if s else None}))")
+def vibe_probe(**extra):
+    r = subprocess.run([PY, "-c", vprobe, str(HERE.parent), vpaper], env=dict(ae, **extra),
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"error": r.stderr[-400:]}
+voff = vibe_probe()
+if core.VIBE_READER:
+    ck(voff.get("ids") == [fake_vibe.NEW, fake_vibe.OLD],
+       f"Vibe's store is read with VIBE_READER on, no test switch needed ({voff})")
+else:
+    ck(voff.get("ids") == [] and voff.get("all") == [],
+       f"Vibe's store is not read while VIBE_READER is off ({voff})")
+von = vibe_probe(AHT_TEST_VIBE_READER="1")
+dg = von.get("dig") or {}
+ck(von.get("ids") == [fake_vibe.NEW, fake_vibe.OLD] and von.get("rew") == [True, True]
+   and von.get("all") == sorted([fake_vibe.NEW, fake_vibe.OLD, fake_vibe.ELSE])
+   and von.get("titles") == ["Heron tokens", "Older work"]
+   and all(isinstance(u, float) and u < time.time() - 500 for u in von.get("upd") or [None])
+   and [x["you"] for x in dg.get("exchanges", [])] == ["look at the heron parser",
+                                                       "make the heron parser read tokens"]
+   and dg["exchanges"][-1]["agent"] == "The heron parser reads tokens now."
+   and dg.get("touched") == ["src/heron.py"]
+   and [t["content"] for t in dg.get("todos", [])] == ["make it read tokens", "add a test"]
+   and [e["tool"] for e in von["ev"] if e["role"] == "tool"] == ["write_file", "bash", "todo"]
+   and "half written" not in json.dumps(von) and "context Vibe added" not in json.dumps(von)
+   and vmark not in json.dumps(von)
+   and (von.get("file") or "").endswith(f"{fake_vibe.NEW}/journal/0000000000000013.jsonl")
+   and von.get("gone") == "None"
+   and str(von.get("res", "")).endswith(f"--resume {fake_vibe.NEW}"),
+   f"Vibe: sessions from meta.json, a subagent's left out; the history from the generation "
+   f"and the journal (added, replaced, removed; a half-written line waits); tool calls, the "
+   f"to-dos still open, never its reasoning ({von})")
+# switching away from Vibe, search and the secrets check show nothing aht must not read
+d = A("switch", vpaper, "--to", "claude", "--session", fake_vibe.NEW, "--brief-only", "--apply",
+      "--json", AHT_TEST_VIBE_READER="1")
+vbrief = Path(d.get("brief") or "/x").read_text() if d.get("brief") else ""
+sr = A("search", "heron", "--json", AHT_TEST_VIBE_READER="1", AHT_NO_SEARCH_INDEX="")
+hit = next((x for x in sr.get("results", []) if x.get("agent") == "vibe"), {})
+sec = A("secrets", vpaper, "--json", AHT_TEST_VIBE_READER="1")
+seen = (json.dumps(d) + vbrief + json.dumps(sr) + json.dumps(sec)
+        + json.dumps(A("relays", vpaper, "--json")) + json.dumps(A("journal", vpaper, "--json",
+                                                                   AHT_TEST_VIBE_READER="1")))
+ck("The heron parser reads tokens now." in vbrief and d.get("source", {}).get("agent") == "vibe"
+   and hit.get("session") == fake_vibe.NEW and vmark not in seen and "signed in" not in seen
+   and vfiles() == vbefore,
+   f"Vibe as a source, in search, the journal and the secrets check; nothing of its other "
+   f"files, records or reasoning appears, and its store is left as it was "
+   f"({d.get('blockers') or hit or sr})")
+# a key in a Vibe session is found, masked, and never taken out of its store
+vkey = "sk-" + "ant-" + "api03-" + "Vb7x" * 9
+fake_vibe.add_turn(vroot, vother, "e7e7e7e7-0000-4000-8000-0000000000e7",
+                   f"use the key {vkey} for the api", "Noted.", time.time() - 400, vmark)
+sec = A("secrets", vother, "--json", AHT_TEST_VIBE_READER="1")
+fv = next((f for f in sec.get("finds") or [] if f.get("agent") == "vibe"), {})
+dry = A("secrets", vother, "--redact", fv.get("fingerprint") or "x", "--json",
+        AHT_TEST_VIBE_READER="1")
+red = A("secrets", vother, "--redact", fv.get("fingerprint") or "x", "--apply", "--json",
+        AHT_TEST_VIBE_READER="1")
+ck(fv.get("where") == "your message" and vkey not in json.dumps(sec)
+   and dry.get("left") == 1 and red.get("left") == red.get("places") == 1
+   and {k: v for k, v in vfiles().items() if k in vbefore} == vbefore
+   and vkey.encode() in b"".join(p.read_bytes() for p in vroot.rglob("*.json")),
+   f"Vibe: a key is found where it was typed, masked, and left in Vibe's store, whose digests "
+   f"a changed byte would break ({fv}, {red})")
+# Hand Back to Vibe: its own session, after a check that it is still there
+d = A("switch", vpaper, "--to", "claude", "--session", fake_vibe.NEW, "--apply", "--json",
+      AHT_TEST_VIBE_READER="1")
+dry = A("switch", vpaper, "--back", "--json", AHT_TEST_VIBE_READER="1")
+back = A("switch", vpaper, "--back", "--apply", "--json", AHT_TEST_VIBE_READER="1")
+ck(d.get("applied") and dry.get("target") == "vibe" and dry.get("session") == fake_vibe.NEW
+   and back.get("applied") and back.get("start_line", "").startswith(
+       f"{core.shell_quote(astub / 'vibe')} --resume {fake_vibe.NEW} 'While you were away")
+   and (tlines() or [""])[-1].endswith(back["start_line"]),
+   f"Hand Back to Vibe: `vibe --resume <its session>` with the catch-up to read "
+   f"({dry.get('blockers') or dry.get('start_line')}, {back.get('error') or back.get('blockers')})")
+# Hand Back from Vibe: what it did meanwhile is in Claude's catch-up
+d = A("switch", vpaper, "--to", "vibe", "--session", S7, "--apply", "--json",
+      AHT_TEST_VIBE_READER="1")
+VW = "f1f1f1f1-0000-4000-8000-0000000000f1"
+fake_vibe.add_turn(vroot, vpaper, VW, "add the pelican exporter", "The pelican exporter is in.",
+                   time.time() + 1, vmark, edit="src/app.py")
+dry = A("switch", vpaper, "--back", "--json", AHT_TEST_VIBE_READER="1")
+back = A("switch", vpaper, "--back", "--apply", "--json", AHT_TEST_VIBE_READER="1")
+vcut = Path(back.get("brief") or "/x").read_text() if back.get("brief") else ""
+ck(d.get("applied") and back.get("applied") and back.get("target") == "claude"
+   and back.get("session") == S7 and (back.get("source") or {}).get("session") == VW
+   and f"## Mistral Vibe — untitled (`{VW}`)" in vcut and "add the pelican exporter" in vcut
+   and "**Agent:** The pelican exporter is in." in vcut and "- `src/app.py`" in vcut
+   and "aht cannot read" not in vcut + json.dumps(dry) and vmark not in vcut,
+   f"Hand Back from Vibe: Claude's catch-up holds Vibe's exchange and the file it changed "
+   f"({back.get('error') or back.get('blockers') or vcut[:600]})")
+
 # another agent open in the folder: a warning; its daemon subcommands are no session
 procs = []
 try:
-    for name in ("codex", "agy"):
+    for name in ("codex", "agy", "vibe", "vibe-rs", "vibe-app-server", "vibe-acp"):
         (astub / "run" / name).parent.mkdir(exist_ok=True)
         (astub / "run" / name).write_text(f"#!{PY}\nimport time\ntime.sleep(600)\n")
         (astub / "run" / name).chmod(0o755)
-    # [F8] Codex's shared daemon and agy's are no session
+    # [F8] Codex's shared daemon and agy's are no session; nor are Vibe's
+    # servers, its tools and a headless run
     procs.append(subprocess.Popen([str(astub / "run" / "codex"), "app-server", "--listen",
                                    "unix://", "--managed-daemon"], cwd=paper))
     procs.append(subprocess.Popen([str(astub / "run" / "agy"), "remote-control"], cwd=paper))
+    for argv in (["vibe", "mcp", "list"], ["vibe", "--check-upgrade"], ["vibe-app-server"],
+                 ["vibe-acp"], ["vibe-rs", "-p", "a headless run"]):
+        procs.append(subprocess.Popen([str(astub / "run" / argv[0])] + argv[1:], cwd=paper))
     time.sleep(1)
     d0 = A("switch", paper, "--to", "claude", "--json")
     procs.append(subprocess.Popen([str(astub / "run" / "codex")], cwd=paper))
+    procs.append(subprocess.Popen([str(astub / "run" / "vibe-rs"), "--resume", "x"], cwd=paper))
     time.sleep(1)
     d = A("switch", paper, "--to", "claude", "--json")
     ck("Codex is still open in this folder; don't type into both" in d.get("warnings", [])
+       and "Mistral Vibe is still open in this folder; don't type into both"
+       in d.get("warnings", [])
        and not any("Antigravity" in w for w in d.get("warnings", []))
-       and not any("Codex" in w or "Antigravity" in w for w in d0.get("warnings", [])),
-       f"another agent open in the folder is a warning; Codex's and agy's daemons are no "
-       f"session ({d0.get('warnings')}, {d.get('warnings')})")
+       and not any("Codex" in w or "Antigravity" in w or "Vibe" in w
+                   for w in d0.get("warnings", [])),
+       f"another agent open in the folder is a warning; Codex's and agy's daemons, Vibe's "
+       f"servers, tools and headless runs are no session ({d0.get('warnings')}, "
+       f"{d.get('warnings')})")
 finally:
     for p in procs:
         p.kill()

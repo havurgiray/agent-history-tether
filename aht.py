@@ -182,6 +182,8 @@ CONFIG_DEFAULTS = {
     "handover_carry_trust": True,    # a folder trusted here is trusted there
     "handover_claude_args": [],      # extra arguments for the resumed session
     "handover_mosh":    True,        # attach with mosh when both sides have it
+    "handover_keep_awake": True,     # the other machine does not sleep while the
+                                     #   agent works there (a closed lid still does)
     "rsync_path":       None,        # None -> the newest rsync found
     # notices: a session that waits for you, or finished a long piece of work
     "notify_waiting":   True,
@@ -4238,9 +4240,24 @@ def can_send_projects() -> bool:
 
 def can_reach_machines() -> bool:
     """Other machines can be asked: their sessions, notices, search and
-    backups.  For now the same as can_send_projects(); in the end only an ssh
-    client is needed."""
-    return can_send_projects()
+    backups.  Only an ssh client is needed, on all three systems (Windows
+    has OpenSSH's client built in), in the exe as well."""
+    return bool(find_tool("ssh") or (os.name == "nt" and os.path.isfile(_WIN_SSH)))
+
+# where Windows keeps its own ssh: a tray started at login may run with a
+# PATH that lacks it
+_WIN_SSH = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows",
+                        "System32", "OpenSSH", "ssh.exe")
+
+def _ssh() -> str:
+    """The ssh aht runs: by name where the PATH has it, else Windows' own."""
+    if os.name == "nt" and not shutil.which("ssh") and os.path.isfile(_WIN_SSH):
+        return _WIN_SSH
+    return "ssh"
+
+NO_SSH = ("aht asks your other machines over ssh, and this computer has no ssh client"
+          + (" (Settings → System → Optional features → OpenSSH Client)"
+             if os.name == "nt" else ""))
 
 handover_supported = can_send_projects      # the old name, for untouched callers
 
@@ -4660,7 +4677,9 @@ def _ssh_opts() -> list:
 
 def _tailscale_exe():
     return os.environ.get("AHT_TAILSCALE") or find_tool("tailscale") or next(
-        (c for c in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",)
+        (c for c in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                     os.path.join(os.environ.get("ProgramFiles") or r"C:\Program Files",
+                                  "Tailscale", "tailscale.exe"))
          if os.path.exists(c)), None)
 
 def tailscale_address(host: str):
@@ -4747,7 +4766,7 @@ class Remote:
             self._route = (self.target, None)
             user, at, host = self.target.rpartition("@")
             try:
-                g = subprocess.run(["ssh", "-G", host], capture_output=True, text=True,
+                g = subprocess.run([_ssh(), "-G", host], capture_output=True, text=True,
                                    timeout=10, cwd="/", **_NO_WINDOW).stdout
                 real = next((l.split(None, 1)[1] for l in g.splitlines()
                              if l.startswith("hostname ")), host)
@@ -4782,7 +4801,8 @@ class Remote:
 
     def _env(self) -> dict:
         e = {k: v for k, v in os.environ.items()
-             if not k.startswith("AHT_") or k in ("AHT_CLAUDE", "AHT_ITERM_TABS")}
+             if not k.startswith("AHT_") or k in ("AHT_CLAUDE", "AHT_ITERM_TABS",
+                                                   "AHT_AWAKE_EVERY", "AHT_SESSION_BUS")}
         e.update(_sandbox_env(self.root + "/home"))
         if os.name == "nt":
             e["USERPROFILE"] = e["HOME"]        # Windows' Path.home()
@@ -4816,9 +4836,11 @@ class Remote:
             else:
                 if self.sandbox and not raw:
                     script = self._sandboxed(script)
-                r = subprocess.run(["ssh"] + self.ssh_opts() + [self.dest, script], **kw)
+                r = subprocess.run([_ssh()] + self.ssh_opts() + [self.dest, script], **kw)
         except subprocess.TimeoutExpired:
             raise LinkError(f"{self.name} did not answer within {timeout:.0f} s")
+        except FileNotFoundError:
+            raise HandoverError(NO_SSH)
         r = _decoded(r)
         if r.returncode == 255:
             raise LinkError(f"cannot reach {self.name} ({self.target}): "
@@ -5096,7 +5118,16 @@ def _agent_probe(req: dict) -> dict:
             "sessions_open": len(running_sessions()),
             "protocol": AGENT_PROTOCOL, "ops": sorted(AGENT_OPS),
             "core_id": _quiet_value(core_id),
-            "machine_id": machine_id(create=False)}
+            "machine_id": machine_id(create=False),
+            "aht_there": _aht_there(),
+            "keep_awake": _awake_tool()[0]}
+    if req.get("test_awake") and info["keep_awake"]:
+        # `remote check`: does it work for this account, over ssh?  (polkit
+        # may refuse systemd-inhibit to a session that is not at the screen;
+        # then GNOME's own inhibitor is tried, and named when it works)
+        name, _path, info["keep_awake_error"] = _awake_pick()
+        info["keep_awake_works"] = bool(name)
+        info["keep_awake"] = name or info["keep_awake"]
     if path:
         anc = Path(path)
         while not anc.exists() and anc != anc.parent:
@@ -5283,6 +5314,9 @@ def _agent_start(req: dict) -> dict:
     if r.returncode != 0:
         return {"ok": False, "error": "could not start the terminal session: "
                 + (r.stderr or r.stdout).strip()[-200:]}
+    # this machine stays awake while the agent works (handover_keep_awake at
+    # home): a helper next to the session, ended by stop and close
+    awake = _spawn_awake(path, name) if req.get("keep_awake") else None
     # the trace of this attempt's start, for resolve_handing: the session
     # may end before anyone asks whether it started
     for old in run.glob("attempt-*"):
@@ -5309,7 +5343,8 @@ def _agent_start(req: dict) -> dict:
         if started:
             break
     return {"ok": True, "mux": os.path.basename(mux), "name": name,
-            "started": started, "attention": attention, "screen": screen}
+            "started": started, "attention": attention, "screen": screen,
+            "keep_awake": _awake_tool()[0] if awake else None}
 
 def _agent_stop(req: dict) -> dict:
     """End an IDLE session the way its user would: Ctrl-C, never text typed
@@ -5337,6 +5372,7 @@ def _agent_stop(req: dict) -> dict:
         time.sleep(2.5)
     if _tmux_has(name):
         _tmux("kill-session", "-t", "=" + name)
+    _end_awake(name)
     return {"ok": True, "stopped": True}
 
 def _agent_close(req: dict) -> dict:
@@ -5347,7 +5383,206 @@ def _agent_close(req: dict) -> dict:
     if had:
         _tmux("kill-session", "-t", "=" + req["name"])
         time.sleep(0.5)
+    _end_awake(req["name"])
     return {"ok": True, "closed": had}
+
+# ---- keeping this machine awake while a handed-over agent works ------------- #
+
+AWAKE_EVERY = 30        # s between two looks at the folder
+AWAKE_EMPTY = 3         # looks that find no session there, then the helper ends
+AWAKE_HOURS = 24        # and it ends after this long in any case
+_WINDOW_NAME = re.compile(r"[A-Za-z0-9._-]{1,80}")
+
+def _session_bus():
+    """This account's session D-Bus socket (/run/user/<uid>/bus; the tests
+    name another in AHT_SESSION_BUS), or None when there is none."""
+    p = os.environ.get("AHT_SESSION_BUS") or f"/run/user/{os.getuid()}/bus"
+    return p if os.path.exists(p) else None
+
+def _awake_tools() -> list:
+    """[(name, path)] of what can keep this machine from sleeping, in the
+    order to try: caffeinate on macOS; on Linux systemd-inhibit, then the
+    GNOME desktop's own inhibitor (gnome-session-inhibit, through the
+    session bus), which an ssh session may use where polkit refuses it
+    systemd-inhibit."""
+    names = ["caffeinate"] if IS_MAC else \
+        ["systemd-inhibit"] + (["gnome-session-inhibit"] if _session_bus() else []) \
+        if IS_LINUX else []
+    return [(n, p) for n in names for p in [find_tool(n)] if p]
+
+def _awake_tool() -> tuple:
+    """(name, path) of the first of them; (None, None) elsewhere or when
+    none is there."""
+    tools = _awake_tools()
+    return tools[0] if tools else (None, None)
+
+def _awake_argv(tool: str, why: str, then: list) -> list:
+    """The tool holding this machine awake for as long as `then` runs: no
+    idle sleep and no suspend asked for by software; a closed lid still
+    sleeps (caffeinate -i; logind lets the lid switch past an inhibitor).
+    GNOME's inhibitor holds off suspend only: the screen still locks, as
+    with caffeinate -i."""
+    if os.path.basename(tool) == "gnome-session-inhibit":
+        return [tool, "--app-id", "aht", "--reason", why, "--inhibit", "suspend"] + then
+    if IS_MAC:
+        return [tool, "-i"] + then
+    return [tool, "--what=sleep:idle", "--who=aht", "--why=" + why, "--mode=block"] + then
+
+def _awake_env(tool: str):
+    """The environment to run the tool with: gnome-session-inhibit reaches
+    the desktop's session through the session bus, which an ssh login may
+    not name (None: this process's own)."""
+    if os.path.basename(tool) != "gnome-session-inhibit" \
+            or os.environ.get("DBUS_SESSION_BUS_ADDRESS") or not _session_bus():
+        return None
+    return dict(os.environ, DBUS_SESSION_BUS_ADDRESS="unix:path=" + _session_bus())
+
+def _awake_pick(why: str = "aht remote check") -> tuple:
+    """(name, path, error): the first tool that works for this account when
+    tried for a moment (on Linux systemd-inhibit, else GNOME's inhibitor
+    where polkit refuses that to an ssh session); (None, None, why each
+    one failed) when none does."""
+    errors = []
+    for name, path in _awake_tools():
+        try:
+            r = subprocess.run(_awake_argv(path, why, ["true"]), env=_awake_env(path),
+                               capture_output=True, text=True, timeout=20, cwd="/")
+            if r.returncode == 0:
+                return name, path, None
+            err = (r.stderr or r.stdout or "").strip()[-200:]
+        except Exception as e:
+            err = str(e)[:200]
+        if err:
+            errors.append(err if not errors else f"{name}: {err}")
+    return None, None, "; ".join(errors) or None
+
+def _awake_file(name: str) -> Path:
+    return aht_home() / "remote" / "run" / name / "awake.pid"
+
+def _cmdline_of(pid: int) -> str:
+    """A process's command line, as one string ("" when it is gone)."""
+    try:
+        if IS_LINUX:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace")
+        return subprocess.run(["ps", "-p", str(pid), "-o", "args="], capture_output=True,
+                              text=True, timeout=10, cwd="/").stdout
+    except Exception:
+        return ""
+
+def _end_awake(name: str) -> bool:
+    """End the keep-awake helper of window `name` through its pid file, once
+    that pid is still the helper (never another process that got its number)."""
+    if not _WINDOW_NAME.fullmatch(str(name or "")):
+        return False
+    f = _awake_file(name)
+    try:
+        pid = int(json.loads(f.read_text())["pid"])
+    except Exception:
+        return False
+    ended = False
+    if pid != os.getpid() and _pid_alive(pid) and "_awake" in _cmdline_of(pid):
+        try:
+            os.kill(pid, 15)
+            ended = True
+        except OSError:
+            pass
+        for _ in range(30):                 # it lets go of the tool, then ends
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.1)
+    try:
+        f.unlink()
+    except OSError:
+        pass
+    return ended
+
+def _spawn_awake(path: str, name: str):
+    """Start `aht _awake` for the session in `path`, detached; its pid, or
+    None where this machine has no way to stay awake."""
+    if not _awake_tool()[1] or not _WINDOW_NAME.fullmatch(str(name or "")):
+        return None
+    _end_awake(name)                        # one from an earlier start of this window
+    return _spawn_aht(["_awake", "--path", path, "--name", name,
+                       "--hours", str(AWAKE_HOURS)])
+
+def cmd_awake(args):
+    """`aht _awake --path P [--name W] [--hours H]`, on the machine a project
+    was handed over to.  Every 30 s it looks at the folder: while a session
+    there works or waits, it holds caffeinate (macOS) or systemd-inhibit
+    (Linux; GNOME's gnome-session-inhibit where polkit refuses that to an
+    ssh session: the tool is picked once, at the start); it lets go when
+    the work is idle.  It ends after three looks with no session there,
+    after H hours, or when `stop` or `close` end it through its pid file.
+    Where every tool is refused, it ends quietly."""
+    import signal
+    if not _awake_tool()[1]:
+        return 0
+    every = float(os.environ.get("AHT_AWAKE_EVERY") or AWAKE_EVERY)
+    end = time.time() + float(args.hours) * 3600
+    real = os.path.realpath(args.path)
+    _name, tool, err = _awake_pick("an agent works on " + real)
+    if not tool:
+        log(f"AWAKE {real}: {_awake_tool()[0]} was refused ({err}); this machine may sleep",
+            "warn")
+        return 0
+    pidf = _awake_file(args.name) if args.name and _WINDOW_NAME.fullmatch(args.name) else None
+    if pidf:
+        pidf.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(pidf, {"pid": os.getpid(), "path": real, "at": _now()})
+    def bye(*_a):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, bye)
+    # the tool runs a loop that ends with this helper, so nothing holds the
+    # machine awake after the helper is gone, even when it was killed
+    then = ["/bin/sh", "-c", f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 5; done"]
+    held, empty = None, 0
+    try:
+        while time.time() < end and empty < AWAKE_EMPTY:
+            sess = running_sessions(inside=real)
+            empty = 0 if sess else empty + 1
+            busy = any(s.get("status") != "idle" for s in sess)
+            if held is not None and held.poll() is not None:
+                log(f"AWAKE {real}: {os.path.basename(tool)} ended by itself; "
+                    "this machine may sleep", "warn")
+                return 0
+            if busy and held is None:
+                held = subprocess.Popen(_awake_argv(tool, "an agent works on " + real, then),
+                                        env=_awake_env(tool),
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, cwd="/",
+                                        start_new_session=True)
+                time.sleep(min(every, 0.5))
+                if held.poll() is not None:             # refused: polkit, say
+                    log(f"AWAKE {real}: {os.path.basename(tool)} was refused; "
+                        "this machine may sleep", "warn")
+                    return 0
+            elif not busy and held is not None:
+                _stop_proc(held)
+                held = None
+            time.sleep(every)
+    finally:
+        if held is not None:
+            _stop_proc(held)
+        try:
+            if pidf and json.loads(pidf.read_text()).get("pid") == os.getpid():
+                pidf.unlink()
+        except (OSError, ValueError):
+            pass
+    return 0
+
+def _stop_proc(p) -> None:
+    """End a process aht started in a session of its own, with what it runs."""
+    for sig in (15, 9):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=5)
+            return
+        except Exception:
+            pass
 
 def _agent_peek(req: dict) -> dict:
     path, name = req["path"], req.get("name") or ""
@@ -5400,7 +5635,8 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "prune": _agent_prune,
              "offsite-list": lambda req: _agent_offsite_list(req),
              "offsite-prune": lambda req: _agent_offsite_prune(req),
-             "offsite-adopt": lambda req: _agent_offsite_adopt(req)}
+             "offsite-adopt": lambda req: _agent_offsite_adopt(req),
+             "search": lambda req: _agent_search(req)}
 
 def cmd_core(args):
     """`aht _core --id`: the id of the core this build carries (the name of
@@ -6706,6 +6942,7 @@ def cmd_handover(args):
                                    claude=info["claude"], note=note,
                                    args=list(cfg_get("handover_claude_args") or []),
                                    task=args.task,
+                                   keep_awake=bool(cfg_get("handover_keep_awake", True)),
                                    remote_control=handover_session_name(sid, real, rem.name)
                                    if cfg_get("handover_remote_control", True) else None)
                     away["mux"] = st.get("mux") or away["mux"]
@@ -7300,34 +7537,101 @@ _INSTALL = {"apt-get": "sudo apt install -y", "dnf": "sudo dnf install -y",
             "pacman": "sudo pacman -S --needed", "zypper": "sudo zypper install -y",
             "brew": "brew install"}
 
+# what to do about a machine that cannot be asked, by what ssh said
+FIX_AGENT_NT = ("In an administrator PowerShell: `Get-Service ssh-agent | Set-Service "
+                "-StartupType Automatic; Start-Service ssh-agent`. Then, in a normal one: "
+                "`ssh-add`. Or use a key without a passphrase.")
+FIX_MAC_LOGIN = "Turn on Remote Login on the Mac: System Settings → General → Sharing."
+
+def _reach_rows(rem: Remote, info: dict = None, err: str = None) -> list:
+    """The checks "for asking" (the machine answers over ssh, with a key and
+    no prompt, and runs python3), from the probe's answer or from what ssh
+    said instead; each with what fixes it."""
+    e = str(err or "")
+    low = e.lower()
+    nt = os.name == "nt"
+    user_host = rem.target or rem.name
+    host = user_host.rpartition("@")[2]
+    rows = []
+    def ck(name, ok, detail, fix=None):
+        rows.append({"check": name, "ok": ok, "detail": str(detail), "needed": True,
+                     "group": "ask", **({"fix": fix} if fix and not ok else {})})
+    if info is not None:
+        ck("reachable", True, f"{info.get('host')} ({info.get('system')})")
+        ck("key login without a prompt", True, "yes")
+        ck("python3 there", True, info.get("python") or "yes")
+        return rows
+    if WINDOWS_FAR in e:
+        ck("reachable", False, e)
+        return rows
+    key = "permission denied" in low or "too many authentication failures" in low
+    hostkey = "host key verification failed" in low or "identification has changed" in low \
+        or "host key is known" in low
+    python = "python3" in low and ("not found" in low or "no such file" in low)
+    other = not python and ("gave no usable answer" in low or "could not prepare" in low)
+    answered = key or hostkey or python or other
+    if answered:
+        ck("reachable", True, host)
+    elif "connection refused" in low:
+        ck("reachable", False, e, FIX_MAC_LOGIN if rem.system == "Darwin" else
+           "Turn on ssh's server there: on Linux `sudo systemctl enable --now ssh`; "
+           "on a Mac: " + FIX_MAC_LOGIN[0].lower() + FIX_MAC_LOGIN[1:])
+    else:
+        ck("reachable", False, e or "no answer",
+           f"Check that {host} is on, awake and on the same network (Tailscale: is "
+           "it connected on both?), and that its name is right.")
+    if hostkey:
+        ck("key login without a prompt", False, "this machine does not know its key yet",
+           f"Connect once in a terminal (`ssh {user_host}`) and accept the machine's key. "
+           "aht never accepts a key for you.")
+    elif key:
+        ck("key login without a prompt", False, "the key was not accepted",
+           FIX_AGENT_NT if nt else f"Put your key there once: `ssh-copy-id {user_host}`. "
+           "If it has a passphrase, load it first: `ssh-add`.")
+    elif answered:
+        ck("key login without a prompt", True, "yes")
+    if python:
+        ck("python3 there", False, "missing", "Install python3 there (on Linux: "
+           "`sudo apt install -y python3`, or your system's package tool).")
+    elif other:
+        ck("aht's copy runs there", False, e[-300:],
+           f"Check that python3 runs there: `ssh {user_host} python3 --version`.")
+    return rows
+
 def remote_checks(rem: Remote, info: dict) -> list:
-    """What a machine needs for a handover, each with the command that
-    fixes it — to be run ON that machine."""
+    """What a machine needs, each with the command that fixes it — to be run
+    ON that machine: for asking it (`group` "ask"), and for a handover
+    ("handover").  Where this machine cannot hand projects over yet (a
+    Windows PC), the handover rows are only for information."""
     tools = info.get("tools") or {}
     rs = find_rsync()
     mine = find_claude()
     home = str(Path.home())
     get = _INSTALL.get(info.get("packages") or "", "install")
-    rows = []
+    sends = can_send_projects()
+    rows = _reach_rows(rem, info)
     def ck(name, ok, detail, fix=None, needed=True):
         rows.append({"check": name, "ok": bool(ok), "detail": str(detail),
-                     "needed": needed, **({"fix": fix} if fix and not ok else {})})
-    ck("reachable", True, f"{info.get('host')} ({info.get('system')})")
-    ck("rsync on this machine", rs, rs.get("version") or "missing",
-       "here:  brew install rsync" if IS_MAC else "here:  install rsync 3")
+                     "needed": needed and sends, "group": "handover",
+                     **({"fix": fix} if fix and not ok else {})})
+    if os.name != "nt":                 # aht's own copy comes for Windows later
+        ck("rsync on this machine", rs, rs.get("version") or "missing",
+           "here:  brew install rsync" if IS_MAC else "here:  install rsync 3")
     ck("rsync there", tools.get("rsync"), tools.get("rsync") or "missing",
        f"{get} rsync")
     ck("tmux there", tools.get("tmux"), tools.get("byobu") or tools.get("tmux")
        or "missing", f"{get} tmux")
-    there = rem.agent("probe", path=rem.path(home))
-    same = info.get("home") == home or bool(there.get("path_exists"))
-    ck(f"{home} exists there", same, "projects keep their path" if same else "missing",
-       f'sudo mkdir -p {shlex.quote(home)} && sudo chown "$USER" {shlex.quote(home)}')
-    if same and info.get("home") != home:
-        shut = not there.get("path_open_to_others")
-        ck(f"only you can look into {home} there", shut,
-           "yes" if shut else "other accounts on that machine can read your projects",
-           f"chmod 700 {shlex.quote(home)}", needed=False)
+    there = rem.agent("probe", path=None if os.name == "nt" else rem.path(home),
+                      test_awake=bool(cfg_get("handover_keep_awake", True)))
+    if os.name != "nt":                 # a PC's folders map to other paths (later)
+        same = info.get("home") == home or bool(there.get("path_exists"))
+        ck(f"{home} exists there", same, "projects keep their path" if same else "missing",
+           f'sudo mkdir -p {shlex.quote(home)} && sudo chown "$USER" {shlex.quote(home)}')
+        if same and info.get("home") != home:
+            shut = not there.get("path_open_to_others")
+            ck(f"only you can look into {home} there", shut,
+               "yes" if shut else "other accounts on that machine can read your projects",
+               f"chmod 700 {shlex.quote(home)}", needed=False)
     ck("Claude Code there", info.get("claude"),
        f"{info.get('claude_version') or 'missing'} "
        f"(here: {claude_version(mine) if mine else 'missing'})",
@@ -7336,14 +7640,36 @@ def remote_checks(rem: Remote, info: dict) -> list:
     if info.get("logged_in") is not None:
         ck("Claude Code is logged in there", info["logged_in"],
            "yes" if info["logged_in"] else "no", "run once there:  claude")
+    tool = there.get("keep_awake")
+    if not cfg_get("handover_keep_awake", True):
+        ck("stays awake while the agent works there", True,
+           "off in aht's settings (handover_keep_awake)", needed=False)
+    elif not tool:
+        ck("stays awake while the agent works there", False,
+           "no caffeinate (macOS), or systemd-inhibit or gnome-session-inhibit (Linux) "
+           "there: it may sleep while the agent works",
+           "keep it from sleeping in its own power settings", needed=False)
+    elif there.get("keep_awake_works") is False:
+        ck("stays awake while the agent works there", False,
+           f"{tool} is refused for your account over ssh"
+           + (f" ({there['keep_awake_error']})" if there.get("keep_awake_error") else "")
+           + ": it may sleep while the agent works",
+           "keep it from sleeping in its own power settings" if tool == "caffeinate" else
+           "stay logged in to its GNOME desktop (aht then uses the desktop's own "
+           "inhibitor, gnome-session-inhibit, which ssh sessions may use), or keep it from "
+           "sleeping in its own power settings", needed=False)
+    else:
+        ck("stays awake while the agent works there", True,
+           f"{tool} (a closed lid still sleeps)", needed=False)
     both = tools.get("mosh-server") and find_tool("mosh")
-    ck("mosh (a connection that survives network changes)", both,
-       "on both" if both else
-       ("missing there" if not tools.get("mosh-server") else "missing here"),
-       f"{get} mosh" if not tools.get("mosh-server")
-       else ("here:  brew install mosh" if IS_MAC else "here:  install mosh"),
-       needed=False)
-    if both:
+    if os.name != "nt":                 # there is no mosh client for Windows
+        ck("mosh (a connection that survives network changes)", both,
+           "on both" if both else
+           ("missing there" if not tools.get("mosh-server") else "missing here"),
+           f"{get} mosh" if not tools.get("mosh-server")
+           else ("here:  brew install mosh" if IS_MAC else "here:  install mosh"),
+           needed=False)
+    if both and os.name != "nt":
         open_ = mosh_usable(rem, test=True)
         where = "in on tailscale0 " if info.get("tailscale_if") else ""
         ck("mosh gets through (UDP 60000–61000)", open_,
@@ -7366,11 +7692,57 @@ def _remember_system(name: str, system) -> None:
             cfg["remotes"] = rs
             save_config(cfg)
 
+SYSTEMS = ("Darwin", "Linux", "Windows")
+
+def remote_rows() -> dict:
+    """The machines set up, as the front-ends list them: each one's settings
+    with `watch`, `system` (Darwin, Linux, Windows or None) and `last_heard`
+    (when it last answered the board, from run/board.json; nothing is asked)."""
+    heard = _board_heard()
+    return {n: dict(s, watch=bool(s.get("watch")),
+                    system=s.get("system") if s.get("system") in SYSTEMS else None,
+                    last_heard=(heard.get(n) or {}).get("heard"))
+            for n, s in remotes_config().items() if isinstance(s, dict)}
+
+def _watch(name: str, on: bool) -> dict:
+    """remotes.<name>.watch: whether the notices ask that machine every 2
+    minutes (it is asked in any case while it holds a project)."""
+    out = {"remote": name, "watch": False, "applied": False}
+    with Lock():
+        cfg = load_config()
+        rs = dict(cfg.get("remotes") or {})
+        if name not in rs:
+            out["error"] = f"unknown machine {name!r}"
+            return out
+        if on and rs[name].get("system") == "Windows":
+            out["error"] = WINDOWS_FAR
+            return out
+        rs[name] = dict(rs[name], watch=on)
+        cfg["remotes"] = rs
+        save_config(cfg)
+    log(f"REMOTE {name}: watch {'on' if on else 'off'}")
+    return dict(out, watch=on, applied=True)
+
 def cmd_remote(args):
     if not can_reach_machines():
-        print("handover needs rsync and ssh; it is not available in this build")
+        print(NO_SSH, file=sys.stderr)
         return 2
     act = args.action or "list"
+    if act == "watch":
+        if not args.name:
+            print("usage: aht remote watch <name> [--off]", file=sys.stderr)
+            return 2
+        out = _watch(args.name, not args.off)
+        if args.json:
+            print(json.dumps(out, indent=2))
+        elif out.get("error"):
+            print(f"✗ {out['error']}", file=sys.stderr)
+        else:
+            print(f"watching {args.name}: you hear when a session there waits for you or "
+                  f"is done (it is asked every {WATCH_EVERY // 60} minutes)" if out["watch"]
+                  else f"not watching {args.name} any more (it is still asked while it "
+                       "holds a project of yours)")
+        return 0 if out["applied"] else 2 if out["error"].startswith("unknown") else 1
     if act == "discover":
         notes = []
         rows = discover_machines(notes)
@@ -7414,6 +7786,7 @@ def cmd_remote(args):
             cfg["remotes"] = rs
             cfg.setdefault("default_remote", args.name)
             save_config(cfg)
+            _forget_heard(args.name)        # nothing heard from a machine set up anew
         print(f"✓ {args.name}: {info.get('host')} ({info.get('system')}), Claude Code "
               f"{info.get('claude_version') or 'not installed'}")
         return 0
@@ -7440,6 +7813,7 @@ def cmd_remote(args):
                 cfg["remotes"] = rs
                 if cfg.get("default_remote") == args.name:
                     cfg.pop("default_remote")
+                _forget_heard(args.name)    # nor its last sessions
             else:
                 cfg["default_remote"] = args.name
             save_config(cfg)
@@ -7462,7 +7836,9 @@ def cmd_remote(args):
                                 "ok": all(c["ok"] for c in rows if c["needed"])})
                 _remember_system(rem.name, info.get("system"))
             except HandoverError as e:
-                results.append({"remote": n, "ok": False, "error": str(e), "checks": [],
+                results.append({"remote": n, "ok": False, "error": str(e),
+                                "target": rem.target if rem else None,
+                                "checks": _reach_rows(rem, err=str(e)) if rem else [],
                                 "system": rem.system if rem else None})
                 if rem is not None and rem.system == "Windows":
                     _remember_system(rem.name, "Windows")
@@ -7473,20 +7849,28 @@ def cmd_remote(args):
             return code
         for r in results:
             print(f"{r['remote']}" + (f"   {r['target']}" if r.get("target") else ""))
-            if r.get("error"):
+            if r.get("error") and not r["checks"]:
                 print(f"  ✗ {r['error']}")
+            group = None
             for c in r["checks"]:
+                if c.get("group") != group:
+                    group = c.get("group")
+                    print("  for asking it:" if group == "ask" else
+                          "  for handing projects over:" if can_send_projects() else
+                          "  for handing projects over (from Windows in a later version "
+                          "of aht):")
                 mark = "✓" if c["ok"] else ("✗" if c["needed"] else "·")
-                print(f"  {mark} {c['check']}   — {c['detail']}")
+                print(f"    {mark} {c['check']}   — {c['detail']}")
                 if c.get("fix"):
-                    print(f"      → {c['fix']}")
+                    print(f"        → {c['fix']}")
         return code
-    rs = remotes_config()
+    rs = remote_rows()
     if args.json:
         print(json.dumps({"remotes": rs, "default": cfg_get("default_remote")}, indent=2))
     else:
         for n, s in sorted(rs.items()):
-            print(f" {'*' if n == cfg_get('default_remote') else ' '} {n}   {s.get('ssh')}")
+            print(f" {'*' if n == cfg_get('default_remote') else ' '} {n}   {s.get('ssh')}"
+                  + ("   (watched)" if s["watch"] else ""))
         if not rs:
             print("no other machine yet — add one with:  aht remote add <name> <user@host>")
     return 0
@@ -7629,7 +8013,7 @@ def handover_status() -> dict:
     rs = find_rsync() if handover_supported() else {}
     rs_cfg = remotes_config()
     return {"supported": handover_supported(), "can_reach": can_reach_machines(),
-            "remotes": rs_cfg,
+            "remotes": remote_rows(),
             "default_remote": cfg_get("default_remote") if cfg_get("default_remote")
             in rs_cfg else (sorted(rs_cfg)[0] if rs_cfg else None),
             "rsync": rs.get("version"), "away": away, "mirrored": mirrored}
@@ -8672,13 +9056,22 @@ def _fts_query(q: str) -> str:
 
 HIT_OPEN, HIT_CLOSE = "\x02", "\x03"
 
+def _search_db_ro():
+    """The index opened to read only: no schema script, nothing written (a
+    search from another machine runs on this one's index this way)."""
+    import sqlite3
+    from urllib.parse import quote
+    return sqlite3.connect("file:" + quote(search_db().as_posix(), safe="/:") + "?mode=ro",
+                           uri=True, timeout=20)
+
 def search_history(q: str, project: str = None, agent: str = None,
-                   limit: int = 20) -> list:
-    """Sessions matching `q`, best first, with the best places in them."""
+                   limit: int = 20, readonly: bool = False) -> list:
+    """Sessions matching `q`, best first, with the best places in them.
+    `readonly`: the index is only read (see _search_db_ro)."""
     fq = _fts_query(q)
     if not fq or not search_db().exists():
         return []
-    db = _open_search_db()
+    db = _search_db_ro() if readonly else _open_search_db()
     try:
         sql = ("select session, agent, project, role, t, snippet(msgs, 0, ?, ?, '…', 14), "
                "bm25(msgs) from msgs where msgs match ?")
@@ -8734,6 +9127,97 @@ def _search_age() -> float:
         return time.time() - (row[0] if row else 0)
     except Exception:
         return float("inf")
+
+def _index_at():
+    """When the index was last brought up to date (read only), or None."""
+    try:
+        db = _search_db_ro()
+        try:
+            row = db.execute("select mtime from files where path = '@updated'").fetchone()
+        finally:
+            db.close()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+def _hit_masked(snippet: str) -> str:
+    """A snippet masked once more.  The marks around the words found could
+    split a key, so the text is masked without them; where that finds
+    something, the snippet comes without marks."""
+    plain = snippet.replace(HIT_OPEN, "").replace(HIT_CLOSE, "")
+    masked = redact(plain)
+    return snippet if masked == plain else masked
+
+def _far_rows(rows: list) -> list:
+    """Results that cross between machines, masked again on each side (an
+    index an older aht made can hold what today's masker takes out).  What
+    would only run over there (resume, restore) is left out."""
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        r = {k: v for k, v in r.items() if k not in ("resume", "restore")}
+        r["title"] = redact(r["title"]) if isinstance(r.get("title"), str) else None
+        r["hits"] = [dict(h, snippet=_hit_masked(str(h.get("snippet") or "")))
+                     for h in r.get("hits") or [] if isinstance(h, dict)]
+        out.append(r)
+    return out
+
+def _agent_search(req: dict) -> dict:
+    """Search this machine's own index for another machine, read only: no
+    index is made here and none is changed."""
+    if not search_db().is_file():
+        return {"ok": True, "indexed": False, "index_at": None, "results": []}
+    try:
+        rows = search_history(str(req.get("query") or ""), req.get("project"),
+                              req.get("agent"), int(req.get("limit") or 20), readonly=True)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "indexed": True, "index_at": _index_at(), "results": _far_rows(rows)}
+
+SEARCH_FAR_WAIT = 20        # s: each other machine has this long to answer
+NO_INDEX = "no search index (aht is not installed there)"
+
+def search_everywhere(q: str, project: str = None, agent: str = None,
+                      limit: int = 20) -> dict:
+    """The other machines search their own indexes, all at once, read only
+    (the `search` op).  -> {machines: [{machine, reachable, indexed, index_at,
+    results, error}], results: [rows with `machine`]}; nothing is kept here."""
+    import threading
+    names = sorted(remotes_config())
+    found = {}
+    def ask(name):
+        row = {"machine": name, "reachable": False, "indexed": None, "index_at": None,
+               "results": 0, "error": None}
+        hits = []
+        try:
+            if not can_reach_machines():
+                raise HandoverError(NO_SSH)
+            rem = get_remote(name)
+            ans = rem.agent("search", timeout=SEARCH_FAR_WAIT, query=q, agent=agent,
+                            limit=limit,
+                            project=rem.path(os.path.realpath(project)) if project else None)
+            hits = _far_rows(ans.get("results"))
+            row.update(reachable=True, indexed=bool(ans.get("indexed")),
+                       index_at=ans.get("index_at"), results=len(hits),
+                       error=None if ans.get("indexed") else NO_INDEX)
+        except HandoverError as e:
+            row["error"] = str(e)
+        found[name] = (row, [dict(h, machine=name) for h in hits])
+    ts = [threading.Thread(target=ask, args=(n,), daemon=True) for n in names]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=SEARCH_FAR_WAIT + 10)
+    machines, results = [], []
+    for n in names:
+        row, hits = found.get(n) or ({"machine": n, "reachable": False, "indexed": None,
+                                      "index_at": None, "results": 0,
+                                      "error": f"{n} did not answer within "
+                                               f"{SEARCH_FAR_WAIT} s"}, [])
+        machines.append(row)
+        results += hits
+    return {"machines": machines, "results": results}
 
 def _spawn_search_update() -> None:
     """From the watcher and the hook: keep the index fresh, detached."""
@@ -8800,14 +9284,20 @@ def cmd_search(args):
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
+    far = search_everywhere(q, args.project, args.agent, args.limit) \
+        if args.everywhere else None
+    # this machine's first (`machine` null), then the others'
+    rows = [dict(r, machine=None) for r in rows] + (far["results"] if far else [])
     if args.json:
-        print(json.dumps({"query": q, "results": rows}, indent=2))
+        print(json.dumps({"query": q, "results": rows,
+                          **({"machines": far["machines"]} if far else {})}, indent=2))
         return 0
     bold = ("\033[1m", "\033[0m") if sys.stdout.isatty() else ("[", "]")
     for r in rows:
         where = r["project"] or "?"
         print(f"{AGENT_NAMES.get(r['agent'], r['agent'])} · {_when_text(r['updated'])} · "
-              f"{r['title'] or r['session']}")
+              f"{r['title'] or r['session']}" + (f"   (on {r['machine']})"
+                                                  if r.get("machine") else ""))
         print(f"   {where}" + ("" if r["live"] else "   (deleted — it lives on in a backup)"))
         for h in r["hits"]:
             s = h["snippet"].replace("\n", " ").replace(HIT_OPEN, bold[0]).replace(HIT_CLOSE, bold[1])
@@ -8821,6 +9311,9 @@ def cmd_search(args):
         print()
     if not rows:
         print("nothing found")
+    for m in (far or {}).get("machines") or []:
+        if m["error"]:
+            print(f"  ! {m['machine']}: {m['error']}")
     return 0
 
 # ---- secrets ------------------------------------------------------------------- #
@@ -10875,41 +11368,108 @@ def open_sessions_here(names: bool = False) -> list:
 
 def _agent_board(req: dict) -> dict:
     return {"ok": True, "host": _here(),
-            "sessions": open_sessions_here(names=bool(req.get("names")))}
+            "sessions": open_sessions_here(names=bool(req.get("names"))),
+            "phone_here": _aht_there()["phone_here"]}
 
-def session_board(remotes: bool = True, names: bool = False) -> list:
-    """Open agent sessions on this machine and on every machine set up for
-    handover (asked in parallel; one that does not answer is reported)."""
+BOARD_STALE = 600       # s: a machine not heard for 10 minutes is "not heard since"
+
+def board_path() -> Path:
+    return aht_home() / "run" / "board.json"
+
+def _board_heard() -> dict:
+    """{machine: {heard, sessions}}: when each other machine last answered
+    the board, and the sessions it named then (run/board.json)."""
+    try:
+        d = json.loads(board_path().read_text())
+        return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _note_heard(rows: list) -> dict:
+    """Keep what the machines that answered just said, for when they do not
+    (machines no longer set up are dropped) -> the whole record."""
+    try:
+        with Lock(timeout=5):
+            d = _board_heard()
+            for b in rows:
+                d[b["machine"]] = {"heard": time.time(), "sessions": b["sessions"]}
+            known = set(remotes_config())
+            d = {k: v for k, v in d.items() if k in known}
+            _write_json(board_path(), d)
+            return d
+    except (TimeoutError, OSError) as e:
+        warn(f"BOARD could not note who answered: {e}")
+        return _board_heard()
+
+def _forget_heard(name: str) -> None:
+    """Drop what machine `name` last said on the board (`remote add` and
+    `remote remove`: a name set up anew starts with nothing heard).  The
+    caller holds the lock, the one _note_heard takes."""
+    try:
+        d = _board_heard()
+        if name in d:
+            del d[name]
+            _write_json(board_path(), d)
+    except OSError as e:
+        warn(f"BOARD could not forget {name}: {e}")
+
+def session_board(remotes: bool = True, names: bool = False, only=None) -> list:
+    """Open agent sessions on this machine and on the other machines (asked
+    in parallel; one that does not answer is reported): every machine set
+    up, or `only` those named.  Each other machine's row also says when it
+    last answered (`last_heard`), whether that is over 10 minutes ago
+    (`stale`), and what it said then (`last_sessions`)."""
     import threading
+    now = time.time()
     here = {"machine": _here(), "local": True, "reachable": True,
-            "sessions": open_sessions_here(names)}
+            "sessions": open_sessions_here(names), "last_heard": now, "stale": False}
+    here["last_sessions"] = here["sessions"]
     boards = [here]
-    if remotes and can_reach_machines():
+    asked = sorted(remotes_config()) if only is None else \
+        sorted(n for n in set(only) if n in remotes_config())
+    if remotes and can_reach_machines() and asked:
         found = []
         def ask(name):
             row = {"machine": name, "local": False, "reachable": False, "sessions": []}
             try:
                 rem = get_remote(name)
                 ans = rem.agent("board", timeout=30, names=names)
-                row.update(reachable=True, host=ans.get("host"), sessions=ans["sessions"])
+                row.update(reachable=True, host=ans.get("host"), sessions=ans["sessions"],
+                           phone_here=bool(ans.get("phone_here")))
             except HandoverError as e:
                 row["error"] = str(e)
             found.append(row)
-        ts = [threading.Thread(target=ask, args=(n,), daemon=True)
-              for n in sorted(remotes_config())]
+        ts = [threading.Thread(target=ask, args=(n,), daemon=True) for n in asked]
         for t in ts:
             t.start()
         for t in ts:
             t.join(timeout=45)
-        boards += sorted(found, key=lambda r: r["machine"])
+        found = sorted(found, key=lambda r: r["machine"])
+        heard = _note_heard([b for b in found if b["reachable"]]) \
+            if any(b["reachable"] for b in found) else _board_heard()
+        for b in found:
+            h = heard.get(b["machine"]) or {}
+            b["last_heard"] = h.get("heard")
+            b["stale"] = not h.get("heard") or now - float(h["heard"]) >= BOARD_STALE
+            b["last_sessions"] = h.get("sessions") or []
+        boards += found
     away = {os.path.realpath(e["real_path"]): (e.get("away") or {})
             for e in load_registry().get("projects", {}).values() if e.get("away")}
     for b in boards:
-        for s in b["sessions"]:
+        for s in b["sessions"] + ([] if b["reachable"] else b["last_sessions"]):
             a = away.get(os.path.realpath(s.get("project") or "/"))
             if a and not b["local"] and a.get("remote") == b["machine"]:
                 s["handed_over"] = True
     return boards
+
+def _board_lines(rows: list) -> list:
+    out = []
+    for s in sorted(rows, key=lambda s: s.get("project") or ""):
+        state = s["status"] + (f": {s['waiting_for']}" if s.get("waiting_for") else "")
+        out.append(f"   {AGENT_NAMES.get(s['agent'], s['agent']):<12} {state:<28} "
+                   f"{s.get('project')}" + ("   (handed over)" if s.get("handed_over") else "")
+                   + (f"\n      “{s['title']}”" if s.get("title") else ""))
+    return out
 
 def cmd_board(args):
     boards = session_board(remotes=not args.local, names=True)
@@ -10920,11 +11480,11 @@ def cmd_board(args):
         print(f"{b['machine']}" + ("" if b["reachable"] else f"   — {b.get('error')}"))
         if b["reachable"] and not b["sessions"]:
             print("   no agent session open")
-        for s in sorted(b["sessions"], key=lambda s: s.get("project") or ""):
-            state = s["status"] + (f": {s['waiting_for']}" if s.get("waiting_for") else "")
-            print(f"   {AGENT_NAMES.get(s['agent'], s['agent']):<12} {state:<28} "
-                  f"{s.get('project')}" + ("   (handed over)" if s.get("handed_over") else "")
-                  + (f"\n      “{s['title']}”" if s.get("title") else ""))
+        if not b["reachable"] and b.get("last_heard"):
+            print(f"   not answering since {_clock(b['last_heard'])}; as of then:"
+                  + ("" if b["last_sessions"] else " no agent session open"))
+        for l in _board_lines(b["sessions"] if b["reachable"] else b["last_sessions"]):
+            print(l)
     return 0
 
 # --------------------------------------------------------------------------- #
@@ -10938,10 +11498,31 @@ def cmd_board(args):
 def notices_state() -> Path:
     return aht_home() / "run" / "notices.json"
 
-def send_to_phone(title: str, message: str) -> str:
+PHONE_FRESH = 180       # s: another machine's notices that ran this recently send its own
+
+def _aht_there() -> dict:
+    """The aht installed on this machine, as the copy of it that another
+    machine runs here sees it: whether there is one, its version (its
+    notices note it), and whether it sends this machine's notices to the
+    phone itself: notify_phone is set and its notices ran within the last 3
+    minutes.  Then the other machine does not send them again."""
+    try:
+        st = json.loads(notices_state().read_text())
+        st = st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        st = {}
+    installed = registry_path().is_file() or config_path().is_file() or bool(st)
+    try:
+        fresh = time.time() - float(st.get("at") or 0) < PHONE_FRESH
+    except (TypeError, ValueError):
+        fresh = False
+    return {"installed": installed, "version": st.get("version") if installed else None,
+            "phone_here": bool(installed and fresh and cfg_get("notify_phone"))}
+
+def send_to_phone(title: str, message: str, target: str = None) -> str:
     """Pass a notice on to the phone, if the user set that up:
     notify_phone = "imessage:<phone or Apple ID>" or "ntfy:<topic or URL>"."""
-    target = str(cfg_get("notify_phone") or "")
+    target = str(cfg_get("notify_phone") or "") if target is None else target
     if os.environ.get("AHT_NOTIFY_LOG"):                 # tests: note it, send nothing
         with open(os.environ["AHT_NOTIFY_LOG"], "a") as fh:
             fh.write(json.dumps({"title": title, "message": message, "phone": target}) + "\n")
@@ -10976,46 +11557,132 @@ def app_running() -> bool:
     except OSError:
         return False
 
-def _notify(title: str, message: str, info: dict = None) -> None:
+def _notify(title: str, message: str, info: dict = None, phone: bool = True) -> None:
+    """Show a notice here, and send it to the phone unless `phone` is False
+    (the tests' log then names no phone)."""
     if os.environ.get("AHT_NOTIFY_LOG"):
-        send_to_phone(title, message)
+        send_to_phone(title, message, None if phone else "")
         return
     notify_user(title, message, info)
-    if cfg_get("notify_phone"):
+    if phone and cfg_get("notify_phone"):
         r = send_to_phone(title, message)
         if r.startswith("failed"):
             warn(f"NOTICE to the phone {r}")
 
+HOLDER_EVERY = 55       # s: a machine that holds a project of this one is asked
+WATCH_EVERY = 120       # s: a watched machine is asked every 2 minutes
+QUIET_AFTER = 600       # s: a holder silent this long gives one notice
+
+def _and(names: list) -> str:
+    names = list(dict.fromkeys(names))
+    return " and ".join([", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
+
+def _due_machines(st: dict, projects: dict, remotes: bool = None) -> tuple:
+    """(due, held, asked): the other machines the notices ask now, the
+    projects each one holds, and every machine they ask at all, due now or
+    not.  A machine that holds a handed-over project, an unfinished
+    handover or a night shift is asked every 55 s, a watched one every 2
+    minutes (a check runs every half minute: a few seconds early count),
+    nobody else.  `remotes` True: all of these now; False: none."""
+    rs = remotes_config()
+    held, busy = {}, set()
+    for e in projects.values():
+        a, h = e.get("away") or {}, e.get("handing") or {}
+        if a.get("remote") in rs:
+            held.setdefault(a["remote"], []).append(os.path.basename(e["real_path"]))
+        busy |= {x for x in (a.get("remote"), h.get("remote")) if x in rs}
+    busy |= {j.get("remote") for j in _load_jobs() if j.get("remote") in rs
+             and j.get("state") in ("starting", "started", "returning")}
+    watched = {n for n, s in rs.items() if isinstance(s, dict) and s.get("watch")}
+    if remotes is False or not can_reach_machines():
+        return [], held, busy | watched
+    asked, now = st.get("asked") or {}, time.time()
+    return sorted(n for n in busy | watched
+                  if remotes or now - float(asked.get(n) or 0)
+                  >= (HOLDER_EVERY if n in busy else WATCH_EVERY) - 5), held, busy | watched
+
+def _quiet_notices(boards: list, held: dict, quiet: dict, now: float) -> list:
+    """A machine holding a project that has not answered for 10 minutes: one
+    notice (to the phone too); when it answers again, one more, on screen
+    only.  The 10 minutes count from the first ask it did not answer, not
+    from when it was last heard (after a long sleep here, or for a machine
+    last heard days ago, the first miss says nothing yet); when it was last
+    heard is what the notice names.  `quiet` ({machine: {first_miss, since,
+    told}}) is kept between checks."""
+    out = []
+    for b in boards:
+        m = b["machine"]
+        if b.get("local"):
+            continue
+        q = quiet.get(m)
+        if b["reachable"]:
+            quiet.pop(m, None)
+            if q and q.get("told"):
+                out.append({"kind": "quiet", "title": f"{m} answers again",
+                            "message": f"{m} answers again; it had not answered since "
+                                       f"{_clock(q['since'])}.",
+                            "info": {"kind": "quiet", "machine": m, "local": False,
+                                     "projects": held.get(m) or []},
+                            "phone": False})
+            continue
+        if m not in held:
+            continue                        # holds nothing: only Sessions says so
+        if not q:
+            q = quiet[m] = {"since": b.get("last_heard") or now, "told": False}
+        q.setdefault("first_miss", now)     # the clock starts at the first miss
+        if not q.get("told") and now - float(q["first_miss"] or now) >= QUIET_AFTER:
+            q["told"] = True
+            names = _and(held[m])
+            out.append({"kind": "quiet", "title": f"{names} on {m}: no answer",
+                        "message": f"{m} has not answered since {_clock(q['since'])}. The "
+                                   f"work on {names} there may have stopped (asleep, off "
+                                   "or offline).",
+                        "info": {"kind": "quiet", "machine": m, "local": False,
+                                 "projects": held[m]}})
+    return out
+
 def check_notices(remotes: bool = None) -> list:
     """Compare the open sessions with the last look and announce what changed:
     a session that now waits for you, and one that finished after working a
-    while.  Every check also settles unfinished handovers (`handing`
-    records: resolve_handing asks their machine).  Other machines' sessions
-    are asked only while a project is handed over."""
+    while — here, and on the other machines that are asked (_due_machines).
+    Once another machine is set up, every notice names its machine.  A
+    notice about another machine's session goes to the phone only when that
+    machine's own aht does not send it (`phone_here`).  A holder that stays
+    silent is announced once (_quiet_notices).  Every check also settles
+    unfinished handovers (`handing` records: resolve_handing asks their
+    machine)."""
     try:
         st = json.loads(notices_state().read_text())
+        st = st if isinstance(st, dict) else {}
     except Exception:
         st = {}
-    seen, last_remote = st.get("seen") or {}, float(st.get("remote_at") or 0)
+    seen = st.get("seen") or {}
+    asked, quiet = dict(st.get("asked") or {}), dict(st.get("quiet") or {})
     projects = load_registry().get("projects", {})
-    away = any(e.get("away") for e in projects.values())
     out = []
     for uid in [u for u, e in projects.items() if e.get("handing")]:
         try:                                # a handover that was cut off
             out += resolve_handing(uid)
         except Exception as e:
             warn(f"HANDOVER resolving an unfinished one: {e}")
-    ask_remote = (remotes if remotes is not None else
-                  away and time.time() - last_remote >= 55)
-    boards = session_board(remotes=ask_remote and can_reach_machines())
-    if ask_remote:
-        last_remote = time.time()
+    due, held, kept = _due_machines(st, projects, remotes)
+    boards = session_board(remotes=bool(due), only=due)
     now, fresh = time.time(), {}
+    for n in due:
+        asked[n] = now
+    rs = remotes_config()
+    named = bool(rs)                        # every notice names its machine
+    # a machine the notices still ask (it holds a project or is watched)
+    # that was not asked this time, or did not answer, keeps what was known
+    # about it; one no longer asked (Watch off, its project taken back) or
+    # no longer set up is forgotten: when it is asked again, that is a first
+    # sight, not a session that went on all that while
+    answered = {b["machine"] for b in boards if b["reachable"]}
+    fresh.update({k: v for k, v in seen.items()
+                  if v.get("machine") not in answered and v.get("machine") in kept})
     finished_after = float(cfg_get("notify_finished_minutes", 3)) * 60
     for b in boards:
         if not b["reachable"]:
-            # a machine that did not answer keeps what was known about it
-            fresh.update({k: v for k, v in seen.items() if v.get("machine") == b["machine"]})
             continue
         for s in b["sessions"]:
             if s["agent"] != "claude":
@@ -11029,22 +11696,27 @@ def check_notices(remotes: bool = None) -> list:
             fresh[key] = {"machine": b["machine"], "raw": raw, "busy_since": busy_since,
                           "project": s.get("project")}
             name = os.path.basename(s.get("project") or "") or "a session"
-            where = "" if b.get("local") else f" on {b['machine']}"
+            where = f" on {b['machine']}" if named or not b.get("local") else ""
             if not prev:
                 continue                          # first sight: nothing changed yet
             info = {"machine": b["machine"], "local": bool(b.get("local")), "pid": s.get("pid"),
                     "session": s.get("session"), "project": s.get("project")}
+            # that machine's own aht sends it to the phone already
+            phone = {} if b.get("local") or not b.get("phone_here") else {"phone": False}
             if raw == "waiting" and prev.get("raw") != "waiting" and cfg_get("notify_waiting", True):
                 out.append({"kind": "waiting", "title": f"{name}{where} waits for you",
                             "message": s.get("waiting_for") or "it needs an answer",
-                            "info": dict(info, kind="waiting")})
+                            "info": dict(info, kind="waiting"), **phone})
             if raw == "idle" and prev.get("raw") in ("busy", "shell") and \
                     cfg_get("notify_finished", True) and prev.get("busy_since") and \
                     now - prev["busy_since"] >= finished_after:
                 mins = int((now - prev["busy_since"]) // 60)
                 out.append({"kind": "finished", "title": f"{name}{where} is done",
                             "message": f"the agent finished after {mins} minute(s)",
-                            "info": dict(info, kind="finished")})
+                            "info": dict(info, kind="finished"), **phone})
+    out += _quiet_notices(boards, held, quiet, now)
+    quiet = {m: q for m, q in quiet.items() if m in held}   # nothing held there: no silence
+    asked = {m: t for m, t in asked.items() if m in rs}
     told = list(st.get("limits_told") or [])
     if cfg_get("notify_limit", True):
         tgt = limit_switch_target()
@@ -11061,6 +11733,8 @@ def check_notices(remotes: bool = None) -> list:
                 msg += " — it continues by itself then"
             elif tgt:
                 msg += f" — open aht to go on in {AGENT_NAMES[tgt]}"
+            if named:
+                name += f" on {_here()}"
             out.append({"kind": "limit", "title": f"{name}: Claude's usage limit",
                         "message": msg, "info": {"kind": "limit", "session": h.get("session"),
                                                  "project": h.get("project")}})
@@ -11079,11 +11753,14 @@ def check_notices(remotes: bool = None) -> list:
                         "info": {"kind": "update", "version": u["latest"]}})
     notices_state().parent.mkdir(parents=True, exist_ok=True)
     tmp = notices_state().with_suffix(".new")
-    tmp.write_text(json.dumps({"seen": fresh, "remote_at": last_remote, "at": now,
-                               "limits_told": told[-200:], "update_told": update_told}))
+    # `version` and `at` also tell another machine's aht that this one sends
+    # its own notices (_aht_there)
+    tmp.write_text(json.dumps({"seen": fresh, "asked": asked, "quiet": quiet, "at": now,
+                               "version": VERSION, "limits_told": told[-200:],
+                               "update_told": update_told}))
     os.replace(tmp, notices_state())
     for n in out:
-        _notify(n["title"], n["message"], n.get("info"))
+        _notify(n["title"], n["message"], n.get("info"), phone=n.get("phone", True))
         log(f"NOTICE {n['title']}: {n['message']}")
     return out
 
@@ -13718,9 +14395,9 @@ def night_shift_tick() -> list:
                 elif st == "planned" and now >= j["start_at"]:
                     if now - j["start_at"] > 3600:
                         j["state"] = "missed"
-                        _job_note(j, "not started: this Mac was asleep or off at the time")
+                        _job_note(j, f"not started: {_here()} was asleep or off at the time")
                         out.append({"kind": "night", "title": f"Night shift: {name}",
-                                    "message": "did not start — this Mac was asleep at "
+                                    "message": f"did not start — {_here()} was asleep at "
                                                "the time"})
                     else:
                         j["state"], j["pid"] = "starting", _spawn_aht(
@@ -13790,7 +14467,7 @@ def night_shift_step(jid: str) -> None:
             d = {"error": (r.stderr or r.stdout).strip()[-300:]}
         if d.get("applied"):
             _update_job(jid, state="back", note="taken back")
-            _notify(f"Night shift: {name}", "is back on this Mac — see what changed in aht")
+            _notify(f"Night shift: {name}", f"is back on {_here()} — see what changed in aht")
             return
         why = "; ".join((d.get("blockers") or [])[:2]) or d.get("error") or "it failed"
         first = not j.get("told_late")
@@ -13837,7 +14514,7 @@ def cmd_night_shift(args):
         lines += [f"{'planned' if res['applied'] else 'would plan'}: {j['project']}",
                   f"   {fmt(j['start_at'])}  hand over to {j['remote']} with the task",
                   f"   {fmt(j['back_at'])}  take it back (once the session is done)",
-                  "   this Mac has to be awake then; the agent there uses its tokens"]
+                  f"   {_here()} has to be awake then; the agent there uses its tokens"]
         if not res["applied"] and not res["blockers"]:
             lines.append("(dry run — pass --apply to plan it)")
     return _emit(args, res, lines)
@@ -16200,9 +16877,10 @@ def build_parser():
     s = sub.add_parser("remote", help="the other machines a project can be "
                        "handed over to")
     s.add_argument("action", nargs="?",
-                   choices=("list", "add", "remove", "default", "check", "discover"))
+                   choices=("list", "add", "remove", "default", "check", "discover", "watch"))
     s.add_argument("name", nargs="?")
     s.add_argument("target", nargs="?", help="user@host, as ssh takes it")
+    s.add_argument("--off", action="store_true", help="with watch: stop watching it")
     s.add_argument("--json", action="store_true")
     s.add_argument("--sandbox", metavar="PATH", help=argparse.SUPPRESS)   # test machines
     s.set_defaults(fn=cmd_remote)
@@ -16292,6 +16970,8 @@ def build_parser():
     s.add_argument("--update", action="store_true", help="only bring the index up to date")
     s.add_argument("--no-update", action="store_true", dest="no_update")
     s.add_argument("--rebuild", action="store_true")
+    s.add_argument("--everywhere", action="store_true",
+                   help="also on your other machines: each searches its own index, read only")
     s.add_argument("--quiet", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_search)
@@ -16559,6 +17239,12 @@ def build_parser():
     s = sub.add_parser("_core")            # the core this build carries
     s.add_argument("--id", action="store_true", help="its checksum id")
     s.set_defaults(fn=cmd_core)
+
+    s = sub.add_parser("_awake")           # next to a handed-over session there
+    s.add_argument("--path", required=True)
+    s.add_argument("--name", help="the session's window: its pid file goes there")
+    s.add_argument("--hours", type=float, default=AWAKE_HOURS)
+    s.set_defaults(fn=cmd_awake)
 
     return p
 

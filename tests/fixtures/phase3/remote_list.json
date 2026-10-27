@@ -1,0 +1,23 @@
+{
+  "remotes": {
+    "box": {
+      "ssh": "me@box",
+      "watch": true,
+      "system": "Linux",
+      "last_heard": 1793117130.240614
+    },
+    "lab": {
+      "ssh": "me@lab",
+      "watch": false,
+      "system": "Linux",
+      "last_heard": 1793117130.240615
+    },
+    "ws": {
+      "ssh": "me@ws",
+      "system": "Linux",
+      "watch": false,
+      "last_heard": 1793115629.267779
+    }
+  },
+  "default": "box"
+}

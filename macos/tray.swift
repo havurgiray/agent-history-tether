@@ -19,7 +19,8 @@
 //   --chimes DIR    write aht's own chimes into DIR as WAV files
 //   --spotlight-check WORD   are sessions with WORD in the title in Spotlight?
 //   aht://…         open parts of the window from Shortcuts, a link or a script:
-//                   aht://search?q=WORDS, aht://sessions, aht://loose-ends,
+//                   aht://search?q=WORDS (&everywhere=1: on the other machines
+//                   too), aht://sessions, aht://loose-ends,
 //                   aht://report, aht://project?path=P, aht://changes?path=P,
 //                   aht://journal?path=P, aht://undo?path=P,
 //                   aht://switch?path=P&to=kimi (&resume=1: its own session),
@@ -524,7 +525,43 @@ func forgottenNote(_ planned: [[String: Any]]) -> String {
 struct Machine: Identifiable, Hashable {
     let name: String
     let target: String
+    var watch = false               // asked every 2 minutes for sessions that wait for you
+    var system = ""                 // Darwin, Linux or Windows, as it answered when added
     var id: String { name }
+}
+
+/// The machines set up (`status --json`'s `handover.remotes`, or
+/// `remote list --json`'s `remotes`: the same {name: settings}).
+func machinesFrom(_ remotes: Any?) -> [Machine] {
+    ((remotes as? [String: Any]) ?? [:]).map { k, v in
+        let d = (v as? [String: Any]) ?? [:]
+        return Machine(name: k, target: d["ssh"] as? String ?? "", watch: d["watch"] as? Bool ?? false,
+                       system: d["system"] as? String ?? "")
+    }.sorted { $0.name < $1.name }
+}
+
+/// "macOS", "Linux", "Windows" for a machine's `system`.
+func systemLabel(_ s: String) -> String { ["Darwin": "macOS"][s] ?? s }
+
+/// What `remote watch NAME [--off] --json` answered: nil when the machine is
+/// watched (or not) as asked, else why not.
+func watchProblem(_ d: [String: Any]?, _ name: String, on: Bool, said: String = "") -> String? {
+    guard let d = d, !d.isEmpty else {
+        let why = said.trimmingCharacters(in: .whitespacesAndNewlines)
+        return why.isEmpty ? "aht gave no answer — see the log (Settings)." : why
+    }
+    if let e = d["error"] as? String { return e }
+    if d["watch"] as? Bool != on || d["applied"] as? Bool == false {
+        return on ? "\(name) is not watched." : "\(name) is still watched."
+    }
+    return nil
+}
+
+/// When a machine was last heard from, as the Machines tab says it.
+func heardText(_ last: Double?, stale: Bool) -> String {
+    guard let t = last else { return "not heard from yet" }
+    return stale ? "not heard since " + clock(NSNumber(value: t))
+        : "last heard " + ago(NSNumber(value: t))
 }
 
 struct Found: Identifiable, Hashable {
@@ -540,6 +577,29 @@ struct Check: Identifiable, Hashable {
     let needed: Bool
     let detail: String
     let fix: String?
+    var group: String? = nil        // ask | handover
+}
+
+/// `remote check NAME --json`: the machine's rows, and what went wrong
+/// when it could not be checked.
+func checkRows(_ d: [String: Any]) -> (rows: [Check], error: String?) {
+    let row = ((d["machines"] as? [[String: Any]]) ?? []).first ?? [:]
+    let rows = ((row["checks"] as? [[String: Any]]) ?? []).map {
+        Check(name: $0["check"] as? String ?? "?", ok: $0["ok"] as? Bool ?? false,
+              needed: $0["needed"] as? Bool ?? true,
+              detail: $0["detail"] as? String ?? "", fix: $0["fix"] as? String,
+              group: $0["group"] as? String)
+    }
+    return (rows, row["error"] as? String ?? (d.isEmpty ? "aht gave no answer" : nil))
+}
+
+/// The checks in their groups: what aht needs to ask the machine at all
+/// (sessions, notices, search), then what a handover needs as well. Rows
+/// from a core without groups stay one list, without a heading.
+func checkGroups(_ rows: [Check]) -> [(title: String, rows: [Check])] {
+    guard rows.contains(where: { $0.group != nil }) else { return rows.isEmpty ? [] : [("", rows)] }
+    let ask = rows.filter { $0.group == "ask" }, rest = rows.filter { $0.group != "ask" }
+    return [("For asking", ask), ("For handing over", rest)].filter { !$0.1.isEmpty }
 }
 
 struct Backend: Identifiable, Hashable {
@@ -583,11 +643,69 @@ struct BoardMachine: Identifiable, Hashable {
     let reachable: Bool
     let error: String?
     let rows: [BoardRow]
+    var local = false
+    var lastHeard: Double? = nil    // when it last answered (seconds since 1970)
+    var stale = false               // not heard for 10 minutes
+    var lastRows: [BoardRow] = []   // what it had open then, shown greyed
     var id: String { name }
+
+    /// Its last rows stand in for live ones: it did not answer this time.
+    var showsOld: Bool { !local && (stale || !reachable) && rows.isEmpty && !lastRows.isEmpty }
+
+    /// The line over a machine that did not answer ("" when it did).
+    var silentNote: String {
+        guard !local && (stale || !reachable) else { return "" }
+        if stale, let t = lastHeard {
+            return "Not answering since \(clock(NSNumber(value: t))) — asleep, switched off or offline?"
+        }
+        return "Not reachable right now — is it switched on, and is Tailscale connected on this Mac?"
+    }
+
+    /// Over its last rows: "as of 11:40".
+    var asOf: String { "as of " + (lastHeard.map { clock(NSNumber(value: $0)) } ?? "earlier") }
+}
+
+/// One session row of `board --json` (`sessions` and `last_sessions`).
+func boardRow(_ r: [String: Any], machine: String, local: Bool) -> BoardRow {
+    BoardRow(machine: machine, local: local, agent: r["agent"] as? String ?? "?",
+             project: r["project"] as? String ?? "?",
+             status: r["status"] as? String ?? "?",
+             waitingFor: r["waiting_for"] as? String,
+             since: (r["since"] as? NSNumber)?.doubleValue,
+             handedOver: r["handed_over"] as? Bool ?? false,
+             session: r["session"] as? String, title: r["title"] as? String,
+             titleOrigin: r["title_origin"] as? String, tab: r["tab"] as? String,
+             pendingTitle: r["pending_title"] as? String,
+             pid: r["pid"] as? Int, inIterm: r["in_iterm"] as? Bool ?? false,
+             background: r["background"] as? Bool ?? false,
+             issues: (r["issues"] as? [String]) ?? [],
+             canRestart: r["can_restart"] as? Bool ?? false,
+             version: r["version"] as? String, installed: r["installed"] as? String,
+             limitResets: (r["limit"] as? [String: Any])?["resets"] as? String,
+             limitAuto: (r["limit"] as? [String: Any])?["auto"] as? Bool ?? false)
+}
+
+/// `board --json`'s machines, sessions that wait for you first.
+func boardMachines(_ d: [String: Any]) -> [BoardMachine] {
+    let order = { (a: BoardRow, b: BoardRow) in
+        (a.status == "waiting for you" ? 0 : 1, a.project) < (b.status == "waiting for you" ? 0 : 1, b.project)
+    }
+    return ((d["machines"] as? [[String: Any]]) ?? []).map { m in
+        let name = m["machine"] as? String ?? "?"
+        let local = m["local"] as? Bool ?? false
+        let rows = { (key: String) in
+            ((m[key] as? [[String: Any]]) ?? []).map { boardRow($0, machine: name, local: local) }.sorted(by: order)
+        }
+        return BoardMachine(name: name, reachable: m["reachable"] as? Bool ?? false,
+                            error: m["error"] as? String, rows: rows("sessions"), local: local,
+                            lastHeard: (m["last_heard"] as? NSNumber)?.doubleValue,
+                            stale: m["stale"] as? Bool ?? false, lastRows: rows("last_sessions"))
+    }
 }
 
 struct SearchHit: Identifiable, Hashable {
     let id = UUID()
+    var machine: String? = nil      // another machine's hit; nil: this Mac's
     let agent: String
     let session: String
     let project: String?
@@ -600,6 +718,65 @@ struct SearchHit: Identifiable, Hashable {
     let restoreProject: String?
     static func == (a: SearchHit, b: SearchHit) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
+}
+
+/// `search … --json`'s results (with `--everywhere`, each row's `machine`
+/// names the machine it came from, null for this Mac): this Mac's first.
+func searchHits(_ d: [String: Any]) -> [SearchHit] {
+    let hits = ((d["results"] as? [[String: Any]]) ?? []).map { r -> SearchHit in
+        let restore = r["restore"] as? [String: Any]
+        return SearchHit(
+            machine: r["machine"] as? String,
+            agent: r["agent"] as? String ?? "?", session: r["session"] as? String ?? "",
+            project: r["project"] as? String,
+            title: (r["title"] as? String) ?? (r["session"] as? String ?? ""),
+            live: r["live"] as? Bool ?? true,
+            updated: (r["updated"] as? NSNumber)?.doubleValue,
+            snippets: ((r["hits"] as? [[String: Any]]) ?? []).map {
+                (role: $0["role"] as? String ?? "", text: $0["snippet"] as? String ?? "")
+            },
+            restoreUUID: restore?["uuid"] as? String,
+            restoreStamp: restore?["stamp"] as? String,
+            restoreProject: restore?["project"] as? String)
+    }
+    return hits.filter { $0.machine == nil } + hits.filter { $0.machine != nil }
+}
+
+/// `search --everywhere --json`'s `machines`: a line for each one that
+/// could not be searched (it did not answer, or has no index).
+func searchMissed(_ d: [String: Any]) -> [String] {
+    ((d["machines"] as? [[String: Any]]) ?? []).compactMap(missedLine)
+}
+
+/// The machines that were searched, by name.
+func searchAsked(_ d: [String: Any]) -> [String] {
+    ((d["machines"] as? [[String: Any]]) ?? []).filter { missedLine($0) == nil }
+        .compactMap { $0["machine"] as? String }
+}
+
+func missedLine(_ m: [String: Any]) -> String? {
+    let name = m["machine"] as? String ?? "?"
+    let err = (m["error"] as? String).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .flatMap { $0.isEmpty ? nil : $0 }
+    let why: String
+    if m["reachable"] as? Bool == false {
+        why = err.map { "it did not answer (\($0))" } ?? "it did not answer"
+    } else if m["indexed"] as? Bool == false {
+        why = "no search index (aht is not installed there)"
+    } else if let e = err {
+        why = e
+    } else {
+        return nil
+    }
+    return "Not searched on \(name): \(why)"
+}
+
+/// "Nothing found for …" after a search, and where it looked.
+func nothingFound(_ q: String, everywhere: [String]?) -> String {
+    guard let names = everywhere, !names.isEmpty else { return "Nothing found for “\(q)”." }
+    let on = names.count == 1 ? names[0]
+        : names.dropLast().joined(separator: ", ") + " or " + names.last!
+    return "Nothing found for “\(q)”, here or on \(on)."
 }
 
 struct SecretFind: Identifiable, Hashable {
@@ -1043,6 +1220,12 @@ final class AppModel: ObservableObject {
     @Published var hits: [SearchHit] = []
     @Published var searched: String?            // the query the hits belong to
     @Published var searching = false
+    @Published var searchEverywhere = UserDefaults.standard.bool(forKey: "searchEverywhere") {
+        didSet { if !demo { UserDefaults.standard.set(searchEverywhere, forKey: "searchEverywhere") } }
+    }
+    @Published var searchMisses: [String] = []  // machines that could not be searched
+    @Published var searchedOn: [String]?        // … and the ones that were (nil: this Mac only)
+    var demo = false                            // a snapshot's made-up rows: nothing asks the core
     @Published var secrets: [SecretFind]?
     @Published var secretsFor: String?          // a project, or nil for every history
     @Published var showSecrets = false
@@ -1128,7 +1311,7 @@ final class AppModel: ObservableObject {
     /// Read only when the Machines tab is shown or Look Again is pressed, not
     /// at every refresh; the last answer is kept in between.
     func discover(_ done: (() -> Void)? = nil) {
-        guard !discovering else { done?(); return }
+        guard !discovering, !demo else { done?(); return }
         discovering = true
         DispatchQueue.global(qos: .userInitiated).async {
             let rows = (ahtJSON(["remote", "discover", "--json"])?["machines"]
@@ -1170,11 +1353,9 @@ final class AppModel: ObservableObject {
     /// Other machines can be asked (an ssh client is there): fetching
     /// backups. Sending projects (and Check Now) needs `supported`.
     var canReach: Bool { handover["can_reach"] as? Bool ?? supported }
-    var machines: [Machine] {
-        ((handover["remotes"] as? [String: Any]) ?? [:]).map { k, v in
-            Machine(name: k, target: ((v as? [String: Any])?["ssh"] as? String) ?? "")
-        }.sorted { $0.name < $1.name }
-    }
+    var machines: [Machine] { machinesFrom(handover["remotes"]) }
+    /// Search can also ask the other machines (set up, and reachable from here).
+    var canSearchEverywhere: Bool { canReach && !machines.isEmpty }
     /// The machine "Hand Over" and "Keep in Sync" go to.
     var machine: String? { handover["default_remote"] as? String }
     var backends: [Backend] {
@@ -1489,35 +1670,10 @@ final class AppModel: ObservableObject {
     // ---- across agents ----
 
     func refreshBoard() {
-        guard !boardLoading else { return }
+        guard !boardLoading, !demo else { return }
         boardLoading = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let d = ahtJSON(["board", "--json"]) ?? [:]
-            let machines = ((d["machines"] as? [[String: Any]]) ?? []).map { m -> BoardMachine in
-                let name = m["machine"] as? String ?? "?"
-                let local = m["local"] as? Bool ?? false
-                let rows = ((m["sessions"] as? [[String: Any]]) ?? []).map { r in
-                    BoardRow(machine: name, local: local, agent: r["agent"] as? String ?? "?",
-                             project: r["project"] as? String ?? "?",
-                             status: r["status"] as? String ?? "?",
-                             waitingFor: r["waiting_for"] as? String,
-                             since: (r["since"] as? NSNumber)?.doubleValue,
-                             handedOver: r["handed_over"] as? Bool ?? false,
-                             session: r["session"] as? String, title: r["title"] as? String,
-                             titleOrigin: r["title_origin"] as? String, tab: r["tab"] as? String,
-                             pendingTitle: r["pending_title"] as? String,
-                             pid: r["pid"] as? Int, inIterm: r["in_iterm"] as? Bool ?? false,
-                             background: r["background"] as? Bool ?? false,
-                             issues: (r["issues"] as? [String]) ?? [],
-                             canRestart: r["can_restart"] as? Bool ?? false,
-                             version: r["version"] as? String, installed: r["installed"] as? String,
-                             limitResets: (r["limit"] as? [String: Any])?["resets"] as? String,
-                             limitAuto: (r["limit"] as? [String: Any])?["auto"] as? Bool ?? false)
-                }.sorted { ($0.status == "waiting for you" ? 0 : 1, $0.project)
-                           < ($1.status == "waiting for you" ? 0 : 1, $1.project) }
-                return BoardMachine(name: name, reachable: m["reachable"] as? Bool ?? false,
-                                    error: m["error"] as? String, rows: rows)
-            }
+            let machines = boardMachines(ahtJSON(["board", "--json"]) ?? [:])
             DispatchQueue.main.async {
                 self.board = machines
                 self.boardAt = Date()
@@ -1937,27 +2093,21 @@ final class AppModel: ObservableObject {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty, !searching else { return }
         searching = true
+        // the other machines too (asked in parallel by the core, 20 s each;
+        // one project's search looks in that project's copy there)
+        let everywhere = searchEverywhere && canSearchEverywhere
         DispatchQueue.global(qos: .userInitiated).async {
             let d = ahtJSON(["search", "--json", "--limit", "40"]
                             + (self.searchProject.map { ["--project", $0] } ?? [])
+                            + (everywhere ? ["--everywhere"] : [])
                             + ["--"] + q.split(separator: " ").map(String.init)) ?? [:]
-            let rows = ((d["results"] as? [[String: Any]]) ?? []).map { r -> SearchHit in
-                let restore = r["restore"] as? [String: Any]
-                return SearchHit(
-                    agent: r["agent"] as? String ?? "?", session: r["session"] as? String ?? "",
-                    project: r["project"] as? String,
-                    title: (r["title"] as? String) ?? (r["session"] as? String ?? ""),
-                    live: r["live"] as? Bool ?? true,
-                    updated: (r["updated"] as? NSNumber)?.doubleValue,
-                    snippets: ((r["hits"] as? [[String: Any]]) ?? []).map {
-                        (role: $0["role"] as? String ?? "", text: $0["snippet"] as? String ?? "")
-                    },
-                    restoreUUID: restore?["uuid"] as? String,
-                    restoreStamp: restore?["stamp"] as? String,
-                    restoreProject: restore?["project"] as? String)
-            }
+            let rows = searchHits(d)
+            let missed = everywhere ? searchMissed(d) : []
+            let asked = everywhere ? searchAsked(d) : nil
             DispatchQueue.main.async {
                 self.hits = rows
+                self.searchMisses = missed
+                self.searchedOn = asked
                 self.searched = q
                 self.searching = false
             }
@@ -1965,12 +2115,12 @@ final class AppModel: ObservableObject {
     }
 
     func resume(_ h: SearchHit) {
-        guard let p = h.project else { return }
+        guard h.machine == nil, let p = h.project else { return }
         background { aht(["resume-here", p, "--session", h.session, "--agent", h.agent]) }
     }
 
     func restore(_ h: SearchHit) {
-        guard let p = h.restoreProject, let u = h.restoreUUID, let st = h.restoreStamp,
+        guard h.machine == nil, let p = h.restoreProject, let u = h.restoreUUID, let st = h.restoreStamp,
               alert("Bring this session back?",
                     "“\(h.title)” was deleted from \((p as NSString).lastPathComponent)'s "
                     + "history; a backup still holds it. Restoring adds what is missing "
@@ -2783,20 +2933,43 @@ final class AppModel: ObservableObject {
 
     func check(_ m: Machine) {
         busy("checking \(m.name)…") {
-            let d = ahtJSON(["remote", "check", m.name, "--json"]) ?? [:]
-            let row = ((d["machines"] as? [[String: Any]]) ?? []).first ?? [:]
-            let rows = ((row["checks"] as? [[String: Any]]) ?? []).map {
-                Check(name: $0["check"] as? String ?? "?", ok: $0["ok"] as? Bool ?? false,
-                      needed: $0["needed"] as? Bool ?? true,
-                      detail: $0["detail"] as? String ?? "", fix: $0["fix"] as? String)
-            }
+            let (rows, error) = checkRows(ahtJSON(["remote", "check", m.name, "--json"]) ?? [:])
             DispatchQueue.main.async {
                 self.checks[m.name] = rows
-                self.checkError[m.name] = row["error"] as? String
-                    ?? (d.isEmpty ? "aht gave no answer" : nil)
+                self.checkError[m.name] = error
             }
         }
     }
+
+    /// Watch: aht asks the machine every 2 minutes and tells you when a
+    /// session there waits for you. The switch moves at once; it moves back
+    /// with what went wrong when the core did not do it.
+    func watch(_ mc: Machine, _ on: Bool) {
+        func mark(_ v: Bool) {
+            var ho = handover, rs = (ho["remotes"] as? [String: Any]) ?? [:]
+            rs[mc.name] = ((rs[mc.name] as? [String: Any]) ?? [:]).merging(["watch": v]) { $1 }
+            ho["remotes"] = rs
+            status["handover"] = ho
+        }
+        mark(on)
+        guard !demo else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript(), "remote", "watch", mc.name] + (on ? [] : ["--off"]) + ["--json"])
+            let d = r.out.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+                as? [String: Any]
+            let problem = watchProblem(d, mc.name, on: on, said: r.err)
+            DispatchQueue.main.async {
+                if let p = problem {
+                    mark(!on)
+                    _ = alert(on ? "\(mc.name) could not be watched" : "\(mc.name) is still watched", p)
+                }
+                self.refresh()
+            }
+        }
+    }
+
+    /// What the Sessions tab last heard from a machine (nil: not asked yet).
+    func heard(_ name: String) -> BoardMachine? { board.first { $0.name == name && !$0.local } }
 
     func remove(_ m: Machine) {
         let held = projects.filter { $0.awayRemote == m.name || $0.handing?.machine == m.name }
@@ -3459,14 +3632,18 @@ struct SessionsView: View {
                     ForEach(m.board) { mc in
                         GroupBox(label: Text(mc.name).font(.headline)) {
                             VStack(alignment: .leading, spacing: 6) {
-                                if !mc.reachable {
-                                    Text("Not reachable right now — is it switched on, and is "
-                                         + "Tailscale connected on this Mac?")
-                                        .foregroundColor(.orange).help(mc.error ?? "")
+                                if !mc.silentNote.isEmpty {
+                                    Text(mc.silentNote).foregroundColor(.orange).help(mc.error ?? "")
                                 } else if mc.rows.isEmpty {
                                     Text("No agent session open.").foregroundColor(.secondary)
                                 }
-                                ForEach(mc.rows) { r in BoardRowView(r: r) }
+                                if mc.showsOld {
+                                    // its last rows, greyed: they may have changed since
+                                    Text(mc.asOf).font(.caption).foregroundColor(.secondary)
+                                    ForEach(mc.lastRows) { r in BoardRowView(r: r, old: true) }
+                                } else {
+                                    ForEach(mc.rows) { r in BoardRowView(r: r) }
+                                }
                             }
                             .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -3483,6 +3660,7 @@ struct SessionsView: View {
 struct BoardRowView: View {
     @EnvironmentObject var m: AppModel
     let r: BoardRow
+    var old = false                 // a machine that did not answer: its last row, greyed, no buttons
 
     var color: Color {
         switch r.status {
@@ -3503,6 +3681,14 @@ struct BoardRowView: View {
     }
 
     var body: some View {
+        if old {
+            row.opacity(0.45).help("What it had open when it last answered; it may have changed since")
+        } else {
+            live
+        }
+    }
+
+    var live: some View {
         VStack(alignment: .leading, spacing: 2) {
             row
             if r.agent == "claude" && (r.title != nil || r.pendingTitle != nil || r.local) {
@@ -3588,8 +3774,10 @@ struct BoardRowView: View {
                 Text(ago(NSNumber(value: t))).foregroundColor(.secondary)
             }
             Spacer()
-            if r.handedOver, let p = m.projects.first(where: { $0.away != nil
-                                                          && r.project.hasSuffix($0.path) }) {
+            if old {
+                EmptyView()
+            } else if r.handedOver, let p = m.projects.first(where: { $0.away != nil
+                                                                 && r.project.hasSuffix($0.path) }) {
                 Button("Open Session") { m.openSession(p) }.controlSize(.small)
             } else if r.local, m.projects.contains(where: { $0.path == r.project }) {
                 Button("Show Project") { m.show(r.project) }.controlSize(.small)
@@ -3621,14 +3809,26 @@ struct SearchView: View {
                 Button("Search") { m.runSearch() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(m.query.trimmingCharacters(in: .whitespaces).isEmpty || m.searching)
+                if m.canSearchEverywhere {
+                    Toggle("Also on my other machines", isOn: $m.searchEverywhere)
+                        .toggleStyle(.checkbox)
+                        .help("Each machine searches its own index; one that does not answer "
+                              + "within 20 seconds is left out")
+                }
                 HelpButton("Search every session")
                 if m.searching { ProgressView().controlSize(.small) }
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
+                    if !m.searching {
+                        ForEach(m.searchMisses, id: \.self) { line in
+                            Label(line, systemImage: "exclamationmark.triangle")
+                                .foregroundColor(.orange)
+                        }
+                    }
                     if let q = m.searched, m.hits.isEmpty, !m.searching {
-                        Text("Nothing found for “\(q)”.").foregroundColor(.secondary)
+                        Text(nothingFound(q, everywhere: m.searchedOn)).foregroundColor(.secondary)
                     }
                     if m.searched == nil {
                         Text("Claude Code, Kimi Code and Codex sessions are searched, also "
@@ -3643,6 +3843,7 @@ struct SearchView: View {
         }
         .onAppear { focused = true }
         .onChange(of: m.focusSearch) { _ in focused = true }
+        .onChange(of: m.searchEverywhere) { _ in if m.searched != nil { m.runSearch() } }
     }
 }
 
@@ -3671,13 +3872,22 @@ struct SearchHitView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(h.title).font(.headline).lineLimit(1)
+                if let mc = h.machine {
+                    Text("on \(mc)").font(.caption)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.18))
+                        .cornerRadius(4)
+                        .help("Found in \(mc)'s own sessions")
+                }
                 Text(AGENT_LABEL[h.agent] ?? h.agent).foregroundColor(.secondary)
                 if let t = h.updated { Text(ago(NSNumber(value: t))).foregroundColor(.secondary) }
                 if !h.live {
                     Text("deleted — in a backup").font(.caption).foregroundColor(.orange)
                 }
                 Spacer()
-                if h.live, let p = h.project, FileManager.default.fileExists(atPath: p) {
+                if h.machine != nil {
+                    EmptyView()                 // another machine's: nothing to open here
+                } else if h.live, let p = h.project, FileManager.default.fileExists(atPath: p) {
                     Button("Resume") { m.resume(h) }.controlSize(.small)
                     Button("Show Project") { m.show(p) }.controlSize(.small)
                         .disabled(!m.projects.contains { $0.path == p })
@@ -3686,8 +3896,8 @@ struct SearchHitView: View {
                 }
             }
             if let p = h.project {
-                Text(p).font(.caption).foregroundColor(.secondary).lineLimit(1)
-                    .truncationMode(.middle)
+                Text(h.machine.map { "\($0): \(p)" } ?? p).font(.caption).foregroundColor(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
             }
             ForEach(Array(h.snippets.enumerated()), id: \.offset) { _, sn in
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -5051,7 +5261,8 @@ struct MachinesView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Text("The machines a project can be handed over to, and kept in sync with.")
+                    Text("The machines a project can be handed over to, and kept in sync with. "
+                         + "Watch one to hear when a session there waits for you.")
                         .foregroundColor(.secondary)
                     Spacer()
                     HelpButton("Hand a project over")
@@ -5071,6 +5282,9 @@ struct MachinesView: View {
                                 Text(mc.name).font(.headline)
                                 Text(mc.target).foregroundColor(.secondary)
                                     .textSelection(.enabled)
+                                if !mc.system.isEmpty {
+                                    Text(systemLabel(mc.system)).foregroundColor(.secondary)
+                                }
                                 if mc.name == m.machine {
                                     Text("projects go here").font(.caption)
                                         .padding(.horizontal, 6).padding(.vertical, 2)
@@ -5091,10 +5305,30 @@ struct MachinesView: View {
                                 Button("Remove…") { m.remove(mc) }
                             }
                             .disabled(m.working != nil)
+                            HStack(spacing: 10) {
+                                Toggle("Watch", isOn: Binding(get: { mc.watch }, set: { m.watch(mc, $0) }))
+                                    .toggleStyle(.switch).controlSize(.small)
+                                    .disabled(!m.canReach)
+                                    .help("aht asks \(mc.name) every 2 minutes and tells you when a "
+                                          + "session there waits for you or is done")
+                                if let b = m.heard(mc.name) {
+                                    // a core without `last_heard`: it answered when the board was read
+                                    let t = b.lastHeard ?? (b.reachable ? m.boardAt?.timeIntervalSince1970 : nil)
+                                    Text(heardText(t, stale: b.stale)).font(.caption)
+                                        .foregroundColor(b.stale ? .orange : .secondary)
+                                        .help(b.error ?? "")
+                                }
+                            }
                             if let e = m.checkError[mc.name] {
                                 Text("✗ " + e).foregroundColor(.red)
                             }
-                            ForEach(m.checks[mc.name] ?? []) { c in CheckRow(c: c) }
+                            ForEach(checkGroups(m.checks[mc.name] ?? []), id: \.title) { g in
+                                if !g.title.isEmpty {
+                                    Text(g.title).font(.caption).fontWeight(.semibold)
+                                        .foregroundColor(.secondary).padding(.top, 2)
+                                }
+                                ForEach(g.rows) { c in CheckRow(c: c) }
+                            }
                         }
                         .padding(6)
                     }
@@ -5131,7 +5365,13 @@ struct MachinesView: View {
             }
             .padding(16)
         }
-        .onAppear { m.discover() }
+        .onAppear {
+            m.discover()
+            // "last heard" comes with the sessions board: read it when it is old
+            if !m.machines.isEmpty && (m.boardAt.map { -$0.timeIntervalSinceNow > 120 } ?? true) {
+                m.refreshBoard()
+            }
+        }
     }
 }
 
@@ -7404,6 +7644,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         case "search":
             openWindow()
             model.tab = .search
+            if let e = q["everywhere"] { model.searchEverywhere = e == "1" }
             if let w = q["q"], !w.isEmpty {
                 model.query = w
                 model.runSearch()
@@ -8153,6 +8394,182 @@ if CommandLine.arguments.contains("--selftest") {
         print("RELAY SAMPLES not checked (" + (dir2.isEmpty ? "AHT_FIXTURES_PHASE2 names no folder"
                                                      : "no samples in \(dir2) yet") + ")")
     }
+    // watch and search every machine: the Watch switch and "last heard" in
+    // Machines, a silent machine's last rows "as of" in Sessions, Search's
+    // other machines; made-up rows in the shape of the core's JSON
+    let now = Date().timeIntervalSince1970
+    let setUp = machinesFrom(["box": ["ssh": "me@box", "watch": true, "system": "Linux"],
+                            "studio": ["ssh": "me@studio", "system": NSNull()], "pc": "odd"])
+    let watchOK = setUp.map { $0.name } == ["box", "pc", "studio"] && setUp[0].watch && !setUp[2].watch
+        && setUp[0].system == "Linux" && setUp[2].system == "" && systemLabel("Darwin") == "macOS"
+        && watchProblem(["remote": "box", "watch": true, "applied": true], "box", on: true) == nil
+        && watchProblem(["remote": "box", "watch": false, "applied": true], "box", on: false) == nil
+        && watchProblem(["remote": "box", "watch": true, "applied": false], "box", on: true)
+            == "box is not watched."
+        && watchProblem(["remote": "box", "watch": true], "box", on: false) == "box is still watched."
+        && watchProblem(nil, "box", on: true, said: "unknown machine 'box'\n") == "unknown machine 'box'"
+        && watchProblem([:], "box", on: true).map { $0.hasPrefix("aht gave no answer") } == true
+        && heardText(nil, stale: false) == "not heard from yet"
+        && heardText(now - 5, stale: false) == "last heard just now"
+        && heardText(now - 1500, stale: true) == "not heard since " + clock(NSNumber(value: now - 1500))
+    let grouped = checkGroups(checkRows(["machines": [["remote": "box", "checks": [
+        ["check": "reachable", "ok": true, "detail": "box (Linux)", "needed": true, "group": "ask"],
+        ["check": "rsync there", "ok": false, "detail": "missing", "needed": true,
+         "fix": "sudo apt install rsync", "group": "handover"],
+        ["check": "keeps box awake while an agent works", "ok": true, "detail": "systemd-inhibit",
+         "needed": false, "group": "handover"],
+        ["check": "python3 there", "ok": true, "detail": "3.12", "needed": true, "group": "ask"]]]]]).rows)
+    let flat = checkGroups(checkRows(["machines": [["checks": [["check": "reachable", "ok": true]]]]]).rows)
+    let failed = checkRows(["machines": [["remote": "box", "error": "ssh: no route", "checks": []]]])
+    let groupsOK = grouped.map { $0.title } == ["For asking", "For handing over"]
+        && grouped[0].rows.map { $0.name } == ["reachable", "python3 there"]
+        && grouped[1].rows.count == 2 && grouped[1].rows[0].fix == "sudo apt install rsync"
+        && flat.map { $0.title } == [""] && failed.error == "ssh: no route" && failed.rows.isEmpty
+        && checkRows([:]).error == "aht gave no answer"
+    print("WATCH AND LAST HEARD \(watchOK && groupsOK ? "OK" : "FAIL — \(setUp) / \(grouped.map { $0.title })")")
+    let row = { (p: String, st: String) -> [String: Any] in
+        ["agent": "claude", "project": "/home/me/code/" + p, "status": st, "since": now - 600]
+    }
+    let boards = boardMachines(["machines": [
+        ["machine": "mac", "local": true, "reachable": true, "sessions": [row("a", "working")]],
+        ["machine": "box", "local": false, "reachable": true, "last_heard": now, "stale": false,
+         "sessions": [row("b", "working"), row("c", "waiting for you")], "last_sessions": NSNull()],
+        ["machine": "studio", "local": false, "reachable": false, "error": "timed out",
+         "last_heard": now - 1500, "stale": true, "sessions": [],
+         "last_sessions": [row("d", "working"), row("e", "waiting for you")]],
+        ["machine": "laptop", "local": false, "reachable": false, "last_heard": now - 200,
+         "stale": false, "sessions": [], "last_sessions": [row("f", "idle")]],
+        ["machine": "pi", "local": false, "reachable": false, "last_heard": NSNull(), "stale": true,
+         "sessions": []],
+        ["machine": "old", "local": false, "reachable": false, "sessions": []]]])   // an older core
+    let (here, box, studio, laptop, pi, old) = (boards[0], boards[1], boards[2], boards[3], boards[4], boards[5])
+    let staleOK = boards.count == 6 && here.silentNote.isEmpty && !here.showsOld
+        && box.silentNote.isEmpty && !box.showsOld && box.rows.first?.status == "waiting for you"
+        && box.lastHeard == now && !box.stale
+        && studio.showsOld && studio.stale && studio.lastRows.map { $0.name } == ["e", "d"]
+        && studio.silentNote == "Not answering since \(clock(NSNumber(value: now - 1500))) — asleep, "
+            + "switched off or offline?"
+        && studio.asOf == "as of " + clock(NSNumber(value: now - 1500))
+        && laptop.showsOld && laptop.silentNote.hasPrefix("Not reachable right now")
+        && !pi.showsOld && pi.silentNote.hasPrefix("Not reachable right now") && pi.lastHeard == nil
+        && !old.showsOld && old.silentNote.hasPrefix("Not reachable right now") && !old.stale
+    print("SESSIONS AS OF \(staleOK ? "OK" : "FAIL — \(boards.map { ($0.name, $0.silentNote, $0.showsOld) })")")
+    let hit = { (machine: Any, title: String) -> [String: Any] in
+        ["machine": machine, "agent": "claude", "session": "s-" + title, "project": "/x/api",
+         "title": title, "live": true, "updated": now - 60,
+         "hits": [["role": "user", "snippet": "the \u{02}login\u{03} redirect"]]]
+    }
+    let found: [String: Any] = ["query": "login", "results": [hit("box", "there"), hit(NSNull(), "here"),
+                                                               hit("studio", "studio one")],
+                                "machines": [
+        ["machine": "box", "reachable": true, "indexed": true, "index_at": now - 30, "results": 1,
+         "error": NSNull()],
+        ["machine": "studio", "reachable": true, "indexed": true, "index_at": now, "results": 1],
+        ["machine": "laptop", "reachable": false, "indexed": NSNull(), "index_at": NSNull(),
+         "results": 0, "error": "ssh: connect to host laptop port 22: Operation timed out\n"],
+        ["machine": "pi", "reachable": true, "indexed": false, "index_at": NSNull(), "results": 0,
+         "error": NSNull()]]]
+    let got = searchHits(found)
+    let missed = searchMissed(found)
+    let searchOK = got.map { $0.title } == ["here", "there", "studio one"]
+        && got.map { $0.machine } == [nil, "box", "studio"] && got[1].snippets.count == 1
+        && missed == ["Not searched on laptop: it did not answer (ssh: connect to host laptop port 22: "
+                        + "Operation timed out)",
+                      "Not searched on pi: no search index (aht is not installed there)"]
+        && searchAsked(found) == ["box", "studio"]
+        && searchHits(["results": [hit(NSNull(), "plain")]]).first?.machine == nil
+        && searchMissed(["results": []]).isEmpty
+        && nothingFound("x", everywhere: nil) == "Nothing found for “x”."
+        && nothingFound("x", everywhere: ["box"]) == "Nothing found for “x”, here or on box."
+        && nothingFound("x", everywhere: ["box", "pi", "studio"])
+            == "Nothing found for “x”, here or on box, pi or studio."
+    print("SEARCH EVERYWHERE \(searchOK ? "OK" : "FAIL — \(got.map { $0.title }) / \(missed)")")
+    // … and the core's phase-3 samples: AHT_FIXTURES_PHASE3
+    var phase3OK = true
+    let dir3 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE3"] ?? ""
+    if !dir3.isEmpty && FileManager.default.fileExists(atPath: dir3) {
+        var miss: [String] = []
+        func sample(_ n: String) -> [String: Any] {
+            let f = URL(fileURLWithPath: dir3).appendingPathComponent(n)
+            guard let data = try? Data(contentsOf: f) else { miss.append(n + " (missing)"); return [:] }
+            let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if d == nil { miss.append(n + " (not JSON)") }
+            return d ?? [:]
+        }
+        // status: whether other machines can be asked, next to whether handover works
+        let ho = sample("status.json")["handover"] as? [String: Any] ?? [:]
+        if !(ho["can_reach"] is Bool) || !(ho["supported"] is Bool) { miss.append("status.json") }
+        // remote list: each machine says whether it is watched, and its system
+        let rl = sample("remote_list.json")["remotes"] as? [String: Any] ?? [:]
+        let ms = machinesFrom(rl)
+        if rl.isEmpty || ms.count != rl.count || ms.contains(where: { mc in
+            let raw = rl[mc.name] as? [String: Any] ?? [:]
+            return !(raw["watch"] is Bool) || mc.watch != raw["watch"] as? Bool
+                || raw["system"] == nil || mc.system != (raw["system"] as? String ?? "")
+        }) {
+            miss.append("remote_list.json")
+        }
+        // remote watch: a done change reads as done, a dry run does not
+        let rw = sample("remote_watch.json")
+        if let name = rw["remote"] as? String, let on = rw["watch"] as? Bool, let applied = rw["applied"] as? Bool {
+            if (watchProblem(rw, name, on: on) == nil) != applied { miss.append("remote_watch.json") }
+        } else {
+            miss.append("remote_watch.json")
+        }
+        // remote check: every row in a group, and the keep-awake row
+        let rc = sample("remote_check.json")
+        let raw = (((rc["machines"] as? [[String: Any]]) ?? []).first?["checks"] as? [[String: Any]]) ?? []
+        let (rows, _) = checkRows(rc)
+        let groups = checkGroups(rows)
+        if raw.isEmpty || rows.count != raw.count
+            || raw.contains(where: { !["ask", "handover"].contains($0["group"] as? String ?? "") })
+            || zip(rows, raw).contains(where: { $0.group != $1["group"] as? String })
+            || !raw.contains(where: { ($0["check"] as? String ?? "").lowercased().contains("awake") })
+            || groups.map({ $0.rows.count }).reduce(0, +) != rows.count
+            || (rows.contains { $0.group == "ask" } && groups.first?.title != "For asking") {
+            miss.append("remote_check.json")
+        }
+        // board: when each machine was last heard, stale ones' last rows "as of"
+        let bd = sample("board.json")
+        let rawBoards = (bd["machines"] as? [[String: Any]]) ?? []
+        let parsed = boardMachines(bd)
+        let others = zip(parsed, rawBoards).filter { !$0.0.local }
+        if rawBoards.isEmpty || others.isEmpty || others.contains(where: { b, r in
+            !(r["stale"] is Bool) || b.stale != r["stale"] as? Bool
+                || (r["last_heard"] == nil) || b.lastHeard != (r["last_heard"] as? NSNumber)?.doubleValue
+                || (r["last_sessions"] as? [Any]).map { $0.count != b.lastRows.count } ?? false
+                || ((b.stale || !b.reachable) && b.silentNote.isEmpty)
+                || (b.showsOld && !b.asOf.hasPrefix("as of "))
+        }) {
+            miss.append("board.json")
+        }
+        // search everywhere: hits with their machine, this Mac's first; a line
+        // for each machine that could not be searched
+        let se = sample("search_everywhere.json")
+        let rawHits = (se["results"] as? [[String: Any]]) ?? []
+        let seHits = searchHits(se)
+        let rawMachines = (se["machines"] as? [[String: Any]]) ?? []
+        let lines = searchMissed(se), asked = searchAsked(se)
+        let named = rawMachines.compactMap { $0["machine"] as? String }
+        let firstThere = seHits.firstIndex { $0.machine != nil } ?? seHits.count
+        if !(se["query"] is String) || rawMachines.isEmpty || seHits.count != rawHits.count
+            || rawHits.contains(where: { $0["machine"] == nil })        // null for here, never missing
+            || seHits[firstThere...].contains(where: { $0.machine == nil })
+            || Set(seHits.compactMap { $0.machine }) != Set(rawHits.compactMap { $0["machine"] as? String })
+            || rawMachines.contains(where: { m in
+                ["machine", "reachable", "indexed", "index_at", "results", "error"].contains { m[$0] == nil } })
+            || named.count != lines.count + asked.count
+            || !zip(rawMachines.filter { missedLine($0) != nil }, lines).allSatisfy({
+                $1.contains($0["machine"] as? String ?? "\u{0}") }) {
+            miss.append("search_everywhere.json")
+        }
+        miss = miss.filter { !miss.contains($0 + " (missing)") && !miss.contains($0 + " (not JSON)") }
+        phase3OK = miss.isEmpty
+        print("PHASE 3 SAMPLES \(phase3OK ? "OK" : "FAIL \(miss)") — \(dir3)")
+    } else {
+        print("PHASE 3 SAMPLES not checked (" + (dir3.isEmpty ? "AHT_FIXTURES_PHASE3 names no folder"
+                                                       : "no samples in \(dir3) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -8188,7 +8605,7 @@ if CommandLine.arguments.contains("--selftest") {
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
          && releaseOK && pauseOK && backOnOK && offsiteOK && relayOK && dialogOK && samplesOK
-         && relaySamplesOK && loginOK ? 0 : 1)
+         && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -8266,7 +8683,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
 // snapshot: the window's tabs (and its dialogs) as PNG files, to look at a
 // layout without clicking through it (needs a login session; nothing changes)
 //   --snapshot DIR [--select-first] [--query WORDS]
-//              [--corner-only | --welcome-only | --handover-only]
+//              [--corner-only | --welcome-only | --handover-only | --machines-only]
 /// --dark renders in the dark appearance; the window's own background is
 /// drawn under every snapshot, so the PNG is opaque (a transparent one is
 /// unreadable on a page of the other colour)
@@ -8310,6 +8727,109 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     NSApplication.shared.setActivationPolicy(.accessory)
     NSApplication.shared.appearance = SNAP_LOOK
+    if args.contains("--machines-only") {
+        // Watch and "last heard" (Machines), a silent machine's last rows
+        // (Sessions), Search on every machine: made-up rows in the shape of
+        // the core's JSON, then the core's own samples (AHT_FIXTURES_PHASE3)
+        // when there are some. Nothing asks the core or another machine.
+        let now = Date().timeIntervalSince1970
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 3", "tracked": 6, "handover": [
+            "supported": true, "can_reach": true, "default_remote": "box", "remotes": [
+                "box": ["ssh": "me@box", "watch": true, "system": "Linux"],
+                "studio": ["ssh": "me@studio.local", "watch": true, "system": "Darwin"],
+                "laptop": ["ssh": "me@laptop", "watch": false, "system": "Linux"]]]]
+        let row = { (p: String, agent: String, st: String, ago: Double) -> [String: Any] in
+            ["agent": agent, "project": "/home/me/code/" + p, "status": st, "since": now - ago,
+             "waiting_for": st == "waiting for you" ? "permission to run the tests" : NSNull()]
+        }
+        demo.board = boardMachines(["machines": [
+            ["machine": "mac", "local": true, "reachable": true, "last_heard": now, "stale": false,
+             "sessions": [row("site", "claude", "working", 120)]],
+            ["machine": "box", "local": false, "reachable": true, "last_heard": now - 40, "stale": false,
+             "sessions": [row("api", "claude", "waiting for you", 300), row("shop", "codex", "working", 900)]],
+            ["machine": "studio", "local": false, "reachable": false, "last_heard": now - 1560,
+             "stale": true, "error": "ssh: connect to host studio.local port 22: Operation timed out",
+             "sessions": [], "last_sessions": [row("paper", "claude", "working", 2400),
+                                               row("thesis", "kimi", "idle", 5000)]],
+            ["machine": "laptop", "local": false, "reachable": false, "last_heard": now - 240,
+             "stale": false, "sessions": [], "last_sessions": [row("blog", "claude", "idle", 3000)]]]])
+        demo.boardAt = Date()
+        demo.checks["box"] = checkRows(["machines": [["remote": "box", "checks": [
+            ["check": "reachable", "ok": true, "detail": "box (Linux)", "needed": true, "group": "ask"],
+            ["check": "python3 there", "ok": true, "detail": "3.12.3", "needed": true, "group": "ask"],
+            ["check": "key login without a prompt", "ok": true, "detail": "yes", "needed": true,
+             "group": "ask"],
+            ["check": "rsync there", "ok": true, "detail": "3.2.7", "needed": true, "group": "handover"],
+            ["check": "tmux there", "ok": true, "detail": "3.4", "needed": true, "group": "handover"],
+            ["check": "keeps box awake while an agent works", "ok": false, "detail": "no systemd-inhibit",
+             "needed": false, "group": "handover", "fix": "sudo apt install systemd"]]]]]).rows
+        demo.tab = .machines
+        snapshot(MainView().environmentObject(demo), dir + "/machines-watch.png", NSSize(width: 900, height: 620))
+        demo.tab = .sessions
+        snapshot(MainView().environmentObject(demo), dir + "/sessions-as-of.png", NSSize(width: 900, height: 620))
+        let hit = { (machine: Any, title: String, p: String, ago: Double, said: String) -> [String: Any] in
+            ["machine": machine, "agent": "claude", "session": UUID().uuidString, "project": p,
+             "title": title, "live": true, "updated": now - ago,
+             "hits": [["role": "user", "snippet": said], ["role": "assistant",
+                      "snippet": "I changed the \u{02}login\u{03} \u{02}redirect\u{03} so it keeps the page you came from"]]]
+        }
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+        let found: [String: Any] = ["query": "login redirect", "results": [
+            hit(NSNull(), "fix the login redirect", home + "/code/site", 3600,
+                "the \u{02}login\u{03} \u{02}redirect\u{03} loses the page"),
+            hit("box", "api: session cookies", "/home/me/code/api", 86400 * 2,
+                "after \u{02}login\u{03} the \u{02}redirect\u{03} goes to /"),
+            hit(NSNull(), "auth tests", home + "/code/site", 86400 * 6,
+                "a test for the \u{02}login\u{03} \u{02}redirect\u{03}")],
+            "machines": [
+                ["machine": "box", "reachable": true, "indexed": true, "index_at": now - 600, "results": 1,
+                 "error": NSNull()],
+                ["machine": "laptop", "reachable": true, "indexed": false, "index_at": NSNull(),
+                 "results": 0, "error": NSNull()],
+                ["machine": "studio", "reachable": false, "indexed": NSNull(), "index_at": NSNull(),
+                 "results": 0, "error": "ssh: connect to host studio.local port 22: Operation timed out"]]]
+        demo.tab = .search
+        demo.searchEverywhere = true
+        (demo.query, demo.searched) = ("login redirect", "login redirect")
+        (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(found), searchMissed(found), searchAsked(found))
+        snapshot(MainView().environmentObject(demo), dir + "/search-everywhere.png", NSSize(width: 900, height: 620))
+        let none = ["query": "kubernetes", "results": [], "machines": found["machines"]!] as [String: Any]
+        (demo.query, demo.searched) = ("kubernetes", "kubernetes")
+        (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(none), searchMissed(none), searchAsked(none))
+        snapshot(MainView().environmentObject(demo), dir + "/search-everywhere-none.png",
+                 NSSize(width: 900, height: 360))
+        // the core's samples, when it has written them
+        let dir3 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE3"] ?? ""
+        func sample(_ n: String) -> [String: Any] {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir3).appendingPathComponent(n))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] ?? [:]
+        }
+        if !dir3.isEmpty && FileManager.default.fileExists(atPath: dir3) {
+            let st = sample("status.json"), rl = sample("remote_list.json")
+            var ho = (st["handover"] as? [String: Any]) ?? [:]
+            if let rs = rl["remotes"] { ho["remotes"] = rs }
+            demo.status = st.merging(["handover": ho]) { $1 }
+            demo.board = boardMachines(sample("board.json"))
+            demo.checks = [:]
+            let rc = sample("remote_check.json")
+            if let name = ((rc["machines"] as? [[String: Any]]) ?? []).first?["remote"] as? String {
+                (demo.checks[name], demo.checkError[name]) = checkRows(rc)
+            }
+            demo.tab = .machines
+            snapshot(MainView().environmentObject(demo), dir + "/machines-sample.png", NSSize(width: 900, height: 620))
+            demo.tab = .sessions
+            snapshot(MainView().environmentObject(demo), dir + "/sessions-sample.png", NSSize(width: 900, height: 620))
+            let se = sample("search_everywhere.json")
+            demo.tab = .search
+            (demo.query, demo.searched) = ((se["query"] as? String) ?? "", se["query"] as? String)
+            (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(se), searchMissed(se), searchAsked(se))
+            snapshot(MainView().environmentObject(demo), dir + "/search-sample.png", NSSize(width: 900, height: 620))
+        }
+        exit(0)
+    }
     let model = AppModel()
     model.take(AppModel.load())
     if args.contains("--select-first") { model.selection = model.shown.first?.path }

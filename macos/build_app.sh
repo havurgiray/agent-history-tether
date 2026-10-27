@@ -204,6 +204,7 @@ if [ "$TEST_AFTER" = "1" ]; then
   # the core's samples (tests/fixtures) go through the app's parsers too
   AHT_FIXTURES="${AHT_FIXTURES:-$REPO/tests/fixtures/phase1}" \
   AHT_FIXTURES_PHASE2="${AHT_FIXTURES_PHASE2:-$REPO/tests/fixtures/phase2}" \
+  AHT_FIXTURES_PHASE3="${AHT_FIXTURES_PHASE3:-$REPO/tests/fixtures/phase3}" \
     "$APP/Contents/MacOS/$EXEC_NAME" --selftest
   "$RES/bin/aht" version
   "$RES/badge_icon" preview "$OUT/badge-preview.png" git agent:claude agent:kimi >/dev/null \

@@ -353,6 +353,8 @@ const ON_WINDOWS = () => (S.status.platform || "").startsWith("win");
 const CAN_HAND_OVER = () => !!(S.status.handover || {}).supported;
 // asking other machines (ssh alone); an older core says only "supported"
 const CAN_REACH = () => { const ho = S.status.handover || {}; return "can_reach" in ho ? !!ho.can_reach : !!ho.supported; };
+// what a PC does with the other machines today, said where Hand Over would be
+const FROM_WINDOWS = "From Windows you can see, search and pick up work on your other machines. Handing projects over from Windows comes in a later version.";
 const flag = (k, d = true) => (k in S.config ? !!S.config[k] : d);
 /** Keep in sync, paused (`mirror_paused`: {reason, at, remote}): Release
  * pauses it, so no sync replaces the copy left on that machine until the
@@ -370,7 +372,8 @@ async function refresh() {
   S.status.home = S.status.home || guessHome();
   S.loaded = true;
   drawTop();
-  if (!document.querySelector("#main input:focus, #main textarea:focus, #main select:focus")) draw();
+  // not while something is typed (a checkbox just clicked keeps the focus too)
+  if (!document.querySelector("#main input:not([type=checkbox]):not([type=radio]):focus, #main textarea:focus, #main select:focus")) draw();
 }
 function guessHome() {
   const r = (S.status.watch_roots || [])[0] || "";
@@ -523,6 +526,7 @@ function detail() {
     ], { right: true }), helpBtn("The window at a glance"));
   }
   d.append(row);
+  if (p.exists && !p.away && !CAN_HAND_OVER() && CAN_REACH() && ON_WINDOWS()) d.append(h("p", { class: "dim small", text: FROM_WINDOWS }));
   if (p.open && !p.away && !p.handing && CAN_HAND_OVER()) {
     d.append(h("p", { class: "warn small", text: p.open === "waiting"
       ? "An agent session in this project is waiting for you. Answer it in its terminal; the project cannot be handed over until it has finished and is closed."
@@ -1210,7 +1214,7 @@ async function loadBoard() {
   const d = await J("board", "--json");
   S.board = d.machines || [];
   S.boardAt = Date.now(); S.boardLoading = false;
-  if (S.tab === "sessions") draw();
+  if (S.tab === "sessions" || S.tab === "machines") draw();
 }
 function drawSessions(m) {
   if (!S.board && !S.boardLoading) loadBoard();
@@ -1220,12 +1224,17 @@ function drawSessions(m) {
     h("button", { text: "Refresh", disabled: S.boardLoading, onclick: loadBoard }), helpBtn("Sessions: what runs right now"));
   m.append(head);
   for (const b of S.board || []) {
+    // a machine that does not answer keeps the sessions it had when it last
+    // did (last_sessions), greyed: "as of 11:40"
+    const old = !b.reachable || b.stale;
+    const rows = old ? b.last_sessions || [] : b.sessions || [];
     const g = h("div", { class: "group", style: "margin-top:12px" }, h("div", { class: "title" }, h("span", { text: b.machine + (b.local ? " (this computer)" : "") }),
-      b.reachable ? null : h("span", { class: "warn small", text: "did not answer" + (b.error ? ": " + b.error : "") })));
-    const list = h("div", { class: "box" });
-    if (b.reachable && !(b.sessions || []).length) list.append(h("p", { class: "dim", text: "No agent session open." }));
-    for (const s of b.sessions || []) {
-      const cls = s.raw_status === "waiting" ? "waiting" : s.raw_status === "busy" ? "working" : "";
+      old ? h("span", { class: "warn small", text: (b.last_heard ? `has not answered since ${clock(b.last_heard)}` : "did not answer") + (b.error ? ": " + b.error : "") }) : null));
+    const list = h("div", { class: "box" + (old ? " stale" : "") });
+    if (!old && !rows.length) list.append(h("p", { class: "dim", text: "No agent session open." }));
+    if (old && rows.length) list.append(h("div", { class: "dim small", text: b.last_heard ? `as of ${clock(b.last_heard)}` : "as last heard" }));
+    for (const s of rows) {
+      const cls = old ? "" : s.raw_status === "waiting" ? "waiting" : s.raw_status === "busy" ? "working" : "";
       list.append(h("div", { class: "row", style: "padding:5px 0;border-bottom:1px solid var(--line)" },
         h("strong", { text: base(s.project) }), h("span", { class: "badge " + cls, text: s.status || s.raw_status || "" }),
         s.waiting_for ? h("span", { class: "warn small", text: s.waiting_for }) : null,
@@ -1237,7 +1246,7 @@ function drawSessions(m) {
           await run(["checkup", "--close", String(s.pid), "--apply"]); loadBoard();
         } }) : null));
     }
-    g.append(list);
+    if (list.childNodes.length) g.append(list);
     m.append(g);
   }
 }
@@ -1246,26 +1255,56 @@ function drawSessions(m) {
 
 function drawSearch(m) {
   const q = h("input", { type: "search", placeholder: "Words from any session, in any agent", value: S.query, style: "width:420px" });
+  // every machine aht can ask (search --everywhere): asked in parallel, this
+  // computer's hits first
+  const others = CAN_REACH() && Object.keys((S.status.handover || {}).remotes || {}).length > 0;
+  const everywhere = () => others && !!S.everywhere;
   const go = async () => {
     S.query = q.value.trim();
     if (!S.query) return;
     S.searching = true; draw();
-    const d = await J("search", "--json", "--", S.query);    // after --, "-rf" is text to find
-    S.hits = d.results || []; S.searching = false; draw();
+    // after --, "-rf" is text to find
+    const all = everywhere();
+    const a = await run(["search", "--json", ...(all ? ["--everywhere"] : []), "--", S.query]);
+    const d = a.json || {};
+    S.hits = d.results || [];
+    S.searched = all ? d.machines || [] : null;
+    S.searchError = a.json ? null : (a.err + a.out).trim() || null;
+    S.searching = false; draw();
   };
   q.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
   m.append(h("div", { class: "row" }, q, h("button", { class: "primary", text: "Search", onclick: go }),
+    others ? h("label", { class: "check" }, h("input", { type: "checkbox", checked: everywhere(),
+      onchange: (e) => { S.everywhere = e.target.checked; if (S.hits && q.value.trim()) go(); } }), "Also on my other machines") : null,
     S.searching ? h("span", { class: "spin" }) : null, helpBtn("Search every session")));
   setTimeout(() => q.focus(), 0);
+  if (S.searchError && !S.searching) m.append(h("p", { class: "warn", style: "white-space:pre-wrap", text: S.searchError }));
+  // the other machines (this one is machine null): a line for each that
+  // could not be searched, with why, and one for those that were
+  const machines = (S.searched || []).filter((x) => x.machine);
+  const failed = (x) => !x.reachable || x.indexed === false || !!x.error;
+  for (const x of machines.filter(failed)) {
+    const why = String(x.error || "").split("\n")[0];
+    m.append(h("p", { class: "warn small", style: "margin:6px 0 0", text: `${x.machine} was not searched: ` + (!x.reachable
+      ? "not reachable" + (why ? ` (${why})` : "") : x.indexed === false ? "no search index (aht is not installed there)" : why) }));
+  }
+  const asked = machines.filter((x) => !failed(x));
+  if (asked.length) m.append(h("p", { class: "dim small", style: "margin:6px 0 0", text: "Also searched: " + asked.map((x) =>
+    `${x.machine} (${plural(x.results || 0, "result")}${x.index_at ? ", index updated " + ago(x.index_at) : ""})`).join(", ") }));
   if (!S.hits) return;
-  if (!S.hits.length) m.append(h("p", { class: "dim", text: "Nothing found." }));
+  if (!S.hits.length && !S.searchError) m.append(h("p", { class: "dim", text: "Nothing found." }));
+  const labelled = (S.searched || []).length > 0 || S.hits.some((r) => r.machine);
   for (const r of S.hits) {
+    // a hit on another machine: Continue and Restore act here, so neither
+    // is offered for it
+    const there = !!r.machine;
     const box = h("div", { class: "box", style: "margin-top:8px" },
       h("div", { class: "row" }, h("strong", { text: r.title || "(no title)" }),
+        labelled ? h("span", { class: "badge" + (there ? " working" : ""), text: there ? r.machine : "this computer" }) : null,
         h("span", { class: "dim small", text: `${base(r.project)} · ${AGENTS[r.agent] || r.agent} · ${when(r.updated)}` }),
         h("span", { class: "grow" }),
         // as the core offers them: only where the project folder is there
-        r.resume ? h("button", { class: "small", text: "Continue", onclick: () => resume([r.project, "--session", r.session, "--agent", r.agent]) })
+        there ? null : r.resume ? h("button", { class: "small", text: "Continue", onclick: () => resume([r.project, "--session", r.session, "--agent", r.agent]) })
           : r.restore && r.restore.project ? h("button", { class: "small", text: "Restore…", onclick: async () => {
             if (!(await confirmIt("Bring this session back?", `“${r.title}” was deleted from ${base(r.project)}'s history; a backup still holds it. Restoring adds what is missing and changes nothing that is there.`, "Restore"))) return;
             const x = await busy("restoring…", () => run(["restore", r.restore.project, "--uuid", r.restore.uuid, "--stamp", r.restore.stamp, "--apply"]));
@@ -1280,48 +1319,154 @@ function drawSearch(m) {
 // ---- Machines ----------------------------------------------------------------------
 
 function drawMachines(m) {
-  if (!CAN_HAND_OVER()) {
+  const ho = S.status.handover || {};
+  if (!CAN_REACH()) {
+    // a core that says can_reach: false has no ssh client to ask with
     m.append(h("div", { class: "box" }, h("h2", { text: "Your other machines", style: "margin-top:0" }),
-      h("p", { text: "Handing a project over, keeping it in sync and backups on another machine need ssh and rsync, which aht uses on macOS and Linux; on Windows they are not there yet." }),
-      helpBtn("Hand a project over")));
+      h("p", { text: ON_WINDOWS() && "can_reach" in ho
+        ? "aht asks your other machines over ssh, and this PC has no ssh client. Add Windows' own in Settings → System → Optional features → OpenSSH Client, then open this tab again."
+        : "Handing a project over, keeping it in sync and backups on another machine need ssh and rsync, which aht uses on macOS and Linux; on Windows they are not there yet." }),
+      helpBtn(ON_WINDOWS() ? "A Windows PC with your other machines" : "Hand a project over")));
     return;
   }
-  const ho = S.status.handover || {};
+  const send = CAN_HAND_OVER();
   const remotes = Object.entries(ho.remotes || {});
-  m.append(h("div", { class: "row" }, h("span", { class: "dim", text: "The machines projects can be handed over to." }), h("span", { class: "grow" }),
-    h("button", { text: "Add a Machine…", onclick: addMachine }), helpBtn("Hand a project over")));
+  m.append(h("div", { class: "row" }, h("span", { class: "dim", text: send ? "The machines projects can be handed over to."
+    : ON_WINDOWS() ? FROM_WINDOWS : "The machines whose sessions aht shows and searches." }), h("span", { class: "grow" }),
+    h("button", { text: "Add a Machine…", onclick: addMachine }), helpBtn(ON_WINDOWS() ? "A Windows PC with your other machines" : "Hand a project over")));
   if (!remotes.length) m.append(h("p", { class: "dim", text: "None yet." }));
+  else m.append(h("p", { class: "dim small", style: "margin:6px 0 0", text: "Watch: every 2 minutes aht asks that machine for sessions that wait for you, and tells you." }));
   for (const [name, r] of remotes) {
+    const winBox = r.system === "Windows";           // aht cannot ask a Windows machine yet
     const box = h("div", { class: "box", style: "margin-top:8px" }, h("div", { class: "row" }, h("strong", { text: name }),
-      h("span", { class: "dim mono", text: r.ssh || "" }), name === ho.default_remote ? h("span", { class: "badge ok", text: "used for handovers" }) : null,
+      h("span", { class: "dim mono", text: r.ssh || "" }), r.system ? h("span", { class: "dim small", text: SYSTEMS[r.system] || r.system }) : null,
+      send && name === ho.default_remote ? h("span", { class: "badge ok", text: "used for handovers" }) : null,
       h("span", { class: "grow" }),
-      name !== ho.default_remote ? h("button", { class: "small", text: "Use This One", onclick: async () => { await run(["remote", "default", name]); refresh(); } }) : null,
-      h("button", { class: "small", text: "Check", onclick: async () => {
-        const d = await busy(`checking ${name}…`, () => J("remote", "check", name, "--json"));
-        const checks = d.checks || (d.machines || [{}])[0].checks || [];
-        tell(`${name}`, checks.length ? checks.map((c) => `${c.ok ? "✓" : "✗"} ${c.check || c.name}${c.detail ? " — " + c.detail : ""}`).join("\n") : JSON.stringify(d).slice(0, 600));
-      } }),
+      send && name !== ho.default_remote ? h("button", { class: "small", text: "Use This One", onclick: async () => { await run(["remote", "default", name]); refresh(); } }) : null,
+      h("button", { class: "small", text: "Check…", onclick: () => checkMachine(name) }),
       h("button", { class: "small", text: "Remove…", onclick: async () => {
         if (!(await confirmIt(`Remove ${name}?`, "aht forgets this machine. Nothing on it is deleted.", "Remove"))) return;
         // a machine that still holds a project stays: aht says how to release it
         const r = await run(["remote", "remove", name]);
         if (!r.ok) await tell(`${name} is not removed`, (r.err + r.out).trim() || "aht gave no answer.");
         refresh();
-      } })));
+      } })),
+      h("div", { class: "row" },
+        h("label", { class: "check", title: winBox ? "aht cannot ask a Windows machine yet." : null },
+          h("input", { type: "checkbox", checked: !!r.watch, disabled: winBox, onchange: (e) => watchMachine(name, e.target) }), "Watch"),
+        h("span", { class: "grow" }), heardLine(name, r)));
     m.append(box);
   }
+}
+/** When aht last heard from a machine (`last_heard`: when it last answered
+ * the session board, which the notices ask every 2 minutes for a watched
+ * one; nothing is asked to show it).  A watched machine silent for 10
+ * minutes, or one that did not answer the board this window asked, has not
+ * answered since then. */
+function heardLine(name, r) {
+  const b = (S.board || []).find((x) => !x.local && x.machine === name);
+  const heard = Math.max(Number(r.last_heard) || 0, Number(b && b.last_heard) || 0) || null;
+  const failed = b && !b.reachable && !(heard && heard * 1000 > S.boardAt);
+  if (failed || (r.watch && heard && Date.now() / 1000 - heard >= 600)) {
+    return h("span", { class: "warn small", text: heard ? `has not answered since ${clock(heard)}` : "has not answered" });
+  }
+  return h("span", { class: "dim small", text: heard ? "last heard " + ago(heard) : "not heard from yet" });
+}
+/** The Watch switch: `remote watch NAME [--off]`. */
+async function watchMachine(name, box) {
+  const on = box.checked;
+  const a = await run(["remote", "watch", name, ...(on ? [] : ["--off"]), "--json"]);
+  const d = a.json || {};
+  if (!a.ok || !d.applied) {
+    box.checked = !on;
+    await tell(on ? `${name} is not watched` : `${name} is still watched`, problems(d) || (a.err + a.out).trim() || "aht gave no answer.");
+  } else toast(on ? `Watching ${name}: a session there that waits for you gives a notice.` : `${name} is no longer watched.`);
+  refresh();
+}
+/** What a fix says, with each `command` in it to copy; a fix that is only a
+ * command ("sudo apt install -y tmux", "here:  brew install rsync") copies
+ * whole; one that is a sentence ("Turn on Remote Login …") is only said. */
+function fixLine(fix) {
+  const copy = (t) => h("button", { class: "small", text: "Copy", title: t, onclick: () => navigator.clipboard.writeText(t).then(() => toast("Copied.")) });
+  const line = h("div", { class: "small fix" });
+  const parts = String(fix).split(/(`[^`]+`)/);
+  if (parts.length > 1) {
+    for (const x of parts) {
+      if (/^`[^`]+`$/.test(x)) line.append(h("code", { text: x.slice(1, -1) }), " ", copy(x.slice(1, -1)));
+      else if (x) line.append(x);
+    }
+  } else if (/\.$/.test(fix) || /^[A-Z]/.test(fix) || /^(nothing to do|open )/i.test(fix)) {
+    line.append(fix);
+  } else {
+    line.append(h("span", { class: "mono", text: fix }), " ", copy(String(fix).replace(/^[^:]*:\s{2,}/, "")));
+  }
+  return line;
+}
+/** Check: what this machine has and lacks, for asking it (its sessions,
+ * search, Watch) and for handing a project over to it; each missing piece
+ * with what fixes it. */
+async function checkMachine(name) {
+  const send = CAN_HAND_OVER();
+  const s = sheet(`Check ${name}`, "Hand a project over", 720);
+  const box = h("div", {}, h("p", { class: "dim" }, h("span", { class: "spin" }), `Asking ${name}…`));
+  s.body.append(box);
+  s.foot.append(h("button", { text: "Check Again", onclick: () => checkMachine(name) }), h("span", { class: "spacer" }),
+    h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+  const a = await run(["remote", "check", name, "--json"]);
+  if (!$("#sheet").contains(box)) return;            // closed meanwhile
+  clear(box);
+  const d = a.json || {};
+  const r = (d.machines || []).find((x) => x.remote === name) || (d.machines || [])[0];
+  if (!r) return box.append(h("p", { class: "warn", style: "white-space:pre-wrap", text: problems(d) || (a.err + a.out).trim() || `${name} did not answer.` }));
+  const rows = r.checks || [];
+  const lacks = (g) => rows.filter((c) => c.group === g && c.needed !== false && !c.ok).length;
+  const steps = (list) => h("div", { class: "steps" }, list.map((c) => h("div", { class: "step" },
+    h("span", { class: "mark " + (c.ok ? "okc" : c.needed === false ? "dim" : "warn"), text: c.ok ? "✓" : c.needed === false ? "·" : "✗" }),
+    h("div", { class: "grow" }, h("div", {}, h("strong", { text: c.check || c.name }), c.detail ? h("span", { class: "dim", text: " — " + c.detail }) : null),
+      c.fix && !c.ok ? fixLine(c.fix) : null))));
+  if (r.error && !rows.length) {
+    box.append(h("div", { class: "callout" }, h("strong", { text: `aht could not ask ${name}` }),
+      h("div", { class: "small", style: "white-space:pre-wrap" }, inline(r.error))));
+  } else if (rows.some((c) => c.group)) {
+    box.append(h("p", { class: lacks("ask") || (send && lacks("handover")) ? "warn" : "okc", text: lacks("ask") ? `aht cannot ask ${name} yet: it needs what is marked ✗ under For asking.`
+      : !send ? `aht can ask ${name}: its sessions, Search and Watch work from here.`
+      : lacks("handover") ? `aht can ask ${name}; handing a project over to it needs what is marked ✗.` : `${name} is ready: aht can ask it and hand projects over to it.` }));
+  }
+  if (rows.some((c) => c.group)) {
+    const ask = rows.filter((c) => c.group === "ask"), hand = rows.filter((c) => c.group !== "ask");
+    if (ask.length) box.append(h("h3", { text: "For asking" }), h("div", { class: "dim small", text: "What aht needs to see the sessions there, search them and watch the machine." }), steps(ask));
+    // where projects cannot be sent from (Windows), what a handover needs is
+    // for later: folded away
+    if (hand.length && send) box.append(h("h3", { text: "For handing over" }), h("div", { class: "dim small", text: "What handing a project over to it needs." }), steps(hand));
+    else if (hand.length) {
+      box.append(h("details", { class: "later" }, h("summary", {}, h("h3", { text: "For handing over" })),
+        h("div", { class: "dim small", text: (ON_WINDOWS() ? "Handing projects over from Windows comes in a later version. " : "") + "This is what it will need." }), steps(hand)));
+    }
+  } else if (rows.length) box.append(steps(rows));
 }
 async function addMachine() {
   const s = sheet("Add a machine", "Hand a project over", 560);
   const name = h("input", { type: "text", placeholder: "a short name, e.g. homebox" });
   const ssh = h("input", { type: "text", placeholder: "user@host, as ssh reaches it" });
-  s.body.append(h("div", { class: "stack" }, h("label", {}, "Name ", name), h("label", {}, "Address ", ssh)));
-  s.foot.append(h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }),
-    h("button", { class: "primary", text: "Add", onclick: async () => {
-      const r = await busy("adding it…", () => run(["remote", "add", name.value.trim(), ssh.value.trim()]));
-      if (!r.ok) return tell("Not added", r.out + r.err);
-      closeSheet(); refresh();
-    } }));
+  const said = h("div");
+  s.body.append(h("div", { class: "stack" }, h("label", {}, "Name ", name), h("label", {}, "Address ", ssh)), said);
+  const add = h("button", { class: "primary", text: "Add", onclick: async () => {
+    const n = name.value.trim(), t = ssh.value.trim();
+    if (!n || !t) return clear(said).append(h("p", { class: "warn small", text: "Give the machine a name and the address ssh reaches it at." }));
+    add.disabled = true;
+    clear(said).append(h("p", { class: "dim small" }, h("span", { class: "spin" }), `Asking ${t}…`));
+    const r = await busy("adding it…", () => run(["remote", "add", n, t]));
+    add.disabled = false;
+    if (!$("#sheet").contains(said)) return;
+    if (!r.ok) {
+      return clear(said).append(h("div", { class: "callout" }, h("strong", { text: "Not added" }),
+        h("div", { class: "small", style: "white-space:pre-wrap" }, inline((r.err + r.out).trim().replace(/^✗\s*/, "") || "aht gave no answer."))));
+    }
+    closeSheet();
+    await refresh();
+    checkMachine(n);                                // what it lacks, right away
+  } });
+  s.foot.append(h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), add);
 }
 
 // ---- Settings ----------------------------------------------------------------------

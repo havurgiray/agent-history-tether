@@ -1,0 +1,149 @@
+{
+  "machines": [
+    {
+      "machine": "mac",
+      "local": true,
+      "reachable": true,
+      "sessions": [
+        {
+          "agent": "claude",
+          "project": "/Users/me/code/paper",
+          "pid": 71726,
+          "session": "s-here",
+          "name": "heron",
+          "title": "Heron parser",
+          "title_origin": "automatic",
+          "tab": null,
+          "pending_title": null,
+          "in_iterm": false,
+          "background": true,
+          "issues": [],
+          "can_restart": false,
+          "version": null,
+          "installed": "9.9.9",
+          "limit": null,
+          "status": "working",
+          "raw_status": "busy",
+          "waiting_for": null,
+          "since": null
+        }
+      ],
+      "last_heard": 1793117129.4947178,
+      "stale": false,
+      "last_sessions": [
+        {
+          "agent": "claude",
+          "project": "/Users/me/code/paper",
+          "pid": 71726,
+          "session": "s-here",
+          "name": "heron",
+          "title": "Heron parser",
+          "title_origin": "automatic",
+          "tab": null,
+          "pending_title": null,
+          "in_iterm": false,
+          "background": true,
+          "issues": [],
+          "can_restart": false,
+          "version": null,
+          "installed": "9.9.9",
+          "limit": null,
+          "status": "working",
+          "raw_status": "busy",
+          "waiting_for": null,
+          "since": null
+        }
+      ]
+    },
+    {
+      "machine": "box",
+      "local": false,
+      "reachable": true,
+      "sessions": [
+        {
+          "agent": "claude",
+          "project": "/home/me/code/paper",
+          "pid": 71727,
+          "session": "s-box",
+          "name": null,
+          "title": "Heron comments",
+          "title_origin": "automatic",
+          "tab": null,
+          "pending_title": null,
+          "in_iterm": false,
+          "background": true,
+          "issues": [],
+          "can_restart": false,
+          "version": null,
+          "installed": "9.9.9",
+          "limit": null,
+          "status": "waiting for you",
+          "raw_status": "waiting",
+          "waiting_for": "approve Bash: make test",
+          "since": null
+        }
+      ],
+      "host": "box",
+      "phone_here": false,
+      "last_heard": 1793117130.240614,
+      "stale": false,
+      "last_sessions": [
+        {
+          "agent": "claude",
+          "project": "/home/me/code/paper",
+          "pid": 71727,
+          "session": "s-box",
+          "name": null,
+          "title": "Heron comments",
+          "title_origin": "automatic",
+          "tab": null,
+          "pending_title": null,
+          "in_iterm": false,
+          "background": true,
+          "issues": [],
+          "can_restart": false,
+          "version": null,
+          "installed": "9.9.9",
+          "limit": null,
+          "status": "waiting for you",
+          "raw_status": "waiting",
+          "waiting_for": "approve Bash: make test",
+          "since": null
+        }
+      ]
+    },
+    {
+      "machine": "lab",
+      "local": false,
+      "reachable": true,
+      "sessions": [],
+      "host": "lab",
+      "phone_here": false,
+      "last_heard": 1793117130.240615,
+      "stale": false,
+      "last_sessions": []
+    },
+    {
+      "machine": "ws",
+      "local": false,
+      "reachable": false,
+      "sessions": [],
+      "error": "cannot reach ws (me@ws): me@ws: Permission denied (publickey,password).",
+      "last_heard": 1793115629.267779,
+      "stale": true,
+      "last_sessions": [
+        {
+          "agent": "claude",
+          "project": "/home/me/code/api",
+          "pid": 4242,
+          "session": "s-ws",
+          "name": null,
+          "status": "working",
+          "raw_status": "busy",
+          "waiting_for": null,
+          "since": 1793115529.267782
+        }
+      ]
+    }
+  ]
+}

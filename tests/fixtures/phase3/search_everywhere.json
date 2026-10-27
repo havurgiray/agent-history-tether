@@ -1,0 +1,80 @@
+{
+  "query": "heron",
+  "results": [
+    {
+      "agent": "claude",
+      "session": "s-here",
+      "project": "/Users/me/code/paper",
+      "rank": -1.032490974729242e-06,
+      "hits": [
+        {
+          "role": "user",
+          "t": 1793117128.0,
+          "snippet": "fix the \u0002heron\u0003 parser's lexer"
+        },
+        {
+          "role": "agent",
+          "t": 1793117128.0,
+          "snippet": "Done: fix the \u0002heron\u0003 parser's lexer"
+        }
+      ],
+      "title": "Heron parser",
+      "started": 1793117128.0,
+      "updated": 1793117128.0,
+      "live": true,
+      "source": "/Users/me/.claude/projects/-Users-me-code-paper/s-here.jsonl",
+      "resume": "cd /Users/me/code/paper && claude --resume s-here",
+      "machine": null
+    },
+    {
+      "agent": "claude",
+      "session": "s-box",
+      "project": "/home/me/code/paper",
+      "rank": -1.03862660944206e-06,
+      "hits": [
+        {
+          "role": "user",
+          "t": 1793117128.0,
+          "snippet": "the \u0002heron\u0003 parser drops comments"
+        },
+        {
+          "role": "agent",
+          "t": 1793117128.0,
+          "snippet": "Done: the \u0002heron\u0003 parser drops comments"
+        }
+      ],
+      "title": "Heron comments",
+      "started": 1793117128.0,
+      "updated": 1793117128.0,
+      "live": true,
+      "source": "/home/me/.claude/projects/-home-me-code-paper/s-box.jsonl",
+      "machine": "box"
+    }
+  ],
+  "machines": [
+    {
+      "machine": "box",
+      "reachable": true,
+      "indexed": true,
+      "index_at": 1793117128.76944,
+      "results": 1,
+      "error": null
+    },
+    {
+      "machine": "lab",
+      "reachable": true,
+      "indexed": false,
+      "index_at": null,
+      "results": 0,
+      "error": "no search index (aht is not installed there)"
+    },
+    {
+      "machine": "ws",
+      "reachable": false,
+      "indexed": null,
+      "index_at": null,
+      "results": 0,
+      "error": "cannot reach ws (me@ws): me@ws: Permission denied (publickey,password)."
+    }
+  ]
+}

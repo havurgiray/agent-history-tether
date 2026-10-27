@@ -11,10 +11,12 @@ before they start the watcher, and the uninstaller takes `aht uninstall`'s
 flags (with --remove-icons it removes the emblem images aht drew, and the
 icon cache with the last icon there), and the tray's notices say what became
 of a handover cut off halfway (finished, undone, or Release offered after an
-hour without an answer) and mask a key in what a session waits for, and
-vm_check.sh copies no DEVNOTES file to the machine it checks, works there in
-a folder of its own in /tmp (not in the home folder) and removes it at the
-end."""
+hour without an answer), mask a key in what a session waits for and name
+the machine of each session that waits, vm_check.sh copies no DEVNOTES file
+to the machine it checks, works there in a folder of its own in /tmp (not in
+the home folder) and removes it at the end, and `aht _awake` holds
+systemd-inhibit while a handed-over session works, or the GNOME desktop's
+own inhibitor where polkit refuses systemd-inhibit over ssh."""
 import hashlib, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
@@ -457,6 +459,7 @@ for f in (nb / "bin").iterdir():
     f.chmod(0o755)
 nenv = dict(env, HOME=str(nb / "home"), AHT_HOME=str(nb / ".aht"),
             AHT_ROOTS=str(nb / "roots"), AHT_ROOT_CLAUDE=str(nb / "claude"),
+            AHT_MACHINE_NAME="laptop",       # this machine, as notices name it
             PATH=str(nb / "bin") + os.pathsep + env.get("PATH", ""))
 if LINUX:
     nenv.pop("AHT_NO_NOTIFY", None)
@@ -587,9 +590,31 @@ else:
                                          "cwd": os.path.realpath(str(nb / "roots" / "web"))},
                                         **({"waitingFor": waiting} if waiting else {}))))
         tray_tick()
-    got = [m for t, m in shown() if t == "web waits for you"]
+    got = [m for t, m in shown() if t == "web on laptop waits for you"]
     ck(len(got) == 1 and key not in got[0] and "[GitHub token: " in got[0],
        f"a session that waits for you: what it waits for is masked ({got})")
+
+    # once another machine is set up, every notice names its machine: one
+    # here names this one (above), and api's session on box (it runs there
+    # since the first check; this test's own process stands in for it) says
+    # box.  box is asked every 55 s while it holds api: the test clears when
+    # it was asked last instead of waiting
+    def ask_again():
+        f = nb / ".aht" / "run" / "notices.json"
+        s = json.loads(f.read_text())
+        s["asked"] = {}
+        f.write_text(json.dumps(s))
+    brec = box / "home" / ".claude" / "sessions" / ("%d.json" % os.getpid())
+    was = json.loads(brec.read_text())
+    ask_again()
+    tray_tick()
+    brec.write_text(json.dumps(dict(was, status="waiting", waitingFor="approve Bash: make test")))
+    ask_again()
+    tray_tick()
+    got = [(t, m) for t, m in shown() if t.endswith("waits for you")]
+    ck(("api on box waits for you", "approve Bash: make test") in got
+       and [t for t, _m in got][:1] == ["web on laptop waits for you"],
+       f"the tray names the machine of each session that waits: box's, and this one's ({got})")
 
 print("\n[7] vm_check.sh works in a folder of its own in /tmp there, copies no DEVNOTES "
       "file and leaves no copy behind")
@@ -651,6 +676,174 @@ else:
     ck(len(kept) == 1 and (kept[0] / "README.md").is_file()
        and f"/tmp/{kept[0].name}" in r.stdout,
        f"--keep leaves the copy there and says where ({kept}, {r.stdout[-200:]!r})")
+
+print("\n[8] a handed-over session keeps its machine awake: systemd-inhibit while it works")
+# `aht _awake`, as a handover starts it next to the session on a Linux
+# machine, with a stand-in systemd-inhibit that notes its calls and waits
+# (a quick try, `… true`, as the helper makes once at its start, ends at
+# once); this test's own process stands in for the session (looks every
+# 0.2 s).  No session bus: GNOME's inhibitor is not tried here
+ka = Path(os.path.realpath(str(sb))) / "awake"
+for d in (ka / "bin", ka / "proj", ka / "claude" / "sessions", ka / "home"):
+    d.mkdir(parents=True)
+alog = ka / "inhibit.log"
+(ka / "bin" / "systemd-inhibit").write_text(
+    '#!/bin/sh\nfor a; do last="$a"; done\n[ "$last" = true ] && exit 0\n'
+    'echo "$$ $*" >> "%s"\nexec sleep 600\n' % alog)
+(ka / "bin" / "systemd-inhibit").chmod(0o755)
+kenv = dict(env, HOME=str(ka / "home"), AHT_HOME=str(ka / ".aht"),
+            AHT_ROOT_CLAUDE=str(ka / "claude" / "projects"), AHT_AWAKE_EVERY="0.2",
+            AHT_SESSION_BUS=str(ka / "no-bus"),
+            PATH=str(ka / "bin") + os.pathsep + env.get("PATH", ""))
+krec = ka / "claude" / "sessions" / ("%d.json" % os.getpid())
+proj = os.path.realpath(str(ka / "proj"))
+def session(status):
+    krec.write_text(json.dumps({"pid": os.getpid(), "cwd": proj, "sessionId": "k1",
+                                "status": status}))
+def holding():
+    rows = [l.split() for l in alog.read_text().splitlines()] if alog.is_file() else []
+    alive = []
+    for r in rows:
+        try:
+            os.kill(int(r[0]), 0)
+            alive.append(r)
+        except OSError:
+            pass
+    return alive
+def until(cond, secs=10.0):
+    end = time.time() + secs
+    while time.time() < end and not cond():
+        time.sleep(0.1)
+    return bool(cond())
+session("busy")
+helper = subprocess.Popen(
+    [PY, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import aht\n"
+     "aht.IS_MAC, aht.IS_LINUX = False, True\nsys.exit(aht.main(sys.argv[2:]))",
+     str(ROOT), "_awake", "--path", proj, "--name", "aht-proj-1", "--hours", "1"],
+    env=kenv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+pidf = ka / ".aht" / "remote" / "run" / "aht-proj-1" / "awake.pid"
+try:
+    held = until(lambda: holding()) and pidf.is_file()
+    line = " ".join((holding() or [[""]])[0][1:])
+    session("idle")
+    let_go = until(lambda: not holding()) and helper.poll() is None
+    krec.unlink()
+    ended = until(lambda: helper.poll() is not None) and not holding() and not pidf.exists()
+finally:
+    if helper.poll() is None:
+        helper.kill()
+    helper.wait()
+    for r in holding():
+        os.kill(int(r[0]), 9)
+ck(held and "--what=sleep:idle" in line and "--mode=block" in line and "--who=aht" in line,
+   f"while the session works, systemd-inhibit blocks sleep ({line})")
+ck(let_go and ended,
+   f"it lets go when the session is idle, and ends three looks after the session is gone "
+   f"({let_go}, {ended})")
+
+print("\n[9] where polkit refuses systemd-inhibit over ssh: GNOME's own inhibitor")
+# on stock Ubuntu polkit refuses systemd-inhibit to an ssh session ("Failed
+# to inhibit: Access denied"); gnome-session-inhibit, through the session
+# bus, is let through.  Stand-ins for both (the GNOME one notes the bus it
+# was given, a quick try ends at once, a hold waits) and for the bus socket
+kg = ka / "gnome"
+(kg / "bin").mkdir(parents=True)
+glog, bus = kg / "inhibit.log", kg / "bus"
+bus.write_text("")
+(kg / "bin" / "systemd-inhibit").write_text(
+    '#!/bin/sh\necho "$$ systemd-inhibit $*" >> "%s"\n'
+    'echo "Failed to inhibit: Access denied" >&2\nexit 1\n' % glog)
+(kg / "bin" / "gnome-session-inhibit").write_text(
+    '#!/bin/sh\necho "$$ gnome-session-inhibit bus=$DBUS_SESSION_BUS_ADDRESS $*" >> "%s"\n'
+    'for a; do last="$a"; done\n[ "$last" = true ] && exit 0\nexec sleep 600\n' % glog)
+(kg / "bin" / "claude").write_text('#!/bin/sh\necho "9.9.9 (Claude Code)"\n')
+for f in (kg / "bin").iterdir():
+    f.chmod(0o755)
+genv = dict(kenv, AHT_SESSION_BUS=str(bus), AHT_CLAUDE=str(kg / "bin" / "claude"),
+            PATH=str(kg / "bin") + os.pathsep + env.get("PATH", ""))
+genv.pop("DBUS_SESSION_BUS_ADDRESS", None)
+LINUX = ("import sys, json; sys.path.insert(0, sys.argv[1]); import aht\n"
+         "aht.IS_MAC, aht.IS_LINUX = False, True\n")
+# what `remote check` shows: the probe there tries the tools, and the row
+ROW = LINUX + ("rem = aht.Remote('box', {'root': sys.argv[2]})\n"
+               "rem.agent = lambda op, timeout=120, **req: aht._agent_probe(req)\n"
+               "row = next(r for r in aht.remote_checks(rem, rem.agent('probe')) "
+               "if r['check'].startswith('stays awake'))\n"
+               "print(json.dumps({'probe': aht._agent_probe({'test_awake': True}), 'row': row}))")
+def checked(e):
+    r = subprocess.run([PY, "-c", ROW, str(ROOT), str(kg / "box")], env=e,
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": (r.stdout + r.stderr)[-400:]}
+def glines(tool):
+    return [l.split() for l in glog.read_text().splitlines()
+            if l.split()[1:2] == [tool]] if glog.is_file() else []
+d = checked(genv)
+pr, row = d.get("probe") or {}, d.get("row") or {}
+tried = glines("gnome-session-inhibit")
+ck(pr.get("keep_awake") == "gnome-session-inhibit" and pr.get("keep_awake_works") is True
+   and glines("systemd-inhibit") and tried
+   and tried[-1][2] == "bus=unix:path=" + str(bus)
+   and tried[-1][3:9] == ["--app-id", "aht", "--reason", "aht", "remote", "check"]
+   and tried[-1][-3:] == ["--inhibit", "suspend", "true"],
+   f"probe: systemd-inhibit refused, GNOME's inhibitor works through the session bus, and "
+   f"keep_awake names it ({pr.get('keep_awake')}, {pr.get('keep_awake_error')}, {tried[-1:]})")
+ck(row.get("ok") is True and "gnome-session-inhibit" in row.get("detail", ""),
+   f"remote check: the keep-awake row passes and names the GNOME inhibitor ({row})")
+d = checked(dict(genv, DBUS_SESSION_BUS_ADDRESS="unix:path=/run/elsewhere"))
+ck((d.get("probe") or {}).get("keep_awake_works") is True
+   and glines("gnome-session-inhibit")[-1][2] == "bus=unix:path=/run/elsewhere",
+   f"a session bus already named is kept ({glines('gnome-session-inhibit')[-1:]})")
+d = checked(dict(genv, AHT_SESSION_BUS=str(kg / "no-bus")))
+pr, row = d.get("probe") or {}, d.get("row") or {}
+ck(pr.get("keep_awake") == "systemd-inhibit" and pr.get("keep_awake_works") is False
+   and "Access denied" in (pr.get("keep_awake_error") or "")
+   and row.get("ok") is False and "refused" in row.get("detail", "")
+   and "gnome-session-inhibit" in row.get("fix", ""),
+   f"no session bus: the row says systemd-inhibit is refused, and the fix names GNOME's "
+   f"inhibitor ({row})")
+# the helper picks GNOME's inhibitor once, at its start, and holds it while
+# the session works
+glog.unlink()
+def gholding():
+    alive = []
+    for r in glines("gnome-session-inhibit"):
+        if r[-1] != "true":
+            try:
+                os.kill(int(r[0]), 0)
+                alive.append(r)
+            except OSError:
+                pass
+    return alive
+session("busy")
+helper = subprocess.Popen(
+    [PY, "-c", LINUX + "sys.exit(aht.main(sys.argv[2:]))", str(ROOT), "_awake", "--path", proj,
+     "--name", "aht-proj-2", "--hours", "1"],
+    env=genv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+pidf = ka / ".aht" / "remote" / "run" / "aht-proj-2" / "awake.pid"
+try:
+    held = until(lambda: gholding()) and pidf.is_file()
+    line = " ".join((gholding() or [[""]])[0][1:])
+    session("idle")
+    let_go = until(lambda: not gholding()) and helper.poll() is None
+    session("busy")
+    again = until(lambda: gholding())
+    krec.unlink()
+    ended = until(lambda: helper.poll() is not None) and not gholding() and not pidf.exists()
+finally:
+    if helper.poll() is None:
+        helper.kill()
+    helper.wait()
+    for r in gholding():
+        os.kill(int(r[0]), 9)
+ck(held and let_go and again and ended and len(glines("systemd-inhibit")) == 1
+   and ("--app-id aht --reason an agent works on %s --inhibit suspend /bin/sh -c" % proj) in line
+   and "bus=unix:path=" + str(bus) in line,
+   f"keep awake: systemd-inhibit tried once at the start, then gnome-session-inhibit held "
+   f"while the session works, let go when idle, ended with the session ({held}, {let_go}, "
+   f"{again}, {ended}: {line})")
 
 shutil.rmtree(sb, ignore_errors=True)
 print("\nLINUX RESULT:", "ALL PASS" if not FAILS else "%d FAIL" % len(FAILS))

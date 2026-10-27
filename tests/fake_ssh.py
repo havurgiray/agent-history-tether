@@ -12,6 +12,9 @@ FAKE_SSH_DIR holds one folder per host name:
                       shells fail on aht's sh scripts, and leaves what they
                       would leave: cmd.exe folders named -p and $HOME in the
                       home, PowerShell the folders named in the home itself
+  <host>/refuse       present: ssh itself fails there (exit 255) with the
+                      file's line, such as "Permission denied (publickey)."
+                      or "Host key verification failed."
 Every command it is given is noted in <host>/commands.log, one JSON string a
 line.  A host without a folder cannot be reached (exit 255, as ssh)."""
 import json, os, sys
@@ -45,6 +48,11 @@ def main(argv):
     cmd = " ".join(argv[i + 1:])
     with open(machine / "commands.log", "a") as fh:
         fh.write(json.dumps(cmd) + "\n")
+    if (machine / "refuse").is_file():
+        line = (machine / "refuse").read_text().strip()
+        print(line if line.startswith("ssh:") or "verification" in line
+              else f"{argv[i]}: {line}", file=sys.stderr)
+        return 255
     home = machine / "home"
     if (machine / "windows").exists():
         if (machine / "windows").read_text().strip() == "powershell":

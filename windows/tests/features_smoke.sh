@@ -1,7 +1,8 @@
 #!/bin/sh
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
 # journal, report, share, secrets, rules, loose ends, undo, tidy, switch
-# (Summary Only) and relays, limits, sessions, workspace; and the hidden ones
+# (Summary Only) and relays, limits, sessions, workspace, asking other
+# machines over Windows' own ssh (status, remote add); and the hidden ones
 # another aht uses: `_core --id`
 # (the core inside the exe is this checkout's aht.py, byte for byte) and
 # `_agent`.  Runs natively on Windows from Git Bash with
@@ -50,6 +51,24 @@ WANT=$(sum256 "$REPO/aht.py" | cut -c1-12)
 GOT=$(W _core --id)
 [ "$GOT" = "$WANT" ] || fail "_core --id is '$GOT', this checkout's aht.py is $WANT"
 has "$(printf '%s' '{"op": "probe"}' | W _agent)" '^@@AHT@@\{.*"ok": true' "_agent did not answer the probe"
+
+echo "== other machines: a PC asks them over its own ssh =="
+# a PC can ask other machines (can_reach) and cannot hand projects over yet
+# (supported); adding a machine that does not answer fails with ssh's own
+# "cannot reach", never "getsockname" (Windows' ssh stops on the Control
+# options).  Only natively: wine has no ssh, and on macOS or Linux the add
+# would ask this machine's real ssh server
+HO=$(W status --json | sed -n '/"handover": {/,/"remotes"/p')
+if [ -z "${AHT_SMOKE_POSIX:-}" ]; then
+  has "$HO" '"supported": false' "status: the exe does not hand projects over yet"
+fi
+if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
+  has "$HO" '"can_reach": true' "status: Windows' own ssh is there, yet other machines cannot be asked"
+  OUT=$(W remote add x nobody@127.0.0.1 2>&1)
+  has "$OUT" "cannot reach x" "remote add to a machine that does not answer did not say so"
+  printf '%s' "$OUT" | grep -q getsockname && fail "Windows' ssh got the Control options: $OUT"
+  printf '%s' "$(W remote --json)" | grep -q '"x"' && fail "remote add kept a machine that did not answer"
+fi
 
 PAPER="$(P roots/paper)"
 echo "x = 1" > "$T/roots/paper/a.py"

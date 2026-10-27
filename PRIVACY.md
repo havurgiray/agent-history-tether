@@ -197,7 +197,7 @@ encrypt it.
 
 | What | What it holds | How long it is kept |
 |---|---|---|
-| `config.json` | your settings, also the machines you added and each one's system (`remotes.<name>.system`) | until you delete it, or `aht uninstall --purge` |
+| `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`) and whether you watch it (`remotes.<name>.watch`) | until you delete it, or `aht uninstall --purge` |
 | `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, or writes a record of a switch into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
 | `offsite.json` | which backups were sent to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched; it replaces `run/offsite.json`, which older versions wrote and aht removes | rewritten at each copy and fetch |
 | `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync and with which machine (and, when a release paused that, why, when and for which machine), and how the last take-back or release went (how many files changed, and the names of those kept in both versions); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
@@ -210,7 +210,8 @@ encrypt it.
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
 | `handover/<project id>/` | for a project handed over: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files), and in `replaced/` what a take-back replaced or removed here | the list until the project is back or released, then the newest 5 earlier lists; in `replaced/` the newest 5 folders and every one younger than 30 days |
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
-| `run/` | short-lived state: notices already shown, open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
+| `run/` | short-lived state: notices already shown (with when each of your other machines was last asked for them, and since when one that holds a project of yours has not answered), open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
+| `run/board.json` | for each of your other machines, when it last answered and the sessions it had open then: for each session its agent, project folder (the path there), process and session ids, state and since when, and its name, title and what it waits for, masked as that machine sent them | rewritten each time one of those machines answers; a machine you remove, or add again under the same name, is dropped at once |
 | `run/autostart.json` | that you answered whether aht's tray starts at login: the answer (on or off) and when.  Written only when your answer took effect, that is when the tray then starts at login, or not, as you chose: by `aht autostart on` or `off` (on a Mac the command itself changes nothing, since the app has the switch), the Windows installer's first install, the start-at-login switches in aht's window, the Mac app and the trays, and the welcome, when setting up changes whether aht starts at login or you changed its switch: so a first setup's no counts even when the tray did not start at login anyway (on a Mac too, where *Getting started* then marks the login step optional); the welcome then keeps that answer | rewritten at your next answer |
 | `run/window.json` | Windows and Linux: the process id and port of aht's window server, and the key a second `aht window` uses to reach it | removed when the server stops (on Linux also when it is stopped at logout) |
 | `run/window-<id>.json` | Windows and Linux: the progress of a handover or a take-back started in aht's window | deleted when the job ends; one left behind is removed after 6 hours, the next time the window starts |
@@ -272,8 +273,11 @@ runs.  With its default settings it makes no network connections.  The
 features below send data, and only after you set them up.
 
 1. **Your other machines** (handover, `aht mirror`, `offsite_backup` and
-   fetching backups, `aht night-shift`, and the session list and notices
-   for those machines; macOS and Linux).  aht connects over SSH, or mosh if
+   fetching backups, `aht night-shift`, and the session list, notices,
+   Watch and search for those machines).  This works from macOS, Windows
+   and Linux.  A Windows PC only asks your other machines (their sessions,
+   notices, Watch and search) and hands no project over yet; it is never
+   asked itself.  aht connects over SSH, or mosh if
    both machines have it, to the machines you add with `aht remote add`.
    Before its first command to a new machine, `aht remote add` and `aht
    remote check` ask which system answers there (`echo aht-os %OS%
@@ -310,9 +314,59 @@ features below send data, and only after you set them up.
    the note the session reads first, its settings, the command it runs
    (with your task, if you gave one), and when this handover's session was
    started (so that aht can tell later, should the link drop, whether it
-   started).  What a session there waits
-   for (the "waiting for" text) is masked before it leaves that machine.
+   started).  While the agent works there, aht keeps that machine from
+   sleeping (`handover_keep_awake`, on by default): a helper of aht's next
+   to the session holds `caffeinate` (macOS), or on Linux
+   `systemd-inhibit`, or the GNOME desktop's own inhibitor
+   (`gnome-session-inhibit`) where ssh sessions may not use it, while a
+   session in the project works or waits for you, and lets go when it is
+   idle; a closed lid still sleeps.  The GNOME one is asked through your
+   own desktop session's bus there (`/run/user/<your uid>/bus`), and holds
+   off suspend only: the screen still locks.  The helper notes its
+   process id, the project's path and when it started in `awake.pid` in
+   that same folder, and ends when it finds no session in the project
+   three times in a row (it looks every 30 seconds), after 24 hours, or
+   when aht ends the session or closes its window there.  On Linux,
+   `systemd-inhibit --list` there shows it, with aht as who and the
+   project's path as why (`gnome-session-inhibit --list` for the GNOME
+   one, with aht as its app).  The helper tries the tools for a moment
+   when it starts and keeps the first that works.  Should every tool be
+   refused (polkit may refuse `systemd-inhibit` over SSH) or end by
+   itself, the helper writes a line naming the project's path into aht's
+   log there (`~/.aht/aht.log`).  `aht remote check` tries them there
+   for a moment too, to tell whether one works.
    Copies on those machines stay there until you remove them.
+
+   **What aht reads from your other machines, when you ask.**  All of it
+   travels over your SSH connection.
+   - *Open sessions:* while you look at the Sessions tab (in the Mac app
+     also when you open the Machines tab, for when each machine was last
+     heard from), when you run `aht board`, and for the notices: every 2
+     minutes for a machine you watch
+     (the *Watch* switch, `aht remote watch`; off for every machine until
+     you switch it on), and about once a minute while a machine holds a
+     project of yours or a handover or night shift with it is under way.
+     For each open session, of any agent, aht reads its
+     agent, project folder, process and session ids, its state and since
+     when, what it waits for, and its name and title (for the Sessions
+     tab also its iTerm2 tab's title, its Claude Code version and whether
+     it stopped at Claude's usage limit).  The names, titles and what a
+     session waits for (the "waiting for" text) are masked before they
+     leave that machine.  With them comes whether aht is installed there
+     and whether it sends that machine's notices to your phone itself
+     (yes or no; nothing about where to), so that this computer does not
+     send them a second time.
+   - *Search excerpts:* when you tick *Also on my other machines* or run
+     `aht search --everywhere`, each machine searches its own index
+     (`~/.aht/search.db` there), opened read only: aht neither builds an
+     index there nor changes one.  For each session found it sends the
+     agent, the session's id and title, its project folder and the path
+     of its history file there, its times and up to three excerpts, masked
+     there and again here, and when that index was last brought up to
+     date.  Nothing of it is kept here.
+   - aht keeps only the last session list of each machine, and when that
+     machine last answered, in `~/.aht/run/board.json` (see
+     [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)).
 
    **Backups there** (`offsite_backup`): copies of the backups go into
    `~/.aht/offsite/<a random id of this computer>/` on that machine, with
@@ -340,7 +394,16 @@ features below send data, and only after you set them up.
    Messages app as an iMessage to the address you give, or to the ntfy
    server you name (ntfy.sh unless you give your own URL).  Anyone who knows an ntfy.sh
    topic's name can read it, so choose a name that is hard to guess, or use
-   your own server.  The notices about a handover that was cut off (it
+   your own server.  Once you have added another machine, every notice
+   names the machine it is about: another machine by the name you gave it
+   in aht, this computer by its own name ("api on box waits for you").  A
+   notice about a session on another machine goes to your phone only when
+   aht there does not send that machine's notices to your phone itself.
+   When a machine that holds a project of yours has not answered for 10
+   minutes, one notice says so and names the projects there ("box has not
+   answered since 15:20. The work on api there may have stopped (asleep,
+   off or offline)."); the one that says it answers again stays on this
+   computer.  The notices about a handover that was cut off (it
    finished, it did not finish, or the other machine has not answered for
    an hour) go there too, and name the project and the machine.
 3. **Features that start an AI agent**, all off until you turn them on or

@@ -163,3 +163,10 @@ mark { background: var(--mark); color: inherit; border-radius: 2px; }
 label.check { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
 .welcome .bullets label.check { margin: 0; }
 .check-note { margin: 0 0 4px 28px; }
+/* a machine that did not answer: the sessions it had when it last did */
+.box.stale > .row { opacity: .55; }
+/* what fixes a missing piece (Machines → Check…) */
+.fix { margin-top: 3px; line-height: 1.9; }
+.fix code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; overflow-wrap: anywhere; }
+details.later > summary { cursor: pointer; }
+details.later > summary h3 { display: inline; }

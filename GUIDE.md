@@ -225,9 +225,11 @@ Getting started.
 - **Notices** come from the tray: a session that waits for you, a long one
   that is done, Claude's usage limit, a new version. On Windows a click on
   one opens the window.
-- **Not on Windows:** handover, keeping in sync, backups on another
-  machine and the night shift need ssh and rsync; the Machines tab says
-  so.
+- **Your other machines from Windows:** a PC asks your Mac and Linux
+  machines what runs there, watches them and searches them (see *A
+  Windows PC with your other machines*). Handover, keeping in sync,
+  backups on another machine and the night shift do not work from Windows
+  yet; the Machines tab says so.
 - **Start at login:** Settings → This computer → *Start aht's tray at
   login* (on Windows the tray then also keeps the watcher running). On
   Linux the switch can be turned on only when the tray can run there: it
@@ -269,6 +271,90 @@ Getting started.
   either, say whether it does). `on` or `off` also counts as your answer,
   so the welcome keeps it, but only when the tray then starts at login, or
   not, as you asked. On a Mac it changes nothing (the app has the switch).
+
+## A Windows PC with your other machines
+
+From a Windows PC, aht can ask your Mac and Linux machines what runs
+there. It uses Windows' own ssh. The PC always does the asking and is
+never asked itself, so it needs no ssh server.
+
+> **Example.** A long Claude Code session runs on your Linux box at home.
+> On the PC at work you add it under **Machines → Add a Machine…** as
+> homebox, `you@homebox`, and tick **Watch**. When the session there stops
+> to ask you something, the tray shows *paper on homebox waits for you:
+> approve Bash: make test*. The Sessions tab lists it too.
+
+**Once, on the PC:**
+
+1. **ssh.** Windows 10 and 11 have OpenSSH's client built in. If `ssh` is
+   missing in PowerShell, add it: Settings → System → Optional features →
+   *OpenSSH Client*.
+2. **A key.** In PowerShell: `ssh-keygen -t ed25519`. Press Enter to keep
+   the file name. A passphrase is up to you (see step 4).
+3. **Put the key on the other machine.** Windows has no `ssh-copy-id`; in
+   PowerShell, this does the same (it asks for your password there once):
+   `type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh you@homebox "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"`
+4. **A key with a passphrase needs ssh-agent,** which Windows ships
+   switched off. In an administrator PowerShell: `Get-Service ssh-agent |
+   Set-Service -StartupType Automatic; Start-Service ssh-agent`. Then, in a
+   normal one: `ssh-add`. Or use a key without a passphrase. aht's ssh never
+   asks for a passphrase, so a key that has one works only once ssh-agent
+   holds it.
+5. **Accept the machine's key once:** run `ssh you@homebox` in a terminal
+   and answer *yes*. aht never accepts a key for you.
+
+**Once, on the other machine:**
+
+- **A Mac:** turn on Remote Login: System Settings → General → Sharing →
+  *Remote Login*.
+- **Linux:** an ssh server must run there. On Ubuntu or Debian: `sudo apt
+  install openssh-server`, then `sudo systemctl enable --now ssh` (the
+  service is `sshd` on Fedora and Arch).
+- **Both:** aht's copy runs there with python3. Most Linux systems have
+  it; on a Mac it comes with Apple's Command Line Tools (`xcode-select
+  --install`).
+
+Then add the machine (**Machines → Add a Machine…**, or `aht remote add`)
+and press **Check…**. Its rows come in two groups:
+
+- **For asking:** *reachable*, *key login without a prompt* and *python3
+  there*. These are all a PC needs. Each one marked ✗ comes with its fix:
+  the ssh-agent steps above when the key was not accepted, *Connect once
+  in a terminal (`ssh you@homebox`) and accept the machine's key* when the
+  PC does not know that machine yet, and *Turn on Remote Login on the Mac*
+  when a Mac refuses the connection.
+- **For handing over:** folded away on a PC. It lists what a handover will
+  need, for a later version.
+
+**What a PC can do today:**
+
+- add, check and remove your Mac and Linux machines; `aht remote
+  discover` lists the ones on your Tailscale network (Windows machines
+  there are left out, since they cannot be asked);
+- see their open sessions in the Sessions tab;
+- **Watch** a machine: the tray tells you when a session there waits for
+  you or is done (see *Hand a project over to another machine*);
+- search their sessions too, with **Also on my other machines** (see
+  *Search every session*).
+
+**What it cannot do yet:**
+
+- hand a project over, take it back, keep it in sync, keep backups on
+  another machine or plan a night shift;
+- be asked by another machine. Adding a PC as a machine on a Mac or on
+  Linux stops with *aht cannot ask a Windows machine yet*, and makes
+  nothing on the PC.
+
+**In the terminal:**
+
+- `aht remote add homebox you@homebox` — add the machine under the name
+  homebox.
+- `aht remote check homebox` — check it; the rows are grouped *for asking
+  it* and *for handing projects over*.
+- `aht remote watch homebox` — watch it.
+- `aht board` — list the open sessions here and on your other machines.
+- `aht search deploy --everywhere` — search here and on your other
+  machines.
 
 ## New versions
 
@@ -497,11 +583,26 @@ that were deleted since and live on only in a backup.
 - After an update from an earlier version, the index is built anew once,
   by itself, at its next update. A session whose history file is gone and
   that no history backup holds is then no longer found.
+- **Also on my other machines:** tick it (it shows once you added a
+  machine), and each of your other machines searches its own index too,
+  all at once, with up to 20 seconds each. This computer's results come
+  first; each one from another machine carries that machine's name, and
+  offers no Resume or Restore, since those act here. A line names each
+  machine that could not be searched, and why: it was not reachable, or
+  *no search index (aht is not installed there)*. *Also searched:* lists
+  the others, with how many results each gave and when its index was last
+  updated. aht builds no index there and changes none, and keeps nothing
+  of what came back; what aht recognises as a key is masked there and
+  again here.
 
 **In the terminal:**
 
 - `aht search deploy api` — find the sessions in which both "deploy" and
   "api" appear, in every project and agent.
+- `aht search deploy api --everywhere` — the same here and on each of
+  your other machines.
+- `open "aht://search?q=deploy&everywhere=1"` — open the Mac app's search
+  with *Also on my other machines* ticked.
 - `aht search "rate limit" --agent kimi` — find that exact phrase, only in
   Kimi Code's sessions.
 - `aht search migration --project ~/Desktop/paper` — search one project
@@ -521,6 +622,12 @@ waiting for you.
 > **Example.** You start agents on three projects and go for lunch. Back,
 > the Sessions tab shows *paper — waiting for you: approve Bash*; the other
 > two are still working. You answer the one that waits.
+
+**A machine that does not answer** (asleep, switched off, offline) keeps
+its place in the list. Its sessions as they were when it last answered
+are shown greyed, under *as of 11:40*, and the machine's line says since
+when it has not answered. `aht board` prints *not answering since 11:40;
+as of then:* over them.
 
 **In the terminal:**
 
@@ -577,9 +684,11 @@ something or offering a next step. **Projects → Look Back → Loose Ends…**
 
 ## Know when a session needs you
 
-aht checks the open sessions every 30 seconds, here and on the machines you
-added, and tells you when one starts **waiting for you** or **finishes** a
-piece of work that took a while.
+aht checks the open sessions every 30 seconds, and tells you when one starts
+**waiting for you** or **finishes** a piece of work that took a while. That
+is every session here; on another machine, those of a machine you watch
+(every 2 minutes) or that holds a project of yours (about once a minute).
+See *Hand a project over to another machine*.
 
 > **Example.** You hand a benchmark over to your machine at home and go into
 > a meeting. Half an hour later a notice says *paper on homebox waits for
@@ -601,8 +710,15 @@ piece of work that took a while.
 - **A handover cut off halfway** gets notices of its own: how it ended,
   and after an hour without an answer from the other machine, that you can
   release the project (see *Hand a project over to another machine*).
+- **Every notice names its machine** once you added another one: *paper
+  on homebox waits for you*, and a session here gets this computer's
+  name.
+- **Your phone gets each notice once:** when aht on the other machine
+  sends that machine's notices to your phone itself, this computer leaves
+  them out.
 - What a session waits for is shown with the keys and passwords aht
-  recognises masked (see *Secrets check*), here and on your phone.
+  recognises masked (see *Secrets check*), here and on your phone. On
+  another machine it is masked before it leaves that machine.
 - **Sessions in the corner:** a small list in the screen's top-right
   corner shows every open Claude session on this Mac: **working** (blue),
   **waiting for you** (orange) or **done** (green), with how long it has
@@ -1323,6 +1439,30 @@ the laptop or your phone.
   waits.
 - **Same Claude Code everywhere:** the other machine gets this Mac's exact
   version.
+- **It stays awake while the agent works.** While the session there works
+  or waits for you, aht keeps that machine from sleeping: `caffeinate` on
+  a Mac; on Linux `systemd-inhibit`, or the GNOME desktop's own inhibitor
+  (`gnome-session-inhibit`) where ssh sessions may not use it. It lets go
+  when the session is idle, and stops when the session ends, after 24
+  hours, or when you take the project back. A closed laptop lid still
+  sleeps. **Check** shows whether it works there and with which tool
+  (*stays awake while the agent works there*); on Linux, polkit may
+  refuse `systemd-inhibit` over ssh, and where GNOME's inhibitor can not
+  stand in either, the row says to stay logged in to that machine's GNOME
+  desktop or to keep it from sleeping in its own power settings. `aht
+  config --set handover_keep_awake=false` turns it off.
+- **Watch:** tick **Watch** for a machine in the Machines tab, and aht asks
+  it every 2 minutes for sessions that wait for you or are done, also
+  when it holds no project of yours. A machine that holds one is asked
+  about once a minute anyway. Each machine shows when aht last heard from
+  it: *last heard 3 min ago*, or, once it has gone silent, *has not
+  answered since 11:40* (on a Mac *not heard since 11:40*).
+- **A machine that goes silent** while it holds a project gets one notice
+  after 10 minutes: *homebox has not answered since 15:20. The work on
+  paper there may have stopped (asleep, off or offline).* (to your phone
+  too). When it answers again, one more says so, on this computer only. A
+  watched machine that holds nothing gets no notice; the Machines tab
+  says it.
 - **Keep in sync:** tick it for a project, and aht copies it in the
   background every 30 minutes, so a handover only sends the last changes.
   A Release pauses it (see below). A sync run checks each project again
@@ -1351,7 +1491,9 @@ the laptop or your phone.
   out.
 - **A Windows PC** cannot be the other machine yet. **Check and Add**
   (`aht remote add`, `aht remote check`) stops with *aht cannot ask a
-  Windows machine yet*, and nothing is made on the PC.
+  Windows machine yet*, and nothing is made on the PC. A PC can ask your
+  Mac and Linux machines, though: see *A Windows PC with your other
+  machines*.
 
 **A handover cut off halfway.** When the link drops or this Mac sleeps
 during a handover, aht cannot tell at once whether the session there
@@ -1438,6 +1580,9 @@ before the session there starts says *did not finish* at once.
   network and in `~/.ssh/config`.
 - `aht remote add homebox you@homebox` — add one under the name homebox.
 - `aht remote check homebox` — check what that machine still lacks.
+- `aht remote watch homebox` — watch homebox: hear when a session there
+  waits for you or is done; `--off` stops. `aht remote` marks a watched
+  machine *(watched)*.
 - `aht handover ~/Desktop/paper` — show what would be sent and what stands
   in the way, without sending anything.
 - `aht handover ~/Desktop/paper --apply --task "run the benchmark"` — hand
@@ -1709,12 +1854,13 @@ a part opens its section; the **?** at the top opens the whole guide.
   one worth a look **Restart in Its Tab…** or **End It…**; at the top
   **Restore Workspace…**, **Name Sessions After Their Tabs…** and
   **Refresh**.
-- **Search tab:** the search over all sessions; *Resume*, *Restore…* and
-  *Show Project* on each result.
+- **Search tab:** the search over all sessions, and *Also on my other
+  machines*; *Resume*, *Restore…* and *Show Project* on each result.
 - **Machines tab:** the machines you added, with **Sync** (keep every
   project in sync with it, or stop), **Check**, **Use for Handover** and
   **Remove…** (refused, with the reason, while the machine holds a
-  project); **Add Another…**; machines aht found on your
+  project), and under each one **Watch** and when aht last heard from it;
+  **Add Another…**; machines aht found on your
   Tailscale network or in `~/.ssh/config`, each with **Add…**, and **Look
   Again**.
 - **Settings tab:** see *Settings* below.
@@ -1830,8 +1976,8 @@ all of them can be set with `aht config --set name=value` and put back with
 
 **Handover**
 
-- `remotes` and `default_remote` — your machines, set in the Machines tab
-  or with `aht remote`.
+- `remotes` and `default_remote` — your machines (also whether you watch
+  each one), set in the Machines tab or with `aht remote`.
 - `mirror_interval_minutes` (30) — how often a kept copy is synced.
 - `handover_excludes` (none) — more names that never travel (besides
   `node_modules`, `.venv` and the like).
@@ -1843,6 +1989,8 @@ all of them can be set with `aht config --set name=value` and put back with
 - `handover_claude_args` (none) — extra options for the session over there.
 - `handover_mosh` (on) — open a handed-over session with mosh when it gets
   through.
+- `handover_keep_awake` (on) — the other machine does not sleep while the
+  agent works there (a closed lid still does).
 - `rsync_path` (the newest rsync found) — which rsync to use.
 - `terminal_app` (automatic: iTerm when installed, wherever it is, else
   Terminal) — the app that opens session windows; Settings → This Mac →

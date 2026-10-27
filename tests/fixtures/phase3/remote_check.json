@@ -1,0 +1,203 @@
+{
+  "ok": false,
+  "machines": [
+    {
+      "remote": "box",
+      "target": "me@box",
+      "checks": [
+        {
+          "check": "reachable",
+          "ok": true,
+          "detail": "box (Linux)",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "key login without a prompt",
+          "ok": true,
+          "detail": "yes",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "python3 there",
+          "ok": true,
+          "detail": "3.9.6",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "rsync on this machine",
+          "ok": true,
+          "detail": "3.4.1",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "rsync there",
+          "ok": true,
+          "detail": "/usr/bin/rsync",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "tmux there",
+          "ok": true,
+          "detail": "/usr/bin/tmux",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "/Users/me exists there",
+          "ok": false,
+          "detail": "missing",
+          "needed": true,
+          "group": "handover",
+          "fix": "sudo mkdir -p /Users/me && sudo chown \"$USER\" /Users/me"
+        },
+        {
+          "check": "Claude Code there",
+          "ok": true,
+          "detail": "9.9.9 (here: 9.9.9)",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "stays awake while the agent works there",
+          "ok": true,
+          "detail": "systemd-inhibit (a closed lid still sleeps)",
+          "needed": false,
+          "group": "handover"
+        },
+        {
+          "check": "mosh (a connection that survives network changes)",
+          "ok": true,
+          "detail": "on both",
+          "needed": false,
+          "group": "handover"
+        },
+        {
+          "check": "mosh gets through (UDP 60000\u201361000)",
+          "ok": false,
+          "detail": "blocked on the way \u2014 ssh is used instead",
+          "needed": false,
+          "group": "handover",
+          "fix": "open UDP ports 60000\u201361000 in that machine's firewall"
+        }
+      ],
+      "system": "Linux",
+      "ok": false
+    },
+    {
+      "remote": "lab",
+      "target": "me@lab",
+      "checks": [
+        {
+          "check": "reachable",
+          "ok": true,
+          "detail": "lab (Linux)",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "key login without a prompt",
+          "ok": true,
+          "detail": "yes",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "python3 there",
+          "ok": true,
+          "detail": "3.9.6",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "rsync on this machine",
+          "ok": true,
+          "detail": "3.4.1",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "rsync there",
+          "ok": true,
+          "detail": "/usr/bin/rsync",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "tmux there",
+          "ok": true,
+          "detail": "/usr/bin/tmux",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "/Users/me exists there",
+          "ok": false,
+          "detail": "missing",
+          "needed": true,
+          "group": "handover",
+          "fix": "sudo mkdir -p /Users/me && sudo chown \"$USER\" /Users/me"
+        },
+        {
+          "check": "Claude Code there",
+          "ok": true,
+          "detail": "9.9.9 (here: 9.9.9)",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "stays awake while the agent works there",
+          "ok": true,
+          "detail": "systemd-inhibit (a closed lid still sleeps)",
+          "needed": false,
+          "group": "handover"
+        },
+        {
+          "check": "mosh (a connection that survives network changes)",
+          "ok": true,
+          "detail": "on both",
+          "needed": false,
+          "group": "handover"
+        },
+        {
+          "check": "mosh gets through (UDP 60000\u201361000)",
+          "ok": false,
+          "detail": "blocked on the way \u2014 ssh is used instead",
+          "needed": false,
+          "group": "handover",
+          "fix": "open UDP ports 60000\u201361000 in that machine's firewall"
+        }
+      ],
+      "system": "Linux",
+      "ok": false
+    },
+    {
+      "remote": "ws",
+      "ok": false,
+      "error": "cannot reach ws (me@ws): me@ws: Permission denied (publickey,password).",
+      "target": "me@ws",
+      "checks": [
+        {
+          "check": "reachable",
+          "ok": true,
+          "detail": "ws",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "key login without a prompt",
+          "ok": false,
+          "detail": "the key was not accepted",
+          "needed": true,
+          "group": "ask",
+          "fix": "Put your key there once: `ssh-copy-id me@ws`. If it has a passphrase, load it first: `ssh-add`."
+        }
+      ],
+      "system": "Linux"
+    }
+  ]
+}

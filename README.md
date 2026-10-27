@@ -97,11 +97,19 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Welcome and setup, Getting started, new versions (opt-in) | ✓ | ✓ | ✓ |
 | Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy, show sessions | ✓ | ✓ | ✓ |
 | Switch agent and hand back, second opinion, informed sessions (use tokens; off by default) | ✓ | ✓ | ✓, not yet tried on Windows |
-| Handover, keep in sync, backups on another machine, night shift | ✓ | ✓ | — (needs ssh and rsync) |
+| Ask your other machines: add and check them, Watch, their sessions and notices, search everywhere | ✓ | ✓ | ✓ (asks Mac and Linux machines, over Windows' own ssh) |
+| Be asked by your other machines | ✓ | ✓ | — (a PC is never asked, so it needs no ssh server) |
+| Handover, keep in sync, backups on another machine, night shift | ✓ | ✓ | — (not from Windows yet) |
+| Stay awake while a handed-over agent works there (a closed lid still sleeps) | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or the GNOME desktop's own inhibitor (`gnome-session-inhibit`) where ssh sessions may not use it) | — |
 | Notices (waiting for you, done, usage limit, new version) | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
 | Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab | ✓ (iTerm2) | — | — |
 | The session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
+
+A Windows PC asks; it is never asked.  From a PC, aht adds and checks
+your Mac and Linux machines, watches them, shows their sessions and
+searches them; it cannot hand a project over yet.  The guide's *A Windows
+PC with your other machines* says how to set up the keys.
 
 CI runs the whole test suite on Linux and macOS for every push, including
 aht's window (its doors, its page and a command through it), and on real
@@ -619,7 +627,8 @@ Locations* page), `move_policy`, `copy_policy`,
 for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `mirror_interval_minutes`, `handover_excludes`, `handover_compress`,
 `handover_remote_control`, `handover_carry_trust`, `handover_claude_args`,
-`handover_mosh`, `rsync_path`, `terminal_app`; notices and reports:
+`handover_mosh`, `handover_keep_awake`, `rsync_path`, `terminal_app`;
+notices and reports:
 `notify_waiting`, `notify_finished`, `notify_finished_minutes`,
 `notify_phone`, `notify_limit`, `session_corner`, `chimes` /
 `chime_done` / `chime_waiting` / `chime_limit` / `chime_done_after` /

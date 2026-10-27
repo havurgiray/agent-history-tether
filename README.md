@@ -98,6 +98,7 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy, show sessions | ✓ | ✓ | ✓ |
 | Switch agent and hand back, second opinion, informed sessions (use tokens; off by default) | ✓ | ✓ | ✓, not yet tried on Windows |
 | Ask your other machines: add and check them, Watch, their sessions and notices, search everywhere | ✓ | ✓ | ✓ (asks Mac and Linux machines, over Windows' own ssh) |
+| Pick Up and Leave a Note: a project's context moves between machines, git moves the files | ✓ | ✓ | ✓ (the PC starts every exchange, with Mac and Linux machines) |
 | Be asked by your other machines | ✓ | ✓ | — (a PC is never asked, so it needs no ssh server) |
 | Handover, keep in sync, backups on another machine, night shift | ✓ | ✓ | — (not from Windows yet) |
 | Stay awake while a handed-over agent works there (a closed lid still sleeps) | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or the GNOME desktop's own inhibitor (`gnome-session-inhibit`) where ssh sessions may not use it) | — |
@@ -107,8 +108,9 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | The session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
 
 A Windows PC asks; it is never asked.  From a PC, aht adds and checks
-your Mac and Linux machines, watches them, shows their sessions and
-searches them; it cannot hand a project over yet.  The guide's *A Windows
+your Mac and Linux machines, watches them, shows their sessions, searches
+them, picks up their work and leaves notes on them; it cannot hand a
+project over yet.  The guide's *A Windows
 PC with your other machines* says how to set up the keys.
 
 CI runs the whole test suite on Linux and macOS for every push, including
@@ -599,14 +601,17 @@ features that make an agent read or work:
 | Switch agent | the agent that goes on reads the summary (a new session) or the catch-up (its own session): one turn; Claude Code's own session gets its catch-up as with Hand back to Claude Code | only when you ask |
 | Hand back to Codex, Kimi Code, Antigravity or Mistral Vibe | that agent reads the catch-up: one turn | only when you ask |
 | Hand back to Claude Code | no turn: aht's hook puts the catch-up (at most 2,000 characters) into the session as it opens, and it goes with your next message; without the hook, reading it is the first turn | only when you ask |
+| Pick Up → Open in | the agent opened here reads the summary made on the other machine: one turn; when the work comes back to Claude Code's own session, it gets its catch-up as with Hand back to Claude Code | only when you ask |
 | Hand over with a task | the resumed session starts on the task | only when you give a task |
 | Handover note | one sentence in a new Claude session while its project is away, half handed over, or just came back or was released | part of handover |
 | Hand-off note | one line in a Claude session another agent took the work over from, when you resume it yourself (the catch-up itself only with `informed_sessions`) | part of switch |
+| Pick Up and note line | one line, once, in the next Claude session in the project on the machine the work came to; one line in a Claude session that starts on the machine it left, while it is out | part of Pick Up and Leave a Note |
 
 Everything else — watching, relinking, badges, backups, search, the
 session board, notices, loose ends, reports, journals, the secrets check,
 what changed, undo, Spotlight, and writing summaries and catch-ups
-(*Summary Only*, `aht switch --brief-only`, `aht relays`) — uses none.
+(*Summary Only*, `aht switch --brief-only`, `aht relays`, a Pick Up that
+opens nothing, and Leave a Note) — uses none.
 
 Development is macOS-first: the window and these features are built and
 tested on macOS; what reaches Linux and Windows is in *Platforms* above.
@@ -680,7 +685,8 @@ click: a row is selected first, a button pressed second.
 `tag` · `keys <path>`
 (each backend's store key for a path) · `encode` · `hook` · `version` ·
 `remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here` ·
-`search` · `board` · `switch` · `relays` · `journal` · `rules` · `secrets` · `notices` ·
+`search` · `board` · `switch` · `relays` · `pickup` · `leave-note` ·
+`journal` · `rules` · `secrets` · `notices` ·
 `changes` · `report` · `share` · `tidy` · `limits` · `checkpoint` · `undo` ·
 `loose-ends` · `second-opinion` · `night-shift` · `sessions` · `tab-names` ·
 `workspace` · `goto` · `checkup` · `getting-started` · `setup` · `update` ·

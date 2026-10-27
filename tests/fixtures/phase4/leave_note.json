@@ -1,0 +1,65 @@
+{
+  "command": "leave-note",
+  "applied": false,
+  "blockers": [],
+  "warnings": [
+    "The two copies are at different commits (here cbc07b5, box 817965a): bring them together with git before going on."
+  ],
+  "error": null,
+  "project": "/Users/me/code/paper",
+  "machine": "box",
+  "match": {
+    "path": "/home/me/code/paper",
+    "how": "id",
+    "candidates": [
+      {
+        "path": "/home/me/code/paper",
+        "how": "id"
+      }
+    ]
+  },
+  "source": {
+    "agent": "claude",
+    "session": "5e5e5e5e-1111-4222-8333-444455556666",
+    "title": "add a login page",
+    "updated": 1793112386.0,
+    "machine": "mac",
+    "path": "/Users/me/code/paper"
+  },
+  "git": {
+    "here": {
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 0,
+      "behind": 0,
+      "head": "cbc07b5",
+      "head_full": "cbc07b5c16116d2f2ed9827c3642ddcf7624b58c",
+      "subject": "First commit",
+      "dirty": 0,
+      "files": [],
+      "untracked": 0
+    },
+    "there": {
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 1,
+      "behind": 0,
+      "head": "817965a",
+      "head_full": "817965ac56adffeba8aae557455e144dfeb0df40",
+      "subject": "Fix the login redirect",
+      "dirty": 1,
+      "files": [
+        "M app.py"
+      ],
+      "untracked": 0
+    },
+    "warning": "The two copies are at different commits (here cbc07b5, box 817965a): bring them together with git before going on."
+  },
+  "brief": "# Note: paper\n\n- From **Claude Code** on mac (macOS) to **Claude Code** on box (macOS), 2026-10-27 18:44\n- Folder on mac: `/Users/me/code/paper`; on box: `/home/me/code/paper`\n- Session it continues: add a login page — `5e5e5e5e-1111-4222-8333-444455556666`\n- To go back to it on mac: `cd /Users/me/code/paper && /opt/homebrew/bin/claude --resume 5e5e5e5e-1111-4222-8333-444455556666`, or bring what happened on box with `aht pickup /Users/me/code/paper --from box`\n\n## Before going on\n\n- The two copies are at different commits (mac cbc07b5, here 817965a): bring them together with git before going on.\n\n## The latest exchanges\n\n**You (15:44):** add a login page\n\n**Agent:** The login page is there.\n\n## Git\n\n- On branch `main`, HEAD `cbc07b5` “First commit”; against origin/main: up to date.\n- Nothing changed that is not committed.\n",
+  "brief_kind": "full",
+  "mode": "new",
+  "back_of": null,
+  "note_for": null,
+  "relay": null,
+  "left": []
+}

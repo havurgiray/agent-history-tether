@@ -1,0 +1,41 @@
+{
+  "command": "pickup",
+  "applied": false,
+  "blockers": [
+    "2 folders on box could be this project (by its git origin): /home/me/code/paper; /home/me/code/paper-copy. Name one with --there PATH"
+  ],
+  "warnings": [],
+  "error": null,
+  "project": "/Users/me/code/paper",
+  "machine": "box",
+  "match": {
+    "path": null,
+    "how": "origin",
+    "candidates": [
+      {
+        "path": "/home/me/code/paper",
+        "how": "origin"
+      },
+      {
+        "path": "/home/me/code/paper-copy",
+        "how": "origin"
+      }
+    ]
+  },
+  "sessions": [],
+  "source": null,
+  "git": null,
+  "brief": null,
+  "brief_kind": null,
+  "mode": null,
+  "back_of": null,
+  "note_for": null,
+  "target": null,
+  "session": null,
+  "relay": null,
+  "left": [],
+  "opened": null,
+  "start_line": null,
+  "command_line": null,
+  "fallback": null
+}

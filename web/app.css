@@ -97,7 +97,7 @@ table.list tbody tr.picked { background: var(--pick); }
 .split { display: flex; flex-direction: column; height: 100%; gap: 10px; }
 .split > .listpane { flex: 1; min-height: 160px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .detail { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
-.badge { font-size: 11.5px; padding: 0 6px; border-radius: 9px; background: var(--hover); color: var(--dim); }
+.badge { font-size: 11.5px; padding: 0 6px; border-radius: 9px; background: var(--hover); color: var(--dim); white-space: nowrap; }
 .badge.working { color: var(--accent); }
 .badge.waiting { color: var(--warn); }
 .badge.ok { color: var(--ok); }
@@ -107,6 +107,22 @@ table.list tbody tr.picked { background: var(--pick); }
   background: var(--panel); background: color-mix(in srgb, var(--warn) 8%, var(--panel));
 }
 .callout strong { color: var(--warn); }
+/* news, not a problem: a note another machine left here */
+.callout.info { border-color: var(--accent); background: var(--panel); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.callout.info strong { color: var(--accent); }
+/* Pick Up and Leave a Note: where the project is on each side, the summary */
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; align-items: baseline; }
+.facts .mono { overflow-wrap: anywhere; }
+.callout .cand { margin-top: 4px; }
+.callout .cand .mono { overflow-wrap: anywhere; }
+.box.git { padding: 6px 10px; }
+.brief { max-height: 42vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; padding: 2px 14px; background: var(--bg); }
+.brief h1, .brief h2 { font-size: 15px; margin: 12px 0 4px; }
+.brief h3, .brief h4 { font-size: 14px; margin: 10px 0 4px; }
+.sessions .s.on { background: var(--pick); border-radius: 6px; }
+/* Open in and what it costs: in sight while the summary above scrolls */
+.openin { position: sticky; bottom: -10px; background: var(--panel); border-top: 1px solid var(--line); padding: 10px 0 10px; margin-bottom: -10px; }
+.openin > * + * { margin-top: 6px; }
 
 .menu { position: relative; display: inline-block; }
 .menu > .items {

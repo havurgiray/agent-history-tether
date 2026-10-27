@@ -2,7 +2,7 @@
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
 # journal, report, share, secrets, rules, loose ends, undo, tidy, switch
 # (Summary Only) and relays, limits, sessions, workspace, asking other
-# machines over Windows' own ssh (status, remote add); and the hidden ones
+# machines over Windows' own ssh (status, remote add, pickup); and the hidden ones
 # another aht uses: `_core --id`
 # (the core inside the exe is this checkout's aht.py, byte for byte) and
 # `_agent`.  Runs natively on Windows from Git Bash with
@@ -69,6 +69,20 @@ if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
   printf '%s' "$OUT" | grep -q getsockname && fail "Windows' ssh got the Control options: $OUT"
   printf '%s' "$(W remote --json)" | grep -q '"x"' && fail "remote add kept a machine that did not answer"
 fi
+
+echo "== Pick Up from a machine that does not answer: a clean failure =="
+# a name that never resolves (.invalid), so no machine is asked: natively and
+# on macOS or Linux ssh says it cannot reach it, under wine there is no ssh;
+# either way the JSON says so, nothing is written and nothing crashes
+printf '%s' '{"remotes": {"gone": {"ssh": "nobody@aht-unreachable.invalid"}}}' > "$T/home/.aht/config.json"
+RC=0; $RUN "$EXE" pickup "$(P roots/paper)" --from gone --json > "$T/pickup.out" 2>&1 || RC=$?
+OUT=$(tr -d '\r' < "$T/pickup.out")
+[ "$RC" = 1 ] || fail "pickup from a machine that does not answer exited $RC: $OUT"
+has "$OUT" '"applied": false' "pickup from a machine that does not answer claims it applied"
+has "$OUT" '"error": "(cannot reach gone|.*ssh)' "pickup from a machine that does not answer gave no error"
+printf '%s' "$OUT" | grep -q Traceback && fail "pickup crashed: $OUT"
+[ ! -e "$T/roots/paper/.aht/handover" ] || fail "pickup wrote a relay though nothing answered"
+rm -f "$T/home/.aht/config.json"
 
 PAPER="$(P roots/paper)"
 echo "x = 1" > "$T/roots/paper/a.py"

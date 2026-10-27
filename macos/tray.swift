@@ -245,10 +245,23 @@ struct Project: Identifiable, Hashable {
     let limitResets: String?
     let handing: Handing?           // a handover that did not finish (yet)
     let relay: Relay?               // another agent here has the work, not handed back yet
+    let incoming: Incoming?         // work that came from another machine: a note, a pickup
+    let pickupFrom: Incoming?       // `pickup_from`: the pickup from another machine open here
+    let knowsPickupFrom: Bool       // … the core says it (an older one says it only in `relay`)
 
     var id: String { path }
-    /// The relay Hand Back answers: one made on this Mac, not left by another machine.
-    var handBack: Relay? { relay.flatMap { $0.incoming ? nil : $0 } }
+    /// The relay Hand Back (switch --back) answers: both ends on this Mac
+    /// (`relay.machine` null); the core refuses it across machines.
+    var handBack: Relay? { relay.flatMap { $0.machine == nil && !$0.incoming ? $0 : nil } }
+    /// The pickup from another machine that is open here: `pickup_from`, also
+    /// when a newer relay here (a switch to another agent) is the row's
+    /// `relay`; from an older core, the row's relay when it is that pickup.
+    var pickedUp: Incoming? {
+        knowsPickupFrom ? pickupFrom : incoming.flatMap { $0.kind == "pickup" ? $0 : nil }
+    }
+    /// The machine this project was picked up from, by this Mac's name for it,
+    /// while that is open: Hand Back to it is `leave-note --on` it.
+    var pickedUpFrom: String? { pickedUp.flatMap { knowsPickupFrom ? $0.remote : $0.name } }
     var name: String { (path as NSString).lastPathComponent }
     var parent: String {
         ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
@@ -291,6 +304,13 @@ struct Project: Identifiable, Hashable {
         lastActivity = d["last_activity"] as? String ?? ""
         handing = (d["handing"] as? [String: Any]).map(Handing.init)
         relay = (d["relay"] as? [String: Any]).map(Relay.init).flatMap { $0.open ? $0 : nil }
+        incoming = (d["relay"] as? [String: Any]).flatMap(Incoming.init)
+        knowsPickupFrom = d.keys.contains("pickup_from")
+        pickupFrom = (d["pickup_from"] as? [String: Any]).flatMap { f in
+            Incoming(["incoming": f.merging(["kind": "pickup", "id": f["relay"] ?? "",
+                                             "machine": f["machine"] as? String ?? f["remote"] ?? ""]) { $1 },
+                      "remote": f["remote"] ?? NSNull()])
+        }
     }
 }
 
@@ -303,7 +323,10 @@ struct Relay: Hashable {
     let to: String                  // the agent that has it now
     let since: Date?
     let open: Bool
-    let incoming: Bool              // left here by another machine
+    let incoming: Bool              // came here from another machine
+    let kind: String?               // switch | back | handover | bring | pickup | note
+    let machine: String?            // the other machine; nil: both ends on this Mac
+    let remote: String?             // … by this Mac's name for it
 
     init(_ d: [String: Any]) {
         id = d["id"] as? String ?? ""
@@ -311,7 +334,60 @@ struct Relay: Hashable {
         to = d["to_agent"] as? String ?? "?"
         since = moment(d["since"])
         open = d["open"] as? Bool ?? true
-        incoming = d["incoming"] as? Bool ?? false
+        incoming = d["incoming"] as? Bool ?? (d["incoming"] is [String: Any])
+        kind = d["kind"] as? String
+        machine = (d["machine"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        remote = (d["remote"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+}
+
+/// `projects --json`'s `relay.incoming`: work that came from another machine.
+/// A note left here (Leave a Note there, or Hand Back from there), or a
+/// pickup made here from that machine, which Hand Back answers. `incoming`
+/// is the record itself, or `true` on a relay that names its machine;
+/// a relay between two agents here has none.
+struct Incoming: Hashable {
+    let id: String
+    let machine: String             // the other machine: where the work was
+    let remote: String?             // … by this Mac's name for it (`relay.remote`)
+    let kind: String                // "note" | "back" | "pickup"
+    let at: Date?
+    let agent: String?              // the agent that worked there
+    let workedFrom: Date?
+    let workedTo: Date?
+    let brief: String?              // the note: its path, or its name in .aht/handover
+    let noteFor: String?            // the session here it is addressed to
+    let noteAgent: String?          // … and that session's agent
+
+    var isNote: Bool { kind != "pickup" }
+    /// The machine as the Machines tab names it (what `--on` takes).
+    var name: String { remote ?? machine }
+
+    init?(_ relay: [String: Any]) {
+        let d: [String: Any]
+        if let own = relay["incoming"] as? [String: Any] {
+            d = relay.merging(own) { $1 }
+        } else if relay["incoming"] as? Bool == true {
+            d = relay
+        } else {
+            return nil
+        }
+        let from = (d["from"] as? [String: Any]) ?? [:]
+        let name = [d["machine"], d["from_remote"], d["from_machine"], from["machine"]]
+            .compactMap { $0 as? String }.first { !$0.isEmpty }
+        guard let mc = name else { return nil }
+        machine = mc
+        remote = (relay["remote"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        id = d["id"] as? String ?? ""
+        kind = (d["kind"] as? String).flatMap { ["note", "back", "pickup"].contains($0) ? $0 : nil } ?? "note"
+        at = moment(d["at"] ?? d["since"])
+        agent = [d["agent"], d["from_agent"], from["agent"]].compactMap { $0 as? String }.first
+        workedFrom = moment(d["worked_from"] ?? d["first_t"])
+        workedTo = moment(d["worked_to"] ?? d["last_t"])
+        brief = d["brief"] as? String
+        let nf = d["note_for"]
+        noteFor = (nf as? String) ?? ((nf as? [String: Any])?["session"] as? String)
+        noteAgent = ((nf as? [String: Any])?["agent"] as? String) ?? d["to_agent"] as? String
     }
 }
 
@@ -879,29 +955,35 @@ struct SwitchPlan: Identifiable {
 /// The switch dialog's text for one way of going on, from `switch --json`'s
 /// dry run: who goes on with what, what that costs, the core's fallback and
 /// warnings. `hook`: aht's SessionStart hook is in place, so a resumed Claude
-/// session is told what changed without a turn.
-func switchText(_ d: [String: Any], mode: String, hook: Bool) -> String {
+/// session is told what changed without a turn. `machine`: the work was done
+/// there (Pick Up), so the session named is that machine's.
+func switchText(_ d: [String: Any], mode: String, hook: Bool, machine: String? = nil) -> String {
     let target = d["target"] as? String ?? ""
     let label = AGENT_LABEL[target] ?? target
     let src = (d["source"] as? [String: Any]) ?? [:]
     let from = AGENT_LABEL[src["agent"] as? String ?? ""] ?? "the other agent"
     let title = (src["title"] as? String).map { " (“\($0)”)" } ?? ""
+    let on = machine.map { " on \($0)" } ?? ""
     var body: String
     switch mode {
     case "back":
         body = "\(label) goes on in its own session, where it left off. It reads only "
-            + "what happened while \(from) had the project\(title): the latest exchanges, "
+            + "what happened while \(from) had the project\(on)\(title): the latest exchanges, "
             + "the files changed and the commits made."
     case "resume":
         body = "\(label) goes on in its own latest session here. It reads only what "
-            + "happened since: the work of the latest \(from) session\(title), the files "
+            + "happened since: the work of the latest \(from) session\(on)\(title), the files "
             + "changed and the commits made."
     default:
-        body = "\(label) continues the work of the latest \(from) session\(title) in a new "
-            + "session. aht writes a summary of where things stood into the project, and "
-            + "\(label) reads it first."
+        body = machine == nil
+            ? "\(label) continues the work of the latest \(from) session\(title) in a new "
+              + "session. aht writes a summary of where things stood into the project, and "
+              + "\(label) reads it first."
+            : "\(label) continues the work of the \(from) session\(on)\(title) in a new "
+              + "session here. aht writes a summary of where things stood into the project, "
+              + "and \(label) reads it first."
     }
-    body += " The \(from) session stays as it is."
+    body += " The \(from) session\(on) stays as it is."
     if target == "kimi" {
         body += "\n\nKimi reads it in a first run of its own; this takes a moment before "
             + "the window opens."
@@ -943,6 +1025,398 @@ func switchDoneText(_ d: [String: Any], project: String) -> String {
     if let f = fell { said = f + "\n\n" + said }
     for w in (d["warnings"] as? [String]) ?? [] { said += "\n⚠ " + w }
     return said
+}
+
+// ---- Pick Up and Leave a Note: work across machines -------------------------
+// `pickup --json` = {match: {path, how, candidates}, source, git, brief,
+// relay, applied, opened, command_line} (and `sessions`, `mode`, `blockers`,
+// `warnings`, `error`); `leave-note --json` the same with `note_for`. Git
+// moves the files; these move only the context.
+
+/// One item of a project's Machines menu: Pick Up from M, Leave a Note on M,
+/// and Hand Back to M while a pickup from M is open (a note in back mode).
+struct MachineItem: Hashable {
+    let title: String
+    let machine: String
+    let kind: String                // "back" | "pickup" | "note"
+}
+
+/// The machines Pick Up and Leave a Note can ask: all but a Windows PC,
+/// which answers no other machine.
+func askableMachines(_ ms: [Machine]) -> [String] {
+    ms.filter { $0.system != "Windows" }.map { $0.name }
+}
+
+/// The Machines menu: Hand Back first, then Pick Up from each machine, then
+/// Leave a Note on each.
+func machineItems(_ p: Project, _ machines: [String]) -> [MachineItem] {
+    var items: [MachineItem] = []
+    if let from = p.pickedUpFrom {
+        items.append(MachineItem(title: "Hand Back to \(from)…", machine: from, kind: "back"))
+    }
+    items += machines.map { MachineItem(title: "Pick Up from \($0)…", machine: $0, kind: "pickup") }
+    items += machines.map { MachineItem(title: "Leave a Note on \($0)…", machine: $0, kind: "note") }
+    return items
+}
+
+/// The line over a project that work came to from another machine:
+/// "pc left a note at 16:40: Codex worked there from 14:10 to 16:40".
+func incomingLine(_ i: Incoming) -> String {
+    let at = clock(i.at).isEmpty ? "" : " at " + clock(i.at)
+    let who = i.agent.map { AGENT_LABEL[$0] ?? $0 }
+    let (a, b) = (clock(i.workedFrom), clock(i.workedTo))
+    let span = !a.isEmpty && !b.isEmpty && a != b ? " from \(a) to \(b)" : ""
+    switch i.kind {
+    case "pickup":
+        return "Picked up from \(i.name)\(at)" + (who.map { ", where \($0) worked" } ?? "")
+    case "back":
+        return "\(i.name) handed this project back\(at)" + (who.map { ": \($0) worked there\(span)" } ?? "")
+    default:
+        return "\(i.name) left a note\(at)" + (who.map { ": \($0) worked there\(span)" } ?? "")
+    }
+}
+
+/// `match`: the folder there, how it was found, and the folders it could be
+/// when that is not clear (paths, or {path, how}).
+struct ThereMatch: Hashable {
+    let path: String?
+    let how: String?
+    let candidates: [String]
+}
+
+func thereMatch(_ d: [String: Any]) -> ThereMatch {
+    let m = (d["match"] as? [String: Any]) ?? [:]
+    let cands = ((m["candidates"] as? [Any]) ?? []).compactMap { c in
+        (c as? String) ?? ((c as? [String: Any])?["path"] as? String)
+    }
+    return ThereMatch(path: (m["path"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                      how: m["how"] as? String, candidates: cands)
+}
+
+/// How the folder there was found, in words, and whether that is sure: its
+/// project id, or a folder the user picked. Anything else is confirmed first.
+func matchHow(_ how: String?) -> (text: String, sure: Bool) {
+    let h = (how ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        .replacingOccurrences(of: " ", with: "_")
+    switch h {
+    case "id", "project_id", "marker", "registry": return ("by its project id", true)
+    case "there", "picked", "user", "given", "chosen": return ("as picked", true)
+    case "origin", "git", "git_origin": return ("by the same git origin and first commit", false)
+    case "path", "same_path": return ("at the same path", false)
+    case "home", "home_relative", "relative": return ("at the same place in the home folder", false)
+    case "": return ("", false)
+    default: return ("by " + (how ?? ""), false)
+    }
+}
+
+/// "Found on box by its project id: /home/me/code/api" ("" when nothing was).
+func matchLine(_ mt: ThereMatch, machine: String) -> String {
+    guard let path = mt.path else { return "" }
+    let how = matchHow(mt.how).text
+    return how.isEmpty ? "The folder on \(machine): \(path)" : "Found on \(machine) \(how): \(path)"
+}
+
+/// Why the folder there is not clear ("" when it is).
+func matchProblem(_ mt: ThereMatch, machine: String) -> String {
+    if mt.path != nil { return "" }
+    switch mt.candidates.count {
+    case 0: return "aht found no folder for this project on \(machine). Type its path there:"
+    case 1: return "One folder on \(machine) could be this project. Is it the one?"
+    default: return "\(mt.candidates.count) folders on \(machine) could be this project. "
+        + "Pick the one to go on with:"
+    }
+}
+
+/// A session there, as `pickup --json` lists them (newest first).
+struct ThereSession: Identifiable, Hashable {
+    let id: String
+    let agent: String
+    let title: String
+    let updated: Double?
+    let state: String?              // "working" | "open" (in a window there) | nil
+}
+
+func thereSessions(_ d: [String: Any]) -> [ThereSession] {
+    let src = (d["source"] as? [String: Any]) ?? [:]
+    let rows = (d["sessions"] as? [[String: Any]]) ?? (src["sessions"] as? [[String: Any]]) ?? []
+    return rows.compactMap { s in
+        let id = s["id"] as? String ?? s["session"] as? String ?? ""
+        guard !id.isEmpty else { return nil }
+        var st = (s["state"] ?? s["status"]) as? String
+        if st == nil { st = s["working"] as? Bool == true ? "working" : s["open"] as? Bool == true ? "open" : nil }
+        return ThereSession(id: id, agent: s["agent"] as? String ?? "?",
+                            title: (s["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? String(id.prefix(8)),
+                            updated: ((s["updated"] ?? s["last_t"] ?? s["t"]) as? NSNumber)?.doubleValue,
+                            state: ["working", "open"].contains(st ?? "") ? st : nil)
+    }
+}
+
+/// The session there the summary is made of: the one picked, else the core's.
+func thereSession(_ d: [String: Any], picked: String?) -> String? {
+    picked ?? ((d["source"] as? [String: Any])?["session"] as? String)
+}
+
+/// The git warning: what to do so the files match, in the core's words ("On
+/// box: branch fix-login, 2 commits not pushed, 6 files not committed. Commit
+/// and push there, then pull here."); nil when git has nothing to say.
+func gitWarning(_ d: [String: Any], machine: String) -> String? {
+    let g = d["git"]
+    if let s = g as? String { return s.isEmpty ? nil : s }
+    guard let gd = g as? [String: Any] else { return nil }
+    for k in ["warning", "advice", "text", "say", "note"] {
+        if let s = gd[k] as? String, !s.isEmpty { return s }
+    }
+    if let lines = (gd["lines"] ?? gd["warnings"]) as? [String], !lines.isEmpty {
+        return lines.joined(separator: " ")
+    }
+    // only the two sides: say what is not where it can be pulled from
+    let side = { (x: Any?, name: String) -> String? in
+        guard let s = x as? [String: Any] else { return nil }
+        var bits = (s["branch"] as? String).map { ["branch " + $0] } ?? []
+        let named = bits.count
+        if let a = s["ahead"] as? Int, a > 0 { bits.append("\(a) commit\(a == 1 ? "" : "s") not pushed") }
+        if let n = s["dirty"] as? Int, n > 0 { bits.append("\(n) file\(n == 1 ? "" : "s") not committed") }
+        return bits.count == named ? nil : "On \(name): " + bits.joined(separator: ", ") + "."
+    }
+    let said = [side(gd["there"], machine), side(gd["here"], "this Mac")].compactMap { $0 }
+    return said.isEmpty ? nil : said.joined(separator: " ")
+}
+
+/// The summary: its Markdown (a dry run) and its file (after --apply).
+func pickupBrief(_ d: [String: Any]) -> (text: String?, file: String?) {
+    var text: String?, file: String?
+    if let b = d["brief"] as? [String: Any] {
+        text = (b["text"] ?? b["markdown"]) as? String
+        file = (b["file"] ?? b["path"]) as? String
+    } else if let s = d["brief"] as? String, !s.isEmpty {
+        if !s.contains("\n") && s.hasSuffix(".md") { file = s } else { text = s }
+    }
+    if text == nil { text = (d["brief_text"] ?? d["markdown"]) as? String }
+    if file == nil { file = (d["brief_file"] ?? d["file"]) as? String }
+    return (text.flatMap { $0.isEmpty ? nil : $0 }, file.flatMap { $0.isEmpty ? nil : $0 })
+}
+
+/// The core's warnings but the git warning, which the sheet shows in its own box.
+func otherWarnings(_ d: [String: Any]) -> [String] {
+    let git = (d["git"] as? [String: Any])?["warning"] as? String
+    return ((d["warnings"] as? [String]) ?? []).filter { $0 != git }
+}
+
+/// The line that starts the agent here with the summary (after --apply).
+func startLine(_ d: [String: Any]) -> String? {
+    ((d["command_line"] ?? d["start_line"]) as? String).flatMap { $0.isEmpty ? nil : $0 }
+        ?? (d["start_line"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+}
+
+/// Back mode: the work comes back to where it left from (an open relay to
+/// that machine), so the session it left goes on and reads only what changed.
+func pickupIsBack(_ d: [String: Any]) -> Bool {
+    if let m = d["mode"] as? String { return m == "back" }
+    if let b = d["back"] as? Bool { return b }
+    return (d["relay"] as? [String: Any])?["kind"] as? String == "back"
+}
+
+/// The agent that goes on here in back mode: the one the work left.
+func pickupTarget(_ d: [String: Any]) -> String? {
+    if let t = d["target"] as? String, !t.isEmpty { return t }
+    for k in ["origin", "resume", "note_for"] {
+        if let a = (d[k] as? [String: Any])?["agent"] as? String { return a }
+    }
+    return nil
+}
+
+/// The agent Open in … offers first: in back mode the one the work left,
+/// else the one that worked there if it is installed here, else the first.
+func pickupAgent(_ d: [String: Any], installed: [String]) -> String? {
+    if pickupIsBack(d), let t = pickupTarget(d) { return t }
+    let src = (d["source"] as? [String: Any])?["agent"] as? String
+    if let s = src, installed.contains(s) { return s }
+    return installed.first ?? src
+}
+
+/// Open in …: the switch dialog's words for the agent picked.
+func pickupOpenText(_ d: [String: Any], agent: String, machine: String, hook: Bool) -> String {
+    var x = d
+    x["target"] = agent
+    x["warnings"] = []                  // the sheet shows them once, above
+    return switchText(x, mode: pickupIsBack(d) ? "back" : "new", hook: hook, machine: machine)
+}
+
+/// What opening costs: one turn of the agent; nil for a Claude session that
+/// hears through aht's hook (the switch dialog's words say so already).
+func openCost(_ agent: String, back: Bool, hook: Bool, machine: String? = nil) -> String? {
+    let label = AGENT_LABEL[agent] ?? agent
+    let copy = "Copy the Start Line writes the summary here and a copy of it on \(machine ?? "the other machine"), "
+        + "and puts the line that starts \(label) with it on the clipboard"
+    if agent == "kimi" {
+        return "Kimi reads the summary in a run of its own first, for Open in and for Copy the Start "
+            + "Line alike: that turn uses tokens. " + copy + "; nothing else runs until you paste it."
+    }
+    if agent == "claude" && back && hook { return nil }
+    return "Open in \(label) runs that one turn, which uses tokens. " + copy + "; nothing runs until "
+        + "you paste it."
+}
+
+/// The session a note is for there (back mode): its agent, id and title.
+func noteFor(_ d: [String: Any]) -> (agent: String?, session: String, title: String?)? {
+    if let n = d["note_for"] as? [String: Any], let s = (n["session"] ?? n["id"]) as? String {
+        return (n["agent"] as? String, s, n["title"] as? String)
+    }
+    if let s = d["note_for"] as? String, !s.isEmpty { return (pickupTarget(d), s, nil) }
+    return nil
+}
+
+/// Who reads the note there.
+func noteReader(_ d: [String: Any], machine: String) -> String {
+    guard let n = noteFor(d) else {
+        return "A full summary for whoever goes on there. It waits in the project's "
+            + ".aht/handover folder on \(machine); nothing runs there, so it uses no tokens."
+    }
+    let label = n.agent.map { AGENT_LABEL[$0] ?? $0 } ?? "The agent"
+    return "For \(label)'s own session on \(machine)" + (n.title.map { " (“\($0)”)" } ?? "")
+        + ": only what changed here. "
+        + noteReads(n.agent, on: " on \(machine)",
+                    file: "the note (in the project's .aht/handover folder there)")
+        + " Nothing runs there, so leaving it uses no tokens."
+}
+
+/// The arguments of the dry run, or of --apply (with Open in …'s agent).
+/// `--agent` picks the session there (that session's agent); `--open` the
+/// agent that starts here. Copy the Start Line (`noWindow`) is --open X
+/// --no-window: the summary, its copy there, and the line, with no terminal.
+func pickupArgs(_ v: PickupView, apply: Bool = false, open: String? = nil,
+                noWindow: Bool = false) -> [String] {
+    var a = v.kind == "note" ? ["leave-note", v.project.path, "--on", v.machine]
+                             : ["pickup", v.project.path, "--from", v.machine]
+    if let t = v.there { a += ["--there", t] }
+    if v.kind == "pickup" {
+        if let s = v.session { a += ["--session", s] }
+        if let g = v.agent { a += ["--agent", g] }
+        if let o = open { a += ["--open", o] }
+    }
+    return a + (apply ? ["--apply"] : []) + (noWindow && open != nil ? ["--no-window"] : []) + ["--json"]
+}
+
+/// What stands in the way, in the core's own words; nil when nothing does.
+func pickupProblems(_ d: [String: Any]) -> String? {
+    if d.isEmpty { return "aht gave no answer — see the log (Settings)." }
+    var lines = (d["blockers"] as? [String]) ?? []
+    if let e = d["error"] as? String, !e.isEmpty { lines.append(e) }
+    return lines.isEmpty ? nil : lines.map { "• " + $0 }.joined(separator: "\n\n")
+}
+
+/// The sheet can go on: the folder there is clear (and confirmed when it was
+/// not found by its project id) and nothing stands in the way.
+func pickupReady(_ v: PickupView) -> Bool {
+    let mt = thereMatch(v.dry)
+    guard !v.loading, !v.applying, v.done == nil, let _ = mt.path,
+          pickupProblems(v.dry) == nil else { return false }
+    return matchHow(mt.how).sure || v.confirmed || v.there != nil
+}
+
+/// What Pick Up did, from `pickup --apply --json`.
+func pickupDoneText(_ d: [String: Any], machine: String, project: String, copied: Bool) -> String {
+    if let why = pickupProblems(d) { return "Pick Up did not go through:\n\n" + why }
+    let file = pickupBrief(d).file.map { tilde(summaryFile($0, in: project)) }
+    let opened = (d["opened"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        ?? (d["opened"] as? Bool == true ? pickupTarget(d) ?? "" : nil)
+    var said: String
+    if let o = opened {
+        let label = AGENT_LABEL[o] ?? (o.isEmpty ? "The agent" : o)
+        said = pickupIsBack(d)
+            ? "Picked up from \(machine): \(label)'s own session is open again and reads what "
+              + "changed first."
+            : "Picked up from \(machine): \(label) is open here and reads the summary first"
+              + (file.map { ": \($0)" } ?? ".")
+    } else {
+        said = "Picked up from \(machine). The summary is here" + (file.map { ": \($0)." } ?? ".")
+            + " Nothing was opened."
+        if copied {
+            said += " The start line is on the clipboard: paste it into a terminal to start."
+        }
+    }
+    for w in otherWarnings(d) { said += "\n⚠ " + w }
+    return said
+}
+
+/// What Leave a Note (or Hand Back to M) did, from `leave-note --apply --json`.
+func noteDoneText(_ d: [String: Any], machine: String) -> String {
+    if let why = pickupProblems(d) { return "The note was not left:\n\n" + why }
+    let file = pickupBrief(d).file.map { (($0 as NSString).lastPathComponent) }
+    var said: String
+    if let n = noteFor(d) {
+        let label = n.agent.map { AGENT_LABEL[$0] ?? $0 } ?? "the agent"
+        said = "Handed back to \(machine)" + (file.map { " (\($0))" } ?? "") + ", for \(label)'s own "
+            + "session there. " + noteReads(n.agent, on: " on \(machine)",
+                                            file: file.map { ".aht/handover/" + $0 })
+    } else {
+        said = "The note is on \(machine)" + (file.map { ": .aht/handover/\($0)" } ?? "")
+            + ". Nothing runs there; Pick Up from this Mac there brings the work over."
+    }
+    for w in otherWarnings(d) { said += "\n⚠ " + w }
+    return said
+}
+
+/// The part of a path under its home folder: "code/api" for /home/me/code/api,
+/// /Users/me/code/api and C:\Users\me\code\api; nil outside a home folder.
+func homeRelative(_ path: String) -> String? {
+    let c = path.replacingOccurrences(of: "\\", with: "/")
+        .split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+    var n = 0
+    if c.count > 3 && c[0].isEmpty && (c[1] == "Users" || c[1] == "home") {
+        n = 3
+    } else if c.count > 3 && c[0].count == 2 && c[0].hasSuffix(":") && c[1].lowercased() == "users" {
+        n = 3
+    } else if c.count > 2 && c[0].isEmpty && c[1] == "root" {
+        n = 2
+    }
+    let rest = c.dropFirst(n).filter { !$0.isEmpty }
+    return n == 0 || rest.isEmpty ? nil : rest.joined(separator: "/")
+}
+
+/// The folders here that may be a folder on another machine, likeliest
+/// first: the same path, the same place in the home folder, the same name.
+func localTwins(_ there: String, _ here: [String], home: String = HOME,
+                exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> [String] {
+    if here.contains(there) { return [there] }
+    if let rel = homeRelative(there) {
+        let p = home + "/" + rel
+        if here.contains(p) || exists(p) { return [p] }
+    }
+    let name = there.replacingOccurrences(of: "\\", with: "/").split(separator: "/").last.map(String.init) ?? ""
+    return name.isEmpty ? [] : here.filter { ($0 as NSString).lastPathComponent == name }
+}
+
+/// Pick Up from M and Leave a Note on M (Hand Back to M is a note too): the
+/// dry run the sheet shows, what the user picked in it, and what --apply did.
+struct PickupView: Identifiable {
+    let id = UUID()
+    let project: Project
+    let machine: String
+    let kind: String                // "pickup" | "note"
+    var back = false                // asked as Hand Back to M
+    var loading = true
+    var dry: [String: Any] = [:]
+    var said = ""                   // what aht said when it gave no JSON
+    var there: String?              // --there: the folder there, picked
+    var session: String?            // --session: a session there, picked
+    var agent: String?              // --agent: that session's agent
+    var confirmed = false           // a folder not found by its project id: "this is it"
+    var typed = ""                  // the folder there, typed when none was found
+    var open: String?               // Open in …: the agent picked
+    var applying = false
+    var done: [String: Any]?        // what --apply answered
+    var copied = false              // its start line went to the clipboard
+}
+
+/// The sheet's title.
+func pickupTitle(_ v: PickupView) -> String {
+    let name = v.project.name
+    if v.kind == "note" {
+        return v.back || noteFor(v.dry) != nil ? "Hand “\(name)” back to \(v.machine)?"
+                                               : "Leave a note about “\(name)” on \(v.machine)?"
+    }
+    return "Pick up “\(name)” from \(v.machine)?"
 }
 
 struct TidyItem: Identifiable {
@@ -1255,6 +1729,7 @@ final class AppModel: ObservableObject {
     @Published var sessionList: SessionListView?
     @Published var showUpdate = false
     @Published var offsite: OffsiteView?        // Fetch Backups From…
+    @Published var pickup: PickupView?          // Pick Up from M, Leave a Note on M
     var openWelcome: (() -> Void)?              // the welcome window, again
     var openWelcomeFirst: ((String) -> Void)?   // … to install aht (this app's version)
     @Published var itermControl = "closed"      // itermControlState(ask: false)
@@ -2272,6 +2747,124 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async { self.summaries[p.path] = f }
             }
         }
+    }
+
+    // ---- Pick Up and Leave a Note: work across machines ----
+
+    /// The Machines menu's items.
+    func machineAction(_ p: Project, _ i: MachineItem) {
+        switch i.kind {
+        case "pickup": pickUp(p, from: i.machine)
+        case "back": leaveNote(p, on: i.machine, back: true)
+        default: leaveNote(p, on: i.machine)
+        }
+    }
+
+    /// Pick Up from M: M is asked for the folder, its sessions, git and a
+    /// summary (a dry run: nothing is written), and the sheet shows them.
+    /// From a search hit: that session, in that folder there.
+    func pickUp(_ p: Project, from machine: String, session: String? = nil, agent: String? = nil,
+                there: String? = nil) {
+        var v = PickupView(project: p, machine: machine, kind: "pickup")
+        (v.session, v.agent, v.there) = (session, agent, there)
+        pickup = v
+        lookThere()
+    }
+
+    /// Leave a Note on M; `back`: asked as Hand Back to M (the core finds
+    /// back mode by itself: a pickup from M is open here).
+    func leaveNote(_ p: Project, on machine: String, back: Bool = false) {
+        var v = PickupView(project: p, machine: machine, kind: "note")
+        v.back = back
+        pickup = v
+        lookThere()
+    }
+
+    /// The dry run, and again after a pick in the sheet (a folder, a session).
+    func lookThere() {
+        guard let v = pickup else { return }
+        pickup?.loading = true
+        pickup?.done = nil
+        pickup?.copied = false
+        guard !demo else { return }
+        let args = pickupArgs(v)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript()] + args)
+            let d = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]
+            DispatchQueue.main.async {
+                guard self.pickup?.id == v.id else { return }
+                self.pickup?.loading = false
+                self.pickup?.dry = d ?? [:]
+                self.pickup?.said = d == nil ? r.err.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                if let d = d, self.pickup?.open == nil || pickupIsBack(d) {
+                    self.pickup?.open = pickupAgent(d, installed: self.agentCLIs)
+                }
+            }
+        }
+    }
+
+    /// The sheet's way on: Open in … (`open`), Copy the Start Line (`copy`,
+    /// with the agent picked as `open`: --no-window), or Leave the Note. A
+    /// folder found other than by its project id goes with --there, as
+    /// confirmed.
+    func applyPickup(open: String? = nil, copy: Bool = false) {
+        guard var v = pickup, pickupReady(v) else { return }
+        if v.there == nil, let path = thereMatch(v.dry).path, !matchHow(thereMatch(v.dry).how).sure {
+            v.there = path
+        }
+        pickup?.applying = true
+        guard !demo else { return }
+        let args = pickupArgs(v, apply: true, open: open, noWindow: copy)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript()] + args)
+            let d = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]
+            DispatchQueue.main.async {
+                guard self.pickup?.id == v.id else { return }
+                let why = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+                let got = d ?? ["error": why.isEmpty ? "aht gave no answer — see the log (Settings)." : why]
+                self.pickup?.applying = false
+                self.pickup?.done = got
+                if copy, pickupProblems(got) == nil, let line = startLine(got) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(line, forType: .string)
+                    self.pickup?.copied = true
+                }
+                self.refresh()
+            }
+        }
+    }
+
+    /// Continue Here… on another machine's search hit: Pick Up that session,
+    /// into the folder here that is that project (asked when unclear).
+    func pickUpHit(_ h: SearchHit) {
+        guard let mc = h.machine else { return }
+        let name = h.project.map { ($0.replacingOccurrences(of: "\\", with: "/") as NSString)
+            .lastPathComponent } ?? "the project"
+        let twins = h.project.map { localTwins($0, projects.map { $0.path }) } ?? []
+        var here: String? = twins.count == 1 ? twins[0] : nil
+        if twins.count > 1 {
+            let pick = choose("Continue “\(name)” from \(mc) in which folder?",
+                              "These folders on this Mac have its name.",
+                              twins.map(tilde) + ["Another Folder…", "Cancel"])
+            if pick >= 0 && pick < twins.count { here = twins[pick] } else if pick != twins.count { return }
+        }
+        if here == nil {
+            here = chooseFolder("The folder on this Mac to continue “\(name)” from \(mc) in "
+                                + "(a clone of the same repository, for example)")
+        }
+        guard let path = here else { return }
+        let p = projects.first { $0.path == path } ?? Project(["real_path": path, "exists": true])
+        pickUp(p, from: mc, session: h.session.isEmpty ? nil : h.session, agent: h.agent, there: h.project)
+    }
+
+    /// A note left here by another machine, in the reading sheet.
+    func readNote(_ p: Project, _ i: Incoming) {
+        guard let b = i.brief else { return }
+        let f = summaryFile(b, in: p.path)
+        let text = (try? String(contentsOfFile: f, encoding: .utf8))
+            ?? "The note is not there any more: \(tilde(f))"
+        textSheet = TextSheet(title: "Note from \(i.name): \(p.name)", text: text, project: nil,
+                              wide: true, topic: "Pick up on another machine")
     }
 
     // ---- tidy up ----
@@ -3296,6 +3889,7 @@ struct MainView: View {
         .sheet(item: $m.sessionList) { v in SessionListSheet(v: v) }
         .sheet(isPresented: $m.showUpdate) { UpdateSheet() }
         .sheet(item: $m.offsite) { _ in FetchBackupsSheet() }
+        .sheet(item: $m.pickup) { _ in PickupSheet() }
     }
 }
 
@@ -3381,6 +3975,8 @@ struct DetailView: View {
                     SyncPausedBanner(p: p, s: s, to: s.machine ?? to)
                 }
                 if let r = p.handBack, p.away == nil { RelayLine(p: p, r: r) }
+                if let i = p.incoming, i.isNote, p.away == nil { IncomingBanner(p: p, i: i) }
+                if let i = p.pickedUp, p.away == nil { IncomingBanner(p: p, i: i) }
                 HStack(spacing: 10) {
                     if p.away != nil {
                         Button("Take Back…") { m.takeBack(p) }
@@ -3414,6 +4010,7 @@ struct DetailView: View {
                         .fixedSize()
                         .disabled(p.sessions == 0 && p.agents.isEmpty || p.handing != nil)
                         HelpButton("Continue in another agent")
+                        MachinesMenu(p: p)
                     }
                     Spacer()
                     if p.exists {
@@ -3570,6 +4167,100 @@ struct SyncPausedBanner: View {
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+        .disabled(m.working != nil)
+    }
+}
+
+/// Pick Up from M, Leave a Note on M, and Hand Back to M while a pickup from
+/// M is open: context across machines (git moves the files).
+struct MachinesMenu: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+
+    var body: some View {
+        let items = machineItems(p, askableMachines(m.machines))
+        Menu("Machines") {
+            ForEach(Array(items.enumerated()), id: \.offset) { k, i in
+                if k > 0 && items[k - 1].kind != i.kind { Divider() }
+                Button(i.title) { m.machineAction(p, i) }
+            }
+        }
+        .fixedSize()
+        .disabled(items.isEmpty || !m.canReach || p.handing != nil)
+        .help(askableMachines(m.machines).isEmpty
+              ? "Add a Mac or Linux machine under Machines to pick up work from it"
+              : "Go on with work from another machine, or leave it a note: a summary moves, "
+                + "git moves the files")
+    }
+}
+
+/// The banner's second line: for a pickup, what Hand Back does; for a note
+/// for a session here, whether that session reads it by itself (Claude
+/// Code, through aht's hook: `hook`) or is asked to; else read it first.
+func incomingDetail(_ i: Incoming, hook: Bool) -> String {
+    if !i.isNote {
+        return "Hand Back leaves a note on \(i.name) for the session the work came from."
+    }
+    if i.noteFor != nil {
+        let label = i.noteAgent.map { AGENT_LABEL[$0] ?? $0 } ?? "Your"
+        let file = i.brief.map { ".aht/handover/" + ($0 as NSString).lastPathComponent }
+        return "The note is for \(label)'s own session here. "
+            + noteReads(i.noteAgent ?? "claude", file: file, hook: hook)
+            + " Pull first if the changes were pushed."
+    }
+    return "Read it before going on: the files may differ from what you remember. "
+        + "Pull first if the changes were pushed."
+}
+
+/// What the session a hand-back note is for does with it when it is
+/// continued (`on`: " on box", or "" for here): Claude Code reads it by
+/// itself, as aht's hook gives it to the session (`hook`: the hook is set
+/// up there). No other agent has that hook: it is asked to read the note
+/// (`file`) first.
+func noteReads(_ agent: String?, on: String = "", file: String? = nil, hook: Bool = true) -> String {
+    let f = file ?? "the note"
+    guard let a = agent else {
+        return "When you continue that session\(on), Claude Code reads it by itself; another agent "
+            + "does not: ask it to read \(f) first."
+    }
+    if a == "claude" && hook { return "Claude Code reads it by itself when you continue that session\(on)." }
+    return "\(AGENT_LABEL[a] ?? a) does not read it by itself" + (a == "claude" ? " (aht's hook is off)" : "")
+        + ": when you continue that session\(on), ask it to read \(f) first."
+}
+
+/// Work that came from another machine: a note left here (Read the Note…),
+/// or a pickup from there (Hand Back to it).
+struct IncomingBanner: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+    let i: Incoming
+
+    var detail: String { incomingDetail(i, hook: m.hookOn) }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: i.isNote ? "envelope.fill" : "arrow.down.circle.fill")
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(incomingLine(i)).fontWeight(.semibold).lineLimit(1)
+                Text(detail).font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if i.isNote {
+                if i.brief != nil { Button("Read the Note…") { m.readNote(p, i) } }
+                if let s = i.noteFor {
+                    Button("Continue Session") {
+                        m.resumeSession(p.path, agent: i.noteAgent ?? "claude", session: s)
+                    }
+                }
+            } else if let to = p.pickedUpFrom {
+                Button("Hand Back to \(to)…") { m.leaveNote(p, on: to, back: true) }
+                    .disabled(!m.canReach || p.handing != nil)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.10)))
         .disabled(m.working != nil)
     }
 }
@@ -3885,8 +4576,12 @@ struct SearchHitView: View {
                     Text("deleted — in a backup").font(.caption).foregroundColor(.orange)
                 }
                 Spacer()
-                if h.machine != nil {
-                    EmptyView()                 // another machine's: nothing to open here
+                if let mc = h.machine {
+                    // another machine's: Pick Up that session here
+                    Button("Continue Here…") { m.pickUpHit(h) }.controlSize(.small)
+                        .disabled(!m.canReach || m.pickup != nil)
+                        .help("Pick up this session from \(mc): a summary of it comes here; git "
+                              + "moves the files")
                 } else if h.live, let p = h.project, FileManager.default.fileExists(atPath: p) {
                     Button("Resume") { m.resume(h) }.controlSize(.small)
                     Button("Show Project") { m.show(p) }.controlSize(.small)
@@ -4004,6 +4699,250 @@ struct SwitchSheet: View {
             }
         }
         .padding(20).frame(width: 520)
+    }
+}
+
+/// Pick Up from M, Leave a Note on M and Hand Back to M: what the dry run
+/// found there (the folder and how, the latest sessions, git, the summary),
+/// then Open in … or Copy the Start Line (Pick Up), or Leave the Note; Done.
+struct PickupSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let v = m.pickup ?? PickupView(project: Project([:]), machine: "", kind: "pickup")
+        VStack(alignment: .leading, spacing: 10) {
+            headed(pickupTitle(v), "Pick up on another machine")
+            if v.loading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(v.kind == "note" ? "Asking \(v.machine) where the project is…"
+                                          : "Asking \(v.machine) for the folder, its sessions and a summary…")
+                        .foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
+            } else if v.dry.isEmpty {
+                Text(v.said.isEmpty ? "aht gave no answer — see the log (Settings)." : v.said)
+                    .foregroundColor(.orange).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            } else {
+                folder(v)
+                if v.kind == "pickup" { sessions(v) } else { about(v) }
+                notices(v)
+                summary(v)
+                if let d = v.done {
+                    result(v, d)
+                } else if v.kind == "pickup" {
+                    if thereMatch(v.dry).path != nil { openIn(v) }
+                } else {
+                    Text(noteReader(v.dry, machine: v.machine)).font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Divider()
+            footer(v)
+        }
+        .padding(20).frame(width: 660, height: 640)
+    }
+
+    /// The folder there: how it was found (and "this is it" when that is not
+    /// sure), or the folders it could be.
+    @ViewBuilder func folder(_ v: PickupView) -> some View {
+        let mt = thereMatch(v.dry)
+        let how = matchHow(mt.how)
+        if mt.path != nil {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: how.sure ? "checkmark.circle.fill" : "questionmark.circle.fill")
+                    .foregroundColor(how.sure ? .green : .orange)
+                Text(matchLine(mt, machine: v.machine)).lineLimit(2).truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+            if !how.sure && v.there == nil && v.done == nil {
+                Toggle("This is the same project", isOn: Binding(
+                    get: { m.pickup?.confirmed ?? false }, set: { m.pickup?.confirmed = $0 }))
+                    .toggleStyle(.checkbox)
+                    .help("aht did not find it by its project id: check the folder before going on")
+            }
+        } else {
+            Label(matchProblem(mt, machine: v.machine), systemImage: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            ForEach(mt.candidates, id: \.self) { c in
+                Button(action: { m.pickup?.there = c; m.lookThere() }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "circle").foregroundColor(.secondary)
+                        Text(c).lineLimit(1).truncationMode(.middle)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Go on with this folder on \(v.machine)")
+            }
+            if mt.candidates.isEmpty {
+                HStack {
+                    TextField("the folder on \(v.machine)", text: Binding(
+                        get: { m.pickup?.typed ?? "" }, set: { m.pickup?.typed = $0 }))
+                        .textFieldStyle(.roundedBorder)
+                    Button("Look There") {
+                        m.pickup?.there = v.typed.trimmingCharacters(in: .whitespaces)
+                        m.lookThere()
+                    }
+                    .disabled(v.typed.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+    }
+
+    /// The latest sessions there; a click picks the one to go on from.
+    @ViewBuilder func sessions(_ v: PickupView) -> some View {
+        let rows = Array(thereSessions(v.dry).prefix(4))
+        let picked = thereSession(v.dry, picked: v.session)
+        if !rows.isEmpty {
+            Text("Latest sessions on \(v.machine)").font(.subheadline).foregroundColor(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(rows) { s in
+                    Button(action: {
+                        guard s.id != picked else { return }
+                        m.pickup?.session = s.id
+                        m.pickup?.agent = s.agent
+                        m.lookThere()
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: s.id == picked ? "largecircle.fill.circle" : "circle")
+                                .foregroundColor(s.id == picked ? .accentColor : .secondary)
+                            Text(s.title).lineLimit(1)
+                            Text(AGENT_LABEL[s.agent] ?? s.agent).foregroundColor(.secondary)
+                            if let t = s.updated { Text(ago(NSNumber(value: t))).foregroundColor(.secondary) }
+                            if let st = s.state {
+                                Text(st == "working" ? "working there" : "open there").font(.caption)
+                                    .foregroundColor(.orange)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(v.done != nil)
+                }
+            }
+        }
+    }
+
+    /// A note: the session here whose work it tells of.
+    @ViewBuilder func about(_ v: PickupView) -> some View {
+        let src = (v.dry["source"] as? [String: Any]) ?? [:]
+        if let a = src["agent"] as? String {
+            Text("About the latest \(AGENT_LABEL[a] ?? a) session here"
+                 + ((src["title"] as? String).map { " (“\($0)”)" } ?? "") + ".")
+                .foregroundColor(.secondary).lineLimit(2)
+        }
+    }
+
+    /// The git warning, the core's warnings, and what stands in the way.
+    @ViewBuilder func notices(_ v: PickupView) -> some View {
+        if let g = gitWarning(v.dry, machine: v.machine) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "arrow.triangle.branch").foregroundColor(.orange)
+                Text(g).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+        }
+        ForEach(otherWarnings(v.dry), id: \.self) { w in
+            Text("⚠ " + w).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+        }
+        if thereMatch(v.dry).path != nil, let why = pickupProblems(v.dry) {
+            Text(why).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    /// The summary the agent reads (masked over there).
+    @ViewBuilder func summary(_ v: PickupView) -> some View {
+        let text = pickupBrief(v.dry).text
+        if let t = text {
+            ScrollView {
+                MarkdownView(text: t).padding(10)
+            }
+            .frame(maxHeight: .infinity)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.03)))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.25)))
+        } else {
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Open in …: the agent, and the switch dialog's words for it with the token line.
+    @ViewBuilder func openIn(_ v: PickupView) -> some View {
+        let back = pickupIsBack(v.dry)
+        let agent = v.open ?? pickupAgent(v.dry, installed: m.agentCLIs) ?? ""
+        if !back && m.agentCLIs.count > 1 {
+            Picker("Open in", selection: Binding(get: { m.pickup?.open ?? agent },
+                                                 set: { m.pickup?.open = $0 })) {
+                ForEach(m.agentCLIs, id: \.self) { Text(AGENT_LABEL[$0] ?? $0).tag($0) }
+            }
+            .fixedSize()
+        }
+        if !agent.isEmpty {
+            Text(pickupOpenText(v.dry, agent: agent, machine: v.machine, hook: m.hookOn))
+                .font(.callout).fixedSize(horizontal: false, vertical: true)
+            if let cost = openCost(agent, back: back, hook: m.hookOn, machine: v.machine) {
+                Text(cost).font(.caption).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    /// What --apply did, and the line that starts the agent.
+    @ViewBuilder func result(_ v: PickupView, _ d: [String: Any]) -> some View {
+        Text(v.kind == "note" ? noteDoneText(d, machine: v.machine)
+                              : pickupDoneText(d, machine: v.machine, project: v.project.path, copied: v.copied))
+            .font(.callout).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        if let line = startLine(d), v.kind == "pickup" {
+            Text(line).font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
+                .help("The line that starts the agent here with the summary")
+        }
+    }
+
+    @ViewBuilder func footer(_ v: PickupView) -> some View {
+        let ready = pickupReady(v)
+        let back = pickupIsBack(v.dry)
+        let agent = v.open ?? pickupAgent(v.dry, installed: m.agentCLIs)
+        let label = agent.map { AGENT_LABEL[$0] ?? $0 } ?? "an Agent"
+        HStack {
+            if let d = v.done {
+                let line = startLine(d) ?? ""
+                if v.kind == "pickup" && !line.isEmpty && pickupProblems(d) == nil {
+                    Button(v.copied ? "Copied" : "Copy the Start Line") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(line, forType: .string)
+                        m.pickup?.copied = true
+                    }
+                }
+                Spacer()
+                Button("Done") { m.pickup = nil }.keyboardShortcut(.defaultAction)
+            } else {
+                Button("Cancel") { m.pickup = nil }.keyboardShortcut(.cancelAction)
+                Spacer()
+                if v.applying { ProgressView().controlSize(.small) }
+                if v.kind == "pickup" {
+                    Button("Copy the Start Line") { m.applyPickup(open: agent, copy: true) }
+                        .disabled(!ready || agent == nil || !(m.agentCLIs.contains(agent ?? "") || back))
+                        .help("Write the summary here and a copy of it on \(v.machine), and put the line "
+                              + "that starts \(label) with it on the clipboard; nothing opens"
+                              + (agent == "kimi" ? " (Kimi reads it in a run of its own first: tokens)" : ""))
+                    Button(back ? "Open \(label)'s Session" : "Open in \(label)") {
+                        m.applyPickup(open: agent)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!ready || agent == nil || !(m.agentCLIs.contains(agent ?? "") || back))
+                } else {
+                    Button(back || v.back ? "Hand Back" : "Leave the Note") { m.applyPickup() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!ready)
+                }
+            }
+        }
     }
 }
 
@@ -7772,7 +8711,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
 
     /// A click on a notice: to the session's tab when it is here, else to the
     /// Sessions tab (another machine) or the project (the usage limit, a
-    /// handover that was cut off).
+    /// handover that was cut off, a note another machine left).
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
                                 withCompletionHandler done: @escaping () -> Void) {
         let info = r.notification.request.content.userInfo
@@ -7791,7 +8730,8 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
                 }
             } else if kind == "update" {
                 self.showUpdateFromMenu()
-            } else if kind == "limit" || kind == "handover", let p = info["project"] as? String {
+            } else if ["limit", "handover", "incoming"].contains(kind),
+                      let p = info["project"] as? String {
                 self.openWindow()
                 self.model.tab = .projects
                 self.model.selection = p
@@ -8570,6 +9510,358 @@ if CommandLine.arguments.contains("--selftest") {
         print("PHASE 3 SAMPLES not checked (" + (dir3.isEmpty ? "AHT_FIXTURES_PHASE3 names no folder"
                                                        : "no samples in \(dir3) yet") + ")")
     }
+    // Pick Up and Leave a Note: the sheet's parts from `pickup --json` and
+    // `leave-note --json`, the Machines menu, the banner when a note arrived,
+    // Continue Here… on another machine's hit; made-up rows in the core's shape
+    let dryPick: [String: Any] = [
+        "command": "pickup", "applied": false, "blockers": [], "warnings": [], "mode": "new",
+        "match": ["path": "/home/me/code/api", "how": "id", "candidates": []],
+        "source": ["machine": "box", "agent": "codex", "session": "019a", "title": "fix the login redirect"],
+        "sessions": [["agent": "codex", "id": "019a", "title": "fix the login redirect", "updated": now - 300,
+                      "state": "working"],
+                     ["agent": "claude", "id": "0f3a", "title": NSNull(), "updated": now - 9000, "open": false]],
+        "git": ["here": ["branch": "main", "ahead": 0, "dirty": 0],
+                "there": ["branch": "fix-login", "ahead": 2, "dirty": 6],
+                "warning": "On box: branch fix-login, 2 commits not pushed, 6 files not committed. "
+                    + "Commit and push there, then pull here."],
+        "brief": "# Picked up from box\n\n## Where things stood\n\nThe redirect keeps the page.",
+        "relay": NSNull(), "opened": NSNull(), "command_line": NSNull()]
+    let dryBlocked: [String: Any] = ["applied": false, "blockers": ["2 folders on box could be this project"],
+        "match": ["path": NSNull(), "how": NSNull(),
+                  "candidates": ["/home/me/code/api", ["path": "/srv/api", "how": "origin"]]]]
+    let dryBackPick: [String: Any] = ["applied": false, "mode": "back", "target": "claude",
+        "match": ["path": "/home/me/code/api", "how": "origin", "candidates": []],
+        "source": ["agent": "codex", "session": "019a", "title": NSNull()],
+        "git": ["there": ["branch": "main", "ahead": 1, "dirty": 0]], "brief": "# Back from box"]
+    let viewOf = { (d: [String: Any], kind: String) -> PickupView in
+        var v = PickupView(project: Project(["real_path": "/x/api", "exists": true]), machine: "box", kind: kind)
+        (v.loading, v.dry) = (false, d)
+        return v
+    }
+    var hitView = viewOf(dryPick, "pickup")
+    (hitView.there, hitView.session, hitView.agent) = ("/home/me/code/api", "019a", "codex")
+    var unsure = viewOf(dryBackPick, "pickup")
+    let unsureBefore = pickupReady(unsure)
+    unsure.confirmed = true
+    let mt = thereMatch(dryPick), blockedMt = thereMatch(dryBlocked)
+    let ss = thereSessions(dryPick)
+    let pickOK = mt.path == "/home/me/code/api" && matchHow(mt.how).sure
+        && matchLine(mt, machine: "box") == "Found on box by its project id: /home/me/code/api"
+        && !matchHow("origin").sure && matchHow("home_relative").text == "at the same place in the home folder"
+        && matchHow("there").sure && matchProblem(mt, machine: "box").isEmpty
+        && blockedMt.path == nil && blockedMt.candidates == ["/home/me/code/api", "/srv/api"]
+        && matchProblem(blockedMt, machine: "box").hasPrefix("2 folders on box could be this project")
+        && ss.map { $0.id } == ["019a", "0f3a"] && ss[0].state == "working" && ss[1].state == nil
+        && ss[1].title == "0f3a" && thereSession(dryPick, picked: nil) == "019a"
+        && thereSession(dryPick, picked: "0f3a") == "0f3a"
+        && gitWarning(dryPick, machine: "box")?.hasPrefix("On box: branch fix-login, 2 commits") == true
+        && gitWarning(dryBackPick, machine: "box") == "On box: branch main, 1 commit not pushed."
+        && gitWarning(["git": NSNull()], machine: "box") == nil
+        && gitWarning(["git": ["there": ["branch": "main", "ahead": 0, "dirty": 0]]], machine: "box") == nil
+        && pickupBrief(dryPick).text?.hasPrefix("# Picked up from box") == true
+        && pickupBrief(["brief": "relay-1.md"]).file == "relay-1.md"
+        && pickupBrief(["brief": ["text": "# x", "file": "/x/api/.aht/handover/relay-1.md"]]).file != nil
+        && !pickupIsBack(dryPick) && pickupIsBack(dryBackPick) && pickupTarget(dryBackPick) == "claude"
+        && pickupAgent(dryPick, installed: ["claude", "codex"]) == "codex"
+        && pickupAgent(dryPick, installed: ["claude"]) == "claude"
+        && pickupAgent(dryBackPick, installed: ["codex"]) == "claude"
+        && pickupOpenText(dryPick, agent: "kimi", machine: "box", hook: true).hasPrefix(
+            "Kimi Code continues the work of the Codex session on box (“fix the login redirect”) in a new "
+            + "session here.")
+        && pickupOpenText(dryBackPick, agent: "claude", machine: "box", hook: true)
+            .contains("while Codex had the project on box")
+        && pickupOpenText(dryBackPick, agent: "claude", machine: "box", hook: true)
+            .contains("nothing runs until you type")
+        && openCost("codex", back: false, hook: true)?.contains("which uses tokens") == true
+        && openCost("claude", back: true, hook: true) == nil
+        && openCost("claude", back: true, hook: false) != nil
+        && pickupArgs(hitView) == ["pickup", "/x/api", "--from", "box", "--there", "/home/me/code/api",
+                                   "--session", "019a", "--agent", "codex", "--json"]
+        && pickupArgs(viewOf([:], "pickup"), apply: true, open: "codex")
+            == ["pickup", "/x/api", "--from", "box", "--open", "codex", "--apply", "--json"]
+        && pickupArgs(viewOf([:], "note"), apply: true) == ["leave-note", "/x/api", "--on", "box", "--apply", "--json"]
+        && pickupArgs({ var v = viewOf([:], "note"); v.there = "/srv/api"; return v }())
+            == ["leave-note", "/x/api", "--on", "box", "--there", "/srv/api", "--json"]
+        && otherWarnings(["warnings": ["a", "b"], "git": ["warning": "a"]]) == ["b"]
+        && startLine(["command_line": NSNull(), "start_line": "codex 'x'"]) == "codex 'x'"
+        && startLine(["command_line": "", "start_line": NSNull()]) == nil
+        && pickupReady(viewOf(dryPick, "pickup")) && !unsureBefore && pickupReady(unsure)
+        && !pickupReady(viewOf(dryBlocked, "pickup")) && !pickupReady(viewOf(["error": "ssh: timed out"], "pickup"))
+        && pickupTitle(viewOf(dryPick, "pickup")) == "Pick up “api” from box?"
+    let opened = pickupDoneText(["applied": true, "opened": "codex", "brief": "relay-7.md",
+                                 "command_line": "codex 'Read …'"], machine: "box", project: "/x/api", copied: false)
+    let copiedTxt = pickupDoneText(["applied": true, "opened": NSNull(), "brief": "/x/api/.aht/handover/relay-7.md",
+                                    "command_line": "codex 'Read …'"], machine: "box", project: "/x/api", copied: true)
+    let backOpened = pickupDoneText(["applied": true, "mode": "back", "target": "claude", "opened": true],
+                                    machine: "box", project: "/x/api", copied: false)
+    let notThrough = pickupDoneText(["error": "box did not answer"], machine: "box", project: "/x/api", copied: false)
+    let noteBack: [String: Any] = ["applied": true, "mode": "back", "brief": "/home/me/code/api/.aht/handover/relay-8.md",
+                                   "note_for": ["agent": "claude", "session": "0f3a", "title": "fix the login redirect"]]
+    let leftBack = noteDoneText(noteBack, machine: "mac")
+    let leftFull = noteDoneText(["applied": true, "brief": "relay-9.md", "note_for": NSNull()], machine: "box")
+    let doneOK = opened == "Picked up from box: Codex is open here and reads the summary first: "
+            + "/x/api/.aht/handover/relay-7.md"
+        && copiedTxt.hasPrefix("Picked up from box. The summary is here: /x/api/.aht/handover/relay-7.md. "
+                               + "Nothing was opened.") && copiedTxt.contains("on the clipboard")
+        && backOpened.hasPrefix("Picked up from box: Claude Code's own session is open again")
+        && notThrough == "Pick Up did not go through:\n\n• box did not answer"
+        && leftBack.hasPrefix("Handed back to mac (relay-8.md), for Claude Code's own session there. "
+                              + "Claude Code reads it by itself when you continue that session on mac.")
+        && leftFull == "The note is on box: .aht/handover/relay-9.md. Nothing runs there; Pick Up from "
+            + "this Mac there brings the work over."
+        && noteReader(noteBack, machine: "mac").hasPrefix("For Claude Code's own session on mac (“fix the login")
+        && noteReader([:], machine: "box").hasPrefix("A full summary for whoever goes on there.")
+        && pickupTitle(viewOf(noteBack, "note")) == "Hand “api” back to box?"
+        && pickupTitle(viewOf([:], "note")) == "Leave a note about “api” on box?"
+    print("PICK UP SHEET \(pickOK && doneOK ? "OK" : "FAIL — \(opened) / \(copiedTxt) / \(leftBack) / \(leftFull)")")
+    // the Machines menu, and the line over a project work came to from another machine
+    let worked = Calendar.current.date(bySettingHour: 0, minute: 20, second: 0, of: Date())!
+    let came = { (inc: Any, extra: [String: Any]) -> Project in
+        Project(["real_path": "/x/api", "exists": true, "sessions": 2,
+                 "relay": (["id": "20261027-141000-ab12", "from_agent": "codex", "to_agent": "claude",
+                            "since": worked.timeIntervalSince1970 + 600, "open": true,
+                            "incoming": inc] as [String: Any]).merging(extra) { $1 }])
+    }
+    let picked = came(["machine": "mac", "kind": "pickup", "agent": "claude"],
+                      ["kind": "pickup", "machine": "mac", "remote": "studio", "arrived": true, "told": true])
+    let noted = came(["machine": "pc", "kind": "note", "agent": "codex", "brief": "relay-20261027-141000-ab12.md",
+                      "worked_from": worked.timeIntervalSince1970 - 3000, "worked_to": worked.timeIntervalSince1970],
+                     ["open": false])
+    let handed = came(true, ["kind": "back", "from_machine": "pc", "note_for": ["agent": "claude", "session": "0f3a"]])
+    let local = came(NSNull(), ["kind": "switch", "machine": NSNull()]), unnamed = came(true, [:])
+    // the sending machine's copy: across machines, so no Phase 2 Hand Back, and no banner
+    let sent = came(NSNull(), ["kind": "pickup", "machine": "pc", "remote": "pc"])
+    let menuP = machineItems(picked, ["box", "studio"]), menuPlain = machineItems(local, ["box"])
+    let at = clock(worked.addingTimeInterval(600))
+    let menuOK = menuP.map { $0.title } == ["Hand Back to studio…", "Pick Up from box…", "Pick Up from studio…",
+                                             "Leave a Note on box…", "Leave a Note on studio…"]
+        && menuP.map { $0.kind } == ["back", "pickup", "pickup", "note", "note"] && menuP[0].machine == "studio"
+        && sent.handBack == nil && sent.incoming == nil && sent.relay?.machine == "pc"
+        && switchItems(sent, ["codex"]).first?.back == false
+        && menuPlain.map { $0.title } == ["Pick Up from box…", "Leave a Note on box…"]
+        && machineItems(local, []).isEmpty
+        && picked.pickedUpFrom == "studio" && picked.handBack == nil && picked.incoming?.isNote == false
+        && picked.incoming?.machine == "mac"
+        && noted.pickedUpFrom == nil && noted.relay == nil && noted.incoming?.machine == "pc"
+        && handed.incoming?.kind == "back" && handed.incoming?.noteFor == "0f3a" && handed.handBack == nil
+        && local.incoming == nil && local.handBack != nil && unnamed.incoming == nil
+        && incomingLine(picked.incoming!) == "Picked up from studio at \(at), where Claude Code worked"
+        && incomingLine(noted.incoming!) == "pc left a note at \(at): Codex worked there from "
+            + "\(clock(worked.addingTimeInterval(-3000))) to \(clock(worked))"
+        && incomingLine(handed.incoming!) == "pc handed this project back at \(at): Codex worked there"
+    let bannerSaid = noted.incoming.map(incomingLine) ?? "-"
+    print("MACHINES MENU AND NOTE BANNER \(menuOK ? "OK" : "FAIL — \(menuP.map { $0.title }) / \(bannerSaid)")")
+    // Continue Here…: the folder here that is that folder there
+    let mine = [HOME + "/code/api", HOME + "/old/api", HOME + "/code/site"]
+    let noFolder = { (_: String) in false }
+    let twinOK = homeRelative("/home/me/code/api") == "code/api"
+        && homeRelative("/Users/me/code/api") == "code/api"
+        && homeRelative("C:\\Users\\me\\code\\api") == "code/api"
+        && homeRelative("/root/api") == "api" && homeRelative("/srv/api") == nil
+        && homeRelative("/home/me") == nil
+        && localTwins("/home/me/code/api", mine, exists: noFolder) == [HOME + "/code/api"]
+        && localTwins(HOME + "/code/site", mine, exists: noFolder) == [HOME + "/code/site"]
+        && localTwins("/srv/www/api", mine, exists: noFolder) == [HOME + "/code/api", HOME + "/old/api"]
+        && localTwins("C:\\Users\\me\\work\\api", mine, exists: { $0 == HOME + "/work/api" })
+            == [HOME + "/work/api"]
+        && localTwins("/srv/www/blog", mine, exists: noFolder).isEmpty
+    print("CONTINUE HERE \(twinOK ? "OK" : "FAIL")")
+    // Phase 4 fixes. [1] Copy the Start Line: --open the agent picked here
+    // with --no-window (--agent stays the session there's agent), and Kimi's
+    // token line kept for it
+    let copyArgs = pickupArgs(hitView, apply: true, open: "claude", noWindow: true)
+    let fix1OK = copyArgs == ["pickup", "/x/api", "--from", "box", "--there", "/home/me/code/api",
+                              "--session", "019a", "--agent", "codex", "--open", "claude", "--apply",
+                              "--no-window", "--json"]
+        && !pickupArgs(viewOf([:], "pickup"), apply: true, noWindow: true).contains("--no-window")
+        && openCost("kimi", back: false, hook: true, machine: "box").map {
+            $0.contains("Kimi reads the summary in a run of its own first, for Open in and for Copy the Start Line")
+                && $0.contains("uses tokens") && $0.contains("a copy of it on box") } == true
+        && openCost("kimi", back: true, hook: true) != nil
+        && openCost("codex", back: false, hook: true, machine: "box")?.contains("a copy of it on box") == true
+        && pickupOpenText(dryPick, agent: "kimi", machine: "box", hook: true).contains("Kimi reads it in a first run")
+    print("P4 FIX 1 COPY THE START LINE \(fix1OK ? "OK" : "FAIL — \(copyArgs)")")
+    // [2] a hand-back note: Claude Code reads it by itself (aht's hook);
+    // another agent is asked to read it, here and on the other machine
+    let codexBack: [String: Any] = ["applied": true, "mode": "back", "brief": "/srv/api/.aht/handover/relay-8.md",
+                                    "note_for": ["agent": "codex", "session": "019a", "title": "redirect"]]
+    let handedCx = Project(["real_path": "/x/api", "exists": true, "relay": [
+        "id": "20261027-141000-ab12", "from_agent": "codex", "to_agent": "codex", "open": false, "kind": "note",
+        "machine": "pc", "incoming": ["machine": "pc", "kind": "back", "agent": "claude",
+                                      "brief": "/x/api/.aht/handover/relay-20261027-141000-ab12.md",
+                                      "note_for": ["agent": "codex", "session": "019a"]]]])
+    let fix2Said = [noteReader(codexBack, machine: "mac"), noteDoneText(codexBack, machine: "mac"),
+                    handedCx.incoming.map { incomingDetail($0, hook: true) } ?? "-",
+                    handed.incoming.map { incomingDetail($0, hook: true) } ?? "-",
+                    handed.incoming.map { incomingDetail($0, hook: false) } ?? "-"]
+    let fix2OK = noteReads("claude", on: " on mac") == "Claude Code reads it by itself when you continue that session on mac."
+        && noteReads("vibe", file: "x.md") == "Mistral Vibe does not read it by itself: when you continue that session, ask it to read x.md first."
+        && noteReads(nil).contains("another agent does not")
+        && fix2Said[0].contains("Codex does not read it by itself: when you continue that session on mac, ask it to read the note")
+        && fix2Said[1].contains("Codex does not read it by itself") && fix2Said[1].contains("ask it to read .aht/handover/relay-8.md first")
+        && fix2Said[2].contains("Codex does not read it by itself") && fix2Said[2].contains(".aht/handover/relay-20261027-141000-ab12.md")
+        && fix2Said[3].contains("Claude Code reads it by itself when you continue that session.")
+        && fix2Said[4].contains("Claude Code does not read it by itself (aht's hook is off)")
+        && noteReader(noteBack, machine: "mac").contains("Claude Code reads it by itself when you continue that session on mac.")
+        && !(fix2Said + [noteReader(noteBack, machine: "mac"), leftBack]).contains { $0.contains("when it opens again") }
+    print("P4 FIX 2 HAND-BACK NOTE PER AGENT \(fix2OK ? "OK" : "FAIL — \(fix2Said)")")
+    // [3] `pickup_from`: the pickup open here, also under a newer local relay
+    // (Hand Back to box, and the line); null: none; missing: the relay's
+    let pf: [String: Any] = ["machine": "box", "remote": "box", "relay": "20261027-101500-aaaa",
+                             "at": worked.timeIntervalSince1970, "agent": "claude", "session": "s1"]
+    let switched = came(NSNull(), ["kind": "switch", "machine": NSNull(), "from_agent": "claude", "to_agent": "codex"])
+    let pfRow = { (x: Any) -> Project in
+        Project(["real_path": "/x/api", "exists": true, "sessions": 2, "pickup_from": x,
+                 "relay": ["id": "20261027-160000-cccc", "from_agent": "claude", "to_agent": "codex",
+                           "since": worked.timeIntervalSince1970 + 900, "open": true, "kind": "switch",
+                           "machine": NSNull(), "remote": NSNull(), "incoming": NSNull()]])
+    }
+    let pfBoth = pfRow(pf), pfNone = pfRow(NSNull())
+    let unset = pfRow(pf.merging(["remote": NSNull()]) { $1 })
+    let pickedNull = Project(["real_path": "/x/api", "exists": true, "pickup_from": NSNull(),
+                              "relay": ["id": "20261027-141000-ab12", "from_agent": "claude", "to_agent": "codex",
+                                        "open": true, "kind": "pickup", "machine": "mac", "remote": "studio",
+                                        "incoming": ["machine": "mac", "kind": "pickup", "agent": "claude"]]])
+    let fix3OK = pfBoth.pickedUpFrom == "box" && pfBoth.handBack != nil && pfBoth.incoming == nil
+        && pfBoth.pickedUp?.kind == "pickup" && pfBoth.pickedUp?.agent == "claude"
+        && incomingLine(pfBoth.pickedUp!) == "Picked up from box at \(clock(worked)), where Claude Code worked"
+        && machineItems(pfBoth, ["box", "mini"]).first?.title == "Hand Back to box…"
+        && machineItems(pfBoth, ["box", "mini"]).first?.kind == "back"
+        && switchItems(pfBoth, ["codex"]).first?.title == "Hand Back to Claude Code (its own session)…"
+        && pfNone.pickedUp == nil && pfNone.pickedUpFrom == nil && machineItems(pfNone, ["box"]).first?.kind == "pickup"
+        && unset.pickedUp != nil && unset.pickedUpFrom == nil && machineItems(unset, ["box"]).first?.kind == "pickup"
+        && pickedNull.pickedUpFrom == nil && pickedNull.pickedUp == nil && pickedNull.incoming?.isNote == false
+        && switched.pickedUpFrom == nil && picked.pickedUpFrom == "studio" && picked.pickedUp?.machine == "mac"
+    print("P4 FIX 3 PICKUP_FROM \(fix3OK ? "OK" : "FAIL — \(machineItems(pfBoth, ["box"]).map { $0.title })")")
+    // [4] a Windows PC answers no other machine: not in the Machines menu
+    let mixed = machinesFrom(["pc": ["ssh": "me@pc", "system": "Windows"], "box": ["ssh": "me@box", "system": "Linux"],
+                              "mini": ["ssh": "me@mini", "system": "Darwin"], "old": ["ssh": "me@old"]])
+    let fix4OK = askableMachines(mixed) == ["box", "mini", "old"]
+        && !machineItems(local, askableMachines(mixed)).contains { $0.machine == "pc" }
+        && askableMachines(machinesFrom(["pc": ["ssh": "me@pc", "system": "Windows"]])).isEmpty
+    print("P4 FIX 4 NO WINDOWS IN MACHINES MENU \(fix4OK ? "OK" : "FAIL — \(askableMachines(mixed))")")
+    // … and the core's phase-4 samples: AHT_FIXTURES_PHASE4
+    var phase4OK = true
+    let dir4 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE4"] ?? ""
+    if !dir4.isEmpty && FileManager.default.fileExists(atPath: dir4) {
+        var miss: [String] = []
+        func sample(_ n: String) -> [String: Any] {
+            let f = URL(fileURLWithPath: dir4).appendingPathComponent(n)
+            guard let data = try? Data(contentsOf: f) else { miss.append(n + " (missing)"); return [:] }
+            let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if d == nil { miss.append(n + " (not JSON)") }
+            return d ?? [:]
+        }
+        let contract = ["match", "source", "git", "brief", "relay", "applied", "opened", "command_line"]
+        // a `how` the app has no words for reads "by <how>"
+        let unknownHow = { (h: String?) in matchHow(h).text.isEmpty || matchHow(h).text == "by " + (h ?? "") }
+        func view(_ d: [String: Any], _ kind: String) -> PickupView {
+            var v = PickupView(project: Project(["real_path": d["project"] as? String ?? "/x", "exists": true]),
+                               machine: (d["machine"] ?? d["from"] ?? d["on"]) as? String ?? "box", kind: kind)
+            (v.loading, v.dry) = (false, d)
+            return v
+        }
+        // the dry run: every field of the contract, a folder found in words the
+        // app knows, the sessions there, a summary to show, and the Open in text
+        let pk = sample("pickup.json")
+        let pkm = thereMatch(pk), pkv = view(pk, "pickup")
+        let agent = pickupAgent(pk, installed: SWITCH_AGENTS) ?? ""
+        if contract.contains(where: { pk[$0] == nil }) || pk["applied"] as? Bool != false
+            || pkm.path == nil || unknownHow(pkm.how)
+            || thereSessions(pk).isEmpty || pickupBrief(pk).text == nil
+            || (matchHow(pkm.how).sure && !pickupReady(pkv))
+            || pickupIsBack(pk) || AGENT_LABEL[agent] == nil
+            || !pickupOpenText(pk, agent: agent, machine: pkv.machine, hook: true)
+                .hasPrefix(AGENT_LABEL[agent] ?? "?")
+            || thereSessions(pk).contains(where: { AGENT_LABEL[$0.agent] == nil })
+            || ((pk["sessions"] as? [[String: Any]]) ?? []).contains(where: { r in
+                let st = thereSessions(["sessions": [r]]).first?.state
+                return st != (r["working"] as? Bool == true ? "working" : r["open"] as? Bool == true ? "open" : nil)
+            })
+            || ((pk["git"] as? [String: Any])?["warning"] as? String).map({ w in
+                otherWarnings(pk).contains(w) || gitWarning(pk, machine: pkv.machine) != w }) == true
+            || !["full", "catchup", "full+catchup"].contains(pk["brief_kind"] as? String ?? "")
+            || (pk["git"] is [String: Any] && gitWarning(pk, machine: pkv.machine) == nil
+                && ((pk["git"] as? [String: Any])?["there"] as? [String: Any]).map {
+                    ($0["dirty"] as? Int ?? 0) + ($0["ahead"] as? Int ?? 0) > 0 } == true) {
+            miss.append("pickup.json")
+        }
+        // two folders could be the project: blocked, each one listed to pick
+        let bl = sample("pickup_blocked.json")
+        let blm = thereMatch(bl)
+        var picked4 = view(bl, "pickup")
+        picked4.there = blm.candidates.first
+        if blm.path != nil || blm.candidates.count < 2 || pickupReady(view(bl, "pickup"))
+            || !pickupArgs(picked4).contains(blm.candidates.first ?? "\u{0}")
+            || !matchProblem(blm, machine: "box").hasPrefix("\(blm.candidates.count) folders")
+            || Set(blm.candidates).count != blm.candidates.count {
+            miss.append("pickup_blocked.json")
+        }
+        // back mode: the session the work left goes on, reading what changed
+        let bk = sample("pickup_back.json")
+        let bkAgent = pickupAgent(bk, installed: []) ?? ""
+        if contract.contains(where: { bk[$0] == nil }) || !pickupIsBack(bk) || pickupTarget(bk) == nil
+            || !(bk["brief_kind"] as? String ?? "").contains("catchup") || !(bk["back_of"] is String)
+            || AGENT_LABEL[bkAgent] == nil
+            || !pickupOpenText(bk, agent: bkAgent, machine: "box", hook: true).contains("goes on in its own session")
+            || pickupBrief(bk).text == nil && pickupBrief(bk).file == nil {
+            miss.append("pickup_back.json")
+        }
+        // a note: where it goes, what it says, and for whom
+        let ln = sample("leave_note.json")
+        let lnm = thereMatch(ln)
+        if ln["applied"] == nil || lnm.path == nil || unknownHow(lnm.how)
+            || (pickupBrief(ln).text == nil && pickupBrief(ln).file == nil)
+            || (ln["note_for"] != nil && !(ln["note_for"] is NSNull) && noteFor(ln) == nil)
+            || noteReader(ln, machine: "box").isEmpty
+            || ((ln["applied"] as? Bool == true) && pickupProblems(ln) == nil
+                && noteDoneText(ln, machine: "box").hasPrefix("The note was not left")) {
+            miss.append("leave_note.json")
+        }
+        // projects: each row with work from another machine names it, and a
+        // pickup gets Hand Back to that machine first in the Machines menu
+        let pj = sample("projects.json")
+        let rows = (pj["projects"] as? [[String: Any]]) ?? (pj.isEmpty ? [] : [pj])
+        let came = rows.filter { r in
+            let inc = (r["relay"] as? [String: Any])?["incoming"]
+            return inc is [String: Any] || inc as? Bool == true
+        }
+        if came.isEmpty { miss.append("projects.json (no row with relay.incoming)") }
+        for r in came {
+            let p = Project(r)
+            guard let i = p.incoming else { miss.append("projects.json (incoming without its machine)"); continue }
+            let first = machineItems(p, [i.name]).first
+            let rl = (r["relay"] as? [String: Any]) ?? [:]
+            let remote = rl["remote"] as? String
+            if i.at == nil || !incomingLine(i).contains(i.name) || p.relay?.machine == nil && p.relay != nil
+                || (remote != nil && i.name != remote)
+                || (i.kind == "pickup" && (first?.title != "Hand Back to \(i.name)…" || p.pickedUpFrom != i.name))
+                || (i.kind != "pickup" && first?.kind == "back")
+                || (i.isNote && i.brief == nil) || p.handBack != nil {
+                miss.append("projects.json")
+            }
+        }
+        // a newer core's `pickup_from`: the pickup open here, by its machine
+        for r in rows where r.keys.contains("pickup_from") {
+            let p = Project(r)
+            guard let f = r["pickup_from"] as? [String: Any] else {
+                if !(r["pickup_from"] is NSNull) || p.pickedUp != nil { miss.append("projects.json (pickup_from)") }
+                continue
+            }
+            let remote = f["remote"] as? String
+            if p.pickedUp?.kind != "pickup" || p.pickedUp?.at == nil || p.pickedUpFrom != remote
+                || (remote != nil && machineItems(p, [remote!]).first?.title != "Hand Back to \(remote!)…")
+                || ["machine", "remote", "relay", "at", "agent", "session"].contains(where: { f[$0] == nil }) {
+                miss.append("projects.json (pickup_from)")
+            }
+        }
+        miss = miss.filter { !miss.contains($0 + " (missing)") && !miss.contains($0 + " (not JSON)") }
+        phase4OK = miss.isEmpty
+        print("PHASE 4 SAMPLES \(phase4OK ? "OK" : "FAIL \(miss)") — \(dir4)")
+    } else {
+        print("PHASE 4 SAMPLES not checked (" + (dir4.isEmpty ? "AHT_FIXTURES_PHASE4 names no folder"
+                                                       : "no samples in \(dir4) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -8605,7 +9897,8 @@ if CommandLine.arguments.contains("--selftest") {
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
          && releaseOK && pauseOK && backOnOK && offsiteOK && relayOK && dialogOK && samplesOK
-         && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK ? 0 : 1)
+         && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
+         && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -8683,7 +9976,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
 // snapshot: the window's tabs (and its dialogs) as PNG files, to look at a
 // layout without clicking through it (needs a login session; nothing changes)
 //   --snapshot DIR [--select-first] [--query WORDS]
-//              [--corner-only | --welcome-only | --handover-only | --machines-only]
+//              [--corner-only | --welcome-only | --handover-only | --machines-only
+//               | --pickup-only]
 /// --dark renders in the dark appearance; the window's own background is
 /// drawn under every snapshot, so the PNG is opaque (a transparent one is
 /// unreadable on a page of the other colour)
@@ -8827,6 +10121,180 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
             (demo.query, demo.searched) = ((se["query"] as? String) ?? "", se["query"] as? String)
             (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(se), searchMissed(se), searchAsked(se))
             snapshot(MainView().environmentObject(demo), dir + "/search-sample.png", NSSize(width: 900, height: 620))
+        }
+        exit(0)
+    }
+    if args.contains("--pickup-only") {
+        // Pick Up and Leave a Note: the sheet in each state, the banner when a
+        // note arrived, the line over a pickup, Continue Here… on another
+        // machine's hit; made-up rows in the shape of the core's JSON, then the
+        // core's own samples (AHT_FIXTURES_PHASE4) when there are some.
+        // Nothing asks the core or another machine.
+        let now = Date().timeIntervalSince1970
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 4", "tracked": 6, "hook_installed": true,
+                       "agent_clis": ["claude": "/x/claude", "codex": "/x/codex", "kimi": "/x/kimi",
+                                      "agy": NSNull(), "vibe": NSNull()],
+                       "handover": ["supported": true, "can_reach": true, "default_remote": "box", "remotes": [
+                           "box": ["ssh": "me@box", "watch": true, "system": "Linux"],
+                           "pc": ["ssh": "me@pc", "watch": false, "system": "Windows"]]]]
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+        let row = { (name: String, incoming: [String: Any]) -> Project in
+            Project(["real_path": home + "/code/" + name, "exists": true, "sessions": 5, "bytes": 3_100_000,
+                     "agents": ["claude", "codex"],
+                     "relay": ["id": "20261027-164000-k3f9", "from_agent": "codex", "to_agent": "claude",
+                               "since": now - 1200, "open": true, "incoming": incoming]])
+        }
+        demo.projects = [
+            row("api", ["machine": "pc", "kind": "note", "agent": "codex", "brief": "relay-20261027-164000-k3f9.md",
+                        "worked_from": now - 10200, "worked_to": now - 1200]),
+            row("paper", ["machine": "box", "kind": "pickup", "agent": "codex"]),
+            row("site", ["machine": "pc", "kind": "back", "agent": "codex", "brief": "relay-20261027-164000-k3f9.md",
+                         "worked_from": now - 10200, "worked_to": now - 1200,
+                         "note_for": ["agent": "claude", "session": "0f3a"]])]
+        for (p, name) in zip(demo.projects, ["note-arrived", "picked-up", "handed-back"]) {
+            demo.selection = p.path
+            snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                     dir + "/detail-\(name).png", NSSize(width: 900, height: 176))
+        }
+        let paper = demo.projects[1]
+        let brief = """
+            # Picked up from box
+
+            From **Codex** on box (Linux), session “fix the login redirect”, last turn 16:40. \
+            The folder there: /home/me/code/paper.
+
+            ## Where things stood
+
+            The login redirect now keeps the page the user came from; the cookie check moved \
+            into `auth/session.py`. The redirect tests pass; logout is still open.
+
+            ## The latest exchanges
+
+            - **you, 16:12:** after login the redirect goes to / instead of the page I was on
+            - **Codex, 16:20:** `next` is kept in `auth/views.py`; added `test_login_keeps_page`.
+            - **you, 16:35:** make sure the key sk-…a3f9 is never logged
+            - **Codex, 16:40:** the logger masks it now.
+
+            ## Open to-dos
+
+            - logout clears the `next` cookie
+            - a line in the changelog
+
+            ## Files changed recently
+
+            - auth/views.py
+            - auth/session.py
+            - tests/test_login.py
+
+            ## Git there
+
+            Branch fix-login, HEAD 9f8e7d6 “keep the page after login”; 2 commits not pushed; \
+            6 files not committed.
+            """
+        let line = "/opt/homebrew/bin/codex 'You are taking over this project from Codex on box. Read "
+            + ".aht/handover/relay-20261027-164512-p4c1.md first: it records where the work stood.'"
+        let dry: [String: Any] = [
+            "command": "pickup", "applied": false, "blockers": [], "warnings": [], "mode": "new",
+            "project": paper.path, "machine": "box",
+            "match": ["path": "/home/me/code/paper", "how": "id", "candidates": []],
+            "source": ["machine": "box", "agent": "codex", "session": "019a", "title": "fix the login redirect"],
+            "sessions": [
+                ["agent": "codex", "id": "019a", "title": "fix the login redirect", "updated": now - 300,
+                 "state": "working"],
+                ["agent": "claude", "id": "0f3a", "title": "cookie check", "updated": now - 7200],
+                ["agent": "kimi", "id": "k-77", "title": "changelog", "updated": now - 86400 * 2]],
+            "git": ["warning": "On box: branch fix-login, 2 commits not pushed, 6 files not committed. "
+                        + "Commit and push there, then pull here."],
+            "brief": brief, "relay": NSNull(), "opened": NSNull(), "command_line": NSNull()]
+        func sheet(_ d: [String: Any], _ name: String, kind: String = "pickup", project: Project? = nil,
+                   machine: String = "box", _ change: (inout PickupView) -> Void = { _ in }) {
+            var v = PickupView(project: project ?? paper, machine: machine, kind: kind)
+            (v.loading, v.dry) = (false, d)
+            v.open = pickupAgent(d, installed: demo.agentCLIs)
+            change(&v)
+            demo.pickup = v
+            snapshot(PickupSheet().environmentObject(demo), dir + "/sheet-\(name).png",
+                     NSSize(width: 660, height: 640))
+        }
+        sheet(dry, "pickup")
+        sheet(dry.merging(["match": ["path": "/home/me/src/paper", "how": "home", "candidates": []]]) { $1 },
+              "pickup-confirm")
+        sheet(dry.merging(["blockers": ["2 folders on box could be this project: pick one (--there)"],
+                           "match": ["path": NSNull(), "how": NSNull(),
+                                     "candidates": ["/home/me/code/paper", "/home/me/old/paper"]],
+                           "sessions": [], "brief": NSNull(), "git": NSNull()]) { $1 }, "pickup-blocked")
+        sheet(dry.merging(["mode": "back", "target": "claude",
+                           "brief": brief.replacingOccurrences(of: "# Picked up from box",
+                                                               with: "# Back from box: what changed")]) { $1 },
+              "pickup-back")
+        sheet(dry, "pickup-done") { v in
+            v.done = ["applied": true, "opened": NSNull(), "command_line": line,
+                      "brief": paper.path + "/.aht/handover/relay-20261027-164512-p4c1.md"]
+            v.copied = true
+        }
+        sheet([:], "pickup-unreachable") { v in
+            v.said = "ssh: connect to host box port 22: Operation timed out"
+        }
+        let api = demo.projects[0]
+        let note: [String: Any] = [
+            "command": "leave-note", "applied": false, "blockers": [], "warnings": [], "mode": "new",
+            "project": api.path, "machine": "pc",
+            "match": ["path": "C:\\Users\\me\\code\\api", "how": "id", "candidates": []],
+            "source": ["agent": "claude", "session": "0f3a", "title": "rate limits"],
+            "git": ["warning": "Here: 1 commit not pushed. Push here, then pull on pc."],
+            "brief": brief.replacingOccurrences(of: "# Picked up from box", with: "# A note from this Mac"),
+            "note_for": NSNull(), "relay": NSNull()]
+        sheet(note, "leave-note", kind: "note", project: api, machine: "pc")
+        sheet(note.merging(["mode": "back", "note_for": ["agent": "codex", "session": "019a",
+                                                          "title": "fix the login redirect"]]) { $1 },
+              "hand-back", kind: "note", project: api, machine: "pc") { $0.back = true }
+        demo.pickup = nil
+        // Search: another machine's hit offers Continue Here…
+        let hit = { (machine: Any, title: String, p: String, ago: Double) -> [String: Any] in
+            ["machine": machine, "agent": "codex", "session": UUID().uuidString, "project": p, "title": title,
+             "live": true, "updated": now - ago,
+             "hits": [["role": "user", "snippet": "the \u{02}login\u{03} \u{02}redirect\u{03} goes to /"]]]
+        }
+        let found: [String: Any] = ["query": "login redirect", "results": [
+            hit(NSNull(), "auth tests", home + "/code/paper", 86400 * 3),
+            hit("box", "fix the login redirect", "/home/me/code/paper", 300)],
+            "machines": [["machine": "box", "reachable": true, "indexed": true, "index_at": now - 60,
+                          "results": 1, "error": NSNull()]]]
+        demo.tab = .search
+        demo.searchEverywhere = true
+        (demo.query, demo.searched) = ("login redirect", "login redirect")
+        (demo.hits, demo.searchMisses, demo.searchedOn) = (searchHits(found), searchMissed(found), searchAsked(found))
+        snapshot(MainView().environmentObject(demo), dir + "/search-continue-here.png",
+                 NSSize(width: 900, height: 420))
+        // the core's samples, when it has written them
+        let dir4 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE4"] ?? ""
+        if !dir4.isEmpty && FileManager.default.fileExists(atPath: dir4) {
+            func sample(_ n: String) -> [String: Any] {
+                let data = try? Data(contentsOf: URL(fileURLWithPath: dir4).appendingPathComponent(n))
+                return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] ?? [:]
+            }
+            let at = { (d: [String: Any]) -> Project in
+                Project(["real_path": d["project"] as? String ?? paper.path, "exists": true])
+            }
+            for (n, kind) in [("pickup", "pickup"), ("pickup_blocked", "pickup"), ("pickup_back", "pickup"),
+                              ("leave_note", "note")] {
+                let d = sample(n + ".json")
+                sheet(d, n.replacingOccurrences(of: "_", with: "-") + "-sample", kind: kind, project: at(d),
+                      machine: (d["machine"] ?? d["from"] ?? d["on"]) as? String ?? "box")
+            }
+            demo.pickup = nil
+            let pj = sample("projects.json")
+            let rows = ((pj["projects"] as? [[String: Any]]) ?? (pj.isEmpty ? [] : [pj])).map(Project.init)
+                .filter { $0.incoming != nil }
+            demo.projects = rows
+            for (k, p) in rows.prefix(4).enumerated() {
+                demo.selection = p.path
+                snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                         dir + "/detail-sample-\(k + 1).png", NSSize(width: 900, height: 176))
+            }
         }
         exit(0)
     }

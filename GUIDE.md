@@ -226,8 +226,9 @@ Getting started.
   that is done, Claude's usage limit, a new version. On Windows a click on
   one opens the window.
 - **Your other machines from Windows:** a PC asks your Mac and Linux
-  machines what runs there, watches them and searches them (see *A
-  Windows PC with your other machines*). Handover, keeping in sync,
+  machines what runs there, watches them, searches them, picks up their
+  work and leaves notes on them (see *A Windows PC with your other
+  machines*). Handover, keeping in sync,
   backups on another machine and the night shift do not work from Windows
   yet; the Machines tab says so.
 - **Start at login:** Settings → This computer → *Start aht's tray at
@@ -275,8 +276,8 @@ Getting started.
 ## A Windows PC with your other machines
 
 From a Windows PC, aht can ask your Mac and Linux machines what runs
-there. It uses Windows' own ssh. The PC always does the asking and is
-never asked itself, so it needs no ssh server.
+there, and pick up their work. It uses Windows' own ssh. The PC always does
+the asking and is never asked itself, so it needs no ssh server.
 
 > **Example.** A long Claude Code session runs on your Linux box at home.
 > On the PC at work you add it under **Machines → Add a Machine…** as
@@ -335,7 +336,12 @@ and press **Check…**. Its rows come in two groups:
 - **Watch** a machine: the tray tells you when a session there waits for
   you or is done (see *Hand a project over to another machine*);
 - search their sessions too, with **Also on my other machines** (see
-  *Search every session*).
+  *Search every session*);
+- **Pick Up** a project's work from them, and **Leave a Note** on them
+  before you leave the PC (**Machines** under the project; see *Pick up on
+  another machine*). Since no machine can ask the PC, the PC starts every
+  exchange: Pick Up from the Mac when you sit down, and Leave a Note (or
+  Hand Back) on the Mac before you go.
 
 **What it cannot do yet:**
 
@@ -343,7 +349,8 @@ and press **Check…**. Its rows come in two groups:
   another machine or plan a night shift;
 - be asked by another machine. Adding a PC as a machine on a Mac or on
   Linux stops with *aht cannot ask a Windows machine yet*, and makes
-  nothing on the PC.
+  nothing on the PC. So a Mac cannot pick up work from the PC or leave a
+  note on it.
 
 **In the terminal:**
 
@@ -355,6 +362,11 @@ and press **Check…**. Its rows come in two groups:
 - `aht board` — list the open sessions here and on your other machines.
 - `aht search deploy --everywhere` — search here and on your other
   machines.
+- `aht pickup $HOME\Desktop\paper --from homebox` — show what picking up
+  paper's work from homebox would bring (in PowerShell); `--open codex
+  --apply` writes the summary and opens Codex with it.
+- `aht leave-note $HOME\Desktop\paper --on homebox --apply` — leave a
+  summary of the work here in paper's folder on homebox.
 
 ## New versions
 
@@ -418,18 +430,23 @@ Uses tokens**, or when you first use them:
 Some spend tokens only when you ask for them, each time: **Switch Agent**
 (the agent that goes on reads a summary, or a catch-up in its own session:
 one turn), **Hand Back** to Codex, Kimi Code, Antigravity or Mistral Vibe
-(one turn of that agent) and **Hand Over** with a task (the session starts
-on it). Hand Back to Claude Code runs no turn: the catch-up is in the
-session when it opens, and Claude reads it with your next message. Writing
-a summary, **Summary Only** and `aht relays` spend nothing (see *Continue
-in another agent*).
+(one turn of that agent), **Hand Over** with a task (the session starts
+on it) and **Pick Up** with **Open in** (the agent opened here reads the
+summary from the other machine: one turn). Hand Back to Claude Code runs no
+turn: the catch-up is in the session when it opens, and Claude reads it
+with your next message. Writing a summary, **Summary Only**, `aht relays`,
+a Pick Up that opens nothing and **Leave a Note** spend nothing (see
+*Continue in another agent* and *Pick up on another machine*).
 
 A handed-over project also puts one sentence into a new Claude session in
 its folder, so the session knows the project is away, that a handover of it
 did not finish yet, or that it has just come back or was released. In the
 same way, a Claude session that another agent took the work over from gets
 one line when you resume it yourself: who worked on the project since, and
-where the summary is.
+where the summary is. After a Pick Up or a note, the next Claude session in
+the folder on the machine the work came to gets one line, once, and a Claude
+session that starts on the machine the work left gets one line while the
+work is out (see *Pick up on another machine*).
 
 ## Folders that move keep their history
 
@@ -587,8 +604,12 @@ that were deleted since and live on only in a backup.
   machine), and each of your other machines searches its own index too,
   all at once, with up to 20 seconds each. This computer's results come
   first; each one from another machine carries that machine's name, and
-  offers no Resume or Restore, since those act here. A line names each
-  machine that could not be searched, and why: it was not reachable, or
+  offers no Resume or Restore, since those act here, but **Continue
+  Here…**: it picks up that session's work from that machine into the
+  project's folder here (see *Pick up on another machine*). That folder is
+  the one aht tracks under the same name; when there is none, or more than
+  one, you choose it. A line names each machine that could not be
+  searched, and why: it was not reachable, or
   *no search index (aht is not installed there)*. *Also searched:* lists
   the others, with how many results each gave and when its index was last
   updated. aht builds no index there and changes none, and keeps nothing
@@ -1638,6 +1659,151 @@ before the session there starts says *did not finish* at once.
   project it refuses, and names `aht reclaim … --release` for each);
   `aht remote check all` checks every machine.
 
+## Pick up on another machine
+
+Go on with a project's work on another machine of yours, in any agent, and
+give it back later. Only the context moves: a summary of the latest
+session there, made and masked on that machine. git moves the files. Unlike
+a handover, each machine keeps its own copy of the project, a clone of the
+same repository for example, and the copies may sit at different paths.
+
+> **Example.** In the evening you worked on paper with Claude Code on your
+> Mac. In the morning, on the PC at work, you select paper → **Machines →
+> Pick Up from mac…**. The sheet says where aht found paper on the mac
+> (*found by its project id*), lists the latest sessions there and says what
+> git still has to do, since the summary carries no files: *The two copies
+> are at different commits (mac 817965a, here cbc07b5): bring them together
+> with git before going on.* Below it is the summary: where things stood,
+> the latest exchanges, the open to-dos and git. You run `git pull`, choose
+> Codex under **Open in** and press **Open in Codex**. Codex opens and reads
+> the summary first. Before you leave, **Machines → Hand Back to mac…**
+> leaves a note in paper's folder on the mac. At home, paper shows *pc
+> handed this project back at 17:30: Codex worked there from 09:10 to
+> 17:20*. **Continue Session** opens your Claude session where it stopped,
+> and it learns what Codex did on the PC.
+
+- **The summary** goes into the project's `.aht/handover/` here, which git
+  ignores. The other machine builds it from its own histories and masks
+  there the keys and passwords aht recognises (aht masks it again here).
+  It holds where things stood, the latest exchanges, the open to-dos, the
+  files changed last and the state of git, and names the session it
+  continues and how to go back to it there. Any agent can go on from any
+  other: Claude Code, Codex, Kimi Code, Antigravity or Mistral Vibe.
+- **Which session.** The latest one in that folder there; scripted
+  `claude -p` runs do not count. The sheet lists the latest sessions there,
+  marked *open there* or *working*, and a click picks another one. When a
+  session there is working right now, aht warns that its latest turns may
+  be missing from the summary.
+- **How aht finds the folder there**, in this order:
+  1. the project's id: in that machine's list of projects, or in the
+     `.aht/.project-id` of a folder at the same path or the same place in
+     the home folder there;
+  2. the same git origin (compared without user name or password) and the
+     same first commit, among the repositories in the folders aht watches
+     there;
+  3. the same path;
+  4. the same place in the home folder (`~/code/paper` on both).
+
+  The first of these that finds anything decides, and the sheet says which
+  (*found by its git origin*). A folder found any other way than by its id
+  could be another project: on a Mac you tick *This is the same project*
+  first; aht's window says *check that it is the same project*.
+- **Two folders, or none.** When the same way finds two folders (two clones
+  of one repository, say), aht takes neither and lists both: *2 folders on
+  box could be this project (by its git origin): /home/me/code/paper;
+  /home/me/code/paper-copy*. Pick one. When aht finds none, type the
+  folder's path there and press **Look There**. In the terminal,
+  `--there PATH` names it.
+- **git.** The summary moves no files. The sheet compares git on both
+  machines and says what to do first: *On box: branch main, 1 commit not
+  pushed, 1 file not committed. Commit and push there, then pull here.*, or
+  that the two copies are at different commits, or that one folder holds
+  no git repository. The same words head the summary, so the agent reads
+  them too. aht never pulls, pushes or fetches for you.
+- **Open in, or not.** **Open in Codex** (or the agent you choose among
+  those installed here) writes the summary and starts that agent with it in
+  a new terminal window. **Copy the Start Line** writes the summary, opens
+  nothing and puts the line that starts the agent on the clipboard.
+  **Cancel** (in aht's window, **Done**) writes nothing. Before an agent
+  starts, the checks of *Continue in another agent* apply: not while a
+  Claude session in the project here works or waits for you.
+- **Back mode: the work comes back.** When the work went from here to that
+  machine (you left a note on it, or it picked the work up from here), Pick
+  Up from it brings the work back: the summary is a catch-up of what
+  happened there since, and the session here that the work left from goes
+  on (**Open Claude Code's Session** on a Mac). When that session is gone,
+  a new session reads the full summary and the catch-up, and aht says so;
+  another agent you open instead reads both too. The other way round,
+  while work that came from box is here (you picked it up from box, or box
+  left a note here), Leave a Note on box hands it back: a note for the
+  session on box that the work came from, with only what happened here
+  since. After a Pick Up from box, **Machines** offers it first, as **Hand
+  Back to box…**. `--full` gives a full summary instead.
+- **Leave a Note** (**Machines → Leave a Note on box…**) puts a summary of
+  the latest work here into the project's folder on box before you go.
+  Nothing runs there. aht only adds files there and never replaces one;
+  when the note cannot be written there, nothing is kept here either.
+- **When a note arrives** on a machine where aht is installed:
+  - a notice says so, once: *pc left a note on paper* (*from Codex: “fix
+    the login redirect”*), or *pc handed paper back* (*Codex worked
+    09:10–17:20*). On the machine the work left from, it is *pc picked up
+    paper* (*… work may go on there*). With *Also send them to my phone*
+    set on that machine, the notice reaches your phone too.
+  - the project shows the note: *pc left a note at 17:30: Codex worked
+    there* (in aht's window, *A note from pc*), with **Read the Note…**
+    and, when the note hands work back to a session here, **Continue
+    Session** (in aht's window, **Continue That Session**). A Claude Code
+    session gets its catch-up from aht's hook as it opens, once.
+  - the next Claude Code session in the folder gets one line from aht's
+    hook, once: *[aht] “pc” left a note about this project at 17:30 (Codex
+    had worked on it there). If the user asks to continue that work, read
+    .aht/handover/relay-….md first.* It reads the note only if you ask.
+  - on the machine the work left from, a Claude session that starts in the
+    folder while the work is out hears *[aht] This project was picked up on
+    “pc” at 09:10 (Codex). Work may go on there: if the user asks to
+    continue that work, check with them before changing anything here.*
+- **A PC starts every exchange.** No machine can ask a Windows PC. So at
+  the PC, Pick Up from the Mac; before you leave the PC, Leave a Note (or
+  Hand Back) on the Mac. Aimed at a PC, both stop with *aht cannot ask a
+  Windows machine yet. On the PC, use Pick Up or Leave a Note.*
+- **What it costs.** Writing the summary costs nothing: aht reads the
+  histories itself. **Open in** makes the agent read the summary as its
+  first turn, which uses tokens (Kimi reads it in a run of its own before
+  its window opens). When the work comes back to Claude Code's own session,
+  aht's hook gives it the catch-up as it opens, and nothing runs until you
+  type. The summary alone (Copy the Start Line, or `--apply` without
+  `--open`) and Leave a Note spend nothing.
+- **Both machines keep the record.** Each exchange leaves a small record
+  next to its summary in the project's `.aht/handover/`, here and there:
+  Pick Up leaves a copy of its record and its summary on the machine it
+  picked up from. `aht relays` lists them (*Pick up*, *Note*).
+- **What it needs:** the other machine added under **Machines** (see *Hand a
+  project over to another machine*, or from a PC *A Windows PC with your
+  other machines*), with its *For asking* rows in **Check** all ✓.
+
+**In the terminal:**
+
+- `aht pickup ~/Desktop/paper --from box` — say where paper is on box and
+  how aht found it, which session there it would go on from, and what git
+  still has to do; nothing is written.
+- `aht pickup ~/Desktop/paper --from box --apply` — write the summary into
+  paper's `.aht/handover/` here and leave a copy of it and its record on
+  box; nothing opens.
+- `aht pickup ~/Desktop/paper --from box --open codex --apply` — the same,
+  then Codex opens here with the summary (one turn: uses tokens).
+- `aht pickup ~/Desktop/paper --from box --session <id>` — go on from that
+  session there; `--agent codex` goes on from Codex's latest one there.
+- `aht pickup ~/Desktop/paper --from box --there /home/me/code/paper` — use
+  that folder on box, when aht found none or two.
+- `aht pickup ~/Desktop/paper --from box --full --apply` — a full summary,
+  also when the work comes back.
+- `aht leave-note ~/Desktop/paper --on box` — say what the note holds and
+  where it would go on box; `--apply` leaves it. While work that came from
+  box is here, it hands the work back; `--full` leaves a full summary
+  instead, and `--there PATH` names the folder there.
+- `aht relays ~/Desktop/paper` — every hand-off of the project, also those
+  across machines.
+
 ## The night shift (uses tokens, off by default)
 
 Plan a handover with a task for the evening, and aht takes the project back
@@ -1844,7 +2010,10 @@ a part opens its section; the **?** at the top opens the whole guide.
   handover is unfinished, a note with **Check Now** and **Release…** (see
   *Hand a project over to another machine*); **Keep in sync**;
   **Continue Session** (opens the latest session in a new terminal window);
-  **Switch Agent**; **More**, with *Show Sessions…*, *What Changed…*,
+  **Switch Agent**; **Machines**, once you added one, with *Pick Up from
+  box…*, *Leave a Note on box…* and, while work picked up from box is
+  here, *Hand Back to box…* (see *Pick up on another machine*); **More**,
+  with *Show Sessions…*, *What Changed…*,
   *Undo a Session…*, *Journal*, *AI-Use Statement*, *Share a Session…*,
   *Project Rules…*, *Check for Secrets*, *Second Opinion…*, *Night Shift…*
   and *Show in Finder*. Notes about the project, such as the usage limit,
@@ -1855,7 +2024,8 @@ a part opens its section; the **?** at the top opens the whole guide.
   **Restore Workspace…**, **Name Sessions After Their Tabs…** and
   **Refresh**.
 - **Search tab:** the search over all sessions, and *Also on my other
-  machines*; *Resume*, *Restore…* and *Show Project* on each result.
+  machines*; *Resume*, *Restore…* and *Show Project* on each result, and
+  *Continue Here…* on one from another machine.
 - **Machines tab:** the machines you added, with **Sync** (keep every
   project in sync with it, or stop), **Check**, **Use for Handover** and
   **Remove…** (refused, with the reason, while the machine holds a

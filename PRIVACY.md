@@ -64,7 +64,8 @@ switch agents off (`backends`) or point aht at other folders
 - the folders under the roots it watches (`watch_roots`): their names and
   paths, to notice moves, copies and renames, and their git status for the
   folder badges and `aht loose-ends`;
-- for a switch's summary and its catch-up, the project's git state: its
+- for the summaries and catch-ups of a switch, Pick Up and Leave a Note,
+  the project's git state: its
   branch, latest commits and their subjects, how far it is ahead of or
   behind its upstream, and which files are not committed or changed since
   a commit.  aht never fetches, and masks the subjects and file names;
@@ -141,17 +142,24 @@ switch agents off (`backends`) or point aht at other folders
   project's instruction files with `aht rules --unify --apply`, and files
   put back with `aht undo --apply` or `aht changes --revert --apply`.
   Whatever these replace is set aside in `~/.aht` first;
-- only when you hand a project over or switch agents, in `.aht/handover/`:
-  a handover's summary, and for each switch and Hand Back a record of who
-  handed the work to whom, `relay-<id>.json` (this computer's name, its
-  random id from `machine.json` and its system; the project's path and
-  identifier; the two agents, their session ids and the session's title,
-  masked; when; and the git branch, the latest commit, and how many files
-  were not committed and commits not pushed), its summary `relay-<id>.md`
+- only when you hand a project over, switch agents, or pick up work or
+  leave a note across machines, in `.aht/handover/`: a handover's summary,
+  and for each switch, Hand Back, Pick Up and note a record of who handed
+  the work to whom, `relay-<id>.json` (this computer's name, its random id
+  from `machine.json` and its system; for a Pick Up or a note also the
+  other machine's name in aht, its random id and its system, and the
+  project's path there; the project's path and identifier; the two
+  agents, their session ids and the session's title, masked; when; and the
+  git branch, the latest commit, and how many files were not committed and
+  commits not pushed), its summary `relay-<id>.md`
   (exchanges, to-dos, file names, git state and commit subjects, with keys
   masked), and later small markers: `relay-<id>.closed` (what answered it,
   and when) and `relay-<id>.told` (the session told of it, and when).
-  Every hand-off still open and the newest 12 others are kept.  Like
+  Every hand-off still open and the newest 12 others are kept.  Your
+  other machines add the same files to a project here when they pick its
+  work up from this computer or leave a note here, and this computer adds
+  them to the project's folder there (see
+  [What can leave your device](#what-can-leave-your-device)).  Like
   `.aht/journal/`, the folder carries its own `.gitignore`, so git leaves
   it out.  A record that came with the folder all the same (a repository
   that committed one) is read only as aht writes them: a machine's name of
@@ -198,7 +206,7 @@ encrypt it.
 | What | What it holds | How long it is kept |
 |---|---|---|
 | `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`) and whether you watch it (`remotes.<name>.watch`) | until you delete it, or `aht uninstall --purge` |
-| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, or writes a record of a switch into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
+| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, or writes a record of a switch, a Pick Up or a note into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
 | `offsite.json` | which backups were sent to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched; it replaces `run/offsite.json`, which older versions wrote and aht removes | rewritten at each copy and fetch |
 | `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync and with which machine (and, when a release paused that, why, when and for which machine), and how the last take-back or release went (how many files changed, and the names of those kept in both versions); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
 | `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session identifiers, the names of your other machines (and, when aht reached one by its Tailscale address, that address), the notices it showed (for example "input needed" or "the agent finished after 4 minute(s)"), warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one, so about 10 MB at most |
@@ -212,6 +220,7 @@ encrypt it.
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
 | `run/` | short-lived state: notices already shown (with when each of your other machines was last asked for them, and since when one that holds a project of yours has not answered), open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
 | `run/board.json` | for each of your other machines, when it last answered and the sessions it had open then: for each session its agent, project folder (the path there), process and session ids, state and since when, and its name, title and what it waits for, masked as that machine sent them | rewritten each time one of those machines answers; a machine you remove, or add again under the same name, is dropped at once |
+| `run/incoming.jsonl` | what your other machines left in this computer's projects through Pick Up and Leave a Note, one line each: when, the record's identifier and kind, whether the work left from here or came here and whether it came back, the project's path and folder name, the other machine's name (as it names itself), the agent that worked and its session's title (masked), and when that work began and ended.  This computer's notices tell of each new line once, and its hook and window use the file to tell that aht itself put a record there | the newest 300 lines |
 | `run/autostart.json` | that you answered whether aht's tray starts at login: the answer (on or off) and when.  Written only when your answer took effect, that is when the tray then starts at login, or not, as you chose: by `aht autostart on` or `off` (on a Mac the command itself changes nothing, since the app has the switch), the Windows installer's first install, the start-at-login switches in aht's window, the Mac app and the trays, and the welcome, when setting up changes whether aht starts at login or you changed its switch: so a first setup's no counts even when the tray did not start at login anyway (on a Mac too, where *Getting started* then marks the login step optional); the welcome then keeps that answer | rewritten at your next answer |
 | `run/window.json` | Windows and Linux: the process id and port of aht's window server, and the key a second `aht window` uses to reach it | removed when the server stops (on Linux also when it is stopped at logout) |
 | `run/window-<id>.json` | Windows and Linux: the progress of a handover or a take-back started in aht's window | deleted when the job ends; one left behind is removed after 6 hours, the next time the window starts |
@@ -273,12 +282,13 @@ runs.  With its default settings it makes no network connections.  The
 features below send data, and only after you set them up.
 
 1. **Your other machines** (handover, `aht mirror`, `offsite_backup` and
-   fetching backups, `aht night-shift`, and the session list, notices,
-   Watch and search for those machines).  This works from macOS, Windows
-   and Linux.  A Windows PC only asks your other machines (their sessions,
-   notices, Watch and search) and hands no project over yet; it is never
-   asked itself.  aht connects over SSH, or mosh if
-   both machines have it, to the machines you add with `aht remote add`.
+   fetching backups, `aht night-shift`, Pick Up and Leave a Note, and the
+   session list, notices, Watch and search for those machines).  This
+   works from macOS, Windows and Linux.  A Windows PC only asks your other
+   machines (their sessions, notices, Watch and search, Pick Up and Leave
+   a Note) and hands no project over yet; it is never asked itself.  aht
+   connects over SSH, or mosh if both machines have it, to the machines
+   you add with `aht remote add`.
    Before its first command to a new machine, `aht remote add` and `aht
    remote check` ask which system answers there (`echo aht-os %OS%
    $env:OS`); aht cannot ask a Windows PC yet, so for one it stops right
@@ -364,9 +374,64 @@ features below send data, and only after you set them up.
      of its history file there, its times and up to three excerpts, masked
      there and again here, and when that index was last brought up to
      date.  Nothing of it is kept here.
+   - *A session summary and git state (Pick Up), and the folder for Leave
+     a Note:* when you open either for a project (`aht pickup`, `aht
+     leave-note`), aht sends that machine what identifies the project, so
+     that it can find its copy there: the project's identifier, its git
+     origin without any user name or password in it, its first commit, its
+     path and its path below your home folder, the name you gave that
+     machine in aht, this computer's clock, and the earlier exchanges with
+     that machine that the work may come back on (their identifiers and
+     times, that machine's name and identifier, the agents, session ids,
+     latest commit and branch name (masked), and how many files were not
+     committed and commits not pushed; for Leave a Note also the folder
+     there the work came from, which that machine then takes as it is,
+     when it is still there); for Pick Up also
+     this computer's name and system, the project's path here and the
+     agent you open it in.  That machine looks for the folder in its own list
+     of projects and in the `.aht/.project-id` of folders at those paths,
+     and only when that finds nothing, among the git repositories in the
+     folders it watches (their origin and first commit; up to 400
+     repositories, for at most 6 seconds); only the folders that match
+     come back.  For the folder found it sends its path and how it was
+     found; that machine's name, random identifier, system, home folder
+     path and clock; its latest sessions (agent, id, title, when, and
+     whether one is open or working, from the programs running there); its
+     git state (branch, upstream, how far ahead or behind, the latest
+     commit and its subject, up to 30 names of files not committed, and
+     how many are untracked); and its records of who handed the work to
+     whom (identifiers, kinds, times and machine names).  For Pick Up it
+     also sends a summary of the chosen session there, or, when the work
+     comes back, a catch-up of what happened there since, made there from
+     the agents' histories the way aht makes one here.  Titles, commit
+     subjects, file names and summaries are masked there (as under
+     [Security](#security)), and the summary again here.  Leave a Note
+     reads the same, without a summary.
    - aht keeps only the last session list of each machine, and when that
      machine last answered, in `~/.aht/run/board.json` (see
-     [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)).
+     [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)),
+     and the summary you picked up, with its record, in the project's
+     `.aht/handover/` here (with `--apply`: *Open in* or *Copy the Start
+     Line*; a look that writes nothing keeps nothing).
+
+   **What Pick Up and Leave a Note write there.**  Leave a Note writes its
+   summary (`relay-<id>.md`) and its record (`relay-<id>.json`, as under
+   [What aht changes](#what-aht-changes)) into the project's
+   `.aht/handover/` on that machine; Pick Up with `--apply` leaves a copy
+   of its record and of the summary it took there.  When they answer
+   earlier exchanges, they also leave small `relay-<id>.closed` markers
+   there.  aht only adds there: it creates each file only when no file of
+   that name is there (a marker that is there already stands), never
+   replaces or removes one, takes only files named as aht names them, at
+   most 200 KB each, and writes only into the folder it found, while that
+   folder has the project identifier it had then.  The folder gets its own
+   `.gitignore` when it has none, so git leaves it out.  When aht is
+   installed on that machine, it also adds a line to
+   `~/.aht/run/incoming.jsonl` there (see
+   [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)),
+   so that machine's notices and its Claude hook tell of it.  When Leave a
+   Note cannot write there, it removes its record and summary here too.
+   Nothing runs there, and no agent starts.
 
    **Backups there** (`offsite_backup`): copies of the backups go into
    `~/.aht/offsite/<a random id of this computer>/` on that machine, with
@@ -399,6 +464,11 @@ features below send data, and only after you set them up.
    in aht, this computer by its own name ("api on box waits for you").  A
    notice about a session on another machine goes to your phone only when
    aht there does not send that machine's notices to your phone itself.
+   When another machine leaves a note in one of this computer's projects,
+   hands work back to it, or picks work up from it, this computer's
+   notices tell of it once, with that machine's own name, the project's
+   folder name, the agent and the session's title, masked ("pc left a
+   note on paper: from Codex: “fix the login redirect”").
    When a machine that holds a project of yours has not answered for 10
    minutes, one notice says so and names the projects there ("box has not
    answered since 15:20. The work on api there may have stopped (asleep,
@@ -410,11 +480,12 @@ features below send data, and only after you set them up.
    ask for them: informed sessions, going on in another agent at Claude's
    usage limit, second opinion, night shift, switching agents and handing
    the work back (to Claude Code, Codex, Kimi Code, Antigravity or Mistral
-   Vibe), and a handover with a task.  aht hands the agent a summary of
-   earlier sessions or a catch-up of what happened since (with keys masked
-   as under [Security](#security)), or your task, and the agent sends it to
-   its provider under your account, as it does with anything you type into
-   it.
+   Vibe), Pick Up with *Open in* (the agent opened here reads the summary
+   from the other machine), and a handover with a task.  aht hands the
+   agent a summary of earlier sessions or a catch-up of what happened
+   since (with keys masked as under [Security](#security)), or your task,
+   and the agent sends it to its provider under your account, as it does
+   with anything you type into it.
    Codex, Kimi Code, Antigravity and Mistral Vibe read it as their first
    turn (aht runs Kimi's itself, `kimi -p`); a Claude Code session handed
    the work back, or switched to as Claude Code's own session, gets its
@@ -422,8 +493,16 @@ features below send data, and only after you set them up.
    After a switch, the hook also adds one line to the Claude session that
    handed the work on, when you resume it yourself: which agent worked on
    the project since, when, and where the summary is; the catch-up itself
-   only with informed sessions on.  These go to Anthropic with your next
-   message in that session.
+   only with informed sessions on.  After Pick Up or Leave a Note, the
+   hook adds one line, once, to the next Claude session in the project on
+   the machine the work came to (which machine it came from, when, which
+   agent worked there, and where the summary is), and one line to a Claude
+   session that starts on the machine the work left while it is out
+   (which machine has it, since when, and in which agent).  A note that
+   hands work back, or a Pick Up that brings it back to Claude Code's own
+   session, gives that session its catch-up, at most 2,000 characters,
+   once.  On another machine, aht installed there adds these lines.
+   These go to Anthropic with your next message in that session.
 4. **What an agent does with its own files.**  The session names aht
    records become part of the agent's history.  An agent may sync that
    history; Claude Code, for example, shows session names in the Claude app
@@ -506,8 +585,10 @@ access to them and no control over them.
    folder.
 4. If you used other machines: delete `~/.aht` there too (it holds this
    computer's backups in `~/.aht/offsite/<id>/` and the copies of aht in
-   `~/.aht/remote/aht-*.py`), any project copies you no longer want, and
-   `~/.claude.json.bak-aht` if a handover left one.  Here, deleting
+   `~/.aht/remote/aht-*.py`), any project copies you no longer want, the
+   summaries and records that Pick Up and Leave a Note left in those
+   projects' `.aht/handover/`, and `~/.claude.json.bak-aht` if a handover
+   left one.  Here, deleting
    `~/.aht` also removes `machine.json` and `offsite.json`.
 
 ## Security

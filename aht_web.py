@@ -55,7 +55,8 @@ JOB_KEEP = 600                          # seconds a finished job's answer is kep
 COMMANDS = {
     "status", "config", "projects", "sessions", "search", "journal", "changes", "undo",
     "checkpoint", "rules", "secrets", "report", "share", "tidy", "loose-ends", "board",
-    "remote", "handover", "reclaim", "mirror", "resume-here", "switch", "relays", "second-opinion",
+    "remote", "handover", "reclaim", "mirror", "resume-here", "switch", "relays", "pickup",
+    "leave-note", "second-opinion",
     "night-shift", "backup", "restore", "icons", "backends", "adopt", "setup", "update",
     "getting-started", "doctor", "reconcile", "reload", "version", "notices", "limits",
     "logs", "checkup", "forget", "orphans", "prune", "guide", "bind", "autostart",

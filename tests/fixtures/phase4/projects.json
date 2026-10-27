@@ -1,0 +1,56 @@
+{
+  "uuid": "61c8b05b9c5143d49771312cccddbb33",
+  "real_path": "/Users/me/code/paper",
+  "exists": true,
+  "stores": [
+    "claude"
+  ],
+  "updated_at": "2026-10-27T18:44:47",
+  "is_git": true,
+  "away": null,
+  "away_remote": null,
+  "away_since": null,
+  "mirror": null,
+  "mirror_synced_at": null,
+  "mirror_status": null,
+  "mirror_paused": null,
+  "handing": null,
+  "relay": {
+    "id": "20261027-184448-ea8c",
+    "from_agent": "claude",
+    "to_agent": "codex",
+    "since": 1793123088.827517,
+    "open": true,
+    "incoming": {
+      "machine": "box",
+      "kind": "pickup",
+      "at": 1793123088.827517,
+      "agent": "claude",
+      "brief": "/Users/me/code/paper/.aht/handover/relay-20261027-184448-ea8c.md",
+      "worked_from": null,
+      "worked_to": 1793119546.0,
+      "note_for": null
+    },
+    "kind": "pickup",
+    "machine": "box",
+    "remote": "box",
+    "arrived": true,
+    "told": true
+  },
+  "pickup_from": {
+    "machine": "box",
+    "remote": "box",
+    "relay": "20261027-184448-ea8c",
+    "at": 1793123088.827517,
+    "agent": "claude",
+    "session": "0f3a9c2e-1111-4222-8333-444455556666"
+  },
+  "agents": [
+    "claude"
+  ],
+  "open": null,
+  "limit": null,
+  "sessions": 1,
+  "bytes": 1054,
+  "last_activity": "2026-10-27T15:46:26"
+}

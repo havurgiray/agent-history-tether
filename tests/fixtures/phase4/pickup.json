@@ -1,0 +1,92 @@
+{
+  "command": "pickup",
+  "applied": false,
+  "blockers": [],
+  "warnings": [
+    "On box: branch main, 1 commit not pushed, 1 file not committed. Commit and push there, then pull here."
+  ],
+  "error": null,
+  "project": "/Users/me/code/paper",
+  "machine": "box",
+  "match": {
+    "path": "/home/me/code/paper",
+    "how": "id",
+    "candidates": [
+      {
+        "path": "/home/me/code/paper",
+        "how": "id"
+      }
+    ]
+  },
+  "sessions": [
+    {
+      "agent": "claude",
+      "id": "0f3a9c2e-1111-4222-8333-444455556666",
+      "title": "fix the login redirect",
+      "updated": 1793123086.9634812,
+      "open": false,
+      "working": false,
+      "state": "closed"
+    },
+    {
+      "agent": "codex",
+      "id": "c0dec0de-0000-4000-8000-000000000001",
+      "title": null,
+      "updated": 1793118896.962637,
+      "open": false,
+      "working": false,
+      "state": "closed"
+    }
+  ],
+  "source": {
+    "agent": "claude",
+    "session": "0f3a9c2e-1111-4222-8333-444455556666",
+    "title": "fix the login redirect",
+    "updated": 1793123086.9634812,
+    "last_t": 1793119546.0,
+    "path": "/home/me/code/paper",
+    "machine": "box"
+  },
+  "git": {
+    "here": {
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 0,
+      "behind": 0,
+      "head": "cbc07b5",
+      "head_full": "cbc07b5c16116d2f2ed9827c3642ddcf7624b58c",
+      "subject": "First commit",
+      "dirty": 0,
+      "files": [],
+      "untracked": 0
+    },
+    "there": {
+      "branch": "main",
+      "upstream": "origin/main",
+      "ahead": 1,
+      "behind": 0,
+      "head": "817965a",
+      "head_full": "817965ac56adffeba8aae557455e144dfeb0df40",
+      "subject": "Fix the login redirect",
+      "dirty": 1,
+      "files": [
+        "M app.py"
+      ],
+      "untracked": 0
+    },
+    "warning": "On box: branch main, 1 commit not pushed, 1 file not committed. Commit and push there, then pull here."
+  },
+  "brief": "# Pick up: paper\n\n- From **Claude Code** on box (macOS) to mac (macOS), 2026-10-27 18:44\n- Folder on box: `/home/me/code/paper`; on mac: `/Users/me/code/paper`\n- Session it continues: fix the login redirect — `0f3a9c2e-1111-4222-8333-444455556666`\n- To go back to it on box: `cd /home/me/code/paper && /opt/homebrew/bin/claude --resume 0f3a9c2e-1111-4222-8333-444455556666`; to hand the work back from mac: `aht leave-note /Users/me/code/paper --on box`\n\n## Before going on\n\n- On box: branch main, 1 commit not pushed, 1 file not committed. Commit and push there, then pull here.\n\n## The latest exchanges\n\n**You (17:44):** fix the login redirect; the key is [Anthropic API key: sk-a…4w]\n\n**Agent:** login.py now redirects home.\n\n## Git\n\n- On branch `main`, HEAD `817965a` “Fix the login redirect”; against origin/main: 1 commit(s) not pushed.\n- Not committed (1):\n  - `M app.py`\n",
+  "brief_kind": "full",
+  "mode": "new",
+  "back_of": null,
+  "note_for": null,
+  "target": "claude",
+  "session": null,
+  "relay": null,
+  "left": [],
+  "opened": null,
+  "start_line": null,
+  "command_line": null,
+  "fallback": null
+}

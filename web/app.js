@@ -353,8 +353,12 @@ const ON_WINDOWS = () => (S.status.platform || "").startsWith("win");
 const CAN_HAND_OVER = () => !!(S.status.handover || {}).supported;
 // asking other machines (ssh alone); an older core says only "supported"
 const CAN_REACH = () => { const ho = S.status.handover || {}; return "can_reach" in ho ? !!ho.can_reach : !!ho.supported; };
-// what a PC does with the other machines today, said where Hand Over would be
-const FROM_WINDOWS = "From Windows you can see, search and pick up work on your other machines. Handing projects over from Windows comes in a later version.";
+// what a PC does with a project and the other machines, said where Hand Over
+// would be: with a Mac or Linux machine to ask, and without one
+const FROM_WINDOWS = "With Machines ▾, Pick Up brings this project's latest work on another machine here as a summary, and Leave a Note leaves a summary of your work here on that machine before you go. Git moves the files. Handing projects over from Windows comes in a later version.";
+const FROM_WINDOWS_NONE = "Add your Mac or Linux machines in the Machines tab: then you can pick up a project's work from them here, and leave a note on them before you go. Handing projects over from Windows comes in a later version.";
+// …and at the top of the Machines tab
+const PC_MACHINES = "From this PC you can see, search and watch your other machines, pick up a project's work from them and leave a note on them. Handing projects over from Windows comes in a later version.";
 const flag = (k, d = true) => (k in S.config ? !!S.config[k] : d);
 /** Keep in sync, paused (`mirror_paused`: {reason, at, remote}): Release
  * pauses it, so no sync replaces the copy left on that machine until the
@@ -435,6 +439,8 @@ function projState(p) {
   if (p.open === "waiting") return ["waiting for you", "waiting"];
   if (p.open === "working") return ["working", "working"];
   if (p.open === "idle") return ["open", ""];
+  const x = crossing(p);
+  if (x && x.kind === "note" && x.arrived) return [`${x.back ? "back" : "note"} from ${x.remote || x.machine || "another machine"}`, "working"];
   if (p.limit) return ["usage limit", "waiting"];
   if (syncPaused(p)) return ["sync paused", ""];
   return ["", ""];
@@ -482,6 +488,10 @@ function detail() {
   else if (!p.away && p.exists && syncPaused(p)) d.append(pausedBanner(p));
   const relay = openRelay(p);
   if (relay) d.append(relayLine(p, relay));
+  const across = crossing(p), line = across && crossingLine(p, across);
+  if (line) d.append(line);
+  const from = pickedUp(p);
+  if (from) d.append(pickupLine(p, from));
   const row = h("div", { class: "row" });
   const handover = CAN_HAND_OVER() && (S.status.handover || {}).default_remote;
   if (p.away) {
@@ -504,6 +514,8 @@ function detail() {
       relay ? [`Hand Back to ${AGENTS[relay.from_agent] || relay.from_agent} (its own session)…`, () => handBack(p)] : null,
       relay && to.length ? "-" : null, ...to], { disabled: !(p.sessions > 0 || (p.agents || []).length) || held }));
     row.append(helpBtn("Continue in another agent"));
+    const ms = askable();
+    if (ms.length) row.append(machinesMenu(p, ms, held));
   }
   row.append(h("span", { class: "grow" }));
   if (p.exists) {
@@ -526,7 +538,7 @@ function detail() {
     ], { right: true }), helpBtn("The window at a glance"));
   }
   d.append(row);
-  if (p.exists && !p.away && !CAN_HAND_OVER() && CAN_REACH() && ON_WINDOWS()) d.append(h("p", { class: "dim small", text: FROM_WINDOWS }));
+  if (p.exists && !p.away && !CAN_HAND_OVER() && CAN_REACH() && ON_WINDOWS()) d.append(h("p", { class: "dim small", text: askable().length ? FROM_WINDOWS : FROM_WINDOWS_NONE }));
   if (p.open && !p.away && !p.handing && CAN_HAND_OVER()) {
     d.append(h("p", { class: "warn small", text: p.open === "waiting"
       ? "An agent session in this project is waiting for you. Answer it in its terminal; the project cannot be handed over until it has finished and is closed."
@@ -655,10 +667,10 @@ async function summaryOnly(p, target) {
 }
 
 /** The open relay on a project that is here (`relay`: {id, from_agent,
- * to_agent, since, open, incoming}): another agent took the work over and
- * has not handed it back.  A relay another machine left here comes with
- * Pick Up and is not offered here. */
-const openRelay = (p) => (p.relay && p.relay.open !== false && !p.relay.incoming && p.exists && !p.away ? p.relay : null);
+ * to_agent, since, open, machine, incoming, …}): another agent took the work
+ * over on this machine and has not handed it back.  One that crosses
+ * machines (`machine` set) goes back with Leave a Note, not here. */
+const openRelay = (p) => (p.relay && p.relay.open !== false && !p.relay.machine && !p.relay.incoming && p.exists && !p.away ? p.relay : null);
 function relayLine(p, r) {
   return h("div", { class: "row" },
     h("span", { text: `${AGENTS[r.to_agent] || r.to_agent} has had this project${r.since ? " since " + clock(r.since) : ""}, taken over from ${AGENTS[r.from_agent] || r.from_agent}.` }),
@@ -685,6 +697,476 @@ async function handBack(p) {
   const a = await busy(`handing ${name} back to ${back}…`, () => job(["switch", p.real_path, "--back", "--apply", "--json"]));
   switched(p, a, back, (d) => (d.fallback ? `${d.fallback}\n\n${back}'s window is open. The summary it read: ${d.brief || ""}`
     : `${back} is back in its own session; its window is open. What ${now} did meanwhile: ${d.brief || ""}`), "Handing back did not go through");
+}
+
+// ---- across machines: Pick Up and Leave a Note ----------------------------------------
+// They move the context only; git moves the files.  Every machine but a
+// Windows PC can be asked, so a PC starts each exchange: at the PC, Pick Up
+// from the Mac; before leaving it, Leave a Note on the Mac.
+
+/** The machines Pick Up and Leave a Note can ask: all but a Windows PC. */
+const askable = () => (CAN_REACH() ? Object.entries((S.status.handover || {}).remotes || {})
+  .filter(([, r]) => r.system !== "Windows").map(([n]) => n).sort() : []);
+
+/** The relay on a project's row that crosses machines (`relay.machine`: the
+ * other one), or null: {kind, machine, remote, arrived, told, since,
+ * from_agent, to_agent, back, agent, worked_from, worked_to, note_for}.
+ * `arrived`: the work came here (a pickup made here, a note left here);
+ * otherwise `machine` picked it up from here, and the work may go on there.
+ * `remote`: that machine's name when it is set up here, so it can be asked.
+ * `incoming` (on the receiving machine only) says more: its kind (pickup,
+ * note, or back: the work handed back), who worked there and when, and the
+ * session here a note is for.  A note that arrived opens nothing: it stays
+ * on the row (open: false) until a session here heard of it (`told`). */
+function crossing(p) {
+  const r = p.relay;
+  if (!r || !(r.machine || r.incoming) || !p.exists || p.away) return null;
+  const inc = r.incoming && typeof r.incoming === "object" ? r.incoming : {};
+  const kind = r.kind || inc.kind;
+  const arrived = "arrived" in r ? !!r.arrived : !!r.incoming;
+  if (!kind || (r.open === false && !(kind === "note" && arrived && !r.told))) return null;
+  const nf = inc.note_for || r.note_for || null;
+  return Object.assign({}, r, { kind, arrived, machine: r.machine || inc.machine || null, since: r.since || inc.at,
+    back: inc.kind === "back", agent: inc.agent || r.from_agent, worked_from: inc.worked_from, worked_to: inc.worked_to,
+    note_for: nf && typeof nf === "object" ? nf.session || null : nf,
+    note_agent: (nf && typeof nf === "object" && nf.agent) || r.to_agent, note_title: nf && typeof nf === "object" ? nf.title : null,
+    note_file: inc.brief ? ".aht/handover/" + base(inc.brief) : r.id ? `.aht/handover/relay-${r.id}.md` : null });
+}
+
+/** The pickup from another machine that is open here: {machine, remote,
+ * relay, at, agent, session} (agent and session: the one there the work
+ * came from), or null.  A newer core names it in the row's `pickup_from`
+ * (null: none), also when a newer relay here (a switch to another agent,
+ * say) is the row's `relay`; an older one only through that relay. */
+function pickedUp(p) {
+  if (!p.exists || p.away) return null;
+  if ("pickup_from" in p) {
+    const f = p.pickup_from;
+    return f && typeof f === "object" && (f.machine || f.remote) ? f : null;
+  }
+  const x = crossing(p);
+  return x && x.arrived && x.kind === "pickup" && !x.back
+    ? { machine: x.machine, remote: x.remote, relay: x.id, at: x.since, agent: x.from_agent, session: null } : null;
+}
+/** "Picked up from M at T: X's session there", with Hand Back to M (a note
+ * for that session) when M is set up here and can be asked. */
+function pickupLine(p, f) {
+  const who = f.remote || f.machine || "another machine", at = f.at ? " at " + clock(f.at) : "";
+  const fa = AGENTS[f.agent] || f.agent;
+  // the agent it went on in here, while the pickup is still the row's relay
+  const to = p.relay && p.relay.id === f.relay ? p.relay.to_agent : null, ta = AGENTS[to] || to;
+  const can = !!f.remote && askable().includes(f.remote);
+  return h("div", { class: "row" },
+    h("span", { text: `Picked up from ${who}${at}${fa ? `: ${fa}'s session there` : ""}${ta && ta !== fa ? `, going on in ${ta}` : ""}.` }),
+    can ? h("button", { class: "small", text: `Hand Back to ${f.remote}…`, disabled: !!p.handing, onclick: () => leaveNote(p, f.remote) }) : null);
+}
+
+/** What the session a hand-back note is for does with it when it is
+ * continued (`where`: " on box", or "" for here): Claude Code reads it by
+ * itself, as aht's hook gives it to the session (`hook`: the hook is set
+ * up there).  No other agent has that hook: it is asked to read the note
+ * (`file`) first. */
+function noteReads(agent, where, file, hook = true) {
+  const f = file || "the note";
+  if (!agent) return `When you continue that session${where}, Claude Code reads it by itself; another agent does not: ask it to read ${f} first.`;
+  if (agent === "claude" && hook) return `Claude Code reads it by itself when you continue that session${where}.`;
+  return `${AGENTS[agent] || agent} does not read it by itself${agent === "claude" ? " (aht's hook is off)" : ""}: when you continue that session${where}, ask it to read ${f} first.`;
+}
+/** …and a note for no session in particular: aht's hook tells a Claude
+ * Code session that starts there of it, once. */
+function noteTold(where, file, hook = true) {
+  const f = file || "the note";
+  return hook ? `A Claude Code session that starts ${where} is told of it; with another agent, ask it to read ${f}.`
+    : `aht's hook is off, so no session is told of it: ask the agent to read ${f}.`;
+}
+
+/** The line under a project whose work crossed machines; a note that
+ * arrived is a banner of its own.  Work picked up here from another
+ * machine has its own line (pickupLine). */
+function crossingLine(p, x) {
+  const who = x.remote || x.machine || "another machine", at = x.since ? " at " + clock(x.since) : "";
+  const ta = AGENTS[x.to_agent] || x.to_agent;
+  const can = askable().includes(x.remote);
+  if (x.kind === "note" && x.arrived) return noteBanner(p, x);
+  if (x.kind !== "pickup") return null;
+  if (x.arrived && x.back) return h("div", { class: "dim small", text: `The work came back from ${who}${at}.` });
+  if (x.arrived) return null;
+  return h("div", { class: "row" },
+    h("span", { text: `Picked up on ${who}${at}${ta ? ` (${ta})` : ""}: the work may go on there.` }),
+    can ? h("button", { class: "small", text: `Pick Up from ${who}…`, disabled: !!p.handing, onclick: () => pickUp(p, who) })
+      : h("span", { class: "dim small", text: `When it comes back, ${who} leaves a note here.` }));
+}
+/** The banner when another machine left a note here, or handed the work
+ * back (`back`): who worked there and when, which session here it is for;
+ * [Read the Note…] and, for a session here (`note_for`), [Continue That
+ * Session]: Claude Code's reads the note as it opens (aht's hook), another
+ * agent's is asked to. */
+function noteBanner(p, x) {
+  const who = x.remote || x.machine || "another machine", by = AGENTS[x.agent] || x.agent;
+  const own = x.note_for ? AGENTS[x.note_agent] || x.note_agent || "Claude Code" : null;
+  const hook = S.status.hook_installed !== false;
+  const worked = by && x.worked_from && x.worked_to ? `${by} worked on it there ${clock(x.worked_from)}–${clock(x.worked_to)}.`
+    : `Left${x.since ? " at " + clock(x.since) : ""}${by ? `, after ${by} worked on it there` : ""}.`;
+  return h("div", { class: "callout info row" },
+    h("div", { class: "grow" }, h("strong", { text: x.back ? `${who} handed the work back` : `A note from ${who}` }),
+      h("div", { class: "small", text: `${worked} `
+        + (own ? `The note is for ${own}'s session${x.note_title ? ` “${x.note_title}”` : ""} here. ${noteReads(x.note_agent || "claude", "", x.note_file, hook)}`
+          : noteTold("here", x.note_file, hook)) + ` Pull with git first if the files changed on ${who}.` })),
+    h("button", { class: "small", text: "Read the Note…", onclick: () => readNote(p, x) }),
+    own ? h("button", { class: "small primary", text: "Continue That Session",
+      onclick: () => resume([p.real_path, "--session", x.note_for, "--agent", x.note_agent || "claude"]) }) : null,
+    helpBtn("Pick up on another machine"));
+}
+async function readNote(p, x) {
+  const d = await busy("reading the note…", () => J("relays", p.real_path, "--show", x.id, "--json"));
+  const file = (d.relay || {}).brief;
+  textSheet(`A note from ${x.remote || x.machine || "another machine"}`, d.text || "The note could not be read.", "Pick up on another machine",
+    file ? h("button", { text: ON_WINDOWS() ? "Show in Explorer" : "Show in Files", onclick: () => post("/api/reveal", { path: parent(file) }) }) : null);
+}
+
+/** The project row's Machines menu.  With work picked up from M open here,
+ * what goes to M is a hand-back (Leave a Note does the same then). */
+function machinesMenu(p, names, held) {
+  const f = pickedUp(p);
+  const back = f && f.remote && names.includes(f.remote) ? f.remote : null;
+  const items = back ? [[`Hand Back to ${back}…`, () => leaveNote(p, back)], "-"] : [];
+  for (const n of names) items.push([`Pick Up from ${n}…`, () => pickUp(p, n)]);
+  const notes = names.filter((n) => n !== back);
+  if (notes.length) items.push("-", ...notes.map((n) => [`Leave a Note on ${n}…`, () => leaveNote(p, n)]));
+  return menu("Machines", items, { disabled: held });
+}
+
+/** How the folder there was found (`match.how`), in the core's words. */
+const FOUND = { id: "found by its project id", origin: "found by its git origin", path: "found at the same path",
+  home: "found at the same place in the home folder", there: "as you named it" };
+const SAME = { origin: "with the same git origin", path: "at the same path", home: "at the same place in the home folder" };
+/** Where the project is on the other machine (`match`: {path, how,
+ * candidates}) and here; why not, when it cannot go ahead.  `error`: the
+ * machine could not be asked; two candidates found the same way block; none
+ * found asks for its path there.  `on.choose(path)` looks again at a folder
+ * there, `on.retry()` asks again, `on.change()` picks another folder here. */
+function matchPart(d, machine, p, on) {
+  const m = d.match || {}, why = problems(d);
+  const cands = (m.candidates || []).filter((c) => c && (!m.how || c.how === m.how));
+  if (d.error || !d.match) {                // not asked, or no answer
+    return h("div", { class: "callout" }, h("strong", { text: `aht could not ask ${machine}` }),
+      h("div", { class: "small", style: "white-space:pre-wrap" }, inline(why || "aht gave no answer.")),
+      h("div", { class: "row", style: "margin-top:6px" }, h("button", { class: "small", text: "Try Again", onclick: on.retry })));
+  }
+  if (m.path) {
+    return [h("div", { class: "facts" },
+      h("span", { class: "dim", text: `On ${machine}` }),
+      h("span", {}, h("span", { class: "mono", text: m.path }), " ", h("span", { class: "dim small", text: FOUND[m.how] || m.how || "" })),
+      h("span", { class: "dim", text: "Here" }),
+      h("span", {}, h("span", { class: "mono", text: tilde(p.real_path) }),
+        on.change ? [" ", h("button", { class: "small", text: "Another Folder…", onclick: on.change })] : null)),
+    SAME[m.how] ? h("p", { class: "warn small", text: `aht found no folder on ${machine} with this project's id, only one ${SAME[m.how]}: check that it is the same project.` }) : null,
+    why ? h("div", { class: "callout" }, h("strong", { text: "Not possible now" }), h("div", { class: "small", style: "white-space:pre-wrap", text: why })) : null];
+  }
+  if (cands.length > 1) {
+    return h("div", { class: "callout" }, h("strong", { text: `${plural(cands.length, "folder")} on ${machine} could be this project` }),
+      h("div", { class: "small", text: "Choose the one to use; aht did not find this project's id in either." }),
+      cands.map((c) => h("div", { class: "row cand" }, h("span", { class: "mono grow", text: c.path }),
+        c.how ? h("span", { class: "dim small", text: FOUND[c.how] || c.how }) : null,
+        h("button", { class: "small", text: "This One", onclick: () => on.choose(c.path) }))));
+  }
+  // asked, and no copy there: its folder, typed
+  const input = h("input", { type: "text", placeholder: `its full path on ${machine}`, style: "flex:1;min-width:240px" });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter" && input.value.trim()) on.choose(input.value.trim()); });
+  return h("div", { class: "callout" }, h("strong", { text: `aht found no copy of “${base(p.real_path)}” on ${machine}` }),
+    why ? h("div", { class: "small", style: "white-space:pre-wrap", text: why }) : null,
+    h("div", { class: "row", style: "margin-top:6px" }, input,
+      h("button", { class: "small", text: "Look There", onclick: () => { if (input.value.trim()) on.choose(input.value.trim()); } })));
+}
+/** The latest sessions in the folder there (`sessions`, or the source's):
+ * the one picked up marked, the others a click away. */
+function sessionsThere(d, machine, pick) {
+  const src = d.source || {}, list = d.sessions || src.sessions || [];
+  const cur = src.session || src.id;
+  const facts = (x) => [AGENTS[x.agent] || x.agent, x.updated || x.last_t ? "last active " + ago(x.updated || x.last_t) : null].filter(Boolean).join(" · ");
+  if (!list.length) {
+    return cur ? h("p", { class: "small" }, `From ${machine}: `, h("strong", { text: src.title || "(no title)" }),
+      h("span", { class: "dim", text: " · " + facts(src) })) : null;
+  }
+  return [h("h3", { text: `Latest sessions on ${machine}` }), h("div", { class: "sessions" }, list.slice(0, 6).map((x) => {
+    const id = x.id || x.session, on = id === cur;
+    const state = x.state && x.state !== "closed" ? x.state : x.working ? "working" : x.open ? "open" : "";
+    return h("div", { class: "s" + (on ? " on" : "") },
+      h("div", { class: "grow" }, h("div", { class: "row" }, h("strong", { class: "ellipsis", text: x.title || "(no title)" }),
+        state ? h("span", { class: "badge " + (state === "working" ? "working" : state === "waiting" ? "waiting" : ""),
+          text: state === "open" ? "open there" : state }) : null),
+      h("div", { class: "dim small", text: facts(x) })),
+      on ? h("span", { class: "dim small", text: "picked up" })
+        : h("button", { class: "small", text: "Pick Up This One", onclick: () => pick(id) }));
+  }))];
+}
+/** git on both sides (`git`: {here, there, advice}): the summary carries no
+ * files, so what is not committed or pushed comes first.  The core's advice
+ * says it in its own words; without one, each side's state does. */
+function gitBox(g, machine) {
+  if (!g || typeof g !== "object") return null;
+  const facts = (x) => [x.branch ? `branch ${x.branch}` : "no branch", x.head ? `at ${x.head}` : null,
+    x.ahead ? `${plural(x.ahead, "commit")} not pushed` : null, x.behind ? `${x.behind} behind ${x.upstream || "its upstream"}` : null,
+    x.dirty ? `${plural(x.dirty, "file")} not committed` : null].filter(Boolean).join(", ");
+  const side = (x, where) => (x === undefined ? null : h("div", { class: "small" }, h("span", { class: "dim", text: where + ": " }), x ? facts(x) : "no git repository"));
+  const say = g.advice || g.warning || g.say || null;
+  const todo = !!say || [g.there, g.here].some((x) => x && (x.dirty || x.ahead));
+  return h("div", { class: todo ? "callout git" : "box git" }, todo ? h("strong", { text: "The files move with git, not with the summary" }) : null,
+    say ? h("div", { class: "small", text: say }) : [side(g.there, `On ${machine}`), side(g.here, "Here")]);
+}
+/** The summary in a Pick Up or Leave a Note answer: its text (the dry run
+ * shows it), its file (once written) and its kind (full, catchup or
+ * full+catchup). */
+function briefOf(d) {
+  const b = d.brief, kind = d.brief_kind || (b && b.kind) || null;
+  if (b && typeof b === "object") return { text: b.text || null, file: b.path || null, kind };
+  if (typeof b === "string" && /\n/.test(b)) return { text: b, file: null, kind };
+  return { text: null, file: typeof b === "string" ? b : null, kind };
+}
+/** Work coming back (`back_of`: the relay it went out with): when it left,
+ * read from that relay's id (its date and time). */
+const backMode = (d) => !!d.back_of || d.mode === "back";
+function relayTime(id) {
+  const m = /^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)/.exec(id || "");
+  return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() / 1000 : null;
+}
+/** What opening `agent` with the summary costs: it reads it as its first
+ * turn (tokens), unless Claude Code's own session comes back (`session`:
+ * the one here that goes on), which aht's hook tells as it opens. */
+function tokenLine(agent, d) {
+  const label = AGENTS[agent] || agent, own = agent === d.target && !!d.session;
+  if (own && agent === "claude" && S.status.hook_installed !== false) {
+    return "Claude Code's own session goes on: aht's hook tells it what happened meanwhile, so nothing runs until you type.";
+  }
+  if (agent === "kimi") return "Kimi reads the summary in a first run of its own, before its window opens or its line is copied: that turn uses tokens.";
+  if (own) return `${label}'s own session reads what happened meanwhile as its next turn: it uses tokens.`;
+  return `Reading the summary is ${label}'s first turn: it uses tokens.`;
+}
+const copyText = (t) => navigator.clipboard.writeText(t).then(() => toast("Copied."), () => toast("It could not be copied: select the line and copy it."));
+
+/** Pick Up from M: what was last done in this project on M, as a summary
+ * made and masked there (`pickup --json`, a dry run): the folder there and
+ * how it was found, the latest sessions there, git on both sides, and the
+ * summary.  [Open in X] writes it here and starts X with it (one turn:
+ * tokens); [Copy the Start Line] writes it and copies the line, so nothing
+ * runs; [Done] closes and writes nothing.  `o`: {session, there} to start
+ * from (a search hit), `change`: another folder here. */
+async function pickUp(p, machine, o = {}) {
+  const name = base(p.real_path);
+  note(p, null);
+  const s = sheet(`Pick up “${name}” from ${machine}`, "Pick up on another machine", 860);
+  const agents = SWITCH_TO.filter((a) => (S.status.agent_clis || {})[a]);
+  const st = { session: o.session || null, there: o.there || null, agent: null, d: null, done: null, failed: null, working: null };
+  // the session and the folder there; on --apply also the folder that was
+  // shown, when it was not found by its project id
+  const opts = (apply) => {
+    const m = (st.d && st.d.match) || {};
+    const there = st.there || (apply && m.path && m.how !== "id" ? m.path : null);
+    return [...(there ? ["--there", there] : []), ...(st.session ? ["--session", st.session] : [])];
+  };
+  const planned = () => (st.d ? st.d.target || st.d.agent : null);
+  const look = async () => {
+    st.d = null; st.failed = null; paint();
+    const d = await dryRun(["pickup", p.real_path, "--from", machine, ...opts(false), "--json"]);
+    if (!s.body.isConnected) return;                // closed meanwhile
+    st.d = d;
+    if (!agents.includes(st.agent)) st.agent = [d.target, d.agent, (d.source || {}).agent, "claude"].find((a) => agents.includes(a)) || agents[0] || null;
+    paint();
+  };
+  const copyLine = async () => {
+    if (st.done) return copyText(st.done.line);
+    const label = AGENTS[st.agent] || st.agent;
+    st.working = st.agent === "kimi" ? "Kimi is reading the summary…" : "writing the summary…"; st.failed = null; paint();
+    // --open X with --no-window: the summary here and its copy there, the
+    // line that starts X with it, and no terminal (Kimi reads it first, in a
+    // run of its own); --agent would pick the session there, not X
+    const a = await job(["pickup", p.real_path, "--from", machine, ...opts(true), "--open", st.agent, "--apply", "--no-window", "--json"]);
+    st.working = null;
+    const d = a.json || {};
+    const failed = problems(d) || (a.ok && d.applied ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
+    if (failed) {
+      st.failed = failed;
+      return s.body.isConnected ? paint() : note(p, "The summary was not written:\n\n" + failed);
+    }
+    const line = d.command_line || d.start_line || "";
+    st.done = { line, file: briefOf(d).file, copied: false };
+    note(p, `Picked up from ${machine}; nothing was opened.` + (line ? ` Start ${label} in a terminal with:\n\n${line}` : ""), st.done.file);
+    refresh();
+    if (!s.body.isConnected) return;
+    if (line) st.done.copied = await navigator.clipboard.writeText(line).then(() => true, () => false);
+    paint();
+    if (st.done.copied) toast("Copied.");
+  };
+  const openIn = async () => {
+    const agent = st.agent, label = AGENTS[agent] || agent, back = backMode(st.d) && agent === planned() && !!st.d.session;
+    const extra = opts(true);
+    closeSheet();
+    const a = await busy(agent === "kimi" ? "Kimi is reading the summary…" : `opening ${label}…`,
+      () => job(["pickup", p.real_path, "--from", machine, ...extra, "--open", agent, "--apply", "--json"]));
+    const d = a.json || {};
+    switched(p, Object.assign({}, a, { json: Object.assign({}, d, { brief: briefOf(d).file }) }), label, (x) => (back
+      ? `Back from ${machine}: ${label}'s own session goes on; its window is open. What happened on ${machine} meanwhile: ${x.brief || ""}`
+      : `Picked up from ${machine}: ${label}'s window is open. The summary it read: ${x.brief || ""}`), "Picking up did not go through");
+  };
+  const paint = () => {
+    const b = clear(s.body), f = clear(s.foot), d = st.d;
+    const done = h("button", { text: "Done", onclick: () => { closeSheet(); if (st.done) refresh(); } });
+    if (!d) {
+      b.append(h("p", { class: "dim" }, h("span", { class: "spin" }), `Asking ${machine}…`));
+      f.append(h("span", { class: "spacer" }), done);
+      return;
+    }
+    const m = d.match || {}, ok = !problems(d) && !!m.path, back = backMode(d);
+    const label = () => AGENTS[st.agent] || st.agent || "an agent";
+    const wrap = h("div", { class: "stack" });
+    b.append(wrap);
+    if (st.done) {
+      wrap.append(h("div", { class: "callout info" }, h("strong", { text: "The summary is in the project; nothing was opened" }),
+        st.done.file ? h("div", { class: "small mono", text: st.done.file }) : null,
+        st.done.line ? [h("div", { class: "small", text: st.done.copied ? `The line that starts ${label()} with it is copied: paste it into a terminal.`
+          : `To start ${label()} with it, run this line in a terminal:` }),
+        h("div", { class: "row top" }, h("pre", { class: "grow", style: "white-space:pre-wrap;margin:4px 0", text: st.done.line }),
+          h("button", { class: "small", text: "Copy", onclick: () => copyText(st.done.line) }))] : null));
+    }
+    if (st.failed) wrap.append(h("p", { class: "warn small", style: "white-space:pre-wrap", text: "The summary was not written:\n\n" + st.failed }));
+    wrap.append(matchPart(d, machine, p, { choose: (x) => { st.there = x; look(); }, retry: look, change: o.change }));
+    if (m.path) wrap.append(sessionsThere(d, machine, (id) => { st.session = id; look(); }));
+    if (back && ok) {
+      const t = AGENTS[planned()] || planned() || "The agent", left = relayTime(d.back_of);
+      const title = d.note_for && typeof d.note_for === "object" && d.note_for.title;
+      wrap.append(h("p", { text: `This work went to ${machine}${left ? " at " + clock(left) : ""} and comes back now: `
+        + (d.session ? `${t}'s own session here${title ? ` (“${title}”)` : ""} goes on, and reads only what happened on ${machine} since.`
+          : `a new ${t} session reads the summary and what happened on ${machine} since.`) }));
+    }
+    if (d.fallback) wrap.append(h("p", { class: "warn small", text: d.fallback }));
+    // git's warning is in the box, not again among the warnings
+    wrap.append(gitBox(d.git, machine), (d.warnings || []).filter((w) => w !== (d.git || {}).warning).map((w) => h("p", { class: "warn small", text: "⚠ " + w })));
+    const bf = briefOf(d);
+    if (bf.text) {
+      wrap.append(h("div", {}, h("h3", { text: bf.kind === "catchup" ? `What happened on ${machine} since`
+        : bf.kind === "full+catchup" ? `Where things stood on ${machine}, and what happened since` : `Where things stood on ${machine}` }),
+      h("div", { class: "brief" }, md(bf.text, true))));
+    }
+    const tok = h("span", { class: "dim small" });
+    // what Copy the Start Line does for the agent chosen
+    const cp = st.done ? null : h("div", { class: "dim small" });
+    const go = h("button", { class: "primary", disabled: !ok || !st.agent || !!st.done || !!st.working, onclick: openIn });
+    const runs = d.start_line ? h("details", {}, h("summary", { class: "dim small", text: "What aht runs" }), h("pre", { style: "white-space:pre-wrap", text: d.start_line })) : null;
+    const said = () => {
+      go.textContent = st.agent ? `Open in ${label()}` : "Open in …";
+      tok.textContent = st.agent ? tokenLine(st.agent, d) : "";
+      if (cp) cp.textContent = `Copy the Start Line writes the summary here and a copy of it on ${machine}, and copies the line that starts ${label()} with it: `
+        + (st.agent === "kimi" ? "Kimi reads the summary in a run of its own first (that turn uses tokens), then nothing runs until you paste the line into a terminal."
+          : "nothing runs until you paste it into a terminal.") + " Done closes this and writes nothing.";
+      if (runs) runs.hidden = st.agent !== planned();
+    };
+    if (ok && agents.length) {
+      wrap.append(h("div", { class: "openin" }, h("div", { class: "row" }, h("strong", { text: "Open in" }),
+        h("select", { disabled: !!st.done, onchange: (e) => { st.agent = e.target.value; said(); } },
+          agents.map((a) => h("option", { value: a, text: AGENTS[a] || a, selected: a === st.agent }))), tok),
+      cp, runs));
+    } else if (ok) wrap.append(h("p", { class: "dim small", text: "No agent CLI is installed on this computer to open it in." }));
+    said();
+    f.append(h("button", { text: "Copy the Start Line", disabled: !st.done && (!ok || !st.agent || !!st.working), onclick: copyLine }),
+      st.working ? h("span", { class: "dim small" }, h("span", { class: "spin" }), st.working) : null,
+      h("span", { class: "spacer" }), done, go);
+  };
+  paint();
+  look();
+}
+
+/** Leave a Note on M: a summary of the work here goes into the project's
+ * folder on M (`leave-note --json`; a dry run first).  When this folder
+ * picked the work up from M, it is a hand-back: a catch-up for the session
+ * there that the work came from (`note_for`).  Nothing runs there, and no
+ * agent reads anything now: no tokens. */
+async function leaveNote(p, machine) {
+  const name = base(p.real_path);
+  note(p, null);
+  const s = sheet(`Leave a note for “${name}” on ${machine}`, "Pick up on another machine", 820);
+  const st = { there: null, d: null, failed: null, working: null };
+  const isBack = (d) => backMode(d) || !!d.note_for || d.mode === "catchup";
+  // the session there the work came from: the core's note_for, else the
+  // pickup open on this project's row
+  const x = pickedUp(p) || {};
+  const origin = (d) => (d.note_for && typeof d.note_for === "object" ? d.note_for
+    : { agent: x.agent || null, title: null });
+  const opts = (apply) => {
+    const m = (st.d && st.d.match) || {};
+    const there = st.there || (apply && m.path && m.how !== "id" ? m.path : null);
+    return there ? ["--there", there] : [];
+  };
+  const look = async () => {
+    st.d = null; st.failed = null; paint();
+    const d = await dryRun(["leave-note", p.real_path, "--on", machine, ...opts(false), "--json"]);
+    if (!s.body.isConnected) return;
+    st.d = d;
+    paint();
+  };
+  const leave = async () => {
+    const back = isBack(st.d), extra = opts(true), there = (st.d.match || {}).path;
+    st.working = back ? "handing back…" : "leaving the note…"; st.failed = null; paint();
+    const a = await job(["leave-note", p.real_path, "--on", machine, ...extra, "--apply", "--json"]);
+    st.working = null;
+    const d = a.json || {};
+    const failed = problems(d) || (a.ok && d.applied ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
+    if (failed && s.body.isConnected) { st.failed = failed; return paint(); }
+    if (s.body.isConnected) closeSheet();
+    // where it is there, as the core says it (`left`: the files written there)
+    const file = d.relay && there ? `${there.replace(/\/+$/, "")}/.aht/handover/relay-${d.relay}.md` : (d.left || [])[0] || there;
+    const git = (d.git || st.d.git || {}).warning;
+    const rel = d.relay ? `.aht/handover/relay-${d.relay}.md` : null;
+    note(p, failed ? `The note was not left on ${machine}:\n\n${failed}`
+      : (back ? `Handed back to ${machine}: the note is for the session there that the work came from. ${noteReads(origin(d.note_for ? d : st.d).agent, " on " + machine, rel)}`
+        : `The note is on ${machine}. ${noteTold("there", rel)}`)
+        + (file ? `\n\n${file}` : "") + (git ? `\n\n${git}` : ""));
+    refresh();
+  };
+  const paint = () => {
+    const b = clear(s.body), f = clear(s.foot), d = st.d;
+    const cancel = h("button", { text: "Cancel", onclick: closeSheet });
+    if (!d) {
+      b.append(h("p", { class: "dim" }, h("span", { class: "spin" }), `Asking ${machine}…`));
+      f.append(h("span", { class: "spacer" }), cancel);
+      return;
+    }
+    const m = d.match || {}, ok = !problems(d) && !!m.path, back = isBack(d);
+    s.head.querySelector("h1").textContent = back ? `Hand “${name}” back to ${machine}` : `Leave a note for “${name}” on ${machine}`;
+    const o = origin(d), t = AGENTS[o.agent] || o.agent, came = relayTime(d.back_of);
+    const wrap = h("div", { class: "stack" });
+    b.append(wrap);
+    if (st.failed) wrap.append(h("p", { class: "warn small", style: "white-space:pre-wrap", text: "The note was not left:\n\n" + st.failed }));
+    wrap.append(matchPart(d, machine, p, { choose: (x) => { st.there = x; look(); }, retry: look }));
+    if (ok) {
+      wrap.append(h("p", { text: back
+        ? `The work came here from ${t ? `${t}'s session` : "a session"} on ${machine}${o.title ? ` (“${o.title}”)` : ""}. The note is for that session, with what happened here${came ? " since " + clock(came) : ""}. `
+          + noteReads(o.agent, " on " + machine, "the note (in the project's .aht/handover folder there)")
+        : `The note goes into the project's folder on ${machine}: where things stood here, the latest exchanges, the open to-dos and git's state. ` + noteTold("there") }));
+    }
+    wrap.append(gitBox(d.git, machine), (d.warnings || []).filter((w) => w !== (d.git || {}).warning).map((w) => h("p", { class: "warn small", text: "⚠ " + w })));
+    const bf = briefOf(d);
+    if (bf.text) wrap.append(h("div", {}, h("h3", { text: back ? `The note for ${machine}: what happened here since` : "The note" }), h("div", { class: "brief" }, md(bf.text, true))));
+    f.append(h("span", { class: "dim small", text: `Nothing runs on ${machine}, and no tokens are used.` }),
+      st.working ? h("span", { class: "dim small" }, h("span", { class: "spin" }), st.working) : null,
+      h("span", { class: "spacer" }), cancel,
+      h("button", { class: "primary", text: back ? "Hand Back" : "Leave the Note", disabled: !ok || !!st.working, onclick: leave }));
+  };
+  paint();
+  look();
+}
+
+/** Continue Here… on a search hit from another machine: Pick Up from that
+ * machine, with that session and its folder there, into the project's
+ * folder here (the one tracked here by the same name, or one chosen). */
+async function continueFromThere(r) {
+  const name = base(r.project);
+  const choose = () => pickFolder(`Where is “${name}” on this computer? Pick Up brings the work from ${r.machine} into its folder here.`);
+  const same = S.projects.filter((p) => p.exists && !p.away && base(p.real_path).toLowerCase() === name.toLowerCase());
+  const path = same.length === 1 ? same[0].real_path : await choose();
+  if (!path) return;
+  const go = (x) => pickUp(S.projects.find((p) => p.real_path === x) || { real_path: x, exists: true }, r.machine,
+    { session: r.session, there: r.project, change: async () => { const y = await choose(); if (y) go(y); } });
+  go(path);
 }
 
 // Show Sessions: every session, branches under the one they came from
@@ -1295,8 +1777,8 @@ function drawSearch(m) {
   if (!S.hits.length && !S.searchError) m.append(h("p", { class: "dim", text: "Nothing found." }));
   const labelled = (S.searched || []).length > 0 || S.hits.some((r) => r.machine);
   for (const r of S.hits) {
-    // a hit on another machine: Continue and Restore act here, so neither
-    // is offered for it
+    // a hit on another machine: Continue and Restore act here, so it offers
+    // Continue Here… (Pick Up from that machine, with that session) instead
     const there = !!r.machine;
     const box = h("div", { class: "box", style: "margin-top:8px" },
       h("div", { class: "row" }, h("strong", { text: r.title || "(no title)" }),
@@ -1304,7 +1786,8 @@ function drawSearch(m) {
         h("span", { class: "dim small", text: `${base(r.project)} · ${AGENTS[r.agent] || r.agent} · ${when(r.updated)}` }),
         h("span", { class: "grow" }),
         // as the core offers them: only where the project folder is there
-        there ? null : r.resume ? h("button", { class: "small", text: "Continue", onclick: () => resume([r.project, "--session", r.session, "--agent", r.agent]) })
+        there ? h("button", { class: "small", text: "Continue Here…", title: `Pick up this session's work from ${r.machine}`, onclick: () => continueFromThere(r) })
+          : r.resume ? h("button", { class: "small", text: "Continue", onclick: () => resume([r.project, "--session", r.session, "--agent", r.agent]) })
           : r.restore && r.restore.project ? h("button", { class: "small", text: "Restore…", onclick: async () => {
             if (!(await confirmIt("Bring this session back?", `“${r.title}” was deleted from ${base(r.project)}'s history; a backup still holds it. Restoring adds what is missing and changes nothing that is there.`, "Restore"))) return;
             const x = await busy("restoring…", () => run(["restore", r.restore.project, "--uuid", r.restore.uuid, "--stamp", r.restore.stamp, "--apply"]));
@@ -1332,7 +1815,7 @@ function drawMachines(m) {
   const send = CAN_HAND_OVER();
   const remotes = Object.entries(ho.remotes || {});
   m.append(h("div", { class: "row" }, h("span", { class: "dim", text: send ? "The machines projects can be handed over to."
-    : ON_WINDOWS() ? FROM_WINDOWS : "The machines whose sessions aht shows and searches." }), h("span", { class: "grow" }),
+    : ON_WINDOWS() ? PC_MACHINES : "The machines whose sessions aht shows and searches." }), h("span", { class: "grow" }),
     h("button", { text: "Add a Machine…", onclick: addMachine }), helpBtn(ON_WINDOWS() ? "A Windows PC with your other machines" : "Hand a project over")));
   if (!remotes.length) m.append(h("p", { class: "dim", text: "None yet." }));
   else m.append(h("p", { class: "dim small", style: "margin:6px 0 0", text: "Watch: every 2 minutes aht asks that machine for sessions that wait for you, and tells you." }));

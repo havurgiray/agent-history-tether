@@ -3342,6 +3342,9 @@ def cmd_projects(args):
     except Exception:
         stops = []
     for uid, e in reg.get("projects", {}).items():
+        rels = read_relays(e["real_path"]) if os.path.isdir(e["real_path"]) \
+            and relay_dir(e["real_path"]).is_dir() else []
+        opens = open_relays(e["real_path"], rels) if rels else []
         row = {"uuid": uid, "real_path": e["real_path"],
                "exists": os.path.isdir(e["real_path"]),
                "stores": sorted((e.get("stores") or {})),
@@ -3360,8 +3363,10 @@ def cmd_projects(args):
                if (e.get("mirror") or {}).get("enabled") else None,
                "handing": handing_row(e.get("handing"), uid),
                # an open hand-off to another agent: what Hand Back answers
-               "relay": project_relay(e["real_path"]) if os.path.isdir(e["real_path"])
-               else None,
+               "relay": project_relay(e["real_path"], rels, opens) if rels else None,
+               # work picked up here from another machine, open: what Hand
+               # Back to that machine answers, whatever `relay` is
+               "pickup_from": pickup_from(opens),
                "agents": agents_of(e.get("stores") or {})}
         mine = [s["status"] for s in live
                 if _inside(os.path.realpath(s["cwd"]), os.path.realpath(e["real_path"]))]
@@ -4728,8 +4733,8 @@ def _num(s: str) -> int:
 # run from the tray would flash one)
 _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
-WINDOWS_FAR = ("aht cannot ask a Windows machine yet. On the PC, use Bring Here, "
-               "Pick Up or Leave a Note.")
+WINDOWS_FAR = ("aht cannot ask a Windows machine yet. On the PC, use Pick Up or "
+               "Leave a Note.")
 
 def _decoded(r):
     """A finished run's output as text: bytes travel, UTF-8 is read here (a
@@ -4810,6 +4815,8 @@ class Remote:
             e["PATH"] = os.environ["AHT_REMOTE_PATH"] + os.pathsep + e.get("PATH", "")
         if os.environ.get("AHT_REMOTE_CLAUDE"):     # tests: another version there
             e["AHT_CLAUDE"] = os.environ["AHT_REMOTE_CLAUDE"]
+        if os.environ.get("AHT_REMOTE_MACHINE_NAME"):   # tests: the name it gives itself
+            e["AHT_MACHINE_NAME"] = os.environ["AHT_REMOTE_MACHINE_NAME"]
         return e
 
     def _sandboxed(self, script: str) -> str:
@@ -5636,7 +5643,9 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "offsite-list": lambda req: _agent_offsite_list(req),
              "offsite-prune": lambda req: _agent_offsite_prune(req),
              "offsite-adopt": lambda req: _agent_offsite_adopt(req),
-             "search": lambda req: _agent_search(req)}
+             "search": lambda req: _agent_search(req),
+             "relay-info": lambda req: _agent_relay_info(req),
+             "relay-note": lambda req: _agent_relay_note(req)}
 
 def cmd_core(args):
     """`aht _core --id`: the id of the core this build carries (the name of
@@ -8032,11 +8041,13 @@ def _hook_notes(cwd: str, sid: str = None) -> str:
 
 def _relay_notes(cwd: str, sid) -> list:
     """What the relays of this folder tell a Claude session that starts:
-    (1) the catch-up a Hand Back (or a switch to this session, --resume)
-    left for this very session, once; (2) one line when this is the session
-    another agent took the work over from, resumed by hand (the catch-up
-    itself only with informed_sessions); (3) one line when the work went on
-    on another machine."""
+    (1) the catch-up a Hand Back (or a switch to this session, --resume, or
+    work handed back from another machine) left for this very session, once;
+    (2) one line when this is the session another agent took the work over
+    from, resumed by hand (the catch-up itself only with informed_sessions);
+    (3) one line when the work went on on another machine; (4) one line,
+    once, when work came here from another machine (a pickup made here, a
+    note left here): read only if the user asks to go on with it."""
     rels = read_relays(cwd)
     if not rels:
         return []
@@ -8048,7 +8059,7 @@ def _relay_notes(cwd: str, sid) -> list:
             _mark_relay(cwd, r["id"], "told", {"session": sid})
     opens = open_relays(cwd, rels)
     mine = next((r for r in opens if sid and r["from"].get("session") == sid
-                 and _relay_here(r["from"])), None)
+                 and r.get("side") == "both"), None)
     if mine and not back:
         cd = catchup_digest(cwd, float(mine["at"]), exclude={("claude", sid)}, most=3)
         to = AGENT_NAMES[mine["to"]["agent"]]
@@ -8062,14 +8073,41 @@ def _relay_notes(cwd: str, sid) -> list:
             notes.append(f"[aht] This project was handed to {to} at {_clock(mine['at'])}, "
                          "after this session's last turn. The files may differ from what you "
                          f"remember: read them before editing. Summary: {brief}")
-    there = next((r for r in opens if not _relay_here(r["to"]) and _known_from(r["from"])), None)
+    there = next((r for r in opens if r.get("side") not in ("to", "both")
+                  and _known_from(r["from"])), None)
     if there:
         where = there["to"].get("machine") or "another machine"
-        notes.append(f"[aht] This project was picked up on “{where}” at {_clock(there['at'])} "
-                     f"({AGENT_NAMES[there['to']['agent']]}). Work may go on there: if the "
-                     "user asks to continue that work, check with them before changing "
-                     "anything here.")
+        if there.get("kind") == "note":
+            notes.append(f"[aht] A note about this project was left on “{where}” at "
+                         f"{_clock(there['at'])}, for the work to go on there: if the user "
+                         "asks to continue that work, check with them before changing "
+                         "anything here.")
+        else:
+            notes.append(f"[aht] This project was picked up on “{where}” at "
+                         f"{_clock(there['at'])} ({AGENT_NAMES[there['to']['agent']]}). Work "
+                         "may go on there: if the user asks to continue that work, check with "
+                         "them before changing anything here.")
+    came = next((r for r in opens if r.get("side") == "to" and r.get("told") is None
+                 and r.get("kind") in ("pickup", "note") and _arrival_known(r)), None)
+    if came and sid:
+        where = came["from"].get("machine") or "another machine"
+        brief = f".aht/handover/relay-{came['id']}.md"
+        what = (f"“{where}” left a note about this project at {_clock(came['at'])}"
+                if came["kind"] == "note" else
+                f"This project's work was picked up here from “{where}” at "
+                f"{_clock(came['at'])}")
+        notes.append(f"[aht] {what} ({AGENT_NAMES[came['from']['agent']]} had worked on it "
+                     f"there). If the user asks to continue that work, read {brief} first.")
+        _mark_relay(cwd, came["id"], "told", {"session": sid})
     return notes
+
+def _arrival_known(r: dict) -> bool:
+    """Whether aht itself put here a relay whose work came from another
+    machine: this machine wrote it (a pickup made here), or another machine
+    left it through relay-note, which noted it in run/incoming.jsonl.  A
+    relay file that came with the folder is not taken."""
+    mid = (r.get("to") or {}).get("machine_id")
+    return (bool(mid) and mid == machine_id()) or r.get("id") in _incoming_sides()
 
 def _known_from(end: dict) -> bool:
     """Whether the machine a relay says the work left from is one aht knows:
@@ -8086,7 +8124,8 @@ def _known_from(end: dict) -> bool:
 
 def _catchup_note(cwd: str, r: dict) -> str:
     """A Hand Back's catch-up as the hook gives it: the head of its summary
-    (who worked, files and commits since, what is open), at most
+    (who worked, files and commits since, what is open) and its git warning
+    ("Before going on", work that came from another machine), at most
     HOOK_NOTE_MAX characters."""
     brief = f".aht/handover/relay-{r['id']}.md"
     try:
@@ -8094,9 +8133,12 @@ def _catchup_note(cwd: str, r: dict) -> str:
     except OSError:
         text = ""
     head = text.split("\n## ", 1)[0].split("\n", 1)[-1].strip()     # without its title
+    m = re.search(r"\n## Before going on\n(.*?)(?=\n## |\Z)", text, re.S)
+    first = re.sub(r"^- ", "", " ".join(m.group(1).split())) if m else ""
+    git = f"\nBefore going on: {_clip(redact(first), 600)}" if first else ""
     tail = f"\nThe full summary: {brief}"
     return "[aht] " + _clip(redact(head) or "Work went on here while this session was "
-                            "away.", HOOK_NOTE_MAX - len(tail) - 8) + tail
+                            "away.", HOOK_NOTE_MAX - len(tail) - len(git) - 8) + git + tail
 
 def _copy_note(cwd: str) -> str:
     """When this folder is a copy aht keeps for another machine
@@ -10273,6 +10315,8 @@ def git_state(real: str, since_head: str = None, since: float = None):
         if "R" in xy or "C" in xy:
             i += 1                              # the name it had before
         if xy == "??":
+            if path.startswith(".aht/"):
+                continue                        # aht's own: the marker, the relays
             st["untracked"] += 1
             untracked.append(path)
         elif xy != "!!":
@@ -10397,8 +10441,9 @@ def write_relay(real: str, kind: str, frm: dict, to: dict, text: str, rid: str =
         rid = new_relay_id()
     mid = machine_id(create=True)
     rec = {"v": 1, "id": rid, "kind": kind, "at": time.time(), "project_id": read_marker(real),
-           "from": dict(_here_end(), machine_id=mid, path=real, **frm),
-           "to": dict(_here_end(), machine_id=mid, path=real, **to),
+           # an end on another machine says which (pickup, note): it overrides
+           "from": {**_here_end(), "machine_id": mid, "path": real, **frm},
+           "to": {**_here_end(), "machine_id": mid, "path": real, **to},
            "brief": f"relay-{rid}.md", "back_of": back_of, "note_for": note_for}
     (d / rec["brief"]).write_text(text, encoding="utf-8")
     with open(d / f"relay-{rid}.json", "x", encoding="utf-8") as fh:
@@ -10434,11 +10479,13 @@ def close_relay(real: str, rid: str, by: str) -> bool:
 
 def read_relays(real: str) -> list:
     """The relays of a project, newest first, each with what its markers say
-    (`closed`, `told`: None, or the marker's content).  A record whose id is
-    not its file's name, or that aht would not have written, is passed over;
-    the rest only as _relay_safe keeps them."""
+    (`closed`, `told`: None, or the marker's content) and which end of it
+    this machine is (`side`, _relay_side).  A record whose id is not its
+    file's name, or that aht would not have written, is passed over; the
+    rest only as _relay_safe keeps them."""
     d = relay_dir(real)
     out = []
+    sides = _incoming_sides()
     try:
         files = list(d.glob("relay-*.json")) if d.is_dir() else []
     except OSError:
@@ -10455,9 +10502,20 @@ def read_relays(real: str) -> list:
         if rec is None:
             continue
         out.append(dict(rec, closed=_relay_marker(d, rid, "closed"),
-                        told=_relay_marker(d, rid, "told")))
+                        told=_relay_marker(d, rid, "told"), side=_relay_side(rec, sides)))
     out.sort(key=lambda r: (r["at"], r["id"]), reverse=True)
     return out
+
+def _relay_side(rec: dict, sides: dict = None):
+    """Which end of a relay this machine is: "both" (one machine: a switch,
+    a hand-back), "from" (the work left here), "to" (it came here), or None
+    (a record that came with the folder).  A relay another machine left here
+    (relay-note) says so in run/incoming.jsonl, whatever the names in it."""
+    s = (_incoming_sides() if sides is None else sides).get(rec.get("id"))
+    if s in ("from", "to"):
+        return s
+    f, t = _relay_here(rec.get("from")), _relay_here(rec.get("to"))
+    return "both" if f and t else "from" if f else "to" if t else None
 
 _MACHINE_NAME = re.compile(r"(?=.*[A-Za-z0-9])[A-Za-z0-9._ -]{1,64}")
 _MACHINE_ID = re.compile(r"[0-9a-f]{12}")
@@ -10564,7 +10622,8 @@ def _went_on(real: str, r: dict) -> bool:
     (here, resumed by hand).  Only what the user typed counts: the session
     that ran the switch may still have answered after it."""
     f = r.get("from") or {}
-    if not (_relay_here(f) and f.get("session") and f.get("agent") in _EVENTS):
+    here = r["side"] in ("from", "both") if "side" in r else _relay_here(f)
+    if not (here and f.get("session") and f.get("agent") in _EVENTS):
         return False
     path = session_file(real, f["agent"], f["session"])
     st = _stat(path) if path else None
@@ -10577,9 +10636,11 @@ def _went_on(real: str, r: dict) -> bool:
     return False
 
 def _opens_nothing(r: dict) -> bool:
-    """A hand-back answers a relay and opens none; Summary Only started
-    nothing, so who has the project stays as it was."""
-    return r.get("kind") == "back" or (r.get("to") or {}).get("mode") == "brief-only"
+    """A hand-back answers a relay and opens none, nor does work that comes
+    back from another machine (a pickup or a note with `back_of`); Summary
+    Only started nothing, so who has the project stays as it was."""
+    return r.get("kind") == "back" or bool(r.get("back_of")) \
+        or (r.get("to") or {}).get("mode") == "brief-only"
 
 def open_relays(real: str, relays: list = None) -> list:
     """The project's open relays, newest first: work handed on that has not
@@ -10599,23 +10660,78 @@ def relay_row(r: dict, real: str) -> dict:
     """A relay as `relays --json` lists it."""
     closed = r.get("closed")
     return {"id": r["id"], "kind": r.get("kind"), "at": r.get("at"),
-            "from": r.get("from"), "to": r.get("to"),
+            "from": r.get("from"), "to": r.get("to"), "side": r.get("side"),
+            "back_of": r.get("back_of"),
             "open": closed is None and not _opens_nothing(r),
             "closed_by": (closed or {}).get("by") if closed is not None else None,
             "brief": str(relay_dir(real) / f"relay-{r['id']}.md")}
 
-def project_relay(real: str):
+def project_relay(real: str, rels: list = None, opens: list = None):
     """A project's newest open relay, for its row in the window: None, or
-    {id, from_agent, to_agent, since, open, incoming}.  The same relay Hand
-    Back (switch --back) answers."""
-    if not relay_dir(real).is_dir():
-        return None
-    r = next(iter(open_relays(real)), None)
+    {id, from_agent, to_agent, since, open, incoming, kind, machine, remote,
+    arrived, told}.  `machine`: the other machine's name when the relay
+    crosses machines (None: both ends here, the one Hand Back, switch
+    --back, answers); `remote`: that name when it is one set up here.
+    `incoming` (an object, else None): the work came here from that machine
+    (_incoming_row).  Work that came back from there opens nothing, but
+    until a session here heard of it (`told`) it is the row's relay (open:
+    false), for the banner.  `rels`, `opens`: read_relays and open_relays
+    of it, read already."""
+    if rels is None:
+        if not relay_dir(real).is_dir():
+            return None
+        rels = read_relays(real)
+    opens = open_relays(real, rels) if opens is None else opens
+    r = next(iter(opens), None)
+    new = rels[0] if rels else None
+    if new is not None and new is not r and new.get("side") == "to" \
+            and new.get("told") is None and new.get("closed") is None:
+        r = new
     if r is None:
         return None
+    side = r.get("side")
+    other = None if side == "both" else (r["from"] if side == "to" else r["to"])
+    machine = (other or {}).get("machine") or (None if side == "both" else "another machine")
     return {"id": r["id"], "from_agent": r["from"].get("agent"), "to_agent": r["to"].get("agent"),
-            "since": r.get("at"), "open": True,
-            "incoming": not (_relay_here(r["from"]) and _relay_here(r["to"]))}
+            "since": r.get("at"), "open": r in opens,
+            "incoming": _incoming_row(r, rels, real) if side == "to" else None,
+            "kind": r.get("kind"), "machine": machine,
+            "remote": machine if machine and machine in remotes_config() else None,
+            "arrived": side == "to", "told": r.get("told") is not None}
+
+def pickup_from(opens: list):
+    """The work picked up here from another machine and not handed back yet
+    (an open pickup made here), for the row's "Picked up from M" and "Hand
+    Back to M…", whichever relay is the row's `relay` (a switch to another
+    agent here since, say): None, or {machine, remote, relay, at, agent,
+    session}; `agent` and `session` are the ones it came from there.
+    `opens`: the project's open_relays."""
+    r = next((r for r in opens if r.get("kind") == "pickup" and r.get("side") == "to"
+              and _arrival_known(r)), None)
+    if r is None:
+        return None
+    m = r["from"].get("machine") or "another machine"
+    return {"machine": m, "remote": m if m in remotes_config() else None, "relay": r["id"],
+            "at": r.get("at"), "agent": r["from"].get("agent"),
+            "session": r["from"].get("session")}
+
+def _incoming_row(r: dict, rels: list, real: str) -> dict:
+    """Work that came here from another machine, for the row's banner:
+    {machine, kind (note, back or pickup), at, agent (who worked there),
+    brief (its file here), worked_from, worked_to, note_for: {agent,
+    session, title} of the session here it is for, or None}."""
+    b = next((x for x in rels if x["id"] == r.get("back_of")), None)
+    nf, agent = r.get("note_for"), r["to"].get("agent")
+    title = None
+    if nf:
+        f = session_file(real, agent, nf)
+        title = _line(_session_title({"agent": agent, "file": str(f), "title": None})) \
+            if f else None
+    return {"machine": r["from"].get("machine") or "another machine",
+            "kind": "back" if r.get("back_of") else r.get("kind"), "at": r.get("at"),
+            "agent": r["from"].get("agent"), "brief": str(relay_dir(real) / r["brief"]),
+            "worked_from": b["at"] if b else None, "worked_to": r["from"].get("last_t"),
+            "note_for": {"agent": agent, "session": nf, "title": title} if nf else None}
 
 # ---- the summaries ----------------------------------------------------------- #
 
@@ -10660,22 +10776,24 @@ def _more(items: list, n: int, more: int = 0) -> str:
     extra = len(items) - n + more
     return ", ".join(items[:n]) + (f" and {extra} more" if extra > 0 else "")
 
-def catchup_head(cd: dict, g, away: str, had: list = None) -> list:
+def catchup_head(cd: dict, g, away: str, had: list = None, where: str = "here") -> list:
     """The first lines of a catch-up, which also make the note Claude's
     hook gives the session: who worked, files and commits since, what is
     still open, the last words.  `had`: the agents the relays being answered
-    went to; when none of their work can be read, the head says so."""
+    went to; when none of their work can be read, the head says so.
+    `where`: "here", or "on box" for work done on another machine."""
     who = _names([r["agent"] for r in cd["sessions"]])
     n, k = cd["exchanges"], len(cd["sessions"])
     if k:
         span = _span(cd["first_t"], cd["last_t"])
-        L = [f"While {away} was away, {who} worked here {'from' if ' to ' in span else 'at'} {span} "
-             f"({n} exchange{'s' if n != 1 else ''}" + (f" in {k} sessions" if k > 1 else "") + ")."]
+        L = [f"While {away} was away, {who} worked {where} {'from' if ' to ' in span else 'at'} "
+             f"{span} ({n} exchange{'s' if n != 1 else ''}"
+             + (f" in {k} sessions" if k > 1 else "") + ")."]
     elif had:
         L = [_unread_work(had, cd["since"])]
     else:
         L = [f"While {away} was away (since {_clock(cd['since'])}), no other agent's session "
-             "here that aht can read went on."]
+             f"{where} that aht can read went on."]
     if g and g.get("base"):
         files = [c.split(" ", 1)[1] for c in g["changed"]]
         if files:
@@ -10715,7 +10833,7 @@ def _clip_to(text: str, n: int) -> str:
     return text[:n - 80].rstrip() + f"\n\n[… cut here: a summary holds at most {n} characters]\n"
 
 def relay_brief(real: str, kind: str, source: dict, since: float = None, relay: dict = None,
-                dig: dict = None, had: list = None) -> str:
+                dig: dict = None, had: list = None, where: str = "here") -> str:
     """The summary that goes with a relay, built from the histories without
     spending a token; whatever looks like a key is masked.
     kind "full", for a new session: where things stood in `source` (a
@@ -10725,7 +10843,10 @@ def relay_brief(real: str, kind: str, source: dict, since: float = None, relay: 
     session here did after `since`, the files changed and the commits made
     since.  At most CATCHUP_MAX.  `relay` is the record it goes with (for
     the header); `dig` a digest made already; `had` (catch-up) the agents
-    the relays it answers went to."""
+    the relays it answers went to; `where` (catch-up) where the work was
+    done, as its reader says it ("on box").  A relay whose ends are two
+    machines (a pickup, a note) names both in the header; the machine that
+    builds a full summary is always its `from` end."""
     relay = relay or {}
     frm, to = relay.get("from") or {}, relay.get("to") or {}
     name = os.path.basename(real)
@@ -10736,8 +10857,9 @@ def relay_brief(real: str, kind: str, source: dict, since: float = None, relay: 
         away = AGENT_NAMES.get(source["agent"], source["agent"])
         cd = dig or catchup_digest(real, since, exclude={(source["agent"], source["id"])})
         g = git_state(real, since_head=(frm.get("git") or {}).get("head")
-                      if relay.get("kind") == "back" else None, since=since)
-        L = [f"# Catch-up: {name}", ""] + catchup_head(cd, g, away, had) + warn_codex
+                      if relay.get("kind") == "back" or relay.get("back_of") else None,
+                      since=since)
+        L = [f"# Catch-up: {name}", ""] + catchup_head(cd, g, away, had, where) + warn_codex
         shown = sorted((x for r in cd["sessions"] for x in r["exchanges"]),
                        key=lambda x: x.get("t") or 0)[-12:]
         full = {id(x) for x in shown}
@@ -10787,17 +10909,38 @@ def relay_brief(real: str, kind: str, source: dict, since: float = None, relay: 
     system = {"Darwin": "macOS", "Linux": "Linux", "Windows": "Windows"}
     fa = AGENT_NAMES.get(frm.get("agent") or source["agent"], source["agent"])
     ta = AGENT_NAMES.get(to.get("agent"), to.get("agent") or "?")
-    L = [f"# {label}: {name}", "",
-         f"- From **{fa}** to **{ta}** on {_here()} "
-         f"({system.get(platform.system(), platform.system())}), {when}"]
-    if to.get("path") and to["path"] != real:
-        L += [f"- Folder here: `{real}`; there: `{to['path']}`"]
+    fm, tm = frm.get("machine"), to.get("machine")
+    resume = resume_command(source["agent"], source["id"], real)
+    if fm and tm and fm != tm:              # two machines: this one is the `from` end
+        tsys = to.get("system")
+        L = [f"# {label}: {name}", "",
+             f"- From **{fa}** on {fm} ({system.get(platform.system(), platform.system())}) "
+             f"to " + (f"**{ta}** on " if to.get("agent") else "") + f"{tm} "
+             f"({system.get(tsys, tsys or '?')}), {when}",
+             f"- Folder on {fm}: `{real}`; on {tm}: `{to.get('path') or '?'}`",
+             f"- Session it continues: {_masked(dig.get('title') or 'untitled', 120)} — "
+             f"`{source['id']}`"]
+        if relay.get("kind") == "note":         # it goes back by a pickup from here
+            back = f"`aht pickup {shell_quote(real)} --from {tm}`"
+            L.append(f"- To go back to it on {fm}: `{resume}`, or bring what happened on "
+                     f"{tm} with {back}")
+        else:                                   # by a note from there
+            back = f"`aht leave-note {_quote_for(tsys, to.get('path') or '?')} --on {fm}`"
+            L.append(f"- To go back to it on {fm}: `{resume}`; to hand the work back from "
+                     f"{tm}: {back}")
+        L += warn_codex
     else:
-        L += [f"- Folder: `{real}`"]
-    L += [f"- Session it continues: {_masked(dig.get('title') or 'untitled', 120)} — "
-          f"`{source['id']}`",
-          f"- To go back to it: `{resume_command(source['agent'], source['id'], real)}`, or "
-          f"`aht switch {shell_quote(real)} --back`"] + warn_codex
+        L = [f"# {label}: {name}", "",
+             f"- From **{fa}** to **{ta}** on {_here()} "
+             f"({system.get(platform.system(), platform.system())}), {when}"]
+        if to.get("path") and to["path"] != real:
+            L += [f"- Folder here: `{real}`; there: `{to['path']}`"]
+        else:
+            L += [f"- Folder: `{real}`"]
+        L += [f"- Session it continues: {_masked(dig.get('title') or 'untitled', 120)} — "
+              f"`{source['id']}`",
+              f"- To go back to it: `{resume}`, or "
+              f"`aht switch {shell_quote(real)} --back`"] + warn_codex
     L += _brief_sections(dig, times=True)
     g = git_state(real)
     if g:
@@ -10806,6 +10949,10 @@ def relay_brief(real: str, kind: str, source: dict, since: float = None, relay: 
         L += ["", "## Files outside the project that session used", ""]
         L += [f"- `{redact(p)}`" for p in dig["outside"]]
     return _clip_to("\n".join(L) + "\n", BRIEF_MAX)
+
+def _quote_for(system, s) -> str:
+    """One word for the shell of another machine's system."""
+    return '"' + str(s).replace('"', "") + '"' if system == "Windows" else shlex.quote(str(s))
 
 def codex_unreadable(real: str) -> int:
     """How many Codex sessions in the folder `real` aht cannot read: Codex's
@@ -11086,8 +11233,13 @@ def _switch_back(args, out: dict, lines: list, real: str) -> int:
     from --to), answered in the origin agent's own session with a catch-up
     since the relay.  Gone, that session: a new one reads the full summary
     and the catch-up."""
-    rels = open_relays(real)
+    rels = [r for r in open_relays(real) if r.get("side") == "both"]
     pick = [r for r in rels if not args.to or r["from"].get("agent") == args.to]
+    if not pick and not args.to and any(r.get("side") in ("from", "to") for r in open_relays(real)):
+        out["blockers"].append("the work went between machines: hand it back with "
+                               "aht leave-note (or take it with aht pickup) on the machine "
+                               "you are at")
+        return _emit(args, out, lines)
     if not pick:
         out["blockers"].append("nothing to hand back: no agent took this project over here"
                                + (f" from {AGENT_NAMES[args.to]}" if args.to else ""))
@@ -11250,9 +11402,11 @@ def cmd_relays(args):
     for x in rows:
         fa = AGENT_NAMES.get(x["from"].get("agent"), x["from"].get("agent") or "?")
         ta = AGENT_NAMES.get(x["to"].get("agent"), x["to"].get("agent") or "?")
-        where = "" if _relay_here(x["to"]) else f" on {x['to'].get('machine')}"
+        side = x.get("side")
+        where = "" if side == "both" else f" from {x['from'].get('machine')}" if side == "to" \
+            else f" on {x['to'].get('machine')}"
         state = ("open: " + ta + " has it" if x["open"] else
-                 "" if x["kind"] == "back" else
+                 "" if x["kind"] == "back" or x.get("back_of") else
                  "summary only" if x["to"].get("mode") == "brief-only" else
                  said.get(x["closed_by"], "handed back"))
         print(f"  {time.strftime('%Y-%m-%d %H:%M', time.localtime(x['at'] or 0))}  "
@@ -11260,6 +11414,865 @@ def cmd_relays(args):
               + (f"   ({state})" if state else ""))
         print(f"      {x['id']}   aht relays {shlex.quote(real)} --show {x['id']}")
     return 0
+
+# ---- across machines: Pick Up and Leave a Note ------------------------------ #
+# Context moves; git moves the files.  At the machine you sit at, Pick Up asks
+# the other one (`relay-info`, read only) for the summary of its latest session
+# in the same project, made and masked there, with that folder's git state.
+# Leave a Note puts a summary of the work here into the other copy
+# (`relay-note`, which only adds files).  Both keep the same relay record on
+# both machines.  When the work comes back the way it went (an open relay to
+# that machine, or from it), the summary is a catch-up of what happened since,
+# for the session that left.  A Windows PC is never asked: it starts both.
+
+NOTE_MAX = 200 * 1024           # bytes: the most one file relay-note writes
+INCOMING_KEEP = 300             # lines of run/incoming.jsonl kept
+REPO_SCAN = (4, 400, 6.0)       # a search for clones there: depth, repositories, seconds
+_RELAY_FILE = re.compile(r"relay-(\d{8}-\d{6}-[0-9a-f]{4})\.(json|md|closed|told)")
+_INCOMING = {}                  # (mtime, size) -> rows: run/incoming.jsonl read once
+
+def incoming_path() -> Path:
+    return aht_home() / "run" / "incoming.jsonl"
+
+def _incoming_rows() -> list:
+    """What other machines left here through relay-note, oldest first."""
+    p = incoming_path()
+    st = _stat(p)
+    if st is None:
+        return []
+    key = (str(p), st.st_mtime, st.st_size)
+    if key not in _INCOMING:
+        rows = []
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and _RELAY_ID.fullmatch(str(d.get("relay") or "")):
+                rows.append(d)
+        _INCOMING.clear()
+        _INCOMING[key] = rows
+    return _INCOMING[key]
+
+def _incoming_sides() -> dict:
+    """{relay id: "from" | "to"}: which end of a relay another machine left
+    here this machine is."""
+    return {d["relay"]: d["side"] for d in _incoming_rows() if d.get("side") in ("from", "to")}
+
+def _note_incoming(row: dict) -> None:
+    """One line in run/incoming.jsonl: this machine's notices tell of it."""
+    p = incoming_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except OSError as e:
+        warn(f"RELAY could not note an arrival: {e}")
+
+def _incoming_notices(since, now: float) -> list:
+    """One notice for each relay another machine left here after `since`
+    (the last check; the last hour at the first) and by `now` (a line
+    written while this runs is the next check's: told once): "pc handed
+    paper back: Codex worked 14:10–16:40".  The file keeps its newest
+    INCOMING_KEEP lines."""
+    rows = _incoming_rows()
+    try:
+        since = float(since)
+    except (TypeError, ValueError):
+        since = now - 3600
+    out = []
+    for d in rows:
+        at = _number(d.get("at"))
+        if at is None or at <= since or at > now:     # after `now`: the next check's
+            continue
+        name = _line(d.get("name")) or "a project"
+        m = d.get("machine") if isinstance(d.get("machine"), str) \
+            and _MACHINE_NAME.fullmatch(d["machine"]) else "another machine"
+        agent = AGENT_NAMES.get(d.get("agent"), "an agent")
+        span = _span(_number(d.get("since")), _number(d.get("until")), "–")
+        title = _line(d.get("title"))
+        back = bool(d.get("back"))
+        if d.get("side") == "to" and back:
+            t, msg = f"{m} handed {name} back", (f"{agent} worked {span}" if span
+                                                else f"{agent} had the work")
+        elif d.get("side") == "to":
+            t, msg = f"{m} left a note on {name}", f"from {agent}" + (f": “{title}”" if title
+                                                                       else "")
+        elif back:
+            t, msg = f"{m} took {name} back", (f"{agent} had worked here {span}" if span
+                                              else f"from {agent} here")
+        else:
+            t, msg = f"{m} picked up {name}", (f"{agent}: “{title}”; " if title else "") \
+                + "work may go on there"
+        out.append({"kind": "incoming", "title": t, "message": msg,
+                    "info": {"kind": "incoming", "project": d.get("path"), "relay": d["relay"],
+                             "machine": m, "side": d.get("side"),
+                             "relay_kind": "back" if back else d.get("kind")}})
+    if len(rows) > INCOMING_KEEP:
+        try:
+            with Lock(timeout=5):
+                keep = incoming_path().read_text(encoding="utf-8").splitlines()[-INCOMING_KEEP:]
+                tmp = incoming_path().with_suffix(".new")
+                tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+                os.replace(tmp, incoming_path())
+        except (TimeoutError, OSError) as e:
+            warn(f"RELAY could not trim incoming.jsonl: {e}")
+    return out
+
+# -- finding the project there -------------------------------------------------
+
+def norm_origin(url):
+    """A git remote's address as two clones of one repository share it:
+    no scheme, user, password, port or .git, "host/path" in lower case.
+    https://me:tok@github.com/Me/paper.git and git@github.com:me/paper are
+    one.  None when there is none."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    u = url.strip().replace("\\", "/")
+    m = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://(.*)$", u)
+    if m:
+        rest = m.group(1)
+        host, _sl, path = rest.partition("/")
+        host = host.rpartition("@")[2].split(":")[0]
+        u = host + "/" + path
+    else:
+        m = re.match(r"(?:[^@/]+@)?([^/:]{2,}):(.*)$", u)       # host:path, not C:/
+        if m:
+            u = m.group(1) + "/" + m.group(2)
+    u = re.sub(r"(?:\.git)?/*$", "", u).strip("/")
+    return u.lower() or None
+
+def _git_ident(real: str) -> tuple:
+    """(normalised origin, root commits) of the repository at `real`."""
+    if not is_git(real):
+        return None, []
+    o = _git(real, "config", "--get", "remote.origin.url")
+    roots = (_git(real, "rev-list", "--max-parents=0", "HEAD") or "").split()
+    return norm_origin(o), [r for r in roots if _HEAD.fullmatch(r)][:5]
+
+def _repos_under(roots: list, depth: int, most: int, secs: float) -> list:
+    """The git repositories under `roots` (not inside one another), at most
+    `most`, looked for during at most `secs`."""
+    end, out, n = time.time() + secs, [], 0
+    pruned = prune_dirs()
+    for root in roots:
+        root = os.path.realpath(root)
+        if not os.path.isdir(root):
+            continue
+        base = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, files in os.walk(root):
+            n += 1
+            if ".git" in dirnames or ".git" in files:
+                out.append(os.path.realpath(dirpath))
+                dirnames[:] = []
+                if len(out) >= most:
+                    return out
+                continue
+            if time.time() > end or n > 20000:
+                return out
+            if dirpath.rstrip(os.sep).count(os.sep) - base >= depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in pruned]
+    return out
+
+def _relay_find(req: dict) -> dict:
+    """The folder on this machine that is the project another machine asks
+    about -> {path, how, candidates: [{path, how}], error}.  In order:
+    1. its project id: this machine's registry, or the marker in a folder;
+    2. the same git origin (normalised) and root commit;
+    3. the same path; 4. the same path below the home folder.
+    The first of these that finds anything decides; two folders found by it
+    are two candidates, and nothing is chosen.  `there` (the user's pick)
+    is taken as it is; before the search, `relay_path`: the folder here the
+    work that went to the asking machine came from (its relay records it),
+    when it is still there."""
+    found = {"path": None, "how": None, "candidates": [], "error": None}
+    there = req.get("there")
+    if there:
+        if isinstance(there, str) and _is_abs(there) and os.path.isdir(there):
+            p = os.path.realpath(there)
+            found.update(path=p, how="there", candidates=[{"path": p, "how": "there"}])
+        else:
+            found["error"] = f"there is no folder {there} on this machine"
+        return found
+    rp = req.get("relay_path")
+    if isinstance(rp, str) and _is_abs(rp) and os.path.isdir(rp):
+        p = os.path.realpath(rp)
+        found.update(path=p, how="relay", candidates=[{"path": p, "how": "relay"}])
+        return found
+    near = []
+    for key, how in (("path", "path"), ("home_rel", "home")):
+        v = req.get(key)
+        if not isinstance(v, str) or not v or ".." in v.replace("\\", "/").split("/"):
+            continue
+        p = v if how == "path" else os.path.join(str(Path.home()), *v.split("/"))
+        if _is_abs(p) and os.path.isdir(p) and not _same_dir(p, str(Path.home())):
+            near.append((os.path.realpath(p), how))
+    steps = []
+    pid = req.get("project_id") if isinstance(req.get("project_id"), str) else None
+    reg = load_registry().get("projects", {}) if registry_path().is_file() else {}
+    known = [os.path.realpath(e["real_path"]) for e in reg.values()
+             if isinstance(e, dict) and isinstance(e.get("real_path"), str)
+             and os.path.isdir(e["real_path"])]
+    if pid:
+        ids = [os.path.realpath(reg[pid]["real_path"])] if pid in reg \
+            and os.path.isdir(str(reg[pid].get("real_path"))) else []
+        ids += [p for p, _h in near if read_marker(p) == pid]
+        steps.append(("id", ids))
+    origin = req.get("origin") if isinstance(req.get("origin"), str) else None
+    if origin and not any(hits for _h, hits in steps):
+        want = {r for r in req.get("roots") or [] if isinstance(r, str) and _HEAD.fullmatch(r)}
+        depth, most, secs = REPO_SCAN
+        pool = list(dict.fromkeys([p for p, _h in near] + known
+                                  + _repos_under(default_roots(), depth, most, secs)))
+        if pid:                                 # a marker found on the way still counts first
+            steps[0] = ("id", [p for p in pool if read_marker(p) == pid])
+        same = []
+        for p in pool:
+            if not is_git(p) or norm_origin(_git(p, "config", "--get", "remote.origin.url")) != origin:
+                continue
+            have = set((_git(p, "rev-list", "--max-parents=0", "HEAD") or "").split())
+            if want and have and not (want & have):
+                continue                        # another repository behind the same address
+            same.append(p)
+        steps.append(("origin", same))
+    steps += [("path", [p for p, h in near if h == "path"]),
+              ("home", [p for p, h in near if h == "home"])]
+    seen = set()
+    for how, hits in steps:
+        for p in hits:
+            if p not in seen:
+                seen.add(p)
+                found["candidates"].append({"path": p, "how": how})
+    for how, hits in steps:
+        hits = list(dict.fromkeys(hits))
+        if hits:
+            found["how"] = how
+            if len(hits) == 1:
+                found["path"] = hits[0]
+            found["candidates"] = [c for c in found["candidates"] if c["how"] == how] \
+                + [c for c in found["candidates"] if c["how"] != how]
+            break
+    return found
+
+def _far_sessions(folder: str, most: int = 8) -> list:
+    """The latest sessions in a folder, for another machine: agent, id,
+    title (masked), when, and whether it is open or working now."""
+    run = {}
+    try:
+        run = {s.get("session"): s.get("status") for s in running_sessions(inside=folder)}
+    except Exception:
+        pass
+    procs = set()
+    if os.name != "nt":
+        try:
+            procs = {p["agent"] for p in agent_processes()
+                     if _inside(os.path.realpath(p["project"]), folder)}
+        except Exception:
+            pass
+    rows, marked = [], set()
+    for s in list_sessions(folder):
+        if s["agent"] == "claude" and _is_scripted(s["file"]):
+            continue
+        if s["agent"] == "claude":
+            is_open, working = s["id"] in run, run.get(s["id"]) in ("busy", "shell")
+        else:                       # an agent open in the folder: its newest session
+            is_open, working = s["agent"] in procs and s["agent"] not in marked, False
+            if is_open:
+                marked.add(s["agent"])
+        rows.append({"agent": s["agent"], "id": s["id"], "title": _line(_session_title(s)),
+                     "updated": s["updated"], "open": bool(is_open), "working": bool(working),
+                     "state": "working" if working else "open" if is_open else "closed"})
+        if len(rows) >= most:
+            break
+    return rows
+
+def _far_head(h) -> dict:
+    """The relay header the asking machine sent, as aht writes one."""
+    h = h if isinstance(h, dict) else {}
+    def end(e, keys):
+        e = e if isinstance(e, dict) else {}
+        x = {}
+        for k in keys:
+            v = e.get(k)
+            if k == "machine":
+                x[k] = v if isinstance(v, str) and _MACHINE_NAME.fullmatch(v) else None
+            elif k == "system":
+                x[k] = v if v in ("Darwin", "Linux", "Windows") else None
+            elif k == "path":
+                x[k] = v if isinstance(v, str) and len(v) <= 4096 and not _CONTROL.search(v) else None
+            elif k == "agent":
+                x[k] = v if v in AGENT_NAMES else None
+            elif k == "git":
+                x[k] = {"head": v["head"]} if isinstance(v, dict) and isinstance(v.get("head"), str) \
+                    and _HEAD.fullmatch(v["head"]) else None
+        return x
+    back = h.get("back_of")
+    return {"kind": h.get("kind") if h.get("kind") in RELAY_LABEL else "pickup",
+            "at": _number(h.get("at")) or time.time(),
+            "from": end(h.get("from"), ("machine", "system", "git")),
+            "to": end(h.get("to"), ("machine", "system", "path", "agent")),
+            "back_of": back if isinstance(back, str) and _RELAY_ID.fullmatch(back) else None}
+
+def _agent_relay_info(req: dict) -> dict:
+    """For a machine that picks up the work here, or leaves a note here (read
+    only): the folder that is the project (_relay_find), its latest
+    sessions, its git state, its relays, this machine's clock; with `brief`
+    the summary of the chosen session, made and masked here; and, when the
+    work comes back on one of the relays offered (`back`: those whose far
+    end may be this machine), which one, and with `brief` a catch-up of what
+    happened here since."""
+    now = time.time()
+    skew = now - (_number(req.get("now")) or now)
+    m = _relay_find(req)
+    out = {"ok": True, "host": _here(), "machine_id": machine_id(create=False),
+           "system": platform.system(), "home": str(Path.home()), "clock": now,
+           "skew": round(skew, 1), "match": m, "project_id": None, "sessions": [],
+           "source": None, "git": None, "brief": None, "catchup": None, "back": None,
+           "backs": [], "relays": []}
+    folder = m.get("path")
+    if not folder:
+        return out
+    out["project_id"] = read_marker(folder)
+    out["sessions"] = _far_sessions(folder)
+    out["git"] = git_state(folder)
+    out["relays"] = [{"id": r["id"], "kind": r["kind"], "at": r["at"],
+                      "from": r["from"].get("machine"), "to": r["to"].get("machine"),
+                      "open": relay_row(r, folder)["open"]} for r in read_relays(folder)[:12]]
+    mine, name = machine_id(create=False), req.get("name")
+    backs = []
+    for c in req.get("back") or []:
+        if not (isinstance(c, dict) and _RELAY_ID.fullmatch(str(c.get("id") or ""))
+                and _number(c.get("at")) is not None):
+            continue
+        cid = c.get("machine_id")
+        if (cid and mine and cid == mine) or (not cid and name and c.get("machine") == name):
+            backs.append(c)
+    back = max(backs, key=lambda c: (c["at"], c["id"]), default=None)
+    out["backs"] = [c["id"] for c in backs]
+    out["back"] = back["id"] if back else None
+    if not req.get("brief"):
+        return out
+    head = _far_head(req.get("head"))
+    head["from"]["machine"] = head["from"]["machine"] or _here()
+    sessions = list_sessions(folder)
+    sid, agent = req.get("session"), req.get("agent")
+    if sid:
+        src = next((s for s in sessions if s["id"] == sid), None)
+        if src is None:
+            m["error"] = f"no session {sid} in {folder}"
+    else:
+        pool = [s for s in sessions if not agent or s["agent"] == agent]
+        src = next((s for s in pool if not (s["agent"] == "claude" and _is_scripted(s["file"]))),
+                   pool[0] if pool else None)
+    where = f"on {head['from']['machine']}"
+    if src is not None:
+        dig = events_digest(src, folder)
+        out["source"] = {"agent": src["agent"], "session": src["id"],
+                         "title": _line(dig.get("title") or _session_title(src)),
+                         "updated": src["updated"], "last_t": dig.get("last_t") or src["updated"],
+                         "path": folder}
+        out["brief"] = relay_brief(folder, "full", src, relay=dict(head, back_of=None),
+                                   dig=dig)
+    if back:
+        origin = {"agent": back.get("agent") if back.get("agent") in AGENT_NAMES else "claude",
+                  "id": back.get("session") if isinstance(back.get("session"), str) else ""}
+        since = back["at"] + (skew if abs(skew) > 30 else 0)
+        h = dict(head, back_of=back["id"], **{"from": dict(head["from"], git=_far_head(
+            {"from": {"git": back.get("git")}})["from"].get("git"))})
+        out["catchup"] = relay_brief(folder, "catchup", origin, since, h,
+                                     had=[back["to_agent"]] if back.get("to_agent")
+                                     in AGENT_NAMES else None, where=where)
+    return out
+
+def _agent_relay_note(req: dict) -> dict:
+    """Add relay files to a project's .aht/handover here, for a machine that
+    picked the work up from here or leaves a note: each one only if it is
+    not there yet (exclusive create), a relay file by its name, at most 200
+    KB, into a folder that is there and is the project the caller found
+    (its id).  A marker (.closed, .told) that is there already stands.
+    When aht is installed here, run/incoming.jsonl notes each record, so
+    the notices tell of it and the hook knows aht put it here."""
+    folder = req.get("path")
+    if not (isinstance(folder, str) and _is_abs(folder) and os.path.isdir(folder)):
+        return {"ok": False, "error": f"refused: there is no folder {folder} here"}
+    folder = os.path.realpath(folder)
+    want = req.get("project_id") or None
+    if want != (read_marker(folder) or None):
+        return {"ok": False, "error": f"refused: {folder} is not the project it was (its "
+                                      "project id differs)"}
+    files = req.get("files")
+    if not isinstance(files, dict) or not files:
+        return {"ok": False, "error": "refused: no files"}
+    d = relay_dir(folder)
+    plan, recs = [], []
+    for name, text in files.items():
+        if not isinstance(name, str) or "/" in name or "\\" in name or ".." in name:
+            return {"ok": False, "error": f"refused: {name!r} is not a plain file name"}
+        mt = _RELAY_FILE.fullmatch(name)
+        if not mt or not isinstance(text, str):
+            return {"ok": False, "error": f"refused: {name} is not a relay file"}
+        data = text.encode("utf-8")
+        if len(data) > NOTE_MAX:
+            return {"ok": False, "error": f"refused: {name} is over {NOTE_MAX // 1024} KB"}
+        marker = mt.group(2) in ("closed", "told")
+        if mt.group(2) == "json":
+            try:
+                rec = _relay_safe(json.loads(text), mt.group(1))
+            except ValueError:
+                rec = None
+            if rec is None:
+                return {"ok": False, "error": f"refused: {name} is not a relay record"}
+            recs.append(rec)
+        if (d / name).exists() or (d / name).is_symlink():
+            if marker:
+                continue                    # the first word stands
+            return {"ok": False, "error": f"refused: {name} is there already"}
+        plan.append((("md", "json", "closed", "told").index(mt.group(2)), name, data, marker))
+    d.mkdir(parents=True, exist_ok=True)
+    if not (d / ".gitignore").is_file():    # never into the project's repository
+        (d / ".gitignore").write_text("*\n")
+    written = []
+    for _o, name, data, marker in sorted(plan):    # the summary before its record
+        try:
+            with open(d / name, "xb") as fh:
+                fh.write(data)
+        except FileExistsError:
+            if marker:
+                continue
+            return {"ok": False, "error": f"refused: {name} is there already",
+                    "written": written}
+        written.append(name)
+    side = req.get("side")
+    noted = False
+    if side in ("from", "to") and _aht_there()["installed"]:
+        for rec in recs:
+            if f"relay-{rec['id']}.json" not in written:
+                continue
+            b = next((r for r in read_relays(folder) if r["id"] == rec.get("back_of")), None)
+            other = rec["from"] if side == "to" else rec["to"]
+            _note_incoming({"at": time.time(), "relay": rec["id"], "kind": rec["kind"],
+                            "side": side, "back": bool(rec.get("back_of")), "path": folder,
+                            "name": os.path.basename(folder), "machine": other.get("machine"),
+                            "agent": rec["from"].get("agent"), "title": rec["from"].get("title"),
+                            "since": b["at"] if b else None, "until": rec["from"].get("last_t")})
+            noted = True
+    log(f"RELAY note in {folder}: {', '.join(written) or 'nothing new'}")
+    return {"ok": True, "path": folder, "written": written, "incoming": noted}
+
+# -- the commands ---------------------------------------------------------------
+
+def _relay_remote(out: dict, name: str):
+    """The machine Pick Up or Leave a Note asks, or None (out["error"] says
+    why)."""
+    if not can_reach_machines():
+        out["error"] = NO_SSH
+        return None
+    try:
+        rem = get_remote(name)
+    except HandoverError as e:
+        out["error"] = str(e)
+        return None
+    if rem.system == "Windows":
+        out["error"] = WINDOWS_FAR
+        return None
+    return rem
+
+def _ident_req(real: str, rem: Remote) -> dict:
+    """What identifies the project here, for _relay_find there: its id, its
+    git origin (normalised: no user or password travels) and root commits,
+    its path and its path below the home folder."""
+    origin, roots = _git_ident(real)
+    home = str(Path.home())
+    rel = os.path.relpath(real, home).replace(os.sep, "/") \
+        if _inside(real, home) and not _same_dir(real, home) else None
+    return {"project_id": read_marker(real), "origin": origin, "roots": roots,
+            "path": rem.path(real), "home_rel": rel, "name": rem.name, "now": time.time()}
+
+def _offer(r: dict, end: str) -> dict:
+    """A relay offered to the other machine as the one the work comes back
+    on: its `end` ("to" or "from") must be that machine."""
+    e = r[end]
+    return {"id": r["id"], "at": r["at"], "machine": e.get("machine"),
+            "machine_id": e.get("machine_id"), "agent": r["from"].get("agent"),
+            "session": r["from"].get("session"), "to_agent": r["to"].get("agent"),
+            "git": r["from"].get("git")}
+
+def _found(out: dict, ans: dict, rem: Remote) -> str:
+    """The folder there, or None with a blocker that says why."""
+    m = ans.get("match") or {}
+    cands = [c for c in m.get("candidates") or [] if isinstance(c, dict)]
+    out["match"] = {"path": m.get("path"), "how": m.get("how"), "candidates": cands}
+    if m.get("error"):
+        out["blockers"].append(f"{rem.name}: {m['error']}")
+    elif not m.get("path"):
+        same = [c["path"] for c in cands if c.get("how") == m.get("how")]
+        if len(same) > 1:
+            out["blockers"].append(f"{len(same)} folders on {rem.name} could be this project ("
+                                   f"{RELAY_HOW.get(m.get('how'), m.get('how'))}): "
+                                   + "; ".join(same) + ". Name one with --there PATH")
+        else:
+            out["blockers"].append(f"{rem.name} has no folder that is this project (by its "
+                                   "id, its git origin or its path). Name it with --there PATH")
+    return m.get("path") if not out["blockers"] else None
+
+RELAY_HOW = {"id": "by its project id", "origin": "by its git origin",
+             "path": "at the same path", "home": "at the same place in the home folder",
+             "there": "as you named it", "relay": "where the work came from"}
+
+def _came_from(opens: list, rem: Remote):
+    """The newest open relay whose work came here from the machine `rem`
+    (a pickup made here, a note it left here), or None: by the name it has
+    here, or by the machine id such a relay recorded.  Only a relay aht
+    itself put here (_arrival_known): its far path is where to look."""
+    came = [r for r in opens if r.get("side") == "to" and _arrival_known(r)]
+    ids = {r["from"].get("machine_id") for r in came
+           if r["from"].get("machine") == rem.name} - {None}
+    return next((r for r in came if r["from"].get("machine") == rem.name
+                 or r["from"].get("machine_id") in ids), None)
+
+def _n(k: int, word: str) -> str:
+    return f"{k} {word}{'' if k == 1 else 's'}"
+
+def _git_warning(src, dst, src_at: str, dst_at: str):
+    """What to do so git brings the files, or None: the side the work comes
+    from (`src`, a git_state) has commits not pushed or files not committed,
+    or the two copies are at different commits.  `src_at`, `dst_at`: "here"
+    or the other machine's name."""
+    On = lambda w: "Here" if w == "here" else f"On {w}"
+    on = lambda w: "here" if w == "here" else f"on {w}"
+    if not src and not dst:
+        return None
+    if not src or not dst:
+        return (f"{On(dst_at if src else src_at)}: the folder holds no git repository, so git "
+                "cannot bring the files.")
+    bits = []
+    if src.get("ahead"):
+        bits.append(_n(src["ahead"], "commit") + " not pushed")
+    elif not src.get("upstream") and src.get("head"):
+        bits.append("no upstream branch")
+    changed = (src.get("dirty") or 0) + (src.get("untracked") or 0)
+    if changed:
+        bits.append(_n(changed, "file") + " not committed")
+    where = f"branch {src['branch']}" if src.get("branch") else "no branch"
+    if bits:
+        return (f"{On(src_at)}: {where}, " + ", ".join(bits) + ". Commit and push "
+                + ("here" if src_at == "here" else "there") + f", then pull {on(dst_at)}.")
+    if src.get("head_full") and src.get("head_full") != dst.get("head_full"):
+        return (f"The two copies are at different commits ({src_at} {src['head']}, {dst_at} "
+                f"{dst.get('head') or 'none'}): bring them together with git before going on.")
+    return None
+
+def _with_git_note(text: str, warning) -> str:
+    """The git warning, made here, at the top of a summary made there."""
+    if not warning:
+        return text
+    head, sep, rest = text.partition("\n## ")
+    return head.rstrip("\n") + f"\n\n## Before going on\n\n- {warning}\n" + \
+        (("\n## " + rest) if sep else "")
+
+def cmd_pickup(args):
+    real = os.path.realpath(args.path)
+    out = {"command": "pickup", "applied": False, "blockers": [], "warnings": [], "error": None,
+           "project": real, "machine": args.from_,
+           "match": {"path": None, "how": None, "candidates": []}, "sessions": [],
+           "source": None, "git": None, "brief": None, "brief_kind": None, "mode": None,
+           "back_of": None, "note_for": None, "target": None, "session": None, "relay": None,
+           "left": [], "opened": None,
+           "start_line": None, "command_line": None, "fallback": None}
+    lines = []
+    if not os.path.isdir(real):
+        out["blockers"].append(f"not a folder: {real}")
+        return _emit(args, out, lines)
+    rem = _relay_remote(out, args.from_)
+    if rem is None:
+        return _emit(args, out, lines)
+    out["machine"] = rem.name
+    rels = read_relays(real)
+    opens = open_relays(real, rels)
+    offers = [_offer(r, "to") for r in opens if r.get("side") == "from"]
+    head = {"kind": "pickup", "at": time.time(), "from": {"machine": rem.name},
+            "to": {"machine": _here(), "system": platform.system(), "path": real,
+                   "agent": args.open}}
+    try:
+        ans = rem.agent("relay-info", timeout=120, brief=True, back=offers, head=head,
+                        there=args.there, session=args.session, agent=args.agent,
+                        **_ident_req(real, rem))
+    except HandoverError as e:
+        out["error"] = str(e)
+        return _emit(args, out, lines)
+    there = _found(out, ans, rem)
+    if there is None:
+        return _emit(args, out, lines)
+    out["sessions"] = ans.get("sessions") or []
+    src = ans.get("source")
+    out["source"] = dict(src, machine=rem.name) if isinstance(src, dict) else None
+    gh, gt = git_state(real), ans.get("git")
+    warning = _git_warning(gt, gh, rem.name, "here")
+    out["git"] = {"here": gh, "there": gt, "warning": warning}
+    if warning:
+        out["warnings"].append(warning)
+    if abs(float(ans.get("skew") or 0)) > 120:
+        out["warnings"].append(f"{rem.name}'s clock is {abs(float(ans['skew'])) / 60:.0f} "
+                               "minute(s) off this one's; the times may look odd")
+    if any(s.get("working") for s in out["sessions"]):
+        out["warnings"].append(f"a session on {rem.name} is working now: its latest turns may "
+                               "not be in the summary")
+    back = next((r for r in opens if r["id"] == ans.get("back")), None)
+    full = redact(ans.get("brief") or "")
+    catch = redact(ans.get("catchup") or "")
+    sid = None
+    if back:
+        origin = back["from"]
+        target = args.open or origin.get("agent")
+        gone = session_file(real, origin.get("agent"), origin.get("session")) is None
+        if gone or target != origin.get("agent"):
+            how, kind = "new", "full+catchup"
+            text = _clip_to(full + ("\n---\n\n" if full else "") + catch, BRIEF_MAX)
+            if gone:
+                out["fallback"] = (f"That {AGENT_NAMES.get(origin.get('agent'), '?')} session "
+                                   "is gone here, so a new session reads the full summary")
+            else:
+                out["fallback"] = (f"The work left from {AGENT_NAMES.get(origin.get('agent'), '?')}"
+                                   f", so a new {AGENT_NAMES.get(target, target)} session reads "
+                                   "the full summary and what happened since")
+        else:
+            how, kind, text, sid = "resume", "catchup", catch, origin.get("session")
+            out["note_for"] = {"agent": origin.get("agent"), "session": sid,
+                               "title": origin.get("title")}
+        if args.full and full:          # --full changes only the summary
+            kind, text = "full", full
+        out["back_of"] = back["id"]
+    else:
+        if src is None:
+            out["blockers"].append(f"no agent session in that folder on {rem.name} to pick up")
+            return _emit(args, out, lines)
+        target, how, kind, text = args.open or src["agent"], "new", "full", full
+    text = _with_git_note(text, warning)
+    out.update(target=target, mode="back" if back else "new", session=sid, brief=text,
+               brief_kind=kind)
+    exe = agent_cli(target) if args.open else None
+    if args.open:
+        if not exe:
+            out["blockers"].append(f"{AGENT_NAMES[target]} is not installed on this machine")
+        _switch_checks(out, real, sid if how == "resume" and target == "claude" else None)
+    rid = new_relay_id()
+    rel = os.path.join(".aht", "handover", f"relay-{rid}.md")
+    frm_name = f"{AGENT_NAMES.get((src or {}).get('agent'), 'an agent')} on {rem.name}"
+    if args.open:
+        out["start_line"] = agent_start_line(target, how, sid, _ask(frm_name, rel,
+                                                                    how == "resume"))
+    lines += [f"{'picking up' if args.apply else 'would pick up'}:  {real}",
+              f"   from   {rem.name}: {there} ({RELAY_HOW.get(out['match']['how'], '?')})"]
+    if src:
+        lines.append(f"   session {AGENT_NAMES.get(src['agent'], src['agent'])} — "
+                     f"{src.get('title') or src['session']} ({_clock(src.get('updated'))})")
+    if back:
+        lines.append("   the work comes back: " + ("a full summary" if kind == "full" else
+                                                   f"what happened on {rem.name} since "
+                                                   f"{_clock(back['at'])}")
+                     + (f", for {AGENT_NAMES.get(target, target)}'s own session here"
+                        if how == "resume" else ""))
+    lines.append(f"   then   {AGENT_NAMES[target]} opens with it (uses tokens)" if args.open
+                 else "   then   nothing opens (--open X starts an agent with it: uses tokens)")
+    if out["fallback"]:
+        lines.append(f"   {out['fallback']}")
+    if out["blockers"] or not args.apply:
+        if not out["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, out, lines)
+    if args.open and target == "kimi":      # Kimi reads it in a run of its own first
+        sid, why = _kimi_reads(exe, real, _kimi_prompt(text, frm_name, how == "resume"), sid)
+        if sid is None and why == "":
+            out["fallback"] = ("Kimi did not take the summary into its own session, so a new "
+                               "session read the full summary")
+            how, out["note_for"] = "new", None
+            if not (back and kind == "full"):      # --full's is whole already
+                text = _clip_to(full + ("\n---\n\n" if full else "") + text, BRIEF_MAX)
+            sid, why = _kimi_reads(exe, real, _kimi_prompt(text, frm_name, False))
+        if sid is None:
+            out["error"] = why
+            return _emit(args, out, lines)
+    gm = {"head": gt["head_full"], "branch": gt["branch"], "dirty": gt["dirty"],
+          "ahead": gt["ahead"]} if gt and gt.get("head_full") else None
+    worker = src or {"agent": back["to"].get("agent") if back else "claude"}
+    rec = write_relay(real, "pickup",
+                      {"machine": rem.name, "machine_id": ans.get("machine_id"),
+                       "system": ans.get("system"), "path": there, "agent": worker["agent"],
+                       "session": worker.get("session"), "title": worker.get("title"),
+                       "last_t": worker.get("last_t"), "git": gm},
+                      {"agent": target, "session": sid, "mode": how if args.open else None},
+                      text, rid=rid, back_of=back["id"] if back else None,
+                      note_for=sid if back and how == "resume" else None)
+    out.update(applied=True, relay=rec["id"], session=sid)
+    out["brief"] = str(relay_dir(real) / rec["brief"])      # the file, once it is written
+    lines.append(f"   summary {out['brief']}")
+    closed = [r["id"] for r in opens if r["id"] in (ans.get("backs") or [])] if back else []
+    for x in closed:
+        close_relay(real, x, rec["id"])
+    files = {f"relay-{rec['id']}.json": (relay_dir(real) / f"relay-{rec['id']}.json")
+             .read_text(encoding="utf-8"), rec["brief"]: text}
+    for x in closed:
+        files[f"relay-{x}.closed"] = json.dumps({"by": rec["id"], "at": time.time()})
+    try:
+        out["left"] = rem.agent("relay-note", path=there, project_id=ans.get("project_id"),
+                                files=files, side="from").get("written") or []
+        lines.append(f"   left   a copy of the relay on {rem.name}")
+    except HandoverError as e:
+        out["warnings"].append(f"the copy of the relay could not be left on {rem.name}: {e}")
+    log(f"PICKUP {real}: from {rem.name} {there} ({out['match']['how']}) -> {target} "
+        f"({'back' if back else 'new'})")
+    if not args.open:
+        return _emit(args, out, lines)
+    # the agent reads it as its first turn: the hook says nothing more.  Only
+    # Claude Code resuming its own session hears it from the hook
+    if not (how == "resume" and target == "claude"):
+        _mark_relay(real, rec["id"], "told", {"session": sid})
+    if checkpoints_on():
+        take_checkpoint(real, None, target)
+    rel = os.path.join(".aht", "handover", rec["brief"])
+    line = agent_start_line(target, how, sid, _ask(frm_name, rel, how == "resume"))
+    out["start_line"] = line
+    out["command_line"] = cd_then(real) + line
+    if args.no_window:
+        return _emit(args, out, lines)
+    if open_terminal(line, f"pickup-{os.path.basename(real)}-{target}", cwd=real,
+                     echo=False) != 0:
+        out["error"] = f"No terminal window opened. Run this in a terminal:\n\n{out['command_line']}"
+        return _emit(args, out, lines)
+    out["opened"] = target
+    lines.append(f"   opened  {out['command_line']}")
+    return _emit(args, out, lines)
+
+def cmd_leave_note(args):
+    real = os.path.realpath(args.path)
+    out = {"command": "leave-note", "applied": False, "blockers": [], "warnings": [],
+           "error": None, "project": real, "machine": args.on,
+           "match": {"path": None, "how": None, "candidates": []}, "source": None,
+           "git": None, "brief": None, "brief_kind": None, "mode": None, "back_of": None,
+           "note_for": None,
+           "relay": None, "left": [], "there_file": None}
+    lines = []
+    if not os.path.isdir(real):
+        out["blockers"].append(f"not a folder: {real}")
+        return _emit(args, out, lines)
+    rem = _relay_remote(out, args.on)
+    if rem is None:
+        return _emit(args, out, lines)
+    out["machine"] = rem.name
+    rels = read_relays(real)
+    opens = open_relays(real, rels)
+    offers = [_offer(r, "from") for r in opens if r.get("side") == "to"]
+    came = _came_from(opens, rem)       # the folder there the work came from, as recorded
+    try:
+        ans = rem.agent("relay-info", timeout=120, brief=False, back=offers, there=args.there,
+                        relay_path=came["from"].get("path") if came else None,
+                        **_ident_req(real, rem))
+    except HandoverError as e:
+        out["error"] = str(e)
+        return _emit(args, out, lines)
+    there = _found(out, ans, rem)
+    if there is None:
+        return _emit(args, out, lines)
+    gh, gt = git_state(real), ans.get("git")
+    warning = _git_warning(gh, gt, "here", rem.name)
+    out["git"] = {"here": gh, "there": gt, "warning": warning}
+    if warning:
+        out["warnings"].append(warning)
+    back = next((r for r in opens if r["id"] == ans.get("back")), None)
+    now = time.time()
+    to = {"machine": rem.name, "machine_id": ans.get("machine_id"), "system": ans.get("system"),
+          "path": there}
+    if back:
+        origin, since = back["from"], float(back["at"])
+        to.update(agent=origin.get("agent"), session=origin.get("session"), mode="resume")
+        out.update(mode="back", back_of=back["id"],
+                   note_for={"agent": origin.get("agent"), "session": origin.get("session"),
+                             "title": origin.get("title")})
+    if back and not args.full:
+        cd = catchup_digest(real, since)
+        w = cd["sessions"][-1] if cd["sessions"] else None
+        src = {"agent": w["agent"], "session": w["id"], "title": _line(w.get("title")),
+               "updated": cd["last_t"]} if w else None
+        head = {"kind": "note", "at": now, "from": {"machine": _here(), "git": origin.get("git")},
+                "to": to, "back_of": back["id"]}
+        text = relay_brief(real, "catchup", {"agent": origin.get("agent"),
+                                             "id": origin.get("session") or ""},
+                           since, head, dig=cd, had=[back["to"].get("agent")],
+                           where=f"on {_here()}")
+        out["brief_kind"] = "catchup"
+    else:                       # a new note; or --full, which changes only the summary
+        sessions = list_sessions(real)
+        s = next((x for x in sessions if not (x["agent"] == "claude"
+                                             and _is_scripted(x["file"]))),
+                 sessions[0] if sessions else None)
+        if s is None:
+            out["blockers"].append("no agent session here to leave a note about")
+            return _emit(args, out, lines)
+        dig = events_digest(s, real)
+        src = {"agent": s["agent"], "session": s["id"], "title": _line(dig.get("title")
+                                                                        or _session_title(s)),
+               "updated": dig.get("last_t") or s["updated"]}
+        if not back:
+            to.update(agent=s["agent"], session=None, mode=None)
+        head = {"kind": "note", "at": now, "from": {"machine": _here()}, "to": to}
+        text = relay_brief(real, "full", s, relay=head, dig=dig)
+        out.update(mode="back" if back else "new", brief_kind="full")
+    # the note is read there: its git warning says so, and names this machine
+    text = _with_git_note(text, _git_warning(gh, gt, _here(), "here"))
+    out["source"] = dict(src, machine=_here(), path=real) if src else None
+    out["brief"] = text
+    lines += [f"{'leaving a note' if args.apply else 'would leave a note'}:  {real}",
+              f"   on     {rem.name}: {there} ({RELAY_HOW.get(out['match']['how'], '?')})"]
+    if back:
+        what = (f"a full summary of {AGENT_NAMES.get(src['agent'], src['agent'])} — "
+                f"{src.get('title') or src['session']}" if args.full
+                else f"what happened here since {_clock(back['at'])}")
+        lines.append(f"   it hands the work back: {what}, for "
+                     f"{AGENT_NAMES.get(back['from'].get('agent'), '?')}'s own session there")
+    elif src:
+        lines.append(f"   about  {AGENT_NAMES.get(src['agent'], src['agent'])} — "
+                     f"{src.get('title') or src['session']} ({_clock(src.get('updated'))})")
+    lines.append("   nothing opens there; it costs no tokens")
+    if not args.apply:
+        lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, out, lines)
+    rec = write_relay(real, "note",
+                      {"agent": (src or {}).get("agent") or back["to"].get("agent") or "claude",
+                       "session": (src or {}).get("session"), "title": (src or {}).get("title"),
+                       "last_t": (src or {}).get("updated"), "git": _git_mark(real)},
+                      to, text, back_of=back["id"] if back else None,
+                      note_for=origin.get("session") if back else None)
+    d = relay_dir(real)
+    files = {f"relay-{rec['id']}.json": (d / f"relay-{rec['id']}.json").read_text(encoding="utf-8"),
+             rec["brief"]: text}
+    closed = [r["id"] for r in opens if r["id"] in (ans.get("backs") or [])] if back else []
+    for x in closed:
+        files[f"relay-{x}.closed"] = json.dumps({"by": rec["id"], "at": time.time()})
+    try:
+        res = rem.agent("relay-note", path=there, project_id=ans.get("project_id"),
+                        files=files, side="to")
+    except HandoverError as e:
+        for f in (f"relay-{rec['id']}.json", rec["brief"]):     # it did not get there
+            try:
+                (d / f).unlink()
+            except OSError:
+                pass
+        out["error"] = f"the note could not be left on {rem.name}: {e}"
+        return _emit(args, out, lines)
+    for x in closed:
+        close_relay(real, x, rec["id"])
+    out.update(applied=True, relay=rec["id"], left=res.get("written") or [])
+    out["brief"] = str(d / rec["brief"])          # the file, once it is written
+    out["there_file"] = f"{there}/.aht/handover/{rec['brief']}"     # never a Windows PC there
+    lines.append(f"   left   {out['there_file']}")
+    log(f"NOTE {real}: on {rem.name} {there} ({out['mode']})")
+    return _emit(args, out, lines)
 
 # ---- the session board ----------------------------------------------------------- #
 
@@ -11739,6 +12752,10 @@ def check_notices(remotes: bool = None) -> list:
                         "message": msg, "info": {"kind": "limit", "session": h.get("session"),
                                                  "project": h.get("project")}})
     out += night_shift_tick()
+    try:
+        out += _incoming_notices(st.get("at"), now)
+    except Exception as e:
+        warn(f"NOTICE incoming: {e}")
     update_told = st.get("update_told")
     if cfg_get("update_check"):
         try:
@@ -17021,6 +18038,34 @@ def build_parser():
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_switch)
+
+    s = sub.add_parser("pickup", help="continue here the work of a session on another "
+                       "machine: a summary made (and masked) there, and that folder's git state")
+    s.add_argument("path", help="the project here (a clone or a copy of it)")
+    s.add_argument("--from", dest="from_", metavar="MACHINE", required=True)
+    s.add_argument("--there", metavar="PATH", help="the folder there, when aht cannot find it")
+    s.add_argument("--session", help="the session there to go on from (default: the latest)")
+    s.add_argument("--agent", choices=SWITCH_TARGETS, help="the latest session of this agent "
+                   "there")
+    s.add_argument("--full", action="store_true", help="a full summary, also when the work "
+                   "comes back (default then: what happened there since it left)")
+    s.add_argument("--open", choices=SWITCH_TARGETS, metavar="AGENT",
+                   help="start this agent here with the summary (uses tokens)")
+    s.add_argument("--no-window", action="store_true", dest="no_window")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_pickup)
+
+    s = sub.add_parser("leave-note", help="before leaving this machine: put a summary of "
+                       "the work here into the project's copy on another machine")
+    s.add_argument("path")
+    s.add_argument("--on", metavar="MACHINE", required=True)
+    s.add_argument("--there", metavar="PATH", help="the folder there, when aht cannot find it")
+    s.add_argument("--full", action="store_true", help="a full summary, also when the work "
+                   "goes back (default then: what happened here since it came)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_leave_note)
 
     s = sub.add_parser("relays", help="who handed a project's work to whom, and when, "
                        "with each summary")

@@ -96,7 +96,7 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | The window: projects, sessions, search, settings, the guide | ✓ (the app) | ✓ (aht's window) | ✓ (aht's window) |
 | Welcome and setup, Getting started, new versions (opt-in) | ✓ | ✓ | ✓ |
 | Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy, show sessions | ✓ | ✓ | ✓ |
-| Switch agent, second opinion, informed sessions (use tokens; off by default) | ✓ | ✓ | ✓, not yet tried on Windows |
+| Switch agent and hand back, second opinion, informed sessions (use tokens; off by default) | ✓ | ✓ | ✓, not yet tried on Windows |
 | Handover, keep in sync, backups on another machine, night shift | ✓ | ✓ | — (needs ssh and rsync) |
 | Notices (waiting for you, done, usage limit, new version) | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
@@ -346,9 +346,9 @@ session is open in it, and a transfer shows its progress.
 
 ## Across agents
 
-aht reads the sessions of Claude Code, Kimi Code and Codex, so it can work
-across them.  On macOS all of this is in the app's window; the commands
-behave the same.
+aht reads the sessions of Claude Code, Kimi Code, Codex and Antigravity
+(`agy`), so it can work across them.  On macOS all of this is in the app's window;
+the commands behave the same.
 
 - **Search everything** — `aht search <words>` (the window's *Search* tab)
   looks through every session of every agent and project, including
@@ -362,11 +362,22 @@ behave the same.
   agent session on this Mac and on each machine set up for handover:
   working, waiting for you (and for what), or idle.  The menu bar counts
   the sessions waiting for you.
-- **Switch agent** — `aht switch <folder> --to kimi|claude|codex --apply`
-  continues a project's work in another agent: aht writes a summary of the
-  latest session of the other agent into `.aht/handover/`, and the new agent
-  reads it first, in a window of its own.  The earlier session stays as it
-  was, so you can go back to it.
+- **Switch agent and hand back** — `aht switch <folder> --to
+  claude|codex|kimi|agy --apply` continues a project's work in another
+  agent: aht writes a summary of the latest session of another agent into
+  `.aht/handover/` (where things stood, the latest exchanges, open to-dos,
+  files changed, git), and a new session of that agent reads it first, in a
+  window of its own.  `--resume` goes on in that agent's own latest session
+  in the folder instead, which reads only a catch-up of what happened
+  since; `--brief-only` (*Summary Only*) writes the summary and opens
+  nothing, so who has the project stays as it was.  `aht switch <folder>
+  --back --apply` hands the work back into the session it came from, with
+  a catch-up: the other agents' exchanges since, the to-dos still open, the
+  files changed (`git diff` against the commit the project was at when it
+  was handed on) and the commits made since; when that session is gone, a
+  new one reads the full summary and the catch-up.  The earlier session
+  stays as it was.  Each hand-off leaves a record next to its summary, and
+  `aht relays <folder>` lists who handed the work to whom and when.
 - **Hand over with a task** — `aht handover <folder> --apply --task "…"`
   (a field in the window's handover dialog): the session starts working on
   it the moment it has resumed on the other machine.
@@ -434,7 +445,7 @@ behave the same.
   Wherever aht copies text out of a history, it masks what it recognises
   whole (a key of any length, up to 64 KB), and it masks before it shortens
   a text, so a cut never leaves part of one: the search index, journals,
-  handover and switch summaries (those folders also carry a `.gitignore`),
+  handover, switch and hand-back summaries (those folders also carry a `.gitignore`),
   notices and what a session waits for, shared session pages (also the
   tools they list), Tidy Up's preview, What Changed, the notes for informed
   sessions, loose ends and second opinions, `aht limits`, and session
@@ -517,11 +528,13 @@ behave the same.
   in its transcript (no tokens), says so in a notice with the reset time
   (`notify_limit`), and marks the project.  `aht limits` lists them.  With
   `limit_switch = true` it also offers to go on in `limit_switch_to` (Kimi
-  Code by default) — that agent's tokens are used when you accept.
+  Code by default; Codex or Antigravity) — that agent's tokens are used
+  when you accept.
 - **Informed sessions** — with `informed_sessions = true`, a new Claude Code
   session learns in a few lines where the last session in its folder
   stopped, whichever agent ran it (last request and answer, open to-dos,
-  files changed; keys masked).
+  files changed; keys masked).  A session another agent took the work over
+  from, resumed by hand, learns instead what happened since.
 - **Loose ends** — `aht loose-ends`: projects of the last 30 days with work
   not committed, open to-do items, or a last session that ended on a
   question or an offer.
@@ -575,13 +588,17 @@ features that make an agent read or work:
 | Another agent at the usage limit (`limit_switch`) | the other agent reads a summary, when you accept | off |
 | Second opinion (`second_opinion`) | both agents work on the task | off, and only when you press Start |
 | Night shift (`night_shift`) | the agent on the other machine works on the task | off, and only the shifts you plan |
-| Switch agent | the new agent reads a summary | only when you ask |
+| Switch agent | the agent that goes on reads the summary (a new session) or the catch-up (its own session): one turn; Claude Code's own session gets its catch-up as with Hand back to Claude Code | only when you ask |
+| Hand back to Codex, Kimi Code or Antigravity | that agent reads the catch-up: one turn | only when you ask |
+| Hand back to Claude Code | no turn: aht's hook puts the catch-up (at most 2,000 characters) into the session as it opens, and it goes with your next message; without the hook, reading it is the first turn | only when you ask |
 | Hand over with a task | the resumed session starts on the task | only when you give a task |
 | Handover note | one sentence in a new Claude session while its project is away, half handed over, or just came back or was released | part of handover |
+| Hand-off note | one line in a Claude session another agent took the work over from, when you resume it yourself (the catch-up itself only with `informed_sessions`) | part of switch |
 
 Everything else — watching, relinking, badges, backups, search, the
 session board, notices, loose ends, reports, journals, the secrets check,
-what changed, undo, Spotlight — uses none.
+what changed, undo, Spotlight, and writing summaries and catch-ups
+(*Summary Only*, `aht switch --brief-only`, `aht relays`) — uses none.
 
 Development is macOS-first: the window and these features are built and
 tested on macOS; what reaches Linux and Windows is in *Platforms* above.
@@ -654,7 +671,7 @@ click: a row is selected first, a button pressed second.
 `tag` · `keys <path>`
 (each backend's store key for a path) · `encode` · `hook` · `version` ·
 `remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here` ·
-`search` · `board` · `switch` · `journal` · `rules` · `secrets` · `notices` ·
+`search` · `board` · `switch` · `relays` · `journal` · `rules` · `secrets` · `notices` ·
 `changes` · `report` · `share` · `tidy` · `limits` · `checkpoint` · `undo` ·
 `loose-ends` · `second-opinion` · `night-shift` · `sessions` · `tab-names` ·
 `workspace` · `goto` · `checkup` · `getting-started` · `setup` · `update` ·
@@ -769,14 +786,21 @@ bus), so nothing it started is left running.
 The suites fake every agent's store via `AHT_ROOT_*` env overrides, so they
 never touch real agent data; the handover tests use a folder that stands in
 for the other machine, and a stand-in `ssh` (`tests/fake_ssh.py`) that can
-also answer like a Windows PC (they need rsync 3 and are skipped without it).  GitHub Actions runs the core suites (Linux and
+also answer like a Windows PC (they need rsync 3 and are skipped without it).
+Switching agents runs against stand-in agents (`AHT_CLI_<AGENT>`):
+`tests/fake_codex.py` and `tests/fake_kimi.py` write sessions the way the
+real CLIs do, Claude Code and Antigravity are stubs that only note their
+calls, terminals go to a log (`AHT_TERMINAL_LOG`), and `tests/fake_agy.py`
+builds a stand-in Antigravity store, so no test opens a window or spends a
+token.  GitHub Actions runs the core suites (Linux and
 macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
 smoke-tests the Windows exes, the badge cache and the installer (x64 and ARM64) natively on every push; tagging `vX.Y.Z` builds
 the release artifacts (Windows installers and zips for x64 and ARM64, the universal
 macOS app) and publishes them with checksums.  Honest limits: the
 Cursor/OpenCode/Copilot layouts are implemented from best-effort knowledge and
-self-verify at runtime (they no-op rather than guess); the Linux tray needs a
-real desktop for full exercise.
+self-verify at runtime (they no-op rather than guess); Antigravity's reader
+was checked against one short real conversation (its tool calls and plan
+files follow agy's documented format); the Linux tray needs a real desktop for full exercise.
 
 ## Privacy
 

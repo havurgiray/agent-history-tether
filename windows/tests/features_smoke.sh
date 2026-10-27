@@ -1,7 +1,8 @@
 #!/bin/sh
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
-# journal, report, share, secrets, rules, loose ends, undo, tidy, limits,
-# sessions, workspace; and the hidden ones another aht uses: `_core --id`
+# journal, report, share, secrets, rules, loose ends, undo, tidy, switch
+# (Summary Only) and relays, limits, sessions, workspace; and the hidden ones
+# another aht uses: `_core --id`
 # (the core inside the exe is this checkout's aht.py, byte for byte) and
 # `_agent`.  Runs natively on Windows from Git Bash with
 # AHT_SMOKE_NATIVE=1 (CI), under wine otherwise, or with AHT_SMOKE_POSIX=1
@@ -121,6 +122,28 @@ if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then       # and once to the real Recycle Bin
     $n' | tr -d '\r')
   [ "${RB:-0}" -ge 1 ] 2>/dev/null || fail "the history is not in the Recycle Bin (found: ${RB:-nothing}): $OUT"
 fi
+
+echo "== switch: Summary Only from a Codex session, and the relay it leaves =="
+# switch reads Codex's newer storage through sqlite3, so this also proves the
+# module is inside the exe; no agent starts
+mkdir -p "$T/tools/codex/2026/10/27"
+export AHT_ROOT_CODEX="$(P tools/codex)"
+CXID="c0dec0de-0000-4000-8000-000000000001"
+cat > "$T/tools/codex/2026/10/27/rollout-2026-10-27T10-00-00-$CXID.jsonl" <<EOF
+{"type":"session_meta","timestamp":"$NOW","payload":{"id":"$CXID","cwd":"$(J "$PAPER")"}}
+{"type":"event_msg","timestamp":"$NOW","payload":{"type":"user_message","message":"tidy the pelican module"}}
+{"type":"event_msg","timestamp":"$NOW","payload":{"type":"agent_message","message":"The pelican module is tidy."}}
+EOF
+OUT=$(W switch "$PAPER" --to claude --session "$CXID" --brief-only --apply --json)
+has "$OUT" '"applied": true' "switch --brief-only did not write the summary"
+has "$OUT" '"mode": "brief-only"' "switch --brief-only is not in Summary Only mode"
+RID=$(printf '%s\n' "$OUT" | sed -n 's/.*"relay": "\([0-9a-f-]*\)".*/\1/p' | head -n 1)
+[ -n "$RID" ] || fail "switch --brief-only named no relay: $(printf '%s' "$OUT" | head -c 400)"
+grep -q "pelican module" "$T/roots/paper/.aht/handover/relay-$RID.md" \
+  || fail "the summary lacks the Codex session's exchange"
+OUT=$(W relays "$PAPER" --json)
+has "$OUT" "\"id\": \"$RID\"" "relays does not list the hand-off"
+has "$OUT" '"open": false' "a Summary Only hand-off counts as open"
 
 echo "== limits / sessions / tab names / workspace / checkup =="
 has "$(W limits --json)" '"limits": \[\]' "limits failed"

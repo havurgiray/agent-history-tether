@@ -35,8 +35,11 @@ const clear = (el) => { while (el.firstChild) el.removeChild(el.firstChild); ret
 const base = (p) => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 const parent = (p) => { const s = (p || "").replace(/[\\/]+$/, ""); const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\")); return i > 0 ? s.slice(0, i) : s; };
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-const AGENTS = { claude: "Claude Code", kimi: "Kimi Code", codex: "Codex", gemini: "Gemini CLI",
-  cursor: "Cursor", opencode: "OpenCode", copilot: "Copilot" };
+const AGENTS = { claude: "Claude Code", kimi: "Kimi Code", codex: "Codex", agy: "Antigravity",
+  gemini: "Gemini CLI", cursor: "Cursor", opencode: "OpenCode", copilot: "Copilot" };
+// the agents a project can be switched to (the core's SWITCH_TARGETS), as
+// many as are installed (status.agent_clis)
+const SWITCH_TO = ["claude", "kimi", "codex", "agy"];
 // a computer's system as the core names it (Python's platform.system())
 const SYSTEMS = { Darwin: "macOS", Linux: "Linux", Windows: "Windows" };
 
@@ -474,6 +477,8 @@ function detail() {
     h("div", { class: "dim small mono", text: tilde(p.real_path) }));
   if (p.handing) d.append(handingBanner(p));
   else if (!p.away && p.exists && syncPaused(p)) d.append(pausedBanner(p));
+  const relay = openRelay(p);
+  if (relay) d.append(relayLine(p, relay));
   const row = h("div", { class: "row" });
   const handover = CAN_HAND_OVER() && (S.status.handover || {}).default_remote;
   if (p.away) {
@@ -489,8 +494,12 @@ function detail() {
         + (syncPaused(p) ? " (paused)" : "")));
     }
     row.append(h("button", { text: "Continue Session", disabled: !(p.sessions > 0) || held, onclick: () => continueHere(p) }));
-    row.append(menu("Switch Agent", ["claude", "kimi", "codex"].filter((a) => (S.status.agent_clis || {})[a])
-      .map((a) => [`Continue in ${AGENTS[a]}…`, () => switchAgent(p, a)]), { disabled: !(p.sessions > 0 || (p.agents || []).length) || held }));
+    // with an open relay, giving the project back comes first
+    const to = SWITCH_TO.filter((a) => (S.status.agent_clis || {})[a])
+      .map((a) => [`Continue in ${AGENTS[a]}…`, () => switchAgent(p, a)]);
+    row.append(menu("Switch Agent", [
+      relay ? [`Hand Back to ${AGENTS[relay.from_agent] || relay.from_agent} (its own session)…`, () => handBack(p)] : null,
+      relay && to.length ? "-" : null, ...to], { disabled: !(p.sessions > 0 || (p.agents || []).length) || held }));
     row.append(helpBtn("Continue in another agent"));
   }
   row.append(h("span", { class: "grow" }));
@@ -524,10 +533,17 @@ function detail() {
     d.append(h("div", { class: "row" }, h("span", { class: "warn small", text: `Claude stopped at its usage limit${p.limit.resets ? "; it resets " + p.limit.resets : ""}.` }),
       t ? h("button", { class: "small", text: `Continue in ${AGENTS[t] || t}…`, onclick: () => switchAgent(p, t) }) : null));
   }
-  if (S.notes[p.real_path]) d.append(h("pre", { text: S.notes[p.real_path], style: "white-space:pre-wrap" }));
+  const n = S.notes[p.real_path];
+  if (n) {
+    d.append(h("pre", { text: n.text || n, style: "white-space:pre-wrap" }));
+    if (n.file) d.append(h("button", { class: "small", text: ON_WINDOWS() ? "Show in Explorer" : "Show in Files",
+      onclick: () => post("/api/reveal", { path: parent(n.file) }) }));
+  }
   return d;
 }
-const note = (p, text) => { S.notes[p.real_path || p] = text; draw(); };
+/** A note under the project; `file`: one it names, with a button that shows
+ * its folder. */
+const note = (p, text, file) => { S.notes[p.real_path || p] = text && file ? { text, file } : text; draw(); };
 /** Whether "Start aht's tray at login" can be turned on here: the core knows
  * how, and (on Linux) the tray can run. */
 const loginWorks = () => { const a = S.status.autostart || {}; return !!a.supported && a.runs !== false; };
@@ -545,25 +561,126 @@ async function continueHere(p) {
   await busy(`opening ${base(p.real_path)}…`, () => resume([p.real_path]));
 }
 
+/** A dry run's answer, or why there is none (an older aht that does not
+ * know the option, say). */
+async function dryRun(args) {
+  const a = await run(args);
+  return a.json || { error: ((a.err || "") + (a.out || "")).trim() || "aht gave no answer." };
+}
+
+/** Switch Agent: the dry run, then a dialog that asks how the agent goes
+ * on: in a new session that reads the whole summary, or in its own latest
+ * session here, which reads only what changed since it last worked here
+ * (--resume).  Summary Only writes the summary and opens nothing. */
 async function switchAgent(p, target) {
-  const label = AGENTS[target] || target;
+  const label = AGENTS[target] || target, name = base(p.real_path);
   note(p, null);
-  const plan = await busy(`checking ${base(p.real_path)}…`, () => J("switch", p.real_path, "--to", target, "--json"));
-  const why = problems(plan);
+  // the dry run of both ways at once: a new session, and its own (--resume)
+  const [fresh, ownPlan] = await busy(`checking ${name}…`, () => Promise.all([
+    dryRun(["switch", p.real_path, "--to", target, "--json"]),
+    dryRun(["switch", p.real_path, "--to", target, "--resume", "--json"])]));
+  const plans = { new: fresh, resume: ownPlan };
+  const why = problems(plans.new);
   if (why) return note(p, "Cannot switch now:\n\n" + why);
-  const src = plan.source || {};
+  const src = plans.new.source || {};
   const from = AGENTS[src.agent] || "the other agent";
-  let body = `${label} continues the work of the latest ${from} session${src.title ? ` (“${src.title}”)` : ""}. aht writes a summary of where things stood into the project, and ${label} reads it first. The ${from} session stays as it is.`;
-  for (const w of plan.warnings || []) body += "\n\n⚠ " + w;
-  if (!(await confirmIt(`Continue “${base(p.real_path)}” in ${label}?`, body, "Switch"))) return;
-  const a = await busy(`${label} is reading the summary…`, () => job(["switch", p.real_path, "--to", target, "--apply", "--json"]));
+  // the core finds the agent's own session in its store (the project list's
+  // agents wait for the next sweep); without one it would start a new one
+  const own = plans.resume.mode === "resume";
+  let mode = "new";
+  const s = sheet(`Continue “${name}” in ${label}`, "Continue in another agent", 600);
+  const said = h("div", { class: "stack" });
+  const go = h("button", { class: "primary", text: "Switch", onclick: () => { closeSheet(); startSwitch(p, target, mode); } });
+  // what the chosen way would do: what stops it, what aht does instead
+  // (fallback), and its warnings
+  const pick = (m) => {
+    mode = m;
+    const x = plans[m], stop = problems(x);
+    clear(said).append(stop ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: "Not possible this way:\n\n" + stop }) : null,
+      x.fallback ? h("p", { class: "warn small", text: x.fallback }) : null,
+      (x.warnings || []).map((w) => h("p", { class: "warn small", text: "⚠ " + w })),
+      x.start_line ? h("details", {}, h("summary", { class: "dim small", text: "What aht runs" }),
+        h("pre", { style: "white-space:pre-wrap", text: x.start_line })) : null);
+    go.disabled = !!stop;
+  };
+  const choice = (m, text, hint, off) => h("div", {},
+    h("label", { class: "check" }, h("input", { type: "radio", name: "switch-mode", checked: m === mode, disabled: off,
+      onchange: () => pick(m) }), text),
+    h("div", { class: "dim small check-note", text: hint }));
+  s.body.append(h("p", { text: `${label} continues the work of the latest ${from} session${src.title ? ` (“${src.title}”)` : ""}. aht writes a summary of where things stood into the project. The ${from} session stays as it is.` }),
+    h("div", { class: "stack" }, h("strong", { text: `${label} goes on in` }),
+      choice("new", "A new session", "It reads the whole summary first."),
+      choice("resume", "Its own session", own ? `${label}'s latest session in this project goes on, and reads only what changed since it last worked here.`
+        : `${label} has no session in this project yet.`, !own)),
+    said,
+    h("p", { class: "dim small", text: `Summary Only writes the summary into the project and opens nothing: start ${label} yourself and ask it to read the summary first.` }));
+  s.foot.append(h("button", { text: "Summary Only", onclick: () => { closeSheet(); summaryOnly(p, target); } }),
+    h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), go);
+  pick(mode);
+}
+async function startSwitch(p, target, mode) {
+  const label = AGENTS[target] || target, resume = mode === "resume";
+  const a = await busy(resume ? `${label} is catching up…` : `${label} is reading the summary…`,
+    () => job(["switch", p.real_path, "--to", target, ...(resume ? ["--resume"] : []), "--apply", "--json"]));
+  // fallback: its own session could not take the catch-up, so a new one did
+  switched(p, a, label, (d) => (resume && !d.fallback ? `${label} went on in its own session; its window is open. What it read: ${d.brief || ""}`
+    : `${d.fallback ? d.fallback + "\n\n" : ""}${label} took over; its window is open. The summary it read: ${d.brief || ""}`), "The switch did not go through");
+}
+/** What a switch or a Hand Back did, under the project; `done(answer)`
+ * says it when it went through. */
+function switched(p, a, label, done, notDone) {
   const d = a.json || {};
   // what aht printed holds the line to run by hand when no terminal opened
   const failed = problems(d) || (a.ok && d.applied ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
   // the summary is written before the terminal opens: only that step is left
   if (!(d.blockers || []).length && d.brief && /^No terminal window opened/.test(d.error || ""))
-    return note(p, `aht wrote the summary for ${label} (${d.brief}), but no terminal window opened. ${d.error.replace(/^No terminal window opened\.\s*/, "")}`);
-  note(p, failed ? "The switch did not go through:\n\n" + failed : `${label} took over; its window is open. The summary it read: ${d.brief || ""}`);
+    note(p, `aht wrote the summary for ${label} (${d.brief}), but no terminal window opened. ${d.error.replace(/^No terminal window opened\.\s*/, "")}`);
+  else note(p, failed ? `${notDone}:\n\n${failed}` : done(d));
+  refresh();
+}
+/** Summary Only: the summary and the relay are written, nothing opens; the
+ * user starts the agent when it suits them. */
+async function summaryOnly(p, target) {
+  const label = AGENTS[target] || target;
+  const a = await busy("writing the summary…", () => run(["switch", p.real_path, "--to", target, "--brief-only", "--apply", "--json"]));
+  const d = a.json || {};
+  const failed = problems(d) || (a.ok && d.brief ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
+  if (failed) note(p, "The summary was not written:\n\n" + failed);
+  else note(p, `The summary for ${label} is in the project; nothing was opened. Start ${label} in this folder and ask it to read this file first:\n\n${d.brief}`, d.brief);
+  refresh();
+}
+
+/** The open relay on a project that is here (`relay`: {id, from_agent,
+ * to_agent, since, open, incoming}): another agent took the work over and
+ * has not handed it back.  A relay another machine left here comes with
+ * Pick Up and is not offered here. */
+const openRelay = (p) => (p.relay && p.relay.open !== false && !p.relay.incoming && p.exists && !p.away ? p.relay : null);
+function relayLine(p, r) {
+  return h("div", { class: "row" },
+    h("span", { text: `${AGENTS[r.to_agent] || r.to_agent} has had this project${r.since ? " since " + clock(r.since) : ""}, taken over from ${AGENTS[r.from_agent] || r.from_agent}.` }),
+    h("button", { class: "small", text: "Hand Back…", disabled: !!p.handing, onclick: () => handBack(p) }));
+}
+/** Hand Back: the agent the newest open relay came from goes on in its own
+ * session and reads only what changed since (`switch --back`).  When that
+ * session is gone, the dry run says what aht does instead (fallback). */
+async function handBack(p) {
+  const r = openRelay(p) || {}, name = base(p.real_path);
+  note(p, null);
+  const [x, rl] = await busy(`checking ${name}…`, () => Promise.all([dryRun(["switch", p.real_path, "--back", "--json"]), J("relays", p.real_path, "--json")]));
+  const why = problems(x);
+  if (why) return note(p, "Cannot hand back now:\n\n" + why);
+  const back = AGENTS[x.target] || x.target || AGENTS[r.from_agent] || r.from_agent || "the first agent";
+  const now = AGENTS[r.to_agent] || r.to_agent || "the other agent";
+  // the session it goes back to, as the relay recorded it
+  const rec = (rl.relays || []).find((y) => y.id === r.id) || (rl.relays || []).find((y) => y.open) || {};
+  const title = (rec.from || {}).title;
+  let body = (x.fallback || `${back}'s own session${title ? ` (“${title}”)` : ""} goes on where it stopped, and reads only what ${now} did${r.since ? " since " + clock(r.since) : ""}.`)
+    + ` The ${now} session stays as it is.`;
+  for (const w of x.warnings || []) body += "\n\n⚠ " + w;
+  if (!(await confirmIt(`Hand “${name}” back to ${back}?`, body, "Hand Back"))) return;
+  const a = await busy(`handing ${name} back to ${back}…`, () => job(["switch", p.real_path, "--back", "--apply", "--json"]));
+  switched(p, a, back, (d) => (d.fallback ? `${d.fallback}\n\n${back}'s window is open. The summary it read: ${d.brief || ""}`
+    : `${back} is back in its own session; its window is open. What ${now} did meanwhile: ${d.brief || ""}`), "Handing back did not go through");
 }
 
 // Show Sessions: every session, branches under the one they came from
@@ -1266,7 +1383,8 @@ function drawSettings(m) {
   m.append(group("Uses tokens — off until you turn it on", "What uses tokens",
     tok("A new Claude session learns where the last one in its folder stopped", "informed_sessions", "a few hundred tokens per new session"),
     h("div", { class: "row" }, tok("When Claude stops at its limit, offer to go on in", "limit_switch", null),
-      h("select", { onchange: (e) => setConfig("limit_switch_to", e.target.value) }, [["kimi", "Kimi Code"], ["codex", "Codex"]].map(([v, l]) => h("option", { value: v, text: l, selected: S.config.limit_switch_to === v })))),
+      h("select", { onchange: (e) => setConfig("limit_switch_to", e.target.value) }, ["kimi", "codex", "agy"].filter((a) => a !== "agy" || (S.status.agent_clis || {}).agy)
+        .map((v) => h("option", { value: v, text: AGENTS[v], selected: S.config.limit_switch_to === v })))),
     tok("Second opinion: one task, two agents, compared", "second_opinion", "both agents work"),
     CAN_HAND_OVER() ? tok("Night shift: hand a project over with a task, on a timer", "night_shift", "the agent works while you are away") : null,
     h("div", { class: "dim small", text: "Each of these makes an agent read or work, which counts against your plan or API bill. aht's own work — watching, search, backups, reports, loose ends — never uses tokens." })));

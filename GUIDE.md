@@ -329,12 +329,21 @@ Uses tokens**, or when you first use them:
 - **Going on by itself after the usage limit** (Claude Code's own setting,
   switched in the same group): the session works on when the limit resets.
 
-Two more spend tokens only when you ask for them, each time: **Switch
-Agent** (the new agent reads a summary) and **Hand Over** with a task (the
-session starts on it). A handed-over project also puts one sentence into a
-new Claude session in its folder, so the session knows the project is away,
-that a handover of it did not finish yet, or that it has just come back or
-was released.
+Some spend tokens only when you ask for them, each time: **Switch Agent**
+(the agent that goes on reads a summary, or a catch-up in its own session:
+one turn), **Hand Back** to Codex, Kimi Code or Antigravity (one turn of
+that agent) and **Hand Over** with a task (the session starts on it). Hand
+Back to Claude Code runs no turn: the catch-up is in the session when it
+opens, and Claude reads it with your next message. Writing a summary,
+**Summary Only** and `aht relays` spend nothing (see *Continue in another
+agent*).
+
+A handed-over project also puts one sentence into a new Claude session in
+its folder, so the session knows the project is away, that a handover of it
+did not finish yet, or that it has just come back or was released. In the
+same way, a Claude session that another agent took the work over from gets
+one line when you resume it yourself: who worked on the project since, and
+where the summary is.
 
 ## Folders that move keep their history
 
@@ -697,7 +706,10 @@ last answer, open to-dos and the files changed last.
 
 - **Off until you turn it on** (Settings → Uses tokens), because those
   lines go into the session's context: a few hundred tokens per new
-  session. A resumed session gets nothing; it has its own history.
+  session. A resumed session gets nothing, as it has its own history, with
+  one exception: a session another agent took the work over from, when you
+  resume it yourself, learns what happened since (see *Continue in another
+  agent*).
 - The keys and passwords aht recognises are masked in the note (see
   *Secrets check*).
 - Only Claude Code has a start hook, so only its new sessions get the note.
@@ -830,23 +842,97 @@ what the session's commands changed.
 
 ## Continue in another agent
 
-Hand a project's work from one agent to another, without losing the thread.
+Hand a project's work from one agent to another without losing the thread,
+and hand it back later. Claude Code, Codex, Kimi Code and Antigravity (the
+`agy` command) can each take over; **Switch Agent** lists the ones
+installed on this computer.
 
 > **Example.** Claude Code tells you that you have reached your usage limit
 > in the middle of a task. Select the project → **Switch Agent** →
-> **Continue in Kimi Code…** (or the button under the project, see below).
-> aht writes a summary of where the Claude session stood (the latest
-> exchanges, open to-dos, the files changed) into the project. Kimi reads it and opens in a new window, and tells you in
-> two or three lines what it understood. Later, switch back the same way:
-> Claude reads Kimi's summary.
+> **Continue in Codex…**. The dialog asks how Codex goes on: in **a new
+> session**, which first reads a summary of where the Claude session stood,
+> or in **its own session**, the last one Codex had in this project, which
+> reads only what happened since. You keep *a new session* and press
+> **Switch**. Codex opens in a new window and tells you in two or three
+> lines what it understood. Under the project it now says *Codex has had
+> this project since 14:10, taken over from Claude Code*, with **Hand
+> Back…**. When the limit has reset, you press it: your Claude session
+> opens again where it stopped, and it learns what Codex did meanwhile: the
+> exchanges, the files changed and the commits made.
 
-- The earlier session stays as it was. The summary names the command that
-  goes back to it.
+- **The summary** goes into the project's `.aht/handover/`, which git
+  ignores. It holds where things stood, the latest exchanges, the open
+  to-dos, the files changed last, the state of git (branch, latest commit,
+  what is not committed) and the files outside the project the session
+  used, with the keys and passwords aht recognises masked (see *Secrets
+  check*). It names the command that goes back to the earlier session,
+  which stays as it was.
+- **A new session or its own session.** A new session reads the whole
+  summary. Its own session (that agent's latest one in this project) reads
+  only what happened since it last worked here. When the agent has no
+  session here yet, it goes on in a new one. Claude Code's own session
+  hears the catch-up from aht's hook as it opens, once, as after Hand Back.
+- **Summary Only**, in the same dialog, writes the summary and opens
+  nothing; no agent runs. Start the agent yourself when it suits you, and
+  ask it to read that file first. Since nothing started, who has the
+  project stays as it was: the line under the project and Hand Back still
+  go by the last real hand-off.
+- **Hand Back** gives the work back to the agent it came from, in that
+  agent's own session. While another agent has the work, it is also the
+  first item under **Switch Agent**: *Hand Back to Claude Code (its own
+  session)…*. That session reads a catch-up of what happened after it
+  handed the work on: what the other agents asked and answered, the to-dos
+  still open, the files changed since (from git, when the project is a
+  repository) and the commits made since. When that session is gone, a new
+  one reads the other agent's summary and the catch-up, and the dialog
+  says so before anything happens. When aht cannot read what the other
+  agent did (an agent it has no reader for, or a session it cannot make
+  sense of), the dialog and the catch-up say so: *Antigravity had the
+  project from 14:10; aht cannot read its work, so the files may differ:
+  read them before editing.*
+- **Passed on twice** (Claude Code → Codex → Kimi Code): Hand Back from Kimi
+  goes to Codex, and Hand Back from Codex then goes to Claude Code. In the
+  terminal, `--back --to claude` goes straight back to Claude Code, with a
+  catch-up of both.
+- **What it costs.** Writing a summary or a catch-up costs nothing: aht
+  reads the histories itself. A new session reads the summary as its first
+  turn; Codex, Kimi Code and Antigravity read the catch-up in their own
+  session the same way: one turn of that agent. Kimi reads it in a run of
+  its own before its window opens, so the dialog waits a moment; when Kimi
+  does not take the catch-up into its own session, a new Kimi session reads
+  the full summary instead, and aht says so. **Hand Back to Claude Code,
+  or Claude Code's own session, costs nothing until you type:** aht's
+  Claude hook gives the session its catch-up (at most 2,000 characters) as
+  it opens, once, and Claude reads it with your next message. Without
+  aht's hook, reading it is Claude's first turn. Summary Only spends
+  nothing.
+- **If you go back by hand.** When you resume the Claude session yourself
+  instead of pressing Hand Back, aht's hook gives it one line: *[aht] Codex
+  worked on this project after this session's last turn (14:10–16:40). The
+  files may differ from what you remember: read them before editing.
+  Summary: .aht/handover/relay-….md*. The catch-up itself comes with it only
+  when *A new Claude session learns where the last one in its folder
+  stopped* is on (Settings → Uses tokens; see *Every session starts
+  informed*). Once you type in that session, the project counts as back
+  with Claude, and the line under it goes.
+- **Antigravity** opens in a new conversation (`agy -i`) or continues its
+  own (`agy --conversation <id> -i`), with `--remote-control` when
+  `handover_remote_control` is on. aht checks first that the conversation
+  still exists: for an id it does not know, agy only warns and starts a
+  new one.
+- **Checks first.** Not possible while a Claude session in the project is
+  working or waiting for you. A Claude session open there but idle, or
+  another agent open in the folder, gives a warning: don't type into both.
+  On Windows aht can only tell that Codex, Kimi Code or Antigravity runs on
+  the PC, not in which folder, and says so. Codex's and Antigravity's
+  background services are not counted as open. Hand Back waits while the
+  Claude session it goes back to is still open in its window: exit that
+  session and press Hand Back again (in a terminal, `aht switch <path>
+  --back --brief-only` writes the catch-up for it to read; see below).
+- When copies to undo a session are on (*Undo a whole session*), aht makes
+  one before the other agent starts.
 - When no terminal window can be opened, the summary is written all the
   same, and aht shows the line to run in a terminal yourself.
-- Not possible while an agent is still working in that project.
-- Uses tokens: the new agent reads the summary. It happens only when you
-  press the button.
 - **Going on by itself:** Claude Code has its own setting to continue a
   session by itself once the limit resets. Settings → Uses tokens → *When
   Claude's usage limit resets, the session continues by itself* switches it
@@ -855,26 +941,41 @@ Hand a project's work from one agent to another, without losing the thread.
   say *continues by itself then*.
 - **At Claude's usage limit:** the project shows *Claude stopped at its
   usage limit; it resets 6:20pm*. With Settings → Uses tokens → *When
-  Claude stops at its limit, offer to go on in Kimi Code* turned on, a
-  **Continue in Kimi Code…** button sits right next to it, and the notice
-  says so too. aht spots the limit in the session's history; that costs
-  nothing.
+  Claude stops at its limit, offer to go on in* turned on (you pick Kimi
+  Code, Codex or Antigravity), a **Continue in Kimi Code…** button sits
+  right next to it, and the notice says so too. aht spots the limit in the
+  session's history; that costs nothing.
 
 **In the terminal:**
 
 - `aht limits --auto-continue on` — sessions go on by themselves when the
   limit resets (`off`: they wait for you).
-- `aht switch ~/Desktop/paper --to kimi` — say which session Kimi Code
-  would continue, without starting anything.
-- `aht switch ~/Desktop/paper --to kimi --apply` — do it: write the summary
-  and open Kimi Code on it (`--to claude` and `--to codex` work the same
-  way).
-- `aht switch ~/Desktop/paper --to claude --session <id> --apply` —
-  continue that session rather than the latest one of the other agent.
+- `aht switch ~/Desktop/paper --to codex` — say which session Codex would
+  continue, and how, without starting anything.
+- `aht switch ~/Desktop/paper --to codex --apply` — do it: write the summary
+  and open a new Codex session on it (`--to claude`, `--to kimi` and
+  `--to agy` work the same way).
+- `aht switch ~/Desktop/paper --to codex --resume --apply` — Codex's own
+  latest session in the project goes on, and reads only what happened
+  since.
+- `aht switch ~/Desktop/paper --to kimi --brief-only --apply` — Summary
+  Only: write the summary, open nothing.
+- `aht switch ~/Desktop/paper --to claude --session <id> --apply` — pass on
+  that session's work rather than the latest one of another agent.
+- `aht switch ~/Desktop/paper --back` — say which session the work would go
+  back to, and what happened since; add `--apply` to hand it back.
+- `aht switch ~/Desktop/paper --back --to claude --apply` — straight back to
+  Claude Code, past the agents in between.
+- `aht switch ~/Desktop/paper --back --brief-only --apply` — write the
+  catch-up only and open nothing, for a session that is still open: tell
+  it to read the file.
 - `aht switch ~/Desktop/paper --to kimi --no-window --apply` — prepare
   everything and print the command, without opening a window. (Without
   `--no-window`, when no window opens, it ends with an error that holds the
   command.)
+- `aht relays ~/Desktop/paper` — who handed the paper project's work to
+  whom and when, newest first, and which hand-off is still open.
+- `aht relays ~/Desktop/paper --show <id>` — print that hand-off's summary.
 
 ## A second opinion (uses tokens, off by default)
 
@@ -1235,7 +1336,10 @@ the laptop or your phone.
   the conflict name. Empty folders made there (a packed git repo's
   `refs`) come back too.
 - **Summaries:** each handover and each switch of agent leaves a summary in
-  the project's `.aht/handover/`; the newest 12 are kept, of both kinds.
+  the project's `.aht/handover/`; every hand-off that is still open and the
+  newest 12 others are kept, of both kinds. A handover sends that folder
+  along and never removes anything from it there; Keep in sync leaves it
+  out.
 - **A Windows PC** cannot be the other machine yet. **Check and Add**
   (`aht remote add`, `aht remote check`) stops with *aht cannot ask a
   Windows machine yet*, and nothing is made on the PC.
@@ -1549,7 +1653,9 @@ glance when you steer it from the phone.
   first.
 - The links: `aht://search?q=parser`, `aht://sessions`, `aht://loose-ends`,
   `aht://report`, `aht://project?path=~/Desktop/paper` (and in the same form
-  `changes`, `journal` and `undo`), `aht://switch?path=~/Desktop/paper&to=kimi`,
+  `changes`, `journal` and `undo`), `aht://switch?path=~/Desktop/paper&to=kimi`
+  (add `&resume=1` for Kimi's own session),
+  `aht://switch?path=~/Desktop/paper&back=1` (Hand Back),
   `aht://resume?path=~/Desktop/paper&session=<id>` and
   `aht://getting-started`.
 - For everything else, the Shortcuts action *Run Shell Script* can call the
@@ -1722,7 +1828,8 @@ all of them can be set with `aht config --set name=value` and put back with
   `node_modules`, `.venv` and the like).
 - `handover_compress` (on) — compress what is sent.
 - `handover_remote_control` (on) — a handed-over session is reachable from
-  the Claude app.
+  the Claude app; Antigravity, when you switch to it, starts with
+  `--remote-control` too.
 - `handover_carry_trust` (on) — a folder trusted here is trusted there.
 - `handover_claude_args` (none) — extra options for the session over there.
 - `handover_mosh` (on) — open a handed-over session with mosh when it gets
@@ -1775,12 +1882,14 @@ all of them can be set with `aht config --set name=value` and put back with
 
 **Use tokens: off until you turn them on**
 
-- `informed_sessions` — a new session learns where the last one stopped.
+- `informed_sessions` — a new session learns where the last one stopped; a
+  session another agent took the work over from, resumed by hand, learns
+  what happened since.
 - Claude Code's own `autoContinueAtUsageLimit` (in its settings, switched
   with `aht limits --auto-continue on|off`) — a session goes on by itself
   when the usage limit resets.
 - `limit_switch`, `limit_switch_to` (kimi) — at Claude's usage limit, offer
-  to go on in that agent.
+  to go on in that agent (`kimi`, `codex` or `agy`).
 - `second_opinion` — the same task by two agents.
 - `night_shift` — a handover with a task, on a timer.
 

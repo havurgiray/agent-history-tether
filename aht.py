@@ -293,7 +293,7 @@ def _coerce(key: str, raw: str):
         except Exception as e:
             raise ValueError(f"{key}: {e} — prefer `aht backends --set-root "
                              f"name=/path`")
-        bad = [k for k in obj if k not in BACKEND_NAMES]
+        bad = [k for k in obj if k not in BACKEND_NAMES + [AGY_STORE.name]]
         if bad:
             raise ValueError(f"unknown backend(s) {bad}")
         return {k: _expand(str(v)) for k, v in obj.items()}
@@ -3122,14 +3122,14 @@ def cmd_hook(args):
             apply_badge(cwd, desired_marks(cwd, True))
     except Exception:
         pass
-    notes = [_hook_notes(cwd)]
     source = str(data.get("source") or "startup")
     sid = data.get("session_id")
+    notes = [_hook_notes(cwd, sid if isinstance(sid, str) else None)]
     if source != "compact" and cwd != home:
         _spawn_checkpoint(cwd, sid, "claude")
-    if source in ("startup", "clear") and cfg_get("informed_sessions", False):
+    if source in ("startup", "clear", "resume") and cfg_get("informed_sessions", False):
         try:                        # USES TOKENS: only when the user turned it on
-            notes.append(informed_note(cwd, current=sid))
+            notes.append(informed_note(cwd, current=sid, resumed=source == "resume"))
         except Exception as e:
             warn(f"HOOK informed note: {e}")
     notes = "\n\n".join(n for n in notes if n)
@@ -3357,6 +3357,9 @@ def cmd_projects(args):
                "mirror_paused": (e.get("mirror") or {}).get("paused")
                if (e.get("mirror") or {}).get("enabled") else None,
                "handing": handing_row(e.get("handing"), uid),
+               # an open hand-off to another agent: what Hand Back answers
+               "relay": project_relay(e["real_path"]) if os.path.isdir(e["real_path"])
+               else None,
                "agents": agents_of(e.get("stores") or {})}
         mine = [s["status"] for s in live
                 if _inside(os.path.realpath(s["cwd"]), os.path.realpath(e["real_path"]))]
@@ -3896,9 +3899,9 @@ def cmd_backends(args):
                     return 2
                 name, path = kv.split("=", 1)
                 name = name.strip()
-                if name not in BACKEND_NAMES:
+                if name not in BACKEND_NAMES + [AGY_STORE.name]:     # agy: its data folder
                     print(f"unknown backend {name!r}; known: "
-                          f"{', '.join(BACKEND_NAMES)}", file=sys.stderr)
+                          f"{', '.join(BACKEND_NAMES + [AGY_STORE.name])}", file=sys.stderr)
                     return 2
                 roots_cfg[name] = _expand(path)
                 changed.append(name)
@@ -4036,10 +4039,13 @@ COMMANDS:
   aht encode <path>               claude's dirname encoding for a path
   aht install | uninstall         set up / remove the watcher, hook and command
 
-ACROSS AGENTS (Claude Code, Kimi Code, Codex):
+ACROSS AGENTS (Claude Code, Codex, Kimi Code, Antigravity):
   aht search <words>                    every session, also deleted ones in backups
   aht board                             open sessions here and on other machines
   aht switch <folder> --to kimi         continue the work in another agent
+         [--resume | --brief-only]      … in its own session / only write the summary
+  aht switch <folder> --back            hand it back into the first agent's own session
+  aht relays <folder>                   who had the work when, with each summary
   aht journal <folder>                  a dated diary of the project
   aht rules <folder> [--unify]          one set of project rules for every agent
   aht secrets [folder]                  keys or passwords in the histories (masked)
@@ -4890,10 +4896,11 @@ class Remote:
     def rsync(self, src: str, dst: str, *, delete: bool = False,
               backup_dir: str = None, skip=(), files_from: list = None,
               dry: bool = False, update: bool = False, include: list = None,
-              progress: bool = False, add_only: bool = False) -> dict:
+              progress: bool = False, add_only: bool = False, protect=()) -> dict:
         """One rsync run between this machine and the remote.  Paths ending in
         a slash are directories whose CONTENT is synced.  `add_only`: a file
-        that is there already is never written."""
+        that is there already is never written.  `protect`: patterns of what
+        a --delete never removes on the receiving side."""
         rs = find_rsync()
         if not rs:
             raise HandoverError("no usable rsync on this machine (version 3 or "
@@ -4927,6 +4934,8 @@ class Remote:
             cmd.append("--delete")
         if backup_dir:
             cmd += ["--backup", "--backup-dir=" + backup_dir]
+        for pat in protect:
+            cmd.append("--filter=P " + pat)
         for pat in include or []:
             cmd.append("--include=" + pat)
         if include:
@@ -5427,13 +5436,33 @@ def _clip(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n].rstrip() + " […]"
 
-def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dict:
+def _count_exchange(d: dict, text: str, t) -> None:
+    """A digest's tally of the exchanges it read: how many, when the first
+    and the last were, and each request's start (for one line each)."""
+    d["count"] += 1
+    d["first_t"] = d["first_t"] or t
+    d["last_t"] = t or d["last_t"]
+    d["requests"].append({"t": t, "text": text[:2000]})
+    del d["requests"][:-50]
+
+def _rel_to(path: str, root: str) -> str:
+    """`path` (inside `root`) relative to it, spelt as the system that wrote
+    it spells it: C:\\p\\src\\a.py in C:\\p is src\\a.py, on any system."""
+    if _DRIVE.match(str(root)) or str(root).startswith("\\\\"):
+        return str(path)[len(str(root).rstrip("/\\")):].lstrip("/\\") or "."
+    return os.path.relpath(path, root)
+
+def session_digest(jsonl, project: str, turns: int = 8, tail: int = None,
+                   since: float = None) -> dict:
     """The state of one session, read from its transcript: title, the last
-    compaction summary, the latest exchanges, open to-dos, files it touched
-    and the paths OUTSIDE the project it used.  `tail`: read only the last
-    that many bytes (quick, for a glance at where it stopped)."""
+    compaction summary, the latest exchanges (each with its time), open
+    to-dos, files it touched and the paths OUTSIDE the project it used.
+    `tail`: read only the last that many bytes (quick, for a glance at where
+    it stopped).  `since`: only the exchanges and files after that time; the
+    to-dos as they stand at the end."""
     d = {"title": None, "summary": None, "exchanges": [], "todos": [],
-         "touched": [], "outside": [], "version": None}
+         "touched": [], "outside": [], "version": None, "count": 0, "requests": [],
+         "first_t": None, "last_t": None}
     cur = None
     tasks = {}                  # the task list tools (TaskCreate / TaskUpdate)
     home = str(Path.home())
@@ -5466,9 +5495,13 @@ def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dic
             if e.get("isSidechain") or not isinstance(m, dict):
                 continue
             c = m.get("content")
+            ts = _when(e.get("timestamp"))
+            new = not since or (ts or 0) >= since
             if t == "user":
                 if e.get("isCompactSummary"):
-                    d["summary"], d["exchanges"], cur = _text_of(c), [], None
+                    d["summary"], cur = _text_of(c), None
+                    if not since:
+                        d["exchanges"] = []
                     continue
                 tur = e.get("toolUseResult")
                 if isinstance(tur, dict) and isinstance(tur.get("task"), dict) \
@@ -5483,16 +5516,21 @@ def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dic
                 txt = _text_of(c).strip()
                 if not txt or txt.startswith("<"):      # reminders, notifications
                     continue
-                cur = {"you": txt, "agent": ""}
+                cur = None
+                if not new:
+                    continue
+                cur = {"you": txt, "agent": "", "t": ts}
                 d["exchanges"].append(cur)
                 del d["exchanges"][:-turns]
+                _count_exchange(d, txt, ts)
             elif t == "assistant":
                 txt = _text_of(c).strip()
-                if txt and cur is None and tail:        # its prompt lies before the tail
-                    cur = {"you": "", "agent": ""}
+                if txt and cur is None and tail and not since:  # its prompt lies before the tail
+                    cur = {"you": "", "agent": "", "t": ts}
                     d["exchanges"].append(cur)
                 if txt and cur is not None:
                     cur["agent"] = txt                  # a turn's last text wins
+                    d["last_t"] = ts or d["last_t"]
                 for b in c if isinstance(c, list) else []:
                     if not (isinstance(b, dict) and b.get("type") == "tool_use"):
                         continue
@@ -5503,11 +5541,11 @@ def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dic
                         if inp.get("status"):
                             tasks[str(inp["taskId"])]["status"] = inp["status"]
                     fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
-                    if not (isinstance(fp, str) and _is_abs(fp)):
+                    if not (isinstance(fp, str) and _is_abs(fp)) or not new:
                         continue
                     if _inside(fp, project):
                         if b.get("name") in ("Write", "Edit", "NotebookEdit"):
-                            rel = os.path.relpath(fp, project)
+                            rel = _rel_to(fp, project)
                             if rel in d["touched"]:
                                 d["touched"].remove(rel)
                             d["touched"].append(rel)
@@ -5526,15 +5564,24 @@ RELAYS_KEEP = 12        # closed relays kept in a project's .aht/handover
 
 def prune_relays(d) -> int:
     """One prune for a project's .aht/handover, whatever wrote there last:
-    every open relay stays, and the newest RELAYS_KEEP closed ones.  A summary
-    from before relays (`*-to-*.md`, a handover's or a switch's) counts as a
-    closed one."""
+    every open relay stays, and the newest RELAYS_KEEP closed ones.  A
+    hand-back and a Summary Only open nothing, so they count as closed; so
+    does a summary from before relays (`*-to-*.md`, a handover's or a
+    switch's)."""
     d = Path(d)
     closed = []                     # (name to sort by, files that make it up)
     try:
         for f in d.glob("relay-*.json"):
             rid = f.name[len("relay-"):-len(".json")]
-            if (d / f"relay-{rid}.closed").is_file():
+            done = (d / f"relay-{rid}.closed").is_file()
+            if not done:
+                try:
+                    rec = json.loads(f.read_text(encoding="utf-8"))
+                    done = rec.get("kind") == "back" or (rec.get("to") or {}).get("mode") \
+                        == "brief-only"
+                except (OSError, ValueError, AttributeError):
+                    done = False
+            if done:
                 closed.append((rid, [d / f"relay-{rid}{x}"
                                      for x in (".json", ".md", ".closed", ".told")]))
         closed += [(f.name, [f]) for f in d.glob("*-to-*.md")]
@@ -5876,10 +5923,14 @@ def _check_extra(p: str) -> str:
             return f"~/{bad} holds this machine's own settings and keys"
     return ""
 
+RELAYS_REL = "/.aht/handover/"     # a project's relays: notes left there stay there
+
 def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
-                 dry: bool = False) -> dict:
+                 dry: bool = False, sync: bool = False) -> dict:
     """Make the remote copy of a project and of its history equal to what is
-    here.  What the sync replaces or removes over there is set aside first."""
+    here.  What the sync replaces or removes over there is set aside first.
+    The project's .aht/handover is never removed there: a handover sends
+    what is here into it, and Keep in sync (`sync`) leaves it out."""
     real = os.path.realpath(entry["real_path"])
     rpath = rem.path(real)
     rhome, rclaude = rem.info["home"], rem.info["claude_home"]
@@ -5892,7 +5943,9 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
                                    f"{rclaude}/plans", os.path.dirname(aside)],
                   their_home=rem.path(str(Path.home())))
     res["project"] = rem.rsync(real + "/", rem.spec(rpath + "/"), delete=True,
-                               backup_dir=aside + "/project", skip=handover_skip(),
+                               backup_dir=aside + "/project",
+                               skip=handover_skip() + ([RELAYS_REL] if sync else []),
+                               protect=() if sync else (RELAYS_REL + "***",),
                                dry=dry, progress=progress)
     if not res["project"]["ok"]:
         raise HandoverError("sending the project failed: " + res["project"]["error"])
@@ -6011,7 +6064,7 @@ def mirror_project(uid: str, entry: dict, progress: bool = False) -> dict:
             if not rem.info.get("path_writable"):
                 raise HandoverError(f"{rem.info.get('path_base')} is not writable "
                                     f"on {rem.name}")
-            r = push_project(rem, uid, entry, progress=progress)
+            r = push_project(rem, uid, entry, progress=progress, sync=True)
         sent = r["project"].get("bytes", 0) + r["history"].get("bytes", 0) \
             + sum(x.get("bytes", 0) for x in r["extras"])
         m.update(synced_at=time.time(), status="ok", bytes=sent, path=real)
@@ -7581,9 +7634,107 @@ def handover_status() -> dict:
             in rs_cfg else (sorted(rs_cfg)[0] if rs_cfg else None),
             "rsync": rs.get("version"), "away": away, "mirrored": mirrored}
 
-def _hook_notes(cwd: str) -> str:
-    """What a session that starts here must know about a handover; the hook
-    hands it to Claude Code, which adds it to the session's context."""
+def _hook_notes(cwd: str, sid: str = None) -> str:
+    """What a session that starts here must know about a handover, a hand-off
+    to another agent, or a copy of the folder; the hook hands it to Claude
+    Code, which adds it to the session's context."""
+    notes = [_handover_note(cwd)]
+    try:
+        notes += _relay_notes(cwd, sid)
+    except Exception as e:
+        warn(f"HOOK relay note: {e}")
+    notes.append(_copy_note(cwd))
+    return "\n\n".join(n for n in notes if n)
+
+def _relay_notes(cwd: str, sid) -> list:
+    """What the relays of this folder tell a Claude session that starts:
+    (1) the catch-up a Hand Back (or a switch to this session, --resume)
+    left for this very session, once; (2) one line when this is the session
+    another agent took the work over from, resumed by hand (the catch-up
+    itself only with informed_sessions); (3) one line when the work went on
+    on another machine."""
+    rels = read_relays(cwd)
+    if not rels:
+        return []
+    notes = []
+    back = [r for r in rels if sid and r.get("note_for") == sid and r.get("told") is None]
+    if back:
+        notes.append(_catchup_note(cwd, back[0]))
+        for r in back:
+            _mark_relay(cwd, r["id"], "told", {"session": sid})
+    opens = open_relays(cwd, rels)
+    mine = next((r for r in opens if sid and r["from"].get("session") == sid
+                 and _relay_here(r["from"])), None)
+    if mine and not back:
+        cd = catchup_digest(cwd, float(mine["at"]), exclude={("claude", sid)}, most=3)
+        to = AGENT_NAMES[mine["to"]["agent"]]
+        brief = f".aht/handover/relay-{mine['id']}.md"
+        if cd["sessions"]:
+            who = _names([x["agent"] for x in cd["sessions"]])
+            notes.append(f"[aht] {who} worked on this project after this session's last turn "
+                         f"({_span(cd['first_t'], cd['last_t'], '–')}). The files may differ "
+                         f"from what you remember: read them before editing. Summary: {brief}")
+        else:
+            notes.append(f"[aht] This project was handed to {to} at {_clock(mine['at'])}, "
+                         "after this session's last turn. The files may differ from what you "
+                         f"remember: read them before editing. Summary: {brief}")
+    there = next((r for r in opens if not _relay_here(r["to"]) and _known_from(r["from"])), None)
+    if there:
+        where = there["to"].get("machine") or "another machine"
+        notes.append(f"[aht] This project was picked up on “{where}” at {_clock(there['at'])} "
+                     f"({AGENT_NAMES[there['to']['agent']]}). Work may go on there: if the "
+                     "user asks to continue that work, check with them before changing "
+                     "anything here.")
+    return notes
+
+def _known_from(end: dict) -> bool:
+    """Whether the machine a relay says the work left from is one aht knows:
+    this one, or one a handover went to.  A record without a machine id
+    cannot tell; it is taken (made safe by read_relays)."""
+    mid = end.get("machine_id")
+    if not mid or mid == machine_id():
+        return True
+    try:
+        return mid in {(e.get("away") or {}).get("holder_id")
+                       for e in load_registry().get("projects", {}).values()}
+    except Exception:
+        return False
+
+def _catchup_note(cwd: str, r: dict) -> str:
+    """A Hand Back's catch-up as the hook gives it: the head of its summary
+    (who worked, files and commits since, what is open), at most
+    HOOK_NOTE_MAX characters."""
+    brief = f".aht/handover/relay-{r['id']}.md"
+    try:
+        text = (relay_dir(cwd) / f"relay-{r['id']}.md").read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    head = text.split("\n## ", 1)[0].split("\n", 1)[-1].strip()     # without its title
+    tail = f"\nThe full summary: {brief}"
+    return "[aht] " + _clip(redact(head) or "Work went on here while this session was "
+                            "away.", HOOK_NOTE_MAX - len(tail) - 8) + tail
+
+def _copy_note(cwd: str) -> str:
+    """When this folder is a copy aht keeps for another machine
+    (~/.aht/remote/copies.json): one line about where it came from."""
+    try:
+        copies = json.loads((aht_home() / "remote" / "copies.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    c = next((v for k, v in (copies.items() if isinstance(copies, dict) else [])
+              if isinstance(v, dict) and isinstance(k, str) and _same_dir(k, cwd)), None)
+    if not c:
+        return ""
+    src = c.get("from") or "another machine"
+    if c.get("kind") == "sync":
+        return (f"[aht] This folder is a copy kept in sync from “{src}”; changes made here "
+                "pause that sync.")
+    if c.get("kind") in ("handover", "brought"):
+        return f"[aht] This folder was handed over from “{src}”; send it back when done."
+    return ""
+
+def _handover_note(cwd: str) -> str:
+    """The handover part of the hook's notes: away, unfinished, back."""
     try:
         reg = load_registry()
         uid, entry = _entry_for(reg, cwd)
@@ -7626,11 +7777,12 @@ def _hook_notes(cwd: str) -> str:
 # --------------------------------------------------------------------------- #
 # Across agents: every agent's sessions, read one way.  Search, the secrets
 # check, the journal, switching agent and the session board build on it.
-# Readable: Claude Code, Kimi Code 2.x and Codex; the other agents keep
-# formats aht does not know yet.
+# Readable: Claude Code, Kimi Code 2.x, Codex and Antigravity (agy, behind
+# AGY_READER); the other agents keep formats aht does not know yet.
 # --------------------------------------------------------------------------- #
 
-AGENT_NAMES = {"claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex"}
+AGENT_NAMES = {"claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex",
+               "agy": "Antigravity"}
 
 def _when(v):
     """Seconds since 1970 from an ISO text or a (milli)second number."""
@@ -7659,7 +7811,8 @@ def _target(inp: dict) -> str:
     """What a tool call worked on, for the index, shared pages and the
     journal: masked before it is cut, so a key the cut would split is
     masked whole."""
-    for k in ("file_path", "notebook_path", "path", "command", "pattern", "url", "query"):
+    for k in ("file_path", "notebook_path", "path", "TargetFile", "target_file",
+              "AbsolutePath", "command", "CommandLine", "pattern", "url", "query"):
         v = inp.get(k)
         if isinstance(v, str) and v.strip():
             return _masked(v, 400)
@@ -7719,14 +7872,29 @@ def _kimi_events(e: dict):
             yield {"t": t, "role": "tool", "tool": ev.get("name") or "",
                    "target": _target(args), "input": args}
 
+# What the user and the agent said comes from Codex's events only: older
+# versions write `user_message` / `agent_message`, 0.164 `item_completed`
+# with a UserMessage or AgentMessage.  The `response_item` messages say it
+# again, as the model's input and output, among Codex's own instructions and
+# the environment: never read, so nothing is there twice.
+_CODEX_SAID = {"user_message": "user", "agent_message": "agent",
+               "UserMessage": "user", "AgentMessage": "agent"}
+_CODEX_INJECTED = ("<environment_context>", "<user_instructions>", "# AGENTS.md instructions")
+
 def _codex_events(e: dict):
     typ, t = e.get("type"), _when(e.get("timestamp"))
     p = e.get("payload") if isinstance(e.get("payload"), dict) else {}
-    if typ == "event_msg" and p.get("type") in ("user_message", "agent_message"):
-        txt = str(p.get("message") or "").strip()
-        if txt:
-            yield {"t": t, "role": "user" if p["type"] == "user_message" else "agent",
-                   "text": txt}
+    if typ == "event_msg" and p.get("type") in ("user_message", "agent_message", "item_completed"):
+        if p["type"] == "item_completed":
+            item = p.get("item") if isinstance(p.get("item"), dict) else {}
+            role = _CODEX_SAID.get(item.get("type"))
+            txt = "\n".join(c["text"] for c in item.get("content") or []
+                            if isinstance(c, dict) and str(c.get("type")).lower() == "text"
+                            and isinstance(c.get("text"), str)).strip()
+        else:
+            role, txt = _CODEX_SAID[p["type"]], str(p.get("message") or "").strip()
+        if role and txt and not (role == "user" and txt.startswith(_CODEX_INJECTED)):
+            yield {"t": t, "role": role, "text": txt}
     elif typ == "response_item" and p.get("type") in ("function_call", "custom_tool_call"):
         args = p.get("arguments") if p.get("arguments") is not None else p.get("input")
         if isinstance(args, str):
@@ -7738,10 +7906,224 @@ def _codex_events(e: dict):
         cmd = args.get("command")
         if isinstance(cmd, list):
             args = dict(args, command=" ".join(map(str, cmd)))
-        yield {"t": t, "role": "tool", "tool": p.get("name") or "", "target": _target(args),
-               "input": args}
+        ev = {"t": t, "role": "tool", "tool": p.get("name") or "", "target": _target(args),
+              "input": args}
+        # a patch names the files it writes: apply_patch as a tool of its
+        # own, or run through the shell
+        patch = next((v for v in (args.get("command"), args.get("cmd"), args.get("input"))
+                      if isinstance(v, str) and "*** Begin Patch" in v), None)
+        if patch:
+            ev.update(tool="apply_patch", files=_patch_files(patch, args.get("workdir")))
+        yield ev
 
-_EVENTS = {"claude": _claude_events, "kimi": _kimi_events, "codex": _codex_events}
+_PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$",
+                         re.M)
+
+def _patch_files(patch: str, workdir=None) -> list:
+    """The files a Codex patch adds, changes or removes, as written in it:
+    relative ones below `workdir` when the call names one."""
+    out = []
+    for m in _PATCH_FILE.finditer(patch):
+        p = m.group(1) or m.group(2)
+        if not _is_abs(p) and isinstance(workdir, str) and _is_abs(workdir):
+            sep = "\\" if "\\" in workdir and "/" not in workdir else "/"
+            p = workdir.rstrip("/\\") + sep + p
+        if p not in out:
+            out.append(p)
+    return out
+
+# ---- Antigravity (agy) ------------------------------------------------------ #
+# agy keeps a SQLite file of conversation summaries and a transcript per
+# conversation.  A real conversation (agy 1.4, on a Mac) confirmed the
+# summaries table, the folder, title and time, and the transcript's user
+# input and replies; tool calls, a step's thinking and the plan files were
+# not in it and follow the program's description.  AGY_READER turns the
+# reader off again if a later agy changes the format.  As a target of a
+# switch agy works either way.  Never read: cli.log (it names the signed-in
+# account), history.jsonl (the prompts typed), implicit/ and settings.json.
+
+AGY_READER = True
+_AGY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")       # a conversation's id: a uuid
+AGY_STORE = Backend("agy", "Antigravity CLI", "high",
+                    lambda: Path.home() / ".gemini" / "antigravity-cli")
+
+def agy_reader_on() -> bool:
+    """Whether aht reads agy's own store: AGY_READER, or in the tests a
+    stand-in store (AHT_TEST_AGY_READER)."""
+    return AGY_READER or os.environ.get("AHT_TEST_AGY_READER") == "1"
+
+def _sqlite_rows(db, table: str, cols) -> list:
+    """Rows of one table of another program's SQLite file, as dicts of those
+    of `cols` it has.  The file and its -wal and -shm are copied into
+    ~/.aht/run and the copy is opened read-only: the program's own file is
+    never opened, and what still sits in its WAL is read too.  [] when it
+    cannot be read."""
+    import sqlite3, tempfile
+    db = Path(db)
+    if not db.is_file():
+        return []
+    run = aht_home() / "run"
+    run.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="sqlite-", dir=str(run))).resolve()
+    con = None
+    try:
+        for end in ("", "-wal", "-shm"):
+            if Path(str(db) + end).is_file():
+                shutil.copyfile(str(db) + end, str(tmp / (db.name + end)))
+        # a program that closed cleanly leaves a WAL-mode file without its
+        # -wal, and SQLite cannot open such a copy with mode=ro alone: with
+        # no WAL there is nothing more to read, so the copy opens immutable
+        ro = "?mode=ro" if (tmp / (db.name + "-wal")).is_file() else "?mode=ro&immutable=1"
+        con = sqlite3.connect((tmp / db.name).as_uri() + ro, uri=True, timeout=5)
+        have = [r[1] for r in con.execute(f"pragma table_info({table})")]
+        want = [c for c in cols if c in have]
+        if not want:
+            return []
+        return [dict(zip(want, row))
+                for row in con.execute(f"select {', '.join(want)} from {table}")]
+    except Exception as e:
+        warn(f"READ {db.name}: {e}")
+        return []
+    finally:
+        if con is not None:
+            con.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+def _uri_path(u):
+    """The folder a file:// URI names, on any system: file:///Users/me/x,
+    file:///C:/x and file:///c%3A/x."""
+    from urllib.parse import urlparse, unquote
+    if not (isinstance(u, str) and u.startswith("file:")):
+        return None
+    p = unquote(urlparse(u).path)
+    return (p[1:] if re.match(r"/[A-Za-z]:", p) else p) or None
+
+def _seconds(v):
+    """_when, also for a count of micro- or nanoseconds."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        while v > 1e11:
+            v /= 1000.0
+        return float(v) if v > 0 else None
+    return _when(v)
+
+def _same_dir(p: str, real: str) -> bool:
+    if not _is_abs(p):
+        return False
+    p = p if _DRIVE.match(p) or p.startswith("\\\\") else os.path.realpath(p)
+    return _inside(p, real) and _inside(real, p)
+
+def agy_conversations(real: str = None) -> list:
+    """agy's conversations (in the folder `real`) the way list_sessions gives
+    sessions, from a copy of its conversation_summaries.db.  A subagent's
+    conversation is left out.  agy may rewrite a transcript (compaction), so
+    its rows say `rewrites`: the index reads them again from the start."""
+    if not agy_reader_on():
+        return []
+    root = AGY_STORE.root()
+    out = []
+    for r in _sqlite_rows(root / "conversation_summaries.db", "conversation_summaries",
+                          ("conversation_id", "title", "last_modified_time",
+                           "workspace_uris", "nesting_depth")):
+        cid = str(r.get("conversation_id") or "")
+        try:
+            depth = int(r.get("nesting_depth") or 0)
+        except (TypeError, ValueError):
+            depth = 0
+        if not _AGY_ID.fullmatch(cid) or depth > 0:
+            continue
+        try:
+            uris = json.loads(r.get("workspace_uris") or "[]")
+        except (TypeError, ValueError):
+            uris = []
+        folders = [p for p in map(_uri_path, uris if isinstance(uris, list) else []) if p]
+        if real and not any(_same_dir(p, real) for p in folders):
+            continue
+        f = root / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        st = _stat(f)
+        if st is None:
+            continue
+        title = r.get("title")
+        out.append({"agent": "agy", "id": cid, "project": folders[0] if folders else None,
+                    "file": str(f), "title": redact(str(title)) if title else None,
+                    "updated": _seconds(r.get("last_modified_time")) or st.st_mtime,
+                    "rewrites": True})
+    return out
+
+def agy_conversation_exists(cid: str) -> bool:
+    """agy opens a NEW conversation for an id it does not know, without a
+    word: so aht checks the id first."""
+    return bool(agy_reader_on() and _AGY_ID.fullmatch(cid or "")
+                and (AGY_STORE.root() / "brain" / cid).is_dir())
+
+def _agy_text(c) -> str:
+    """The text of a step: a string, or parts; a part that is thinking is
+    never read."""
+    if isinstance(c, str):
+        return c
+    parts = [c] if isinstance(c, dict) else c if isinstance(c, list) else []
+    return "\n".join(str(p.get("text") or "") for p in parts
+                     if isinstance(p, dict) and not p.get("thought")
+                     and p.get("type") not in ("thinking", "thought"))
+
+_AGY_REQUEST = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
+
+def _agy_events(e: dict):
+    """One step of an agy transcript: what the user typed, the agent's reply
+    and its tool calls.  `type` comes with and without its long prefix.
+    agy wraps what was typed in <USER_REQUEST> and adds blocks of its own
+    (the local time, a changed setting): only the request is the user's."""
+    typ = str(e.get("type") or "").upper()
+    if typ.startswith("CORTEX_STEP_TYPE_"):
+        typ = typ[len("CORTEX_STEP_TYPE_"):]
+    t = _seconds(e.get("created_at") or e.get("createdAt"))
+    if typ == "USER_INPUT":
+        txt = _agy_text(e.get("content")).strip()
+        asked = _AGY_REQUEST.findall(txt)
+        txt = "\n".join(asked).strip() if asked else txt
+        if txt:
+            yield {"t": t, "role": "user", "text": txt}
+    elif typ == "PLANNER_RESPONSE":
+        txt = _agy_text(e.get("content")).strip()
+        if txt:
+            yield {"t": t, "role": "agent", "text": txt}
+        for c in e.get("tool_calls") or []:
+            if not isinstance(c, dict):
+                continue
+            args = c.get("args") if c.get("args") is not None else c.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            args = args if isinstance(args, dict) else {}
+            yield {"t": t, "role": "tool", "tool": str(c.get("name") or ""),
+                   "target": _target(args), "input": args}
+
+AGY_PLAN_FILES = ("walkthrough.md", "implementation_plan.md", "task.md")
+_TASK_LINE = re.compile(r"^\s*[-*] \[( |/)\] (.+?)\s*$", re.M)
+
+def agy_plans(cid: str) -> tuple:
+    """(where things stood, open to-dos) from the plan files agy keeps with a
+    conversation: its walkthrough, implementation plan and task list."""
+    if not (agy_reader_on() and _AGY_ID.fullmatch(cid or "")):
+        return None, []
+    d = AGY_STORE.root() / "brain" / cid
+    parts, todos = [], []
+    for name in AGY_PLAN_FILES:
+        try:
+            text = (d / name).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if text:
+            parts.append(f"### {name}\n\n{text}")
+        if name == "task.md":
+            todos = [{"content": m.group(2),
+                      "status": "in_progress" if m.group(1) == "/" else "pending"}
+                     for m in _TASK_LINE.finditer(text)]
+    return ("\n\n".join(parts) or None), todos
+
+_EVENTS = {"claude": _claude_events, "kimi": _kimi_events, "codex": _codex_events,
+           "agy": _agy_events}
 
 def session_events(agent: str, src, start: int = 0):
     """(end, event) for each message of one session from byte `start` on;
@@ -7779,8 +8161,8 @@ def _store_owners() -> dict:
 
 def list_sessions(project: str = None, agents=None) -> list:
     """Every session aht can read, newest first:
-    {agent, id, project, file, updated[, title]}.  `project` narrows it to one
-    folder."""
+    {agent, id, project, file, updated[, title, rewrites]}.  `project`
+    narrows it to one folder."""
     want = set(agents or AGENT_NAMES)
     real = os.path.realpath(project) if project else None
     out = []
@@ -7841,6 +8223,8 @@ def list_sessions(project: str = None, agents=None) -> list:
                 pass
             out.append({"agent": "codex", "id": meta.get("id") or Path(f).stem,
                         "project": meta.get("cwd"), "file": str(f), "updated": st.st_mtime})
+    if "agy" in want:
+        out += agy_conversations(real)
     out.sort(key=lambda s: s["updated"] or 0, reverse=True)
     return out
 
@@ -7858,7 +8242,8 @@ def resume_command(agent: str, sid: str, project: str = None) -> str:
     """The line that continues a session: in `project` (it goes there
     first), or with no project the line to run in the session's folder."""
     exe = agent_cli(agent) or agent
-    args = {"claude": ["--resume", sid], "kimi": ["-S", sid], "codex": ["resume", sid]}[agent]
+    args = {"claude": ["--resume", sid], "kimi": ["-S", sid], "codex": ["resume", sid],
+            "agy": ["--conversation", sid]}[agent]
     return (cd_then(project) if project else "") + " ".join(shell_quote(a) for a in [exe] + args)
 
 # ---- search -------------------------------------------------------------------- #
@@ -7976,7 +8361,8 @@ def update_search_index(progress=None) -> dict:
             if progress:
                 progress(i, len(todo))
             k = known.get(s["file"])
-            start = k[2] if k and st.st_size >= k[0] and k[2] <= st.st_size else 0
+            start = k[2] if k and st.st_size >= k[0] and k[2] <= st.st_size \
+                and not s.get("rewrites") else 0           # agy may rewrite its file
             if start == 0 and k:
                 db.execute("delete from msgs where file = ?", (s["file"],))
             end, title, first, last = _index_events(
@@ -8774,7 +9160,8 @@ def cmd_secrets(args):
 # ---- journal ------------------------------------------------------------------- #
 
 _CHANGE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "StrReplaceFile",
-                 "WriteFile", "apply_patch"}
+                 "WriteFile", "apply_patch", "write_to_file", "replace_file_content",
+                 "multi_replace_file_content"}
 
 def build_journal(project: str, days: int = None) -> dict:
     """A dated diary of a project from every agent's sessions: what was
@@ -8869,7 +9256,8 @@ RULES_READERS = {        # which instruction file each agent reads in a project
     "claude": "CLAUDE.md, .claude/CLAUDE.md or CLAUDE.local.md — AGENTS.md only when "
               "none of those exists",
     "kimi": "AGENTS.md", "codex": "AGENTS.md", "opencode": "AGENTS.md",
-    "cursor": "AGENTS.md", "copilot": "AGENTS.md", "gemini": "GEMINI.md"}
+    "cursor": "AGENTS.md", "copilot": "AGENTS.md", "gemini": "GEMINI.md",
+    "agy": "AGENTS.md and GEMINI.md, also .agents/rules/"}
 
 def _imports_agents(text: str) -> bool:
     return any(l.strip() in (RULES_IMPORT, "@./AGENTS.md") for l in text.splitlines())
@@ -8909,7 +9297,7 @@ def rules_status(project: str) -> dict:
     return {"project": real, "files": files, "state": state, "summary": say,
             "claude_file": claude_file, "agents_used": used,
             "readers": {a: RULES_READERS[a] for a in RULES_READERS
-                        if a in used or a in ("claude", "kimi", "codex")}}
+                        if a in used or a in SWITCH_TARGETS}}
 
 def unify_rules(project: str, prefer: str = None, apply: bool = False) -> dict:
     """Make AGENTS.md the one set of rules: Claude's file then only imports it.
@@ -9001,22 +9389,32 @@ def cmd_rules(args):
 
 # ---- switch agent ---------------------------------------------------------------- #
 
-SWITCH_TARGETS = ("claude", "kimi", "codex")
+SWITCH_TARGETS = ("claude", "kimi", "codex", "agy")
 
 def agent_cli(agent: str):
     if os.environ.get(f"AHT_CLI_{agent.upper()}"):     # tests: a stand-in CLI
         return os.environ[f"AHT_CLI_{agent.upper()}"]
-    return {"claude": find_claude(), "kimi": find_tool("kimi") or (
-        str(Path.home() / ".kimi-code/bin/kimi")
-        if (Path.home() / ".kimi-code/bin/kimi").exists() else None),
-            "codex": find_tool("codex")}.get(agent)
+    if agent == "claude":
+        return find_claude()
+    if agent == "kimi":
+        own = Path.home() / ".kimi-code/bin/kimi"
+        return find_tool("kimi") or (str(own) if own.exists() else None)
+    return find_tool(agent) if agent in ("codex", "agy") else None
 
-def events_digest(s: dict, project: str, turns: int = 8, tail: int = None) -> dict:
+def _note_file(seen: list, p: str) -> None:
+    """Each file once, the most recent last."""
+    if p in seen:
+        seen.remove(p)
+    seen.append(p)
+
+def events_digest(s: dict, project: str, turns: int = 8, tail: int = None,
+                  since: float = None) -> dict:
     """session_digest for any agent's session."""
     if s["agent"] == "claude":
-        return session_digest(s["file"], project, turns, tail)
+        return session_digest(s["file"], project, turns, tail, since)
     d = {"title": s.get("title"), "summary": None, "exchanges": [], "todos": [],
-         "touched": [], "outside": [], "version": None}
+         "touched": [], "outside": [], "version": None, "count": 0, "requests": [],
+         "first_t": None, "last_t": None}
     cur = None
     home = str(Path.home())
     start = 0
@@ -9024,97 +9422,830 @@ def events_digest(s: dict, project: str, turns: int = 8, tail: int = None) -> di
         st = _stat(s["file"])
         start = max(0, st.st_size - tail) if st else 0
     for _end, ev in session_events(s["agent"], s["file"], start):
+        new = not since or (ev.get("t") or 0) >= since
         if ev["role"] == "user":
-            cur = {"you": ev["text"], "agent": ""}
-            d["exchanges"].append(cur)
-            del d["exchanges"][:-turns]
+            cur = None
+            if new:
+                cur = {"you": ev["text"], "agent": "", "t": ev.get("t")}
+                d["exchanges"].append(cur)
+                del d["exchanges"][:-turns]
+                _count_exchange(d, ev["text"], ev.get("t"))
         elif ev["role"] == "agent" and cur is not None:
             cur["agent"] = ev["text"]
+            d["last_t"] = ev.get("t") or d["last_t"]
         elif ev["role"] == "tool":
-            tgt = ev.get("target") or ""
+            inp = ev.get("input") or {}
             if ev.get("tool") in ("TodoList", "TodoWrite"):
-                todos = (ev.get("input") or {}).get("todos")
+                todos = inp.get("todos")
                 if isinstance(todos, list):
                     d["todos"] = [x for x in todos if isinstance(x, dict)
                                   and x.get("status") not in ("completed", "done")]
-            elif _is_abs(tgt):
-                if _inside(tgt, project):
+            elif ev.get("tool") == "update_plan" and isinstance(inp.get("plan"), list):
+                d["todos"] = [{"content": x.get("step"), "status": x.get("status")}
+                              for x in inp["plan"] if isinstance(x, dict) and x.get("step")
+                              and x.get("status") != "completed"]       # Codex's plan
+            if not new:
+                continue
+            for f in ev.get("files") or [ev.get("target") or ""]:
+                if not _is_abs(f):
+                    if ev.get("files"):             # a patch's own name, in the project
+                        _note_file(d["touched"], f)
+                elif _inside(f, project):
                     if ev.get("tool") in _CHANGE_TOOLS:
-                        rel = os.path.relpath(tgt, project)
-                        if rel in d["touched"]:
-                            d["touched"].remove(rel)
-                        d["touched"].append(rel)
-                elif tgt.startswith(home) and not tgt.startswith((home + "/.",)):
-                    if tgt in d["outside"]:
-                        d["outside"].remove(tgt)
-                    d["outside"].append(tgt)
+                        _note_file(d["touched"], _rel_to(f, project))
+                elif f.startswith(home) and not f.startswith((home + "/.",)):
+                    _note_file(d["outside"], f)
+    if s["agent"] == "agy":                 # its own plan files say where it stood
+        d["summary"], todos = agy_plans(s["id"])
+        d["todos"] = todos or d["todos"]
     d["touched"], d["outside"] = d["touched"][-15:], d["outside"][-15:]
     return d
 
-def _brief_sections(dig: dict) -> list:
+def _brief_sections(dig: dict, times: bool = False) -> list:
     """The body of a handover or switch summary.  Whatever looks like a key
-    is masked: the summary is a new file, and a key must not spread."""
+    is masked: the summary is a new file, and a key must not spread.
+    `times`: each exchange says when it was."""
     L = []
     if dig.get("summary"):
         L += ["", "## Where things stood", "", _masked(dig["summary"], 8000)]
     if dig.get("exchanges"):
         L += ["", "## The latest exchanges"]
         for x in dig["exchanges"]:
-            L += ["", "**You:** " + _masked(x["you"], 1500)]
+            at = f" ({_clock(x['t'])})" if times and x.get("t") else ""
+            L += ["", f"**You{at}:** " + _masked(x["you"], 1500)]
             if x.get("agent"):
                 L += ["", "**Agent:** " + _masked(x["agent"], 2500)]
     if dig.get("todos"):
         L += ["", "## Open to-do items", ""]
-        L += [f"- [ ] {_masked(str(x.get('content') or x.get('subject') or x.get('title') or ''), 200)}"
+        L += [f"- [ ] {_masked(_todo_text(x), 200)}"
               + ("  *(in progress)*" if x.get("status") == "in_progress" else "")
               for x in dig["todos"]]
     if dig.get("touched"):
         L += ["", "## Files changed most recently", ""]
-        L += [f"- `{p}`" for p in reversed(dig["touched"])]
+        L += [f"- `{redact(p)}`" for p in reversed(dig["touched"])]
     return L
 
-def write_switch_brief(real: str, src: dict, dig: dict, target: str) -> Path:
-    out = Path(real) / ".aht" / "handover"
-    out.mkdir(parents=True, exist_ok=True)
-    (out / ".gitignore").write_text("*\n")
-    frm = AGENT_NAMES.get(src["agent"], src["agent"])
-    L = [f"# Switch: {os.path.basename(real)}", "",
-         f"- From **{frm}** to **{AGENT_NAMES.get(target, target)}** on {_here()}, "
-         f"{time.strftime('%Y-%m-%d %H:%M')}",
-         f"- Folder: `{real}`",
-         f"- Session it continues: {redact(dig.get('title') or 'untitled')} — `{src['id']}`",
-         f"- To go back to it: `{resume_command(src['agent'], src['id'], real)}`"]
-    L += _brief_sections(dig)
+def _todo_text(x: dict) -> str:
+    return str(x.get("content") or x.get("subject") or x.get("title") or "")
+
+# ---- git, as a summary tells it ------------------------------------------- #
+
+def _git(real: str, *args):
+    """One git command in the folder `real`: it never asks for a password,
+    never takes a lock and never fetches.  Its output, or None."""
+    try:
+        r = subprocess.run(["git", "-C", real, "--no-optional-locks", *args],
+                           capture_output=True, encoding="utf-8", errors="replace",
+                           timeout=15, cwd="/", **_NO_WINDOW,
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0"))
+    except Exception:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+_HEAD = re.compile(r"[0-9a-f]{7,64}")
+
+def git_state(real: str, since_head: str = None, since: float = None):
+    """The git state of the project at `real`: branch, HEAD and its subject,
+    ahead of and behind its upstream, the uncommitted files (up to 30) and
+    how many are untracked.  With `since_head` (or only `since`, a time):
+    also the files changed since that commit, untracked ones made since,
+    and the commits since (up to 30).  Commit subjects and file names are
+    masked.  None when the folder holds no repository or git is missing."""
+    if not is_git(real):
+        return None
+    out = _git(real, "status", "--porcelain=v1", "-z", "--branch")
+    if out is None:
+        return None
+    st = {"branch": None, "upstream": None, "ahead": 0, "behind": 0, "head": None,
+          "head_full": None, "subject": None, "dirty": 0, "files": [], "untracked": 0}
+    untracked = []
+    recs = out.split("\0")
+    i = 0
+    while i < len(recs):
+        rec, i = recs[i], i + 1
+        if rec.startswith("## "):
+            h = rec[3:]
+            info = re.search(r" \[([^\]]*)\]$", h)
+            if info:
+                h = h[:info.start()]
+                for part in info.group(1).split(", "):
+                    k, _sp, n = part.partition(" ")
+                    if k in ("ahead", "behind") and n.isdigit():
+                        st[k] = int(n)
+            for pre in ("No commits yet on ", "Initial commit on "):
+                h = h[len(pre):] if h.startswith(pre) else h
+            branch, _dots, up = h.partition("...")
+            st["branch"] = None if branch.startswith("HEAD (") else redact(branch)
+            st["upstream"] = redact(up) if up else None
+            continue
+        if len(rec) < 4:
+            continue
+        xy, path = rec[:2], rec[3:]
+        if "R" in xy or "C" in xy:
+            i += 1                              # the name it had before
+        if xy == "??":
+            st["untracked"] += 1
+            untracked.append(path)
+        elif xy != "!!":
+            st["dirty"] += 1
+            if len(st["files"]) < 30:
+                st["files"].append(f"{xy.strip()} {redact(path)}")
+    head = _git(real, "log", "-1", "--format=%H%x00%h%x00%s")
+    if head and head.count("\0") >= 2:
+        st["head_full"], st["head"], subject = head.rstrip("\n").split("\0", 2)
+        st["subject"] = _masked(subject, 200)
+    if since_head is None and since is None:
+        return st
+    base = since_head if since_head and _HEAD.fullmatch(since_head) else None
+    changed = []
+    if base:
+        diff = _git(real, "diff", "--name-status", "-z", base)
+        if diff is None:
+            base = None                         # a commit this repository lacks
+        else:
+            parts = diff.split("\0")
+            j = 0
+            while j < len(parts) and parts[j]:
+                kind = parts[j]
+                n = 2 if kind[:1] in ("R", "C") else 1
+                names = parts[j + 1:j + 1 + n]
+                j += 1 + n
+                if names and not names[-1].startswith(".aht/"):    # aht's own marker
+                    changed.append(f"{kind[:1]} {redact(names[-1])}")
+    for path in untracked:                      # new since then, never committed
+        if path.startswith(".aht/"):
+            continue                            # aht's own: the marker, the relays
+        t = _stat(os.path.join(real, path))
+        if since is None or (t and t.st_mtime >= since):
+            changed.append(f"?? {redact(path)}")
+    if base:
+        log_ = _git(real, "log", "--format=%h%x00%s", "-n", "31", f"{base}..HEAD")
+    elif since:
+        log_ = _git(real, "log", "--format=%h%x00%s", "-n", "31", f"--since=@{int(since)}")
+    else:
+        log_ = None
+    commits = []
+    for line in (log_ or "").splitlines():
+        sha, _z, subject = line.partition("\0")
+        if sha:
+            commits.append({"head": sha, "subject": _masked(subject, 200)})
+    st.update(base=base, changed=changed[:40], changed_more=max(0, len(changed) - 40),
+              commits=commits[:30], commits_more=len(commits) > 30)
+    return st
+
+def _git_mark(real: str):
+    """What a relay remembers of git when it is written: the base for
+    "changed since"."""
+    g = git_state(real)
+    return {"head": g["head_full"], "branch": g["branch"], "dirty": g["dirty"],
+            "ahead": g["ahead"]} if g and g.get("head_full") else None
+
+def _git_lines(g: dict) -> list:
+    """The git section of a full summary."""
+    where = f"branch `{g['branch']}`" if g.get("branch") else "no branch (a detached HEAD)"
+    head = f", HEAD `{g['head']}` “{g['subject']}”" if g.get("head") else ", no commit yet"
+    up = ""
+    if g.get("upstream"):
+        bits = [f"{g['ahead']} commit(s) not pushed" if g["ahead"] else "",
+                f"{g['behind']} behind" if g["behind"] else ""]
+        up = f"; against {g['upstream']}: " + (", ".join(b for b in bits if b) or "up to date")
+    L = ["", "## Git", "", f"- On {where}{head}{up}."]
+    if g.get("files"):
+        L.append(f"- Not committed ({g['dirty']}):")
+        L += [f"  - `{f}`" for f in g["files"]]
+        if g["dirty"] > len(g["files"]):
+            L.append(f"  - … and {g['dirty'] - len(g['files'])} more")
+    else:
+        L.append("- Nothing changed that is not committed.")
+    if g.get("untracked"):
+        L.append(f"- {g['untracked']} file(s) git does not track.")
+    return L
+
+# ---- relays: who handed a project's work to whom --------------------------- #
+# Every pass of work from one agent (or machine) to another leaves a record in
+# the project's .aht/handover: relay-<id>.json, with its summary relay-<id>.md.
+# A record is never edited, so the copies on two machines never conflict;
+# what happens later is a small marker beside it: relay-<id>.closed {by, at}
+# and relay-<id>.told {session, at}.  Open relays stack: Claude Code → Codex →
+# Kimi leaves two, and Hand Back goes one step back (or, with --to, more).
+
+_RELAY_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
+RELAY_LABEL = {"switch": "Switch", "back": "Hand back", "handover": "Handover",
+               "bring": "Bring here", "pickup": "Pick up", "note": "Note"}
+BRIEF_MAX = 40000               # characters: a full summary, read by a new session
+CATCHUP_MAX = 20000             # a catch-up, read by the session that left
+HOOK_NOTE_MAX = 2000            # the catch-up the hook adds to a session's context
+
+def relay_dir(real) -> Path:
+    return Path(real) / ".aht" / "handover"
+
+def new_relay_id() -> str:
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+
+def _here_end() -> dict:
+    return {"machine": _here(), "system": platform.system()}
+
+def _relay_here(end: dict) -> bool:
+    """Whether one end of a relay is this machine: by its machine id, since a
+    Mac's name changes with the network it is on; by name only in a record
+    that has no id."""
+    mid = (end or {}).get("machine_id")
+    if mid:
+        return mid == machine_id()
+    return (end or {}).get("machine") == _here()
+
+def write_relay(real: str, kind: str, frm: dict, to: dict, text: str, rid: str = None,
+                back_of: str = None, note_for: str = None) -> dict:
+    """Write a relay and its summary into the project -> the record.  The
+    summary goes first, so a record never names a file that is not there."""
+    d = relay_dir(real)
+    d.mkdir(parents=True, exist_ok=True)
+    # excerpts of a conversation must never end up in the project's repository
+    if not (d / ".gitignore").is_file():
+        (d / ".gitignore").write_text("*\n")
+    rid = rid if rid and _RELAY_ID.fullmatch(rid) else new_relay_id()
+    while (d / f"relay-{rid}.json").exists():
+        rid = new_relay_id()
+    mid = machine_id(create=True)
+    rec = {"v": 1, "id": rid, "kind": kind, "at": time.time(), "project_id": read_marker(real),
+           "from": dict(_here_end(), machine_id=mid, path=real, **frm),
+           "to": dict(_here_end(), machine_id=mid, path=real, **to),
+           "brief": f"relay-{rid}.md", "back_of": back_of, "note_for": note_for}
+    (d / rec["brief"]).write_text(text, encoding="utf-8")
+    with open(d / f"relay-{rid}.json", "x", encoding="utf-8") as fh:
+        json.dump(rec, fh, indent=1)
+    prune_relays(d)
+    log(f"RELAY {real}: {kind} {rid} {frm.get('agent')} -> {to.get('agent')}")
+    return rec
+
+def _relay_marker(d: Path, rid: str, kind: str):
+    try:
+        v = json.loads((d / f"relay-{rid}.{kind}").read_text(encoding="utf-8"))
+        return v if isinstance(v, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}                   # there but unreadable: it still counts
+
+def _mark_relay(real: str, rid: str, kind: str, data: dict) -> bool:
+    """Write relay-<id>.closed or .told, once: the first word stands."""
+    if not _RELAY_ID.fullmatch(rid or ""):
+        return False
+    try:
+        with open(relay_dir(real) / f"relay-{rid}.{kind}", "x", encoding="utf-8") as fh:
+            json.dump(dict(data, at=time.time()), fh)
+        return True
+    except OSError:
+        return False
+
+def close_relay(real: str, rid: str, by: str) -> bool:
+    """A relay is answered: by the relay that handed the work back, or by
+    "resumed", "taken-back", "sent-back" or "released"."""
+    return _mark_relay(real, rid, "closed", {"by": by})
+
+def read_relays(real: str) -> list:
+    """The relays of a project, newest first, each with what its markers say
+    (`closed`, `told`: None, or the marker's content).  A record whose id is
+    not its file's name, or that aht would not have written, is passed over;
+    the rest only as _relay_safe keeps them."""
+    d = relay_dir(real)
+    out = []
+    try:
+        files = list(d.glob("relay-*.json")) if d.is_dir() else []
+    except OSError:
+        files = []
+    for f in files:
+        rid = f.name[len("relay-"):-len(".json")]
+        if not _RELAY_ID.fullmatch(rid):
+            continue
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        rec = _relay_safe(rec, rid)
+        if rec is None:
+            continue
+        out.append(dict(rec, closed=_relay_marker(d, rid, "closed"),
+                        told=_relay_marker(d, rid, "told")))
+    out.sort(key=lambda r: (r["at"], r["id"]), reverse=True)
+    return out
+
+_MACHINE_NAME = re.compile(r"(?=.*[A-Za-z0-9])[A-Za-z0-9._ -]{1,64}")
+_MACHINE_ID = re.compile(r"[0-9a-f]{12}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+def _number(v):
+    """A time or a count from a record: a number, never a text or a bool."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) \
+        and 0 <= v < 1e11 else None
+
+def _relay_safe(rec, rid: str):
+    """A relay record as aht's notes, summaries and lists may use it, or None
+    to pass it over.  A relay file can come with the folder (a repository
+    that committed one), and the hook puts what it says into a session's
+    context: so a machine's name holds only letters, digits, spaces and
+    . _ - (else "another machine"), an agent is one aht knows, times are
+    numbers, titles are masked and short, and a path or a session id is
+    kept only as aht writes it."""
+    if not (isinstance(rec, dict) and rec.get("id") == rid
+            and rec.get("kind") in RELAY_LABEL and _number(rec.get("at")) is not None):
+        return None
+    ends = {}
+    for side in ("from", "to"):
+        e = rec.get(side)
+        if not isinstance(e, dict) or e.get("agent") not in AGENT_NAMES:
+            return None
+        mid = e.get("machine_id")
+        if mid is not None and not (isinstance(mid, str) and _MACHINE_ID.fullmatch(mid)):
+            return None
+        word = lambda k, ok: e[k] if isinstance(e.get(k), str) and ok(e[k]) else None
+        name = e.get("machine")
+        x = {"machine": name if name is None or (isinstance(name, str)
+                                                 and _MACHINE_NAME.fullmatch(name))
+             else "another machine",
+             "system": word("system", lambda v: v in ("Darwin", "Linux", "Windows")),
+             "path": word("path", lambda v: len(v) <= 4096 and not _CONTROL.search(v)),
+             "agent": e["agent"],
+             "session": word("session", lambda v: len(v) <= 200 and _SESSION_ID.fullmatch(v))}
+        if mid:
+            x["machine_id"] = mid
+        if side == "from":
+            g = e.get("git")
+            x["title"] = _line(e.get("title"))
+            x["last_t"] = _number(e.get("last_t"))
+            x["git"] = {"head": g["head"], "branch": _line(g.get("branch")),
+                        "dirty": int(_number(g.get("dirty")) or 0),
+                        "ahead": int(_number(g.get("ahead")) or 0)} \
+                if isinstance(g, dict) and isinstance(g.get("head"), str) \
+                and _HEAD.fullmatch(g["head"]) else None
+        else:
+            x["mode"] = word("mode", lambda v: v in ("new", "resume", "brief-only"))
+        ends[side] = x
+    pid, back, note = rec.get("project_id"), rec.get("back_of"), rec.get("note_for")
+    return {"v": 1, "id": rid, "kind": rec["kind"], "at": _number(rec["at"]),
+            "project_id": pid if isinstance(pid, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", pid)
+            else None, **ends, "brief": f"relay-{rid}.md",
+            "back_of": back if isinstance(back, str) and _RELAY_ID.fullmatch(back) else None,
+            "note_for": note if isinstance(note, str) and len(note) <= 200
+            and _SESSION_ID.fullmatch(note) else None}
+
+def _line(v):
+    """A short line of text from a record (a title, a branch): masked, on
+    one line; None when there is none."""
+    return _masked(" ".join(v.split()), 120) if isinstance(v, str) and v.strip() else None
+
+def session_file(real: str, agent: str, sid: str):
+    """The file of one session of the folder `real`, found without reading
+    the others; None when it is gone."""
+    if not (sid and _SESSION_ID.fullmatch(sid)) or sid in (".", ".."):
+        return None
+    f = None
+    if agent == "claude":
+        store = _store_of(real)
+        f = Path(store) / f"{sid}.jsonl" if store else None
+    elif agent == "kimi" and BY_NAME.get("kimi-code"):
+        f = BY_NAME["kimi-code"].root() / _key_kimicode(real) / sid / "agents" / "main" / "wire.jsonl"
+    elif agent == "codex":
+        b = BY_NAME.get("codex")
+        if b and b.available():         # its file is named after it, usually
+            f = next((x for x in b.root().rglob(f"rollout-*{sid}.jsonl") if x.is_file()), None) \
+                or next((Path(s["file"]) for s in list_sessions(real, agents=["codex"])
+                         if s["id"] == sid), None)
+    elif agent == "agy" and agy_conversation_exists(sid):
+        f = AGY_STORE.root() / "brain" / sid / ".system_generated" / "logs" / "transcript.jsonl"
+    return f if f and f.is_file() else None
+
+def _session_after(real: str, agent: str, since: float):
+    """The newest session of `agent` in the folder `real` that began after
+    `since`: what the receiving end of a relay opened."""
+    for s in list_sessions(real, agents=[agent]):
+        if (s["updated"] or 0) < since - 1:
+            break
+        for _end, ev in session_events(s["agent"], s["file"]):
+            if ev.get("t"):
+                if ev["t"] >= since - 1:
+                    return s["id"]
+                break
+    return None
+
+def _went_on(real: str, r: dict) -> bool:
+    """Whether someone typed into the session a relay left, after the relay
+    (here, resumed by hand).  Only what the user typed counts: the session
+    that ran the switch may still have answered after it."""
+    f = r.get("from") or {}
+    if not (_relay_here(f) and f.get("session") and f.get("agent") in _EVENTS):
+        return False
+    path = session_file(real, f["agent"], f["session"])
+    st = _stat(path) if path else None
+    at = float(r.get("at") or 0)
+    if st is None or st.st_mtime <= at:
+        return False
+    for _end, ev in session_events(f["agent"], str(path), max(0, st.st_size - (2 << 20))):
+        if ev["role"] == "user" and (ev.get("t") or 0) > at + 1:
+            return True
+    return False
+
+def _opens_nothing(r: dict) -> bool:
+    """A hand-back answers a relay and opens none; Summary Only started
+    nothing, so who has the project stays as it was."""
+    return r.get("kind") == "back" or (r.get("to") or {}).get("mode") == "brief-only"
+
+def open_relays(real: str, relays: list = None) -> list:
+    """The project's open relays, newest first: work handed on that has not
+    come back.  A relay whose origin session was resumed by hand since is
+    closed here ("resumed").  A hand-back and a Summary Only open none."""
+    out = []
+    for r in relays if relays is not None else read_relays(real):
+        if r.get("closed") is not None or _opens_nothing(r):
+            continue
+        if _went_on(real, r):
+            close_relay(real, r["id"], "resumed")
+            continue
+        out.append(r)
+    return out
+
+def relay_row(r: dict, real: str) -> dict:
+    """A relay as `relays --json` lists it."""
+    closed = r.get("closed")
+    return {"id": r["id"], "kind": r.get("kind"), "at": r.get("at"),
+            "from": r.get("from"), "to": r.get("to"),
+            "open": closed is None and not _opens_nothing(r),
+            "closed_by": (closed or {}).get("by") if closed is not None else None,
+            "brief": str(relay_dir(real) / f"relay-{r['id']}.md")}
+
+def project_relay(real: str):
+    """A project's newest open relay, for its row in the window: None, or
+    {id, from_agent, to_agent, since, open, incoming}.  The same relay Hand
+    Back (switch --back) answers."""
+    if not relay_dir(real).is_dir():
+        return None
+    r = next(iter(open_relays(real)), None)
+    if r is None:
+        return None
+    return {"id": r["id"], "from_agent": r["from"].get("agent"), "to_agent": r["to"].get("agent"),
+            "since": r.get("at"), "open": True,
+            "incoming": not (_relay_here(r["from"]) and _relay_here(r["to"]))}
+
+# ---- the summaries ----------------------------------------------------------- #
+
+def catchup_digest(real: str, since: float, exclude=(), tail: int = 4 << 20,
+                   most: int = 6) -> dict:
+    """What happened in the folder `real` after `since`, in every session but
+    those in `exclude` ((agent, id) pairs): {since, sessions (oldest first,
+    each a digest of its exchanges after `since`), exchanges, first_t,
+    last_t}."""
+    rows = []
+    for s in list_sessions(real):
+        if (s["updated"] or 0) < since - 1:
+            break                                   # newest first: the rest are older
+        if (s["agent"], s["id"]) in exclude or (s["agent"] == "claude"
+                                                and _is_scripted(s["file"])):
+            continue
+        dig = events_digest(s, real, turns=12, tail=tail, since=since)
+        if dig["count"] or dig["touched"]:
+            rows.append(dict(dig, agent=s["agent"], id=s["id"],
+                             title=dig.get("title") or _session_title(s)))
+        if len(rows) >= most:
+            break
+    rows.sort(key=lambda r: r["first_t"] or r["last_t"] or 0)
+    times = [t for r in rows for t in (r["first_t"], r["last_t"]) if t]
+    return {"since": since, "sessions": rows, "exchanges": sum(r["count"] for r in rows),
+            "first_t": min(times) if times else None, "last_t": max(times) if times else None}
+
+def _names(agents: list) -> str:
+    names = [AGENT_NAMES.get(a, a) for a in dict.fromkeys(agents)]
+    return " and ".join([", ".join(names[:-1]), names[-1]] if len(names) > 1 else names)
+
+def _span(a, b, to: str = " to ") -> str:
+    """From when to when: "14:10 to 16:40", the date once when not today."""
+    if not a:
+        return ""
+    a_, b_ = _clock(a), _clock(b) if b else ""
+    if not b_ or b_ == a_:
+        return a_
+    return a_ + to + (b_[-5:] if b_[:-5] == a_[:-5] else b_)
+
+def _more(items: list, n: int, more: int = 0) -> str:
+    extra = len(items) - n + more
+    return ", ".join(items[:n]) + (f" and {extra} more" if extra > 0 else "")
+
+def catchup_head(cd: dict, g, away: str, had: list = None) -> list:
+    """The first lines of a catch-up, which also make the note Claude's
+    hook gives the session: who worked, files and commits since, what is
+    still open, the last words.  `had`: the agents the relays being answered
+    went to; when none of their work can be read, the head says so."""
+    who = _names([r["agent"] for r in cd["sessions"]])
+    n, k = cd["exchanges"], len(cd["sessions"])
+    if k:
+        span = _span(cd["first_t"], cd["last_t"])
+        L = [f"While {away} was away, {who} worked here {'from' if ' to ' in span else 'at'} {span} "
+             f"({n} exchange{'s' if n != 1 else ''}" + (f" in {k} sessions" if k > 1 else "") + ")."]
+    elif had:
+        L = [_unread_work(had, cd["since"])]
+    else:
+        L = [f"While {away} was away (since {_clock(cd['since'])}), no other agent's session "
+             "here that aht can read went on."]
+    if g and g.get("base"):
+        files = [c.split(" ", 1)[1] for c in g["changed"]]
+        if files:
+            L.append(f"- Changed since: {_more(files, 6, g['changed_more'])}.")
+    else:
+        files = list(dict.fromkeys(f for r in cd["sessions"] for f in r["touched"]))
+        if files:
+            L.append(f"- Changed since: {_more([redact(f) for f in files], 6)}.")
+    if g and g.get("commits"):
+        L.append("- Commits since: " + _more([f"{c['head']} “{c['subject']}”"
+                                              for c in g["commits"]], 3) + ".")
+    todos = [_todo_text(t) for r in cd["sessions"][-1:] for t in r["todos"]]
+    if todos:
+        L.append("- Still open: " + "; ".join(f"“{_masked(t, 120)}”" for t in todos[:4]) + ".")
+    last = cd["sessions"][-1] if cd["sessions"] else None
+    words = ((last or {}).get("exchanges") or [{}])[-1].get("agent")
+    if words:
+        L.append(f"- {AGENT_NAMES.get(last['agent'], last['agent'])}'s last words: "
+                 f"“{_masked(' '.join(words.split()), 400)}”")
+    if k or (g and (g.get("changed") or g.get("commits")) and not had):
+        L.append("The files on disk may differ from what this conversation remembers: "
+                 "read them before editing.")
+    return L
+
+def _unread_work(had: list, since: float) -> str:
+    """The agents that had the project left nothing aht can read (an agent
+    without a reader, or a session it cannot parse): the files may differ
+    all the same."""
+    names = list(dict.fromkeys(a for a in had if a in AGENT_NAMES))
+    return (f"{_names(names) or 'Another agent'} had the project from {_clock(since)}; aht "
+            f"cannot read {'its' if len(names) < 2 else 'their'} work, so the files may differ: "
+            "read them before editing.")
+
+def _clip_to(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[:n - 80].rstrip() + f"\n\n[… cut here: a summary holds at most {n} characters]\n"
+
+def relay_brief(real: str, kind: str, source: dict, since: float = None, relay: dict = None,
+                dig: dict = None, had: list = None) -> str:
+    """The summary that goes with a relay, built from the histories without
+    spending a token; whatever looks like a key is masked.
+    kind "full", for a new session: where things stood in `source` (a
+    list_sessions row), the latest exchanges, open to-dos, files changed,
+    git, files used outside the project.  At most BRIEF_MAX characters.
+    kind "catchup", for the session that left (`source`): what every other
+    session here did after `since`, the files changed and the commits made
+    since.  At most CATCHUP_MAX.  `relay` is the record it goes with (for
+    the header); `dig` a digest made already; `had` (catch-up) the agents
+    the relays it answers went to."""
+    relay = relay or {}
+    frm, to = relay.get("from") or {}, relay.get("to") or {}
+    name = os.path.basename(real)
+    codex_n = codex_unreadable(real)
+    warn_codex = [f"- Codex has {codex_n} session{'s' if codex_n > 1 else ''} here that aht "
+                  "cannot read (Codex's newer storage)."] if codex_n else []
+    if kind == "catchup":
+        away = AGENT_NAMES.get(source["agent"], source["agent"])
+        cd = dig or catchup_digest(real, since, exclude={(source["agent"], source["id"])})
+        g = git_state(real, since_head=(frm.get("git") or {}).get("head")
+                      if relay.get("kind") == "back" else None, since=since)
+        L = [f"# Catch-up: {name}", ""] + catchup_head(cd, g, away, had) + warn_codex
+        shown = sorted((x for r in cd["sessions"] for x in r["exchanges"]),
+                       key=lambda x: x.get("t") or 0)[-12:]
+        full = {id(x) for x in shown}
+        for r in cd["sessions"]:
+            title = r.get("title") or "untitled"
+            L += ["", f"## {AGENT_NAMES.get(r['agent'], r['agent'])} — {_masked(title, 90)} "
+                      f"(`{r['id']}`), {_span(r['first_t'], r['last_t'])}"]
+            mine = [x for x in r["exchanges"] if id(x) in full]
+            first = mine[0].get("t") if mine else None
+            older = [q for q in r["requests"] if not first or (q["t"] or 0) < first]
+            if older:
+                L += ["", "Earlier requests:"]
+                L += [f"- {_clock(q['t'])} " + _masked(" ".join(q["text"].split()), 160)
+                      for q in older[-10:]]
+            for x in mine:
+                L += ["", f"**You ({_clock(x['t'])}):** " + _masked(x["you"], 1500)]
+                if x.get("agent"):
+                    L += ["", "**Agent:** " + _masked(x["agent"], 2500)]
+            if not mine and r["exchanges"] and r["exchanges"][-1].get("agent"):
+                L += ["", "Its last message: " + _masked(r["exchanges"][-1]["agent"], 2500)]
+        todos = [(r["agent"], t) for r in cd["sessions"] for t in r["todos"]]
+        if todos:
+            L += ["", "## To-dos still open", ""]
+            L += [f"- [ ] {_masked(_todo_text(t), 200)}"
+                  + (f"  *({AGENT_NAMES.get(a, a)})*" if len(cd["sessions"]) > 1 else "")
+                  for a, t in todos]
+        if g and g.get("base"):
+            if g["changed"]:
+                L += ["", "## Files changed since (git)", ""] + [f"- `{c}`" for c in g["changed"]]
+                if g["changed_more"]:
+                    L.append(f"- … and {g['changed_more']} more")
+        else:
+            files = list(dict.fromkeys(f for r in cd["sessions"] for f in r["touched"]))
+            untracked = [c for c in (g or {}).get("changed") or [] if c.startswith("?? ")]
+            if files or untracked:
+                L += ["", "## Files changed since", ""] + [f"- `{redact(f)}`" for f in files] \
+                    + [f"- `{c}`" for c in untracked]
+        if g and g.get("commits"):
+            L += ["", "## Commits since", ""] + [f"- `{c['head']}` {c['subject']}"
+                                                 for c in g["commits"]]
+            if g["commits_more"]:
+                L.append("- … and more")
+        return _clip_to("\n".join(L) + "\n", CATCHUP_MAX)
+    dig = dig or events_digest(source, real)
+    label = RELAY_LABEL.get(relay.get("kind"), "Switch")
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(relay.get("at") or time.time()))
+    system = {"Darwin": "macOS", "Linux": "Linux", "Windows": "Windows"}
+    fa = AGENT_NAMES.get(frm.get("agent") or source["agent"], source["agent"])
+    ta = AGENT_NAMES.get(to.get("agent"), to.get("agent") or "?")
+    L = [f"# {label}: {name}", "",
+         f"- From **{fa}** to **{ta}** on {_here()} "
+         f"({system.get(platform.system(), platform.system())}), {when}"]
+    if to.get("path") and to["path"] != real:
+        L += [f"- Folder here: `{real}`; there: `{to['path']}`"]
+    else:
+        L += [f"- Folder: `{real}`"]
+    L += [f"- Session it continues: {_masked(dig.get('title') or 'untitled', 120)} — "
+          f"`{source['id']}`",
+          f"- To go back to it: `{resume_command(source['agent'], source['id'], real)}`, or "
+          f"`aht switch {shell_quote(real)} --back`"] + warn_codex
+    L += _brief_sections(dig, times=True)
+    g = git_state(real)
+    if g:
+        L += _git_lines(g)
     if dig.get("outside"):
         L += ["", "## Files outside the project that session used", ""]
-        L += [f"- `{p}`" for p in dig["outside"]]
-    name = f"{time.strftime('%Y%m%d-%H%M')}-to-{target}.md"
-    (out / name).write_text("\n".join(L) + "\n", encoding="utf-8")
-    prune_relays(out)
-    return out / name
+        L += [f"- `{redact(p)}`" for p in dig["outside"]]
+    return _clip_to("\n".join(L) + "\n", BRIEF_MAX)
 
-def _kimi_session_after(real: str, since: float):
-    b = BY_NAME.get("kimi-code")
-    bucket = b.root() / _key_kimicode(real) if b else None
-    best = None
-    for sd in (bucket.iterdir() if bucket and bucket.is_dir() else []):
-        st = _stat(sd / "state.json")
-        if sd.name.startswith("session_") and st and st.st_mtime >= since - 1:
-            if best is None or st.st_mtime > best[0]:
-                best = (st.st_mtime, sd.name)
-    return best[1] if best else None
+def codex_unreadable(real: str) -> int:
+    """How many Codex sessions in the folder `real` aht cannot read: Codex's
+    newer storage keeps a thread in its state_5.sqlite without a rollout
+    file.  Read from a copy of that file."""
+    b = BY_NAME.get("codex")
+    if b is None:
+        return 0
+    n = 0
+    for r in _sqlite_rows(b.root().parent / "state_5.sqlite", "threads",
+                          ("id", "rollout_path", "cwd", "archived")):
+        cwd, rp = r.get("cwd"), r.get("rollout_path")
+        if isinstance(cwd, str) and not r.get("archived") and _same_dir(cwd, real) \
+                and not (isinstance(rp, str) and rp and os.path.isfile(rp)):
+            n += 1
+    return n
+
+# ---- switch agent, and hand back ------------------------------------------- #
+
+def agent_start_line(agent: str, mode: str, sid=None, ask: str = None) -> str:
+    """The line that opens `agent` in a terminal: a new session that reads
+    the summary first (mode "new"), or its own session `sid`, which reads
+    the catch-up (mode "resume").  Claude's own session hears of the
+    catch-up from aht's SessionStart hook, so it costs nothing before you
+    type.  Kimi reads its summary in a run of its own first (switch does
+    that), so its line only opens the session."""
+    q = shell_quote
+    exe = q(agent_cli(agent) or agent)
+    resume = mode == "resume" and sid
+    if agent == "kimi":
+        return f"{exe} -S {q(sid)}" if sid else f"{exe} -S <the new session>"
+    if agent == "claude":
+        if resume:
+            return f"{exe} --resume {q(sid)}" + ("" if hook_installed() or not ask
+                                                 else f" -- {q(ask)}")
+        return f"{exe} {q(ask)}"
+    if agent == "codex":
+        return f"{exe} resume {q(sid)} {q(ask)}" if resume else f"{exe} {q(ask)}"
+    if agent == "agy":
+        rc = " --remote-control" if cfg_get("handover_remote_control", True) else ""
+        return f"{exe}{rc} --conversation {q(sid)} -i {q(ask)}" if resume \
+            else f"{exe}{rc} -i {q(ask)}"
+    raise ValueError(f"no start line for {agent}")
+
+def _ask(frm: str, rel: str, catchup: bool) -> str:
+    """The first prompt: it points at the summary's file, since Windows'
+    command line takes at most 8,191 characters."""
+    if catchup:
+        return (f"While you were away, other agents worked on this project. Read {rel} "
+                "first: it lists what they did since your last turn. Then tell me in two "
+                "or three lines what changed, and wait for my next instruction.")
+    return (f"You are taking over this project from {frm}. Read {rel} first: it records "
+            "where the work stood, the latest exchanges and the open items. Then tell me "
+            "in two or three lines what you understood, and wait for my next instruction.")
+
+def _kimi_reads(exe: str, real: str, prompt: str, sid: str = None) -> tuple:
+    """Kimi reads `prompt` in a run of its own, in its session `sid` or in a
+    new one -> (session, None), or (None, why not; "" when the run went
+    fine but the turn is not in that session).  Kimi takes no first prompt
+    in its interactive mode: this is how it gets one."""
+    started = time.time()
+    own = session_file(real, "kimi", sid) if sid else None
+    size = (_stat(own).st_size if own and _stat(own) else 0)
+    if os.name == "nt":
+        prompt = _clip(prompt, 30000)       # a Windows command line's limit is 32,767
+    argv = [exe] + (["-S", sid] if sid else []) + ["-p", prompt, "--output-format", "stream-json"]
+    try:
+        r = subprocess.run(argv, cwd=real, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=600, **_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return None, "Kimi did not finish reading the summary within 10 minutes"
+    except OSError as e:
+        return None, f"Kimi could not be started: {e}"
+    if r.returncode != 0:
+        return None, ("Kimi could not read the summary: "
+                      + ((r.stderr or r.stdout or "").strip()[-300:] or f"exit {r.returncode}"))
+    if sid:                 # the turn must be in that session now, after what was there
+        took = own and any(ev["role"] == "user" for _e, ev in session_events("kimi", str(own), size))
+        return (sid, None) if took else (None, "")
+    new = next(iter(re.findall(r'"(session_[0-9a-f-]{36})"', r.stdout or "")), None) \
+        or _session_after(real, "kimi", started)
+    return (new, None) if new else (None, "Kimi could not read the summary: no session")
+
+def _kimi_prompt(text: str, frm: str, catchup: bool) -> str:
+    if catchup:
+        return ("While you were away, other agents worked on this project. This is what "
+                "they did since your last turn:\n\n" + text + "\nDo not start working yet. "
+                "Reply in two or three lines with what changed; the user continues in this "
+                "session.")
+    return (f"You are taking over this project from {frm}. This is where the work "
+            "stood:\n\n" + text + "\nDo not start working yet. Reply in two or three lines "
+            "with what you understood; the user continues in this session.")
+
+def agents_running_nt() -> set:
+    """Windows: the agent CLIs running on this PC now, by program name
+    (tasklist).  In which folder cannot be told there."""
+    try:
+        r = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=15, **_NO_WINDOW)
+    except Exception:
+        return set()
+    names = {line.split(",")[0].strip('"').lower() for line in r.stdout.splitlines() if line}
+    return {a for a in ("codex", "kimi", "agy") if f"{a}.exe" in names}
+
+def _switch_checks(out: dict, real: str, origin=None, brief_only: bool = False,
+                   back: bool = False) -> None:
+    """What stands in the way of starting an agent in the folder `real`: a
+    Claude session working there blocks; one open but idle, or another agent
+    open there, is a warning.  `origin`: the Claude session to continue; open
+    in its window it blocks (nothing opens a second window on it)."""
+    for s in running_sessions(inside=real):
+        if origin and s.get("session") == origin and not brief_only:
+            out["blockers"].append(
+                "That session is still open in its window. Exit it and press Hand Back "
+                f"again (in a terminal, `aht switch {shell_quote(real)} --back --brief-only` "
+                "writes the summary for it to read)" if back else
+                "That Claude Code session is still open in its window: go on there, or "
+                "exit it first")
+        elif s.get("status") != "idle":
+            out["blockers"] += _activity_blockers({"sessions": [s]}, "on this machine")
+        elif not brief_only:
+            out["warnings"].append("a Claude session is still open in this project; do not "
+                                   "type into both agents at once")
+    if os.name == "nt":
+        for a in sorted(agents_running_nt()):
+            out["warnings"].append(f"{AGENT_NAMES[a]} is running on this PC; aht cannot "
+                                   "tell in which folder")
+        return
+    here = sorted({p["agent"] for p in agent_processes()
+                   if _inside(os.path.realpath(p["project"]), real)})
+    for a in here:
+        out["warnings"].append(f"{AGENT_NAMES.get(a, a)} is still open in this folder; "
+                               "don't type into both")
+
+def _start(args, out: dict, lines: list, real: str, target: str, line: str) -> int:
+    """Open the agent's line in a terminal window (or say what to run)."""
+    out["start_line"] = line
+    cmd = cd_then(real) + line                       # the same line, to run anywhere
+    out["command_line"] = cmd
+    # nothing but the JSON on stdout: the line to run by hand goes in the error
+    if not args.no_window and open_terminal(line, f"switch-{os.path.basename(real)}-{target}",
+                                            cwd=real, echo=False) != 0:
+        out["error"] = f"No terminal window opened. Run this in a terminal:\n\n{cmd}"
+        log(f"SWITCH {real}: -> {target}, but no terminal opened")
+        return _emit(args, out, lines)
+    out["applied"] = True
+    lines.append(f"   opened  {cmd}")
+    return _emit(args, out, lines)
 
 def cmd_switch(args):
-    out = {"command": "switch", "applied": False, "blockers": [], "warnings": []}
+    out = {"command": "switch", "applied": False, "blockers": [], "warnings": [],
+           "project": None, "source": None, "target": None, "brief": None, "session": None,
+           "command_line": None, "error": None,
+           "relay": None, "mode": None, "start_line": None, "fallback": None}
     lines = []
     real = os.path.realpath(args.path)
     out["project"] = real
-    target = args.to
     if not os.path.isdir(real):
         out["blockers"].append(f"not a folder: {real}")
         return _emit(args, out, lines)
+    if args.back:
+        return _switch_back(args, out, lines, real)
+    target = args.to
+    if not target:
+        out["blockers"].append("say which agent goes on: --to claude, codex, kimi or agy "
+                               "(or --back to hand the work back)")
+        return _emit(args, out, lines)
+    mode = "brief-only" if args.brief_only else "resume" if args.resume else "new"
+    out.update(target=target, mode=mode)
     exe = agent_cli(target)
-    if not exe:
+    if not exe and mode != "brief-only":
         out["blockers"].append(f"{AGENT_NAMES[target]} is not installed on this machine")
     sessions = [s for s in list_sessions(real) if s["agent"] != target]
     if args.session:
@@ -9126,74 +10257,288 @@ def cmd_switch(args):
     if src is None:
         out["blockers"].append("no session of another agent in this project to continue"
                                + (f" (no session {args.session})" if args.session else ""))
-    act = activity_in(real)
-    for s in act["sessions"]:
-        if s.get("status") != "idle":
-            out["blockers"] += _activity_blockers({"sessions": [s]}, "on this machine")
-        else:
-            out["warnings"].append("a Claude session is still open in this project; do not "
-                                   "type into both agents at once")
+    own = next((s for s in list_sessions(real, agents=[target]) if not (
+        target == "claude" and _is_scripted(s["file"]))), None)
+    if mode == "resume" and own is None:
+        mode = out["mode"] = "new"
+        out["fallback"] = (f"{AGENT_NAMES[target]} has no earlier session here, so a new "
+                           "session reads the full summary")
+    _switch_checks(out, real, own["id"] if mode == "resume" and target == "claude" else None,
+                   mode == "brief-only")
     if out["blockers"]:
         return _emit(args, out, lines)
     dig = events_digest(src, real)
-    out.update(source={"agent": src["agent"], "session": src["id"],
-                       "title": dig.get("title")}, target=target)
+    frm = AGENT_NAMES[src["agent"]]
+    out["source"] = {"agent": src["agent"], "session": src["id"], "title": dig.get("title")}
+    codex_n = codex_unreadable(real)
+    if codex_n:
+        out["warnings"].append(f"Codex has {codex_n} session{'s' if codex_n > 1 else ''} "
+                               "here that aht cannot read (Codex's newer storage)")
+    rid = new_relay_id()
+    rel = os.path.join(".aht", "handover", f"relay-{rid}.md")
+    sid = own["id"] if mode == "resume" else None
+    out["session"] = sid                # the session that goes on, when it is known
+    ask = _ask(frm, rel, mode == "resume")
+    if mode != "brief-only":
+        out["start_line"] = agent_start_line(target, mode, sid, ask)
     lines += [f"{'switching' if args.apply else 'would switch'}:  {real}",
-              f"   from   {AGENT_NAMES[src['agent']]} — {dig.get('title') or src['id']}",
-              f"   to     {AGENT_NAMES[target]} ({exe})"]
+              f"   from   {frm} — {dig.get('title') or src['id']} ({_clock(src['updated'])})"]
+    if mode == "brief-only":
+        lines.append(f"   to     {AGENT_NAMES[target]}: only the summary is written; nothing opens")
+    elif mode == "resume":
+        lines += [f"   to     {AGENT_NAMES[target]} — its own session "
+                  f"“{_session_title(own) or own['id']}” ({_clock(own['updated'])})",
+                  f"          it reads only what happened since (uses tokens)"]
+        if target == "kimi":
+            lines.append("          if Kimi does not take it into that session, a new one "
+                         "reads the full summary")
+    else:
+        lines.append(f"   to     {AGENT_NAMES[target]}, a new session (reads the full "
+                     "summary: uses tokens)")
+        if own is not None:
+            lines += [f"   {AGENT_NAMES[target]} has its own earlier session here "
+                      f"(“{_session_title(own) or own['id']}”, {_clock(own['updated'])}):",
+                      "   continue that one with --resume (it reads only what happened since)"]
+    if out["fallback"]:
+        lines.append(f"   {out['fallback']}")
+    if not args.apply:
+        lines.append("(dry run — pass --apply to do it"
+                     + ("; --brief-only writes the summary and opens nothing)"
+                        if mode != "brief-only" else ")"))
+        return _emit(args, out, lines)
+    head = {"kind": "switch", "at": time.time(),
+            "from": {"agent": src["agent"], "session": src["id"]},
+            "to": {"agent": target, "path": real}}
+    since = own["updated"] if mode == "resume" else None
+    text = relay_brief(real, "catchup", own, since, head) if mode == "resume" \
+        else relay_brief(real, "full", src, relay=head, dig=dig)
+    if target == "kimi" and mode != "brief-only":
+        # Kimi reads it in a run of its own, before the relay is written: which
+        # session took it is known then
+        sid, why = _kimi_reads(exe, real, _kimi_prompt(text, frm, mode == "resume"), sid)
+        if sid is None and why == "":
+            out["fallback"] = ("Kimi did not take the summary into its own session, so a "
+                               "new session read the full summary")
+            mode = "new"
+            out["mode"] = mode
+            text = relay_brief(real, "full", src, relay=head, dig=dig) + "\n---\n\n" + text
+            sid, why = _kimi_reads(exe, real, _kimi_prompt(text, frm, False))
+        if sid is None:
+            out["error"] = why
+            return _emit(args, out, lines)
+    # Claude's own session hears of its catch-up from aht's hook, which
+    # looks for the relay that names it (as a Hand Back's does)
+    rec = write_relay(real, "switch",
+                      {"agent": src["agent"], "session": src["id"], "title": dig.get("title"),
+                       "last_t": dig.get("last_t") or src["updated"], "git": _git_mark(real)},
+                      {"agent": target, "session": sid, "mode": mode}, text, rid=rid,
+                      note_for=sid if target == "claude" and mode == "resume" else None)
+    out["relay"] = rec["id"]
+    out["brief"] = str(relay_dir(real) / rec["brief"])
+    lines.append(f"   summary {out['brief']}")
+    log(f"SWITCH {real}: {src['agent']} {src['id']} -> {target} ({mode})")
+    if mode == "brief-only":
+        out["applied"] = True
+        return _emit(args, out, lines)
+    if checkpoints_on():
+        take_checkpoint(real, None, target)
+    out["session"] = sid
+    rel = os.path.join(".aht", "handover", rec["brief"])
+    return _start(args, out, lines, real, target,
+                  agent_start_line(target, mode, sid, _ask(frm, rel, mode == "resume")))
+
+def _switch_back(args, out: dict, lines: list, real: str) -> int:
+    """Hand the work back: the newest open relay (or the newest that came
+    from --to), answered in the origin agent's own session with a catch-up
+    since the relay.  Gone, that session: a new one reads the full summary
+    and the catch-up."""
+    rels = open_relays(real)
+    pick = [r for r in rels if not args.to or r["from"].get("agent") == args.to]
+    if not pick:
+        out["blockers"].append("nothing to hand back: no agent took this project over here"
+                               + (f" from {AGENT_NAMES[args.to]}" if args.to else ""))
+        return _emit(args, out, lines)
+    r = pick[0]
+    origin = r["from"]
+    target, sid = origin.get("agent"), origin.get("session")
+    # answered with it: what was stacked on it, and earlier hand-offs from the
+    # same session (an earlier switch from it, say)
+    later = [x for x in rels if x is not r and (((x.get("at") or 0), x["id"])
+                                                > ((r.get("at") or 0), r["id"])
+                                                or (x["from"].get("agent"), x["from"].get("session"))
+                                                == (target, sid))]
+    if target not in SWITCH_TARGETS:
+        out["blockers"].append(f"the work came from {target}, which aht cannot start")
+        return _emit(args, out, lines)
+    now = rels[0]["to"]                                  # who has it now
+    if now.get("agent") == target:
+        out["blockers"].append(f"{AGENT_NAMES[target]} has this project already (since "
+                               f"{_clock(rels[0].get('at'))}): there is nothing to hand back "
+                               "to it")
+        return _emit(args, out, lines)
+    now_sid = now.get("session") or _session_after(real, now.get("agent"), rels[0]["at"])
+    gone = session_file(real, target, sid) is None
+    mode = "brief-only" if args.brief_only else "back"
+    exe = agent_cli(target)
+    if not exe and mode != "brief-only":
+        out["blockers"].append(f"{AGENT_NAMES[target]} is not installed on this machine")
+    out.update(target=target, mode=mode, session=None if gone else sid,
+               source={"agent": now.get("agent"), "session": now_sid, "title": None})
+    if gone:
+        out["fallback"] = (f"That {AGENT_NAMES[target]} session is gone, so a new session "
+                           "reads the full summary")
+    _switch_checks(out, real, sid if target == "claude" and not gone else None,
+                   mode == "brief-only", back=True)
+    if out["blockers"]:
+        return _emit(args, out, lines)
+    since = min(float(x.get("at") or 0) for x in [r] + later
+                if (x["from"].get("agent"), x["from"].get("session")) == (target, sid))
+    cd = catchup_digest(real, since, exclude={(target, sid)})
+    worker = next((x for x in reversed(cd["sessions"]) if x["id"] == now_sid), None)
+    out["source"]["title"] = (worker or {}).get("title")
+    g = git_state(real, since_head=(origin.get("git") or {}).get("head"), since=since)
+    n, k = cd["exchanges"], len(cd["sessions"])
+    # the agents it went to, in turn; none of their work readable: say so
+    had = [x["to"]["agent"] for x in sorted([r] + later, key=lambda x: (x["at"], x["id"]))]
+    if not k:
+        out["warnings"].append(_unread_work(had, since))
+    who = _names([x["agent"] for x in cd["sessions"]]) or AGENT_NAMES.get(now.get("agent"), "?")
+    tally = [f"{who} ({k} session{'s' if k != 1 else ''}, {n} exchange{'s' if n != 1 else ''})"]
+    if g and g.get("base"):
+        tally.append(f"{len(g['changed']) + g['changed_more']} file(s) changed")
+    if g and g.get("commits"):
+        tally.append(f"{len(g['commits'])}{'+' if g['commits_more'] else ''} commit(s)")
+    todos = sum(len(x["todos"]) for x in cd["sessions"][-1:])
+    if todos:
+        tally.append(f"{todos} to-do(s) open")
+    tname = AGENT_NAMES[target]
+    title = origin.get("title") or (sid or "")
+    lines += [f"{'handing back' if args.apply else 'would hand back'}:  {real}",
+              (f"   to     {tname} — a new session; its own (“{title}”) is gone"
+               if gone else f"   to     {tname} — its own session “{title}”"),
+              f"   since  {_clock(since)}: " + ", ".join(tally)]
+    if later:
+        lines.append(f"   also answers {len(later)} later hand-off(s) on the way")
+    if mode == "back" and not gone:
+        lines.append("   Claude reads this with your next message; nothing runs before that"
+                     if target == "claude" and hook_installed()
+                     else f"   {tname} reads it as its first turn (uses tokens)")
+    if out["fallback"]:
+        lines.append(f"   {out['fallback']}")
+    rid = new_relay_id()
+    rel = os.path.join(".aht", "handover", f"relay-{rid}.md")
+    frm = AGENT_NAMES.get(now.get("agent"), now.get("agent") or "?")
+    if mode != "brief-only":
+        out["start_line"] = agent_start_line(target, "new" if gone else "resume",
+                                             None if gone else sid, _ask(frm, rel, not gone))
     if not args.apply:
         lines.append("(dry run — pass --apply to do it)")
         return _emit(args, out, lines)
-    brief = write_switch_brief(real, src, dig, target)
+    head = {"kind": "back", "at": time.time(), "from": dict(origin, agent=now.get("agent")),
+            "to": {"agent": target, "path": real}}
+    catchup = relay_brief(real, "catchup", {"agent": target, "id": sid}, since,
+                          dict(head, **{"from": origin}), dig=cd, had=had)
+    def with_full(text):        # for a new session: the worker's summary first
+        f = worker and session_file(real, worker["agent"], worker["id"])
+        full = relay_brief(real, "full", {"agent": worker["agent"], "id": worker["id"],
+                                          "file": str(f)}, relay=head) if f else ""
+        return _clip_to(full + ("\n---\n\n" if full else "") + text, BRIEF_MAX)
+    text = with_full(catchup) if gone else catchup
+    took = None if gone else sid
+    if target == "kimi" and mode != "brief-only":
+        took, why = _kimi_reads(exe, real, _kimi_prompt(text, frm, not gone), took)
+        if took is None and why == "":
+            out["fallback"] = ("Kimi did not take the summary into its own session, so a "
+                               "new session read the full summary")
+            gone, text = True, with_full(catchup)
+            took, why = _kimi_reads(exe, real, _kimi_prompt(text, frm, False))
+        if took is None:
+            out["error"] = why
+            return _emit(args, out, lines)
+    rec = write_relay(real, "back",
+                      {"agent": now.get("agent"), "session": now_sid,
+                       "title": (worker or {}).get("title"), "last_t": cd["last_t"],
+                       "git": _git_mark(real)},
+                      {"agent": target, "session": took, "mode": "new" if gone else "resume"},
+                      text, rid=rid, back_of=r["id"],
+                      note_for=sid if target == "claude" and not gone else None)
+    for x in [r] + later:
+        close_relay(real, x["id"], rec["id"])
+    out["relay"] = rec["id"]
+    out["brief"] = str(relay_dir(real) / rec["brief"])
+    out["session"] = took
+    lines.append(f"   summary {out['brief']}")
+    log(f"SWITCH {real}: back to {target} {sid} ({'new session' if gone else 'its own'})")
+    if mode == "brief-only":
+        out["applied"] = True
+        return _emit(args, out, lines)
     if checkpoints_on():
         take_checkpoint(real, None, target)
-    rel = os.path.relpath(brief, real)
-    frm = AGENT_NAMES[src["agent"]]
-    ask = (f"You are taking over this project from {frm}. Read {rel} first: it records "
-           "where the work stood, the latest exchanges and the open items. Then tell me "
-           "in two or three lines what you understood, and wait for my next instruction.")
-    out["brief"] = str(brief)
-    if target == "kimi":
-        # Kimi takes no first prompt in its interactive mode: it reads the brief
-        # in one run of its own, and that session is what opens
-        started = time.time()
-        inline = (f"You are taking over this project from {frm}. This is where the work "
-                  "stood:\n\n" + brief.read_text(encoding="utf-8")
-                  + "\nDo not start working yet. Reply in two or three lines with what you "
-                  "understood; the user continues in this session.")
+    rel = os.path.join(".aht", "handover", rec["brief"])
+    return _start(args, out, lines, real, target,
+                  agent_start_line(target, "new" if gone else "resume", took,
+                                   _ask(frm, rel, not gone)))
+
+def cmd_relays(args):
+    real = os.path.realpath(args.path)
+    if not os.path.isdir(real):
+        print(f"not a folder: {real}", file=sys.stderr)
+        return 2
+    open_relays(real)                   # closes those resumed by hand meanwhile
+    rels = read_relays(real)
+    for r in rels:                      # the receiving session, once there is one
+        if relay_row(r, real)["open"] and not r["to"].get("session") and _relay_here(r["to"]):
+            r["to"] = dict(r["to"], session=_session_after(real, r["to"].get("agent"), r["at"]))
+    rows = [relay_row(r, real) for r in rels]
+    if args.show:
+        row = next((x for x in rows if x["id"] == args.show), None)
+        if row is None or not _RELAY_ID.fullmatch(args.show):
+            print(f"no relay {args.show} in {real}", file=sys.stderr)
+            return 2
         try:
-            r = subprocess.run([exe, "-p", inline, "--output-format", "stream-json"],
-                               cwd=real, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired:
-            out["error"] = "Kimi did not finish reading the summary within 10 minutes"
-            return _emit(args, out, lines)
-        sid = next(iter(re.findall(r'"(session_[0-9a-f-]{36})"', r.stdout or "")), None) \
-            or _kimi_session_after(real, started)
-        if r.returncode != 0 or not sid:
-            out["error"] = ("Kimi could not read the summary: "
-                            + ((r.stderr or r.stdout or "").strip()[-300:] or "no session"))
-            return _emit(args, out, lines)
-        out["session"] = sid
-        line = resume_command("kimi", sid)
-    else:
-        line = " ".join(shell_quote(a) for a in (exe, ask))
-    cmd = cd_then(real) + line                       # the same line, to run anywhere
-    out["command_line"] = cmd
-    lines.append(f"   summary {brief}")
-    # nothing but the JSON on stdout: the line to run by hand goes in the error
-    if not args.no_window and open_terminal(line, f"switch-{os.path.basename(real)}-{target}",
-                                            cwd=real, echo=False) != 0:
-        out["error"] = f"No terminal window opened. Run this in a terminal:\n\n{cmd}"
-        log(f"SWITCH {real}: {src['agent']} {src['id']} -> {target}, but no terminal opened")
-        return _emit(args, out, lines)
-    out["applied"] = True
-    log(f"SWITCH {real}: {src['agent']} {src['id']} -> {target}")
-    lines.append(f"   opened  {cmd}")
-    return _emit(args, out, lines)
+            text = redact(Path(row["brief"]).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            text = ""
+        if args.json:
+            print(json.dumps({"project": real, "relay": row, "text": text}, indent=2))
+        else:
+            print(text, end="" if text.endswith("\n") else "\n")
+        return 0
+    if args.json:
+        print(json.dumps({"project": real, "relays": rows}, indent=2))
+        return 0
+    if not rows:
+        print(f"no agent has handed this project to another yet: {real}")
+        return 0
+    print(f"{real} — who had the work when, newest first:")
+    said = {"resumed": "its session went on by hand", "taken-back": "taken back",
+            "sent-back": "sent back", "released": "released"}
+    for x in rows:
+        fa = AGENT_NAMES.get(x["from"].get("agent"), x["from"].get("agent") or "?")
+        ta = AGENT_NAMES.get(x["to"].get("agent"), x["to"].get("agent") or "?")
+        where = "" if _relay_here(x["to"]) else f" on {x['to'].get('machine')}"
+        state = ("open: " + ta + " has it" if x["open"] else
+                 "" if x["kind"] == "back" else
+                 "summary only" if x["to"].get("mode") == "brief-only" else
+                 said.get(x["closed_by"], "handed back"))
+        print(f"  {time.strftime('%Y-%m-%d %H:%M', time.localtime(x['at'] or 0))}  "
+              f"{RELAY_LABEL.get(x['kind'], x['kind']):<10} {fa} → {ta}{where}"
+              + (f"   ({state})" if state else ""))
+        print(f"      {x['id']}   aht relays {shlex.quote(real)} --show {x['id']}")
+    return 0
 
 # ---- the session board ----------------------------------------------------------- #
 
-_AGENT_PROC = re.compile(r"(?:^|/)(kimi|codex|gemini|opencode|cursor-agent|copilot)(?:\s|$)")
+_AGENT_PROC = re.compile(r"(?:^|/)(kimi|codex|agy|gemini|opencode|cursor-agent|copilot)(?:\s|$)")
+# agy's subcommands that hold no conversation: its daemons and its tools
+AGY_NOT_SESSIONS = {"agent", "agents", "changelog", "help", "install", "mcp", "mic-serve",
+                    "models", "plugin", "plugins", "remote-control", "update"}
+# … and Codex's: its shared daemon (`codex app-server … --managed-daemon`),
+# its servers, sign-in and tools
+CODEX_NOT_SESSIONS = {"app-server", "apply", "cloud", "completion", "debug", "features",
+                      "generate-ts", "help", "login", "logout", "mcp", "mcp-server",
+                      "responses-api-proxy", "sandbox", "stdio-to-uds"}
+NOT_SESSIONS = {"agy": AGY_NOT_SESSIONS, "codex": CODEX_NOT_SESSIONS}
 
 def agent_processes() -> list:
     """Agent CLIs other than Claude Code that run right now, with their folder
@@ -9208,10 +10553,16 @@ def agent_processes() -> list:
         parts = line.strip().split(None, 1)
         if len(parts) < 2 or not parts[0].isdigit():
             continue
-        head = " ".join(parts[1].split()[:2])
-        m = _AGENT_PROC.search(head)
-        if m and " -p " not in f" {parts[1]} " and " --prompt " not in f" {parts[1]} ":
-            pids[int(parts[0])] = m.group(1)
+        words = parts[1].split()
+        m = _AGENT_PROC.search(" ".join(words[:2]))
+        if not m or any(f" {f} " in f" {parts[1]} " for f in ("-p", "--prompt", "--print")):
+            continue
+        if m.group(1) in NOT_SESSIONS:
+            at = next((i for i, w in enumerate(words[:2])
+                       if re.search(rf"(?:^|/){m.group(1)}$", w)), 0)
+            if (words[at + 1:at + 2] or [""])[0] in NOT_SESSIONS[m.group(1)]:
+                continue
+        pids[int(parts[0])] = m.group(1)
     if not pids:
         return []
     cwd = {}
@@ -11077,12 +12428,26 @@ def _session_title(s: dict):
 
 # ---- every session starts informed (USES TOKENS: off unless turned on) ------ #
 
-def informed_note(cwd: str, current: str = None, limit: int = 1600) -> str:
+def informed_note(cwd: str, current: str = None, limit: int = 1600,
+                  resumed: bool = False) -> str:
     """Where the latest earlier session in this folder stopped, whichever
     agent ran it: a few lines for a new Claude Code session's context.  Kept
-    short, because the model reads every line of it."""
+    short, because the model reads every line of it.  A session that another
+    agent took the work over from, resumed by hand, learns instead what
+    happened since (the catch-up); another resumed session learns nothing."""
     real = os.path.realpath(cwd)
     if real == os.path.realpath(str(Path.home())):
+        return ""
+    r = next((r for r in open_relays(real) if current and r["from"].get("session") == current
+              and _relay_here(r["from"])), None) if current and relay_dir(real).is_dir() else None
+    if r is not None:
+        cd = catchup_digest(real, float(r["at"]), exclude={("claude", current)}, most=3)
+        g = git_state(real, since_head=(r["from"].get("git") or {}).get("head"),
+                      since=float(r["at"]))
+        return _clip(redact("[aht] " + "\n".join(catchup_head(cd, g, "this session",
+                                                              [r["to"]["agent"]]))),
+                     HOOK_NOTE_MAX)
+    if resumed:
         return ""
     for s in list_sessions(real)[:6]:
         if s["id"] == current or (s["agent"] == "claude" and _is_scripted(s["file"])):
@@ -11702,18 +13067,11 @@ def loose_ends(days: int = 30) -> list:
         if not sessions or now - (sessions[0]["updated"] or 0) > days * 86400:
             continue
         items = []
-        if os.path.exists(os.path.join(real, ".git")):
-            try:
-                r = subprocess.run(["git", "-C", real, "--no-optional-locks", "status",
-                                    "--porcelain"], capture_output=True, text=True,
-                                   timeout=15, cwd="/")
-                n = len([l for l in r.stdout.splitlines() if l.strip()]) \
-                    if r.returncode == 0 else 0
-            except Exception:
-                n = 0
-            if n:
-                items.append({"kind": "uncommitted", "count": n,
-                              "text": f"{n} file(s) not committed"})
+        g = git_state(real)
+        n = g["dirty"] + g["untracked"] if g else 0
+        if n:
+            items.append({"kind": "uncommitted", "count": n,
+                          "text": f"{n} file(s) not committed"})
         s = sessions[0]
         dig = events_digest(s, real, turns=1, tail=4 << 20)
         todos = [_masked(str(t.get("content") or t.get("subject") or t.get("title")
@@ -14710,15 +16068,32 @@ def build_parser():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_rules)
 
-    s = sub.add_parser("switch", help="continue a project's work in another agent")
+    s = sub.add_parser("switch", help="continue a project's work in another agent, or "
+                       "hand it back to the agent it came from")
     s.add_argument("path")
-    s.add_argument("--to", required=True, choices=SWITCH_TARGETS)
+    s.add_argument("--to", choices=SWITCH_TARGETS,
+                   help="the agent that goes on (with --back: hand back what came from it)")
+    s.add_argument("--resume", action="store_true",
+                   help="go on in that agent's own latest session here: it reads only what "
+                   "happened since (default: a new session reads the whole summary)")
     s.add_argument("--session", help="the session to continue (default: the latest of "
                    "another agent)")
+    s.add_argument("--brief-only", action="store_true", dest="brief_only",
+                   help="write the summary and open nothing")
+    s.add_argument("--back", action="store_true",
+                   help="hand the work back into the first agent's own session, with what "
+                   "happened since")
     s.add_argument("--no-window", action="store_true", dest="no_window")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_switch)
+
+    s = sub.add_parser("relays", help="who handed a project's work to whom, and when, "
+                       "with each summary")
+    s.add_argument("path")
+    s.add_argument("--show", metavar="ID", help="print that hand-off's summary")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_relays)
 
     s = sub.add_parser("board", help="open agent sessions on this machine and the "
                        "others: working, waiting for you, idle")

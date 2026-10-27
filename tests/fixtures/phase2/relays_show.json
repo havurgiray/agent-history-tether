@@ -1,0 +1,37 @@
+{
+  "project": "/Users/me/code/paper",
+  "relay": {
+    "id": "20261027-123733-f9c5",
+    "kind": "switch",
+    "at": 1793101053.152189,
+    "from": {
+      "machine": "mac",
+      "system": "Darwin",
+      "path": "/Users/me/code/paper",
+      "agent": "claude",
+      "session": "0f3a9c2e-1111-4222-8333-444455556666",
+      "machine_id": "bcece8bb688a",
+      "title": "fix the login redirect",
+      "last_t": 1793097512.437712,
+      "git": {
+        "head": "6a6c7d2f68e47fa6452af9feb20ba79bd635befe",
+        "branch": "main",
+        "dirty": 0,
+        "ahead": 0
+      }
+    },
+    "to": {
+      "machine": "mac",
+      "system": "Darwin",
+      "path": "/Users/me/code/paper",
+      "agent": "codex",
+      "session": "c0dec0de-0000-4000-8000-000000000001",
+      "machine_id": "bcece8bb688a",
+      "mode": "new"
+    },
+    "open": true,
+    "closed_by": null,
+    "brief": "/Users/me/code/paper/.aht/handover/relay-20261027-123733-f9c5.md"
+  },
+  "text": "# Switch: paper\n\n- From **Claude Code** to **Codex** on mac (macOS), 2026-10-27 12:37\n- Folder: `/Users/me/code/paper`\n- Session it continues: fix the login redirect — `0f3a9c2e-1111-4222-8333-444455556666`\n- To go back to it: `cd /Users/me/code/paper && /opt/homebrew/bin/claude --resume 0f3a9c2e-1111-4222-8333-444455556666`, or `aht switch /Users/me/code/paper --back`\n\n## The latest exchanges\n\n**You (11:37):** fix the login redirect; deploy with [Anthropic API key: sk-a…4w]\n\n**Agent:** The redirect loop is fixed in src/app.py.\n\n## Open to-do items\n\n- [ ] check the mobile redirect\n\n## Files changed most recently\n\n- `src/app.py`\n\n## Git\n\n- On branch `main`, HEAD `6a6c7d2` “First commit”.\n- Nothing changed that is not committed.\n- 1 file(s) git does not track.\n"
+}

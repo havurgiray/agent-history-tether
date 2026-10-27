@@ -1,0 +1,21 @@
+{
+  "command": "switch",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/paper",
+  "source": {
+    "agent": "claude",
+    "session": "0f3a9c2e-1111-4222-8333-444455556666",
+    "title": "fix the login redirect"
+  },
+  "target": "codex",
+  "brief": "/Users/me/code/paper/.aht/handover/relay-20261027-123732-45ef.md",
+  "session": null,
+  "command_line": null,
+  "error": null,
+  "relay": "20261027-123732-45ef",
+  "mode": "brief-only",
+  "start_line": null,
+  "fallback": null
+}

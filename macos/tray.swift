@@ -22,7 +22,9 @@
 //                   aht://search?q=WORDS, aht://sessions, aht://loose-ends,
 //                   aht://report, aht://project?path=P, aht://changes?path=P,
 //                   aht://journal?path=P, aht://undo?path=P,
-//                   aht://switch?path=P&to=kimi, aht://resume?path=P&session=ID,
+//                   aht://switch?path=P&to=kimi (&resume=1: its own session),
+//                   aht://switch?path=P&back=1 (Hand Back; &to=claude: to that agent),
+//                   aht://resume?path=P&session=ID,
 //                   aht://getting-started, aht://welcome, aht://update
 //                   (whatever starts an agent or changes files asks first)
 import AppKit
@@ -241,8 +243,11 @@ struct Project: Identifiable, Hashable {
     let limitSession: String?       // a Claude session stopped at its usage limit
     let limitResets: String?
     let handing: Handing?           // a handover that did not finish (yet)
+    let relay: Relay?               // another agent here has the work, not handed back yet
 
     var id: String { path }
+    /// The relay Hand Back answers: one made on this Mac, not left by another machine.
+    var handBack: Relay? { relay.flatMap { $0.incoming ? nil : $0 } }
     var name: String { (path as NSString).lastPathComponent }
     var parent: String {
         ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
@@ -284,6 +289,28 @@ struct Project: Identifiable, Hashable {
         bytes = (d["bytes"] as? NSNumber)?.int64Value ?? 0
         lastActivity = d["last_activity"] as? String ?? ""
         handing = (d["handing"] as? [String: Any]).map(Handing.init)
+        relay = (d["relay"] as? [String: Any]).map(Relay.init).flatMap { $0.open ? $0 : nil }
+    }
+}
+
+/// `projects --json`'s `relay`: the newest open relay of the project. A
+/// switch writes one when it passes the work to another agent; Hand Back
+/// (or the first agent's session resumed by hand) closes it.
+struct Relay: Hashable {
+    let id: String
+    let from: String                // the agent that passed the work on
+    let to: String                  // the agent that has it now
+    let since: Date?
+    let open: Bool
+    let incoming: Bool              // left here by another machine
+
+    init(_ d: [String: Any]) {
+        id = d["id"] as? String ?? ""
+        from = d["from_agent"] as? String ?? "claude"
+        to = d["to_agent"] as? String ?? "?"
+        since = moment(d["since"])
+        open = d["open"] as? Bool ?? true
+        incoming = d["incoming"] as? Bool ?? false
     }
 }
 
@@ -612,8 +639,134 @@ struct TextSheet: Identifiable {
 }
 
 let AGENT_LABEL = ["claude": "Claude Code", "kimi": "Kimi Code", "codex": "Codex",
-                   "gemini": "Gemini", "opencode": "OpenCode", "cursor": "Cursor",
-                   "copilot": "Copilot"]
+                   "agy": "Antigravity", "gemini": "Gemini", "opencode": "OpenCode",
+                   "cursor": "Cursor", "copilot": "Copilot"]
+
+/// The agents a project can be switched to, in the menu's order.
+let SWITCH_AGENTS = ["claude", "kimi", "codex", "agy"]
+
+/// Those of them installed here (`status --json`'s `agent_clis` names their CLI).
+func switchAgents(_ status: [String: Any]) -> [String] {
+    let d = (status["agent_clis"] as? [String: Any]) ?? [:]
+    return SWITCH_AGENTS.filter { d[$0] is String }
+}
+
+/// One item of the Switch Agent menu; `back`: Hand Back into the first
+/// agent's own session.
+struct SwitchItem: Hashable {
+    let title: String
+    let to: String
+    let back: Bool
+}
+
+/// The Switch Agent menu: while another agent has the work here, Hand Back
+/// comes first, then every agent installed.
+func switchItems(_ p: Project, _ agents: [String]) -> [SwitchItem] {
+    var items: [SwitchItem] = []
+    if let r = p.handBack {
+        items.append(SwitchItem(title: "Hand Back to \(AGENT_LABEL[r.from] ?? r.from) (its own session)…",
+                                to: r.from, back: true))
+    }
+    return items + agents.map { SwitchItem(title: "Continue in \(AGENT_LABEL[$0] ?? $0)…", to: $0, back: false) }
+}
+
+/// The line under a project that another agent took over here:
+/// "Codex has had this project since 14:10, taken over from Claude Code".
+func relayLine(_ r: Relay) -> String {
+    let at = clock(r.since)
+    return "\(AGENT_LABEL[r.to] ?? r.to) has had this project" + (at.isEmpty ? "" : " since \(at)")
+        + ", taken over from \(AGENT_LABEL[r.from] ?? r.from)"
+}
+
+/// A switch or Hand Back asked for by a link (aht://switch?path=…&to=agy,
+/// …&to=codex&resume=1, …&back=1, …&back=1&to=claude); nil: nothing to do.
+func switchLink(_ q: [String: String]) -> (to: String?, back: Bool, resume: Bool)? {
+    let yes = { (k: String) in ["1", "true", "yes"].contains((q[k] ?? "").lowercased()) }
+    let to = q["to"].flatMap { SWITCH_AGENTS.contains($0) ? $0 : nil }
+    if yes("back") { return (to, true, true) }
+    return to.map { ($0, false, yes("resume")) }
+}
+
+/// A switch's dry run, kept for the dialog: one plan per way of going on
+/// ("new" and "resume" for a switch, "back" for Hand Back).
+struct SwitchPlan: Identifiable {
+    let id = UUID()
+    let project: Project
+    let target: String              // the agent that goes on
+    let back: Bool
+    let backTo: String?             // Hand Back straight to this agent (a link's `to`)
+    let plans: [String: [String: Any]]
+    var mode: String                // "new" | "resume" | "back"
+}
+
+/// The switch dialog's text for one way of going on, from `switch --json`'s
+/// dry run: who goes on with what, what that costs, the core's fallback and
+/// warnings. `hook`: aht's SessionStart hook is in place, so a resumed Claude
+/// session is told what changed without a turn.
+func switchText(_ d: [String: Any], mode: String, hook: Bool) -> String {
+    let target = d["target"] as? String ?? ""
+    let label = AGENT_LABEL[target] ?? target
+    let src = (d["source"] as? [String: Any]) ?? [:]
+    let from = AGENT_LABEL[src["agent"] as? String ?? ""] ?? "the other agent"
+    let title = (src["title"] as? String).map { " (“\($0)”)" } ?? ""
+    var body: String
+    switch mode {
+    case "back":
+        body = "\(label) goes on in its own session, where it left off. It reads only "
+            + "what happened while \(from) had the project\(title): the latest exchanges, "
+            + "the files changed and the commits made."
+    case "resume":
+        body = "\(label) goes on in its own latest session here. It reads only what "
+            + "happened since: the work of the latest \(from) session\(title), the files "
+            + "changed and the commits made."
+    default:
+        body = "\(label) continues the work of the latest \(from) session\(title) in a new "
+            + "session. aht writes a summary of where things stood into the project, and "
+            + "\(label) reads it first."
+    }
+    body += " The \(from) session stays as it is."
+    if target == "kimi" {
+        body += "\n\nKimi reads it in a first run of its own; this takes a moment before "
+            + "the window opens."
+    } else if target == "claude" && mode != "new" && hook {
+        body += "\n\nClaude Code is told when the session opens; nothing runs until you type."
+    } else {
+        body += "\n\nReading it is \(label)'s first turn."
+    }
+    if let f = d["fallback"] as? String, !f.isEmpty { body += "\n\n" + f }
+    for w in (d["warnings"] as? [String]) ?? [] { body += "\n\n⚠ " + w }
+    return body
+}
+
+/// The summary a switch wrote: `brief` is its path, or its name in the
+/// project's .aht/handover folder.
+func summaryFile(_ brief: String, in project: String) -> String {
+    brief.hasPrefix("/") ? brief : project + "/.aht/handover/" + (brief as NSString).lastPathComponent
+}
+
+/// What a switch, a Hand Back or Summary Only did, from `switch --apply --json`.
+func switchDoneText(_ d: [String: Any], project: String) -> String {
+    let target = d["target"] as? String ?? ""
+    let label = AGENT_LABEL[target] ?? target
+    let file = (d["brief"] as? String).map { tilde(summaryFile($0, in: project)) } ?? ""
+    // fallback: its own session could not take the catch-up, so a new one did
+    let fell = (d["fallback"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    var said: String
+    switch fell == nil ? d["mode"] as? String : "new" {
+    case "brief-only":
+        said = "The summary is written: \(file). Nothing was opened; \(label) can read it "
+            + "when you start it."
+    case "back":
+        said = "Handed back: \(label)'s own session is open again and reads what changed first."
+    case "resume":
+        said = "\(label) went on in its own session; its window is open. What it reads first: \(file)"
+    default:
+        said = "\(label) took over; its window is open. The summary it read: \(file)"
+    }
+    if let f = fell { said = f + "\n\n" + said }
+    for w in (d["warnings"] as? [String]) ?? [] { said += "\n⚠ " + w }
+    return said
+}
 
 struct TidyItem: Identifiable {
     let id = UUID()
@@ -877,6 +1030,7 @@ final class AppModel: ObservableObject {
     @Published var working: String?             // a transfer or check in progress
     @Published var percent: Double?
     @Published var notes: [String: String] = [:]    // per project: how the last action went
+    @Published var summaries: [String: String] = [:] // … and the summary a switch wrote
     @Published var checks: [String: [Check]] = [:]  // per machine
     @Published var checkError: [String: String] = [:]
     @Published var adding: NewMachine?
@@ -893,6 +1047,7 @@ final class AppModel: ObservableObject {
     @Published var secretsFor: String?          // a project, or nil for every history
     @Published var showSecrets = false
     @Published var handoverPlan: HandoverPlan?
+    @Published var switchPlan: SwitchPlan?      // Switch Agent and Hand Back, before they run
     @Published var rules: RulesView?
     @Published var textSheet: TextSheet?
     @Published var tidy: [TidyItem]?
@@ -1036,10 +1191,9 @@ final class AppModel: ObservableObject {
             .sorted { $0.lastActivity > $1.lastActivity }
     }
     var selected: Project? { projects.first { $0.path == selection } }
-    var agentCLIs: [String] {
-        let d = (status["agent_clis"] as? [String: Any]) ?? [:]
-        return ["claude", "kimi", "codex"].filter { d[$0] is String }
-    }
+    var agentCLIs: [String] { switchAgents(status) }
+    /// aht's SessionStart hook is in place (a resumed Claude session hears what changed).
+    var hookOn: Bool { status["hook_installed"] as? Bool ?? true }
     var waiting: Int { projects.filter { $0.open == "waiting" }.count }
     var limited: [Project] { projects.filter { $0.limitSession != nil && $0.away == nil } }
     var summary: String {
@@ -1123,7 +1277,10 @@ final class AppModel: ObservableObject {
     }
 
     func note(_ path: String, _ text: String?) {
-        DispatchQueue.main.async { self.notes[path] = text }
+        DispatchQueue.main.async {
+            self.notes[path] = text
+            self.summaries[path] = nil          // it belonged to the note before
+        }
     }
 
     func handOver(_ p: Project) {
@@ -1894,38 +2051,75 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func switchAgent(_ p: Project, to target: String) {
-        let label = AGENT_LABEL[target] ?? target
+    /// Continue the project in another agent: the dry run of both ways (a
+    /// new session, or the agent's own one), then the dialog. `resume`: its
+    /// own session is the one picked first.
+    func switchAgent(_ p: Project, to target: String, resume: Bool = false) {
         note(p.path, nil)
         busy("checking \(p.name)…") {
-            let plan = ahtJSON(["switch", p.path, "--to", target, "--json"]) ?? [:]
+            var own: [String: Any] = [:]
+            let both = DispatchGroup()              // the two dry runs at once
+            DispatchQueue.global().async(group: both) {
+                own = ahtJSON(["switch", p.path, "--to", target, "--resume", "--json"]) ?? [:]
+            }
+            let new = ahtJSON(["switch", p.path, "--to", target, "--json"]) ?? [:]
+            both.wait()
             DispatchQueue.main.async {
-                if let why = self.problems(plan) {
-                    self.note(p.path, "Cannot switch now:\n\n" + why)
+                let newOK = self.problems(new) == nil, ownOK = self.problems(own) == nil
+                if !newOK && !ownOK {
+                    self.note(p.path, "Cannot switch now:\n\n" + (self.problems(new) ?? ""))
                     return
                 }
-                let src = (plan["source"] as? [String: Any]) ?? [:]
-                let from = AGENT_LABEL[src["agent"] as? String ?? ""] ?? "the other agent"
-                var body = "\(label) continues the work of the latest \(from) session"
-                    + ((src["title"] as? String).map { " (“\($0)”)" } ?? "") + ". aht writes "
-                    + "a summary of where things stood into the project, and \(label) "
-                    + "reads it first. The \(from) session stays as it is."
-                if target == "kimi" {
-                    body += "\n\nKimi reads the summary in a first run of its own; this "
-                        + "takes a moment before the window opens."
+                self.switchPlan = SwitchPlan(project: p, target: target, back: false, backTo: nil,
+                                             plans: ["new": new, "resume": own],
+                                             mode: ownOK && (resume || !newOK) ? "resume" : "new")
+            }
+        }
+    }
+
+    /// Hand Back: the agent that passed the work on goes on in its own
+    /// session and reads only what changed. `to`: past several agents,
+    /// straight back to that one.
+    func handBack(_ p: Project, to: String? = nil) {
+        note(p.path, nil)
+        busy("checking \(p.name)…") {
+            let plan = ahtJSON(["switch", p.path, "--back", "--json"] + (to.map { ["--to", $0] } ?? [])) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    self.note(p.path, "Cannot hand back now:\n\n" + why)
+                    return
                 }
-                for w in (plan["warnings"] as? [String]) ?? [] { body += "\n\n⚠ " + w }
-                guard alert("Continue “\(p.name)” in \(label)?", body,
-                            confirm: "Switch") else { return }
-                self.busy("\(label) is reading the summary…") {
-                    let d = ahtJSON(["switch", p.path, "--to", target, "--apply", "--json"]) ?? [:]
-                    if let why = self.problems(d) {
-                        self.note(p.path, "The switch did not go through:\n\n" + why)
-                    } else {
-                        self.note(p.path, "\(label) took over; its window is open. The summary "
-                                  + "it read: " + (d["brief"] as? String ?? ""))
-                    }
-                }
+                let target = plan["target"] as? String ?? to ?? p.handBack?.from ?? "claude"
+                self.switchPlan = SwitchPlan(project: p, target: target, back: true, backTo: to,
+                                             plans: ["back": plan], mode: "back")
+            }
+        }
+    }
+
+    /// The dialog's Switch, Hand Back or Summary Only (write the summary and
+    /// the relay, open nothing).
+    func confirmSwitch(_ s: SwitchPlan, briefOnly: Bool = false) {
+        let p = s.project, label = AGENT_LABEL[s.target] ?? s.target
+        var args = ["switch", p.path]
+        if s.back {
+            args += ["--back"] + (s.backTo.map { ["--to", $0] } ?? [])
+        } else {
+            args += ["--to", s.target]
+                + (briefOnly ? ["--brief-only"] : s.mode == "resume" ? ["--resume"] : [])
+        }
+        let what = briefOnly ? "writing the summary…"
+            : s.target == "kimi" ? "\(label) is reading the summary…" : "opening \(label)…"
+        busy(what) {
+            let d = ahtJSON(args + ["--apply", "--json"]) ?? [:]
+            if let why = self.problems(d) {
+                self.note(p.path, (s.back ? "Hand Back did not go through:\n\n"
+                                          : "The switch did not go through:\n\n") + why)
+                return
+            }
+            self.note(p.path, switchDoneText(d, project: p.path))
+            if let b = d["brief"] as? String, !b.isEmpty {
+                let f = summaryFile(b, in: p.path)
+                DispatchQueue.main.async { self.summaries[p.path] = f }
             }
         }
     }
@@ -2913,6 +3107,7 @@ struct MainView: View {
         .frame(minWidth: 820, minHeight: 560)
         .sheet(item: $m.adding) { n in AddMachineView(draft: n) }
         .sheet(item: $m.handoverPlan) { plan in HandoverSheet(plan: plan) }
+        .sheet(item: $m.switchPlan) { plan in SwitchSheet(plan: plan) }
         .sheet(item: $m.rules) { r in RulesSheet(r: r) }
         .sheet(item: $m.textSheet) { t in TextSheetView(t: t) }
         .sheet(isPresented: $m.showSecrets) { SecretsSheet() }
@@ -3012,6 +3207,7 @@ struct DetailView: View {
                 if let s = p.syncPaused, let to = p.mirror, p.away == nil, p.handing == nil {
                     SyncPausedBanner(p: p, s: s, to: s.machine ?? to)
                 }
+                if let r = p.handBack, p.away == nil { RelayLine(p: p, r: r) }
                 HStack(spacing: 10) {
                     if p.away != nil {
                         Button("Take Back…") { m.takeBack(p) }
@@ -3035,10 +3231,11 @@ struct DetailView: View {
                         Button("Continue Session") { m.continueHere(p) }
                             .disabled(p.sessions == 0 || p.handing != nil)
                         Menu("Switch Agent") {
-                            ForEach(m.agentCLIs, id: \.self) { a in
-                                Button("Continue in \(AGENT_LABEL[a] ?? a)…") {
-                                    m.switchAgent(p, to: a)
+                            ForEach(switchItems(p, m.agentCLIs), id: \.self) { i in
+                                Button(i.title) {
+                                    if i.back { m.handBack(p) } else { m.switchAgent(p, to: i.to) }
                                 }
+                                if i.back { Divider() }
                             }
                         }
                         .fixedSize()
@@ -3099,9 +3296,16 @@ struct DetailView: View {
                     }
                 }
                 if let n = m.notes[p.path] {
-                    ScrollView {
-                        Text(n).font(.callout).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .top, spacing: 10) {
+                        ScrollView {
+                            Text(n).font(.callout).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if let f = m.summaries[p.path] {
+                            Button("Show Summary in Finder") {
+                                NSWorkspace.shared.selectFile(f, inFileViewerRootedAtPath: "")
+                            }
+                        }
                     }
                 }
                 Spacer(minLength: 0)
@@ -3193,6 +3397,29 @@ struct SyncPausedBanner: View {
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+        .disabled(m.working != nil)
+    }
+}
+
+/// Another agent has the work here since a switch: who, since when, and
+/// Hand Back into the first agent's own session.
+struct RelayLine: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+    let r: Relay
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "arrow.left.arrow.right.circle.fill").foregroundColor(.accentColor)
+            Text(relayLine(r)).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button("Hand Back…") { m.handBack(p) }
+                .disabled(p.handing != nil)
+                .help("\(AGENT_LABEL[r.from] ?? r.from) goes on in its own session and reads "
+                      + "only what changed")
+        }
+        .padding(.horizontal, 10).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.10)))
         .disabled(m.working != nil)
     }
 }
@@ -3502,6 +3729,68 @@ struct HandoverSheet: View {
                     m.confirmHandover(p)
                 }
                 .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20).frame(width: 520)
+    }
+}
+
+/// Switch Agent and Hand Back: what the dry run found for the way picked
+/// (a new session or the agent's own one), then Switch, or Summary Only.
+struct SwitchSheet: View {
+    @EnvironmentObject var m: AppModel
+    @State var plan: SwitchPlan
+
+    var body: some View {
+        let label = AGENT_LABEL[plan.target] ?? plan.target
+        let d = plan.plans[plan.mode] ?? [:]
+        let blocked = m.problems(d)
+        VStack(alignment: .leading, spacing: 12) {
+            headed(plan.back ? "Hand “\(plan.project.name)” back to \(label)?"
+                             : "Continue “\(plan.project.name)” in \(label)?",
+                   "Continue in another agent")
+            if !plan.back {
+                Picker("\(label) goes on in", selection: $plan.mode) {
+                    Text("a new session").tag("new")
+                    Text("its own session").tag("resume")
+                }
+                .pickerStyle(.radioGroup)
+            }
+            Text(blocked.map {
+                (plan.mode == "new" ? "A new session cannot start now:"
+                                    : "\(label)'s own session cannot be used now:") + "\n\n" + $0
+            } ?? switchText(d, mode: plan.mode, hook: m.hookOn))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            if blocked == nil, let line = d["start_line"] as? String, !line.isEmpty {
+                Text(line).font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                    .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
+                    .help("What aht runs in the new terminal window")
+            }
+            if !plan.back {
+                Text("Summary Only writes the summary into the project and opens nothing; no "
+                     + "agent runs.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack {
+                if !plan.back {
+                    Button("Summary Only") {
+                        let s = plan
+                        m.switchPlan = nil
+                        m.confirmSwitch(s, briefOnly: true)
+                    }
+                    .help("Write the summary into the project and open nothing")
+                }
+                Spacer()
+                Button("Cancel") { m.switchPlan = nil }.keyboardShortcut(.cancelAction)
+                Button(plan.back ? "Hand Back" : "Switch") {
+                    let s = plan
+                    m.switchPlan = nil
+                    m.confirmSwitch(s)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(blocked != nil)
             }
         }
         .padding(20).frame(width: 520)
@@ -5951,6 +6240,7 @@ struct SettingsView: View {
                                                           set: { m.set("limit_switch_to", $0) })) {
                                 Text("Kimi Code").tag("kimi")
                                 Text("Codex").tag("codex")
+                                Text("Antigravity").tag("agy")
                             }
                             .labelsHidden().fixedSize()
                             Text("that agent reads a summary").font(.caption).foregroundColor(.secondary)
@@ -7141,8 +7431,11 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         case "undo": withProject { self.model.openUndo($0) }
         case "switch":
             withProject { p in
-                if let to = q["to"], ["claude", "kimi", "codex"].contains(to) {
-                    self.model.switchAgent(p, to: to)
+                guard let ask = switchLink(q) else { return }
+                if ask.back {
+                    self.model.handBack(p, to: ask.to)
+                } else if let to = ask.to {
+                    self.model.switchAgent(p, to: to, resume: ask.resume)
                 }
             }
         case "resume":
@@ -7322,11 +7615,16 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     @objc func serviceSwitch(_ pboard: NSPasteboard, userData: String?,
                              error: AutoreleasingUnsafeMutablePointer<NSString?>) {
         fromFinder(pboard) { p in
-            let agents = self.model.agentCLIs
+            let items = switchItems(p, self.model.agentCLIs)
             let pick = choose("Continue “\(p.name)” in another agent?",
                               "The agent reads a summary of where the work stood first.",
-                              agents.map { AGENT_LABEL[$0] ?? $0 } + ["Cancel"])
-            if pick >= 0 && pick < agents.count { self.model.switchAgent(p, to: agents[pick]) }
+                              items.map { String($0.title.dropLast()) } + ["Cancel"])
+            guard pick >= 0 && pick < items.count else { return }
+            if items[pick].back {
+                self.model.handBack(p)
+            } else {
+                self.model.switchAgent(p, to: items[pick].to)
+            }
         }
     }
 
@@ -7637,6 +7935,72 @@ if CommandLine.arguments.contains("--selftest") {
         && fetchedText(nil, listed[1], said: "box did not answer\n")
             == "Nothing was fetched: box did not answer"
     print("BACKUPS FROM ANOTHER MACHINE \(offsiteOK ? "OK" : "FAIL")")
+    // agents on one machine: agy in the menu (`status --json`'s `agent_clis`),
+    // an open relay (`projects --json`'s `relay`) as the line under the
+    // project with Hand Back first, the switch dialog from `switch --json`
+    let clis = switchAgents(["agent_clis": ["claude": "/x/claude", "codex": NSNull(), "agy": "/x/agy",
+                                            "kimi": "/x/kimi"]])
+    let since = Calendar.current.date(bySettingHour: 0, minute: 10, second: 0, of: Date())!
+    let relayRow = { (extra: [String: Any]) in
+        Project(["real_path": "/x/api", "exists": true, "sessions": 3, "agents": ["claude", "codex"],
+                 "relay": (["id": "20261026-153012-k3f9", "from_agent": "claude", "to_agent": "codex",
+                            "since": since.timeIntervalSince1970, "open": true,
+                            "incoming": false] as [String: Any]).merging(extra) { $1 }])
+    }
+    let taken = relayRow([:]), arrived = relayRow(["incoming": true])
+    let menu = switchItems(taken, clis), plainMenu = switchItems(arrived, clis)
+    let line = taken.handBack.map(relayLine) ?? ""
+    let relayOK = clis == ["claude", "kimi", "agy"]
+        && menu.map { $0.title } == ["Hand Back to Claude Code (its own session)…",
+                                     "Continue in Claude Code…", "Continue in Kimi Code…",
+                                     "Continue in Antigravity…"]
+        && menu[0].back && menu[0].to == "claude" && !plainMenu[0].back && arrived.handBack == nil
+        && line == "Codex has had this project since \(clock(since)), taken over from Claude Code"
+        && Project(["real_path": "/x/api", "relay": NSNull()]).relay == nil
+    print("RELAY LINE AND SWITCH MENU \(relayOK ? "OK" : "FAIL — \(clis) / \(menu.map { $0.title }) / \(line)")")
+    let src: [String: Any] = ["agent": "claude", "session": "0f3a", "title": "fix the login redirect"]
+    let dryNew = switchText(["command": "switch", "applied": false, "blockers": [], "warnings": [
+        "Codex is still open in this folder; don't type into both"], "source": src, "target": "codex",
+        "relay": NSNull(), "mode": "new", "start_line": "codex 'Read .aht/handover/relay-1.md first'",
+        "fallback": NSNull()], mode: "new", hook: true)
+    let dryOwn = switchText(["source": src, "target": "agy", "mode": "resume", "warnings": [],
+                             "fallback": "Antigravity's own session is gone: a new session reads "
+                                + "the full summary and what changed."], mode: "resume", hook: true)
+    let dryBack = switchText(["source": ["agent": "codex", "session": "019a", "title": NSNull()],
+                              "target": "claude", "mode": "back", "warnings": [], "fallback": NSNull()],
+                             mode: "back", hook: true)
+    let wrote = switchDoneText(["applied": true, "mode": "brief-only", "target": "agy",
+                                "brief": "/x/api/.aht/handover/relay-1.md", "start_line": NSNull(),
+                                "warnings": [], "fallback": NSNull()], project: "/x/api")
+    let wroteName = switchDoneText(["applied": true, "mode": "brief-only", "target": "kimi",
+                                    "brief": "relay-2.md"], project: "/x/api")
+    let fellBack = switchDoneText(["applied": true, "mode": "back", "target": "claude",
+                                   "brief": "/x/api/.aht/handover/relay-3.md",
+                                   "fallback": "That session is gone: a new one reads the full summary."],
+                                  project: "/x/api")
+    let link = [switchLink(["path": "/x/api", "to": "agy", "back": "1", "resume": "1"]),
+                switchLink(["path": "/x/api", "to": "kimi"]),
+                switchLink(["path": "/x/api", "to": "codex", "resume": "1"]),
+                switchLink(["path": "/x/api", "back": "1"]),
+                switchLink(["path": "/x/api", "to": "somebody"])]
+    let dialogOK = dryNew.hasPrefix("Codex continues the work of the latest Claude Code session "
+                                    + "(“fix the login redirect”) in a new session.")
+        && dryNew.contains("\n\n⚠ Codex is still open in this folder") && !dryNew.contains("<null>")
+        && dryOwn.hasPrefix("Antigravity goes on in its own latest session here.")
+        && dryOwn.contains("\n\nAntigravity's own session is gone: a new session reads")
+        && dryBack.hasPrefix("Claude Code goes on in its own session, where it left off.")
+        && dryBack.contains("while Codex had the project:")
+        && dryBack.contains("nothing runs until you type")
+        && !switchText(["source": src, "target": "claude", "mode": "back"], mode: "back", hook: false)
+            .contains("nothing runs until you type")
+        && wrote.hasPrefix("The summary is written: /x/api/.aht/handover/relay-1.md. Nothing was opened")
+        && wroteName.contains("/x/api/.aht/handover/relay-2.md")
+        && fellBack.hasPrefix("That session is gone: a new one reads the full summary.\n\nClaude Code "
+                              + "took over; its window is open.")
+        && link[0]?.back == true && link[0]?.to == "agy"
+        && link[1]?.back == false && link[1]?.to == "kimi" && link[1]?.resume == false
+        && link[2]?.resume == true && link[3]?.back == true && link[3]?.to == nil && link[4] == nil
+    print("SWITCH DIALOG \(dialogOK ? "OK" : "FAIL — \(dryNew) / \(dryOwn) / \(dryBack) / \(wrote)")")
     // the core's own output (its samples in tests/fixtures/phase1, or fresh
     // ones: build_app.sh --test passes the folder in AHT_FIXTURES) through
     // the same parsers, value for value
@@ -7720,6 +8084,71 @@ if CommandLine.arguments.contains("--selftest") {
     } else {
         print("CORE SAMPLES not checked (AHT_FIXTURES names no folder)")
     }
+    // … and the core's phase-2 samples (switch, relays): AHT_FIXTURES_PHASE2
+    var relaySamplesOK = true
+    let dir2 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE2"] ?? ""
+    if !dir2.isEmpty && FileManager.default.fileExists(atPath: dir2) {
+        let dir = dir2
+        func sample(_ n: String) -> [String: Any] {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir).appendingPathComponent(n))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] ?? [:]
+        }
+        var miss: [String] = []
+        // the status: agy is among the agents, and the menu has each one installed
+        let st = sample("status.json")
+        let named = (st["agent_clis"] as? [String: Any]) ?? [:]
+        let installed = switchAgents(st)
+        if named["agy"] == nil || installed != SWITCH_AGENTS.filter({ named[$0] is String })
+            || (named["agy"] is String && !switchItems(Project([:]), installed)
+                .contains { $0.title == "Continue in Antigravity…" }) {
+            miss.append("status.json")
+        }
+        // the projects: a row with an open relay gets the line and Hand Back first
+        let listed = sample("projects_relay.json")
+        let rows = (listed["projects"] as? [[String: Any]]).map { $0.filter { $0["relay"] is [String: Any] } }
+            ?? (listed.isEmpty ? [] : [listed])
+        if rows.isEmpty { miss.append("projects_relay.json (no row with a relay)") }
+        for row in rows {
+            let g = row["relay"] as? [String: Any] ?? [:]
+            let p = Project(row)
+            let from = AGENT_LABEL[g["from_agent"] as? String ?? ""] ?? "?"
+            let to = AGENT_LABEL[g["to_agent"] as? String ?? ""] ?? "?"
+            let first = switchItems(p, installed).first
+            if p.relay?.id != g["id"] as? String || p.relay?.since == nil
+                || !(p.handBack.map(relayLine) ?? "").hasPrefix("\(to) has had this project since ")
+                || !(p.handBack.map(relayLine) ?? "").hasSuffix("taken over from \(from)")
+                || first?.back != true || first?.title != "Hand Back to \(from) (its own session)…" {
+                miss.append("projects_relay.json")
+            }
+        }
+        // the switch dialogs: the text for each way, with the fallback and the warnings
+        for (n, mode) in [("switch_dry.json", "new"), ("switch_back_dry.json", "back")] {
+            let d = sample(n)
+            let said = switchText(d, mode: mode, hook: true)
+            let label = AGENT_LABEL[d["target"] as? String ?? ""] ?? "?"
+            if d["mode"] as? String != mode || d["applied"] as? Bool != false || !said.hasPrefix(label)
+                || !((d["fallback"] as? String).map { said.contains($0) } ?? (d["fallback"] is NSNull))
+                || !((d["warnings"] as? [String]) ?? []).allSatisfy({ said.contains("⚠ " + $0) })
+                || !(d["start_line"] is String) || said.contains("the other agent")
+                || (d["source"] as? [String: Any])?["agent"] as? String == d["target"] as? String {
+                miss.append(n)                  // `source`: the agent whose work goes on
+            }
+        }
+        let wrote = sample("switch_brief_only.json")
+        let project = wrote["project"] as? String ?? ""
+        let told = switchDoneText(wrote, project: project)
+        if wrote["mode"] as? String != "brief-only" || wrote["applied"] as? Bool != true
+            || !(wrote["start_line"] is NSNull) || !(wrote["relay"] is String)
+            || ((wrote["brief"] as? String) ?? "").isEmpty
+            || !told.hasPrefix("The summary is written: ") {
+            miss.append("switch_brief_only.json")
+        }
+        relaySamplesOK = miss.isEmpty
+        print("RELAY SAMPLES \(relaySamplesOK ? "OK" : "FAIL \(miss)") — \(dir)")
+    } else {
+        print("RELAY SAMPLES not checked (" + (dir2.isEmpty ? "AHT_FIXTURES_PHASE2 names no folder"
+                                                     : "no samples in \(dir2) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -7754,7 +8183,8 @@ if CommandLine.arguments.contains("--selftest") {
     try? FileManager.default.removeItem(atPath: tmp)
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
-         && releaseOK && pauseOK && backOnOK && offsiteOK && samplesOK && loginOK ? 0 : 1)
+         && releaseOK && pauseOK && backOnOK && offsiteOK && relayOK && dialogOK && samplesOK
+         && relaySamplesOK && loginOK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -7945,18 +8375,53 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
         ("shop", ["away": "box", "away_remote": "box", "away_since": stamp(7200)]),
         ("blog", ["mirror": "box", "mirror_synced_at": Date().timeIntervalSince1970 - 9000,
                   "mirror_status": "ok",
-                  "mirror_paused": ["reason": "released", "at": stamp(1800), "remote": "box"]])]
+                  "mirror_paused": ["reason": "released", "at": stamp(1800), "remote": "box"]]),
+        ("paper", ["agents": ["claude", "codex"],
+                   "relay": ["id": "20261026-141000-k3f9", "from_agent": "claude", "to_agent": "codex",
+                             "since": Date().timeIntervalSince1970 - 5400, "open": true,
+                             "incoming": false]])]
     demo.projects = demoRows.map { name, extra in
         Project(["real_path": home + "/code/" + name, "exists": true, "sessions": 6,
                  "bytes": 4_200_000, "agents": ["claude"]].merging(extra) { $1 })
     }
     demo.status["handover"] = ((demo.status["handover"] as? [String: Any]) ?? [:])
         .merging(["default_remote": "box"]) { $1 }
-    for (p, name) in zip(demo.projects, ["handing", "handing-checking", "away", "sync-paused"]) {
+    for (p, name) in zip(demo.projects, ["handing", "handing-checking", "away", "sync-paused", "relay"]) {
         demo.selection = p.path
         snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
                  dir + "/detail-\(name).png", NSSize(width: 900, height: 176))
     }
+    // the switch dialog (a new session, its own session) and Hand Back, from
+    // dry runs in the shape of `switch --json`
+    let paper = demo.projects.last!
+    let wrote = switchDoneText(["applied": true, "mode": "brief-only", "target": "agy",
+                                "brief": paper.path + "/.aht/handover/relay-20261026-153012-k3f9.md"],
+                               project: paper.path)
+    (demo.notes[paper.path], demo.summaries[paper.path]) = (wrote, paper.path + "/.aht/handover")
+    demo.selection = paper.path
+    snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+             dir + "/detail-summary-only.png", NSSize(width: 900, height: 176))
+    let from: [String: Any] = ["agent": "claude", "session": "0f3a", "title": "fix the login redirect"]
+    let dry = { (mode: String, extra: [String: Any]) -> [String: Any] in
+        ["command": "switch", "applied": false, "blockers": [], "warnings": [], "project": paper.path,
+         "source": from, "target": "codex", "relay": NSNull(), "mode": mode, "fallback": NSNull(),
+         "start_line": "codex 'Read .aht/handover/relay-20261026-153012-k3f9.md first: it records "
+            + "where the work stood.'"].merging(extra) { $1 }
+    }
+    let plans = ["new": dry("new", ["warnings": ["Codex is still open in this folder; don't type into both"]]),
+                 "resume": dry("resume", ["fallback": "Codex has no session of its own here: a new "
+                                            + "session reads the full summary instead."])]
+    for (mode, name) in [("new", "new"), ("resume", "own")] {
+        snapshot(SwitchSheet(plan: SwitchPlan(project: paper, target: "codex", back: false, backTo: nil,
+                                              plans: plans, mode: mode)).environmentObject(demo),
+                 dir + "/sheet-switch-\(name).png", NSSize(width: 520, height: 420))
+    }
+    snapshot(SwitchSheet(plan: SwitchPlan(project: paper, target: "claude", back: true, backTo: nil,
+                                          plans: ["back": dry("back", ["target": "claude", "source": [
+                                            "agent": "codex", "session": "019a", "title": NSNull()],
+                                            "start_line": "claude --resume 0f3a"])],
+                                          mode: "back")).environmentObject(demo),
+             dir + "/sheet-hand-back.png", NSSize(width: 520, height: 330))
     demo.offsite = OffsiteView(machine: "box", loading: false, folders: offsiteFolders(["folders": [
         ["id": "a1b2c3d4e5f6", "name": "studio", "system": "Darwin", "updated": stamp(5400),
          "projects": 14, "files": 131, "bytes": 412_000_000, "mine": true, "legacy": false],

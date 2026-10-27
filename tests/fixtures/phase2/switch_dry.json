@@ -1,0 +1,21 @@
+{
+  "command": "switch",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/paper",
+  "source": {
+    "agent": "claude",
+    "session": "0f3a9c2e-1111-4222-8333-444455556666",
+    "title": "fix the login redirect"
+  },
+  "target": "codex",
+  "brief": null,
+  "session": null,
+  "command_line": null,
+  "error": null,
+  "relay": null,
+  "mode": "new",
+  "start_line": "/opt/homebrew/bin/codex 'You are taking over this project from Claude Code. Read .aht/handover/relay-20261027-123732-2db0.md first: it records where the work stood, the latest exchanges and the open items. Then tell me in two or three lines what you understood, and wait for my next instruction.'",
+  "fallback": null
+}

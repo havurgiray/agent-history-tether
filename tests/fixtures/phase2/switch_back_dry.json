@@ -1,0 +1,21 @@
+{
+  "command": "switch",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/paper",
+  "source": {
+    "agent": "codex",
+    "session": "c0dec0de-0000-4000-8000-000000000001",
+    "title": null
+  },
+  "target": "claude",
+  "brief": null,
+  "session": "0f3a9c2e-1111-4222-8333-444455556666",
+  "command_line": null,
+  "error": null,
+  "relay": null,
+  "mode": "back",
+  "start_line": "/opt/homebrew/bin/claude --resume 0f3a9c2e-1111-4222-8333-444455556666",
+  "fallback": null
+}

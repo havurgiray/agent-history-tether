@@ -1,0 +1,250 @@
+{
+  "version": "0.13.0",
+  "platform": "darwin",
+  "python": "3.9.6",
+  "aht_home": "/Users/me/.aht",
+  "registry": "/Users/me/.aht/registry.json",
+  "tracked": 1,
+  "tracked_alive": 1,
+  "missing": 0,
+  "orphan_claude_stores": 0,
+  "declined_moves": 0,
+  "watch_roots": [
+    "/Users/me/Desktop",
+    "/Users/me/Documents",
+    "/Users/me/code"
+  ],
+  "setup_done": false,
+  "setup_dismissed": false,
+  "home": "/Users/me",
+  "autostart": {
+    "supported": false,
+    "on": false,
+    "answered": false
+  },
+  "backends": [
+    {
+      "name": "claude",
+      "label": "Claude Code",
+      "kind": "dir",
+      "confidence": "verified",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/claude",
+      "root_source": "env",
+      "tracked_stores": 1
+    },
+    {
+      "name": "gemini",
+      "label": "Gemini CLI",
+      "kind": "dir",
+      "confidence": "high",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/gemini",
+      "root_source": "env",
+      "tracked_stores": 0
+    },
+    {
+      "name": "cursor",
+      "label": "Cursor Agent CLI",
+      "kind": "dir",
+      "confidence": "best-effort",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/cursor",
+      "root_source": "env",
+      "tracked_stores": 0
+    },
+    {
+      "name": "opencode",
+      "label": "OpenCode",
+      "kind": "dir",
+      "confidence": "best-effort",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/opencode",
+      "root_source": "env",
+      "tracked_stores": 0
+    },
+    {
+      "name": "codex",
+      "label": "OpenAI Codex CLI",
+      "kind": "files",
+      "confidence": "high",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/codex",
+      "root_source": "env",
+      "tracked_stores": 0
+    },
+    {
+      "name": "copilot",
+      "label": "GitHub Copilot CLI",
+      "kind": "files",
+      "confidence": "best-effort",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/copilot",
+      "root_source": "env",
+      "tracked_stores": 0
+    },
+    {
+      "name": "kimi-code",
+      "label": "Kimi Code",
+      "kind": "dir",
+      "confidence": "verified",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/kimi_code",
+      "root_source": "env",
+      "tracked_stores": 0
+    },
+    {
+      "name": "kimi",
+      "label": "Kimi CLI 1.x",
+      "kind": "dir",
+      "confidence": "verified",
+      "enabled": true,
+      "available": true,
+      "root": "/Users/me/tools/kimi",
+      "root_source": "env",
+      "tracked_stores": 0
+    }
+  ],
+  "watcher": {
+    "platform": "darwin",
+    "owner": "agent",
+    "installed": false,
+    "running": false,
+    "kind": "launchagent",
+    "detail": ""
+  },
+  "backups": {
+    "enabled": true,
+    "interval_hours": 24.0,
+    "keep": 10,
+    "dir": "/Users/me/.aht/backups",
+    "last_run": null,
+    "projects": 0,
+    "snapshots": 0,
+    "bytes": 0
+  },
+  "handover": {
+    "supported": true,
+    "can_reach": true,
+    "remotes": {},
+    "default_remote": null,
+    "rsync": "3.4.1",
+    "away": [],
+    "mirrored": []
+  },
+  "agent_clis": {
+    "claude": "/opt/homebrew/bin/claude",
+    "kimi": "/opt/homebrew/bin/kimi",
+    "codex": "/opt/homebrew/bin/codex",
+    "agy": "/opt/homebrew/bin/agy"
+  },
+  "log": {
+    "path": "/Users/me/.aht/aht.log",
+    "recent_problems": 0
+  },
+  "hook_installed": true,
+  "prompt_hook_installed": false,
+  "claude_remote_control": false,
+  "iterm_api": false,
+  "getting_started": [
+    {
+      "id": "iterm",
+      "ok": true,
+      "optional": false,
+      "title": "iTerm2",
+      "text": "Installed.",
+      "how": ""
+    },
+    {
+      "id": "iterm_api",
+      "ok": true,
+      "optional": false,
+      "title": "iTerm2's Python API",
+      "text": "On: a name you give a session (/rename, in the Claude app, or Rename… in aht) reaches its tab too.",
+      "how": ""
+    },
+    {
+      "id": "login",
+      "ok": false,
+      "optional": false,
+      "title": "Start at login",
+      "text": "aht does not start at login. The corner list, the chimes and saving the iTerm2 layout work only while the app runs.",
+      "how": "Settings → This Mac → Start aht in the menu bar at login."
+    },
+    {
+      "id": "remote_control",
+      "ok": false,
+      "optional": true,
+      "title": "Your sessions in the Claude app",
+      "text": "Remote Control is off, so your sessions are not in the Claude app on your phone.",
+      "how": "In Claude Code: /config → Enable Remote Control for all sessions."
+    },
+    {
+      "id": "corner",
+      "ok": false,
+      "optional": true,
+      "title": "Sessions in the corner",
+      "text": "Off. It lists the open Claude sessions in the screen's top-right corner, as working, waiting for you or done. A click brings a session's iTerm2 tab to the front.",
+      "how": "∞ menu → Sessions in the Corner."
+    },
+    {
+      "id": "chimes",
+      "ok": false,
+      "optional": true,
+      "title": "Chimes",
+      "text": "Off. A short sound when a session is done or waits for you.",
+      "how": "∞ menu → Chimes."
+    },
+    {
+      "id": "new_output_dot",
+      "ok": true,
+      "optional": true,
+      "title": "iTerm2's blue dot",
+      "text": "Off: no blue dot on tabs with new output.",
+      "how": ""
+    },
+    {
+      "id": "tab_colours",
+      "ok": false,
+      "optional": true,
+      "title": "Tab colours for Restore Workspace",
+      "text": "iTerm2 has kept no window state on this Mac, which is where aht reads tab colours from, so Restore Workspace opens tabs without their colours.",
+      "how": "iTerm2 keeps it to bring its windows back: iTerm2 → Settings → General → Startup → Window restoration policy."
+    }
+  ],
+  "update": {
+    "enabled": false,
+    "current": "0.13.0",
+    "latest": null,
+    "newer": false,
+    "notes": "",
+    "url": "https://github.com/havurgiray/agent-history-tether/releases/latest",
+    "published": null,
+    "checked": null,
+    "error": null,
+    "how": "brew",
+    "upgrade": "brew upgrade --cask aht && aht install && open -a aht",
+    "installer": null
+  },
+  "claude_auto_continue": false,
+  "terminals": {
+    "installed": [
+      "iTerm",
+      "Terminal"
+    ],
+    "chosen": null,
+    "used": "iTerm"
+  },
+  "gui_dialogs": true,
+  "policies": {
+    "moves": "ask",
+    "copies": "ask"
+  }
+}

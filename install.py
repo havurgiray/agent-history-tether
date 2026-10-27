@@ -5,8 +5,18 @@ from aht.app's Resources folder with its prebuilt binaries — compiles whatever
 binary is still missing (swiftc), generates the LaunchAgent plist with correct
 paths, installs the `aht` command, registers the SessionStart hook (backing up
 settings.json), and loads the watcher.  Idempotent."""
-import argparse, json, os, shutil, signal, subprocess, sys
+import argparse, json, os, shlex, shutil, signal, subprocess, sys
 from pathlib import Path
+from xml.sax.saxutils import escape
+
+if sys.platform != "darwin":
+    # a checkout holds this file next to linux/, and aht imports it to
+    # restart the watcher: neither may write LaunchAgents off a Mac
+    NOT_MAC = ("This installer is for macOS. On Linux, run linux/install.sh instead. "
+               "On Windows, run aht.exe install.")
+    if __name__ == "__main__":
+        sys.exit(NOT_MAC)
+    raise ImportError(NOT_MAC)
 
 HOME = Path.home()
 NAME = "agent-history-tether"
@@ -21,8 +31,11 @@ NOTICES_LABEL = "com.aht.notices"        # "waiting for you" / "finished" notice
 NOTICES_PLIST = LA_DIR / f"{NOTICES_LABEL}.plist"
 PY = "/usr/bin/python3"
 SCRIPT = TOOLS / "aht.py"
-HOOK_CMD = f"{PY} {SCRIPT} hook"
-HOOK_TAIL = "aht.py hook"           # how uninstall/idempotency recognises our hook
+# a shell runs the hook: each path quoted, so a home folder with a space or a
+# $ works (a plain path stays as it was)
+HOOK_CMD = f"{shlex.quote(PY)} {shlex.quote(str(SCRIPT))} hook"
+HOOK_TAIL = "aht.py hook"           # with its quotes removed: how uninstall and a
+                                    # second install recognise our hook
 
 SOURCES = ("aht.py", "install.py", "uninstall.py", "badge_icon.swift",
            "watcher.swift", "README.md", "GUIDE.md", "LICENSE")
@@ -37,7 +50,8 @@ ap.add_argument("--keep-pid", type=int, help="(aht.app) pid of the running tray,
                 "so any other tray process is stopped")
 ap.add_argument("--tray-exe", help="(aht.app) executable the tray autostart "
                 "entry should launch from now on")
-ARGS = ap.parse_args()
+# imported by aht to restart the watcher: the defaults, not aht's own command line
+ARGS = ap.parse_args() if __name__ == "__main__" else ap.parse_args([])
 SRC = Path(ARGS.src or Path(__file__).resolve().parent).resolve()
 FROM_APP = ARGS.tray_exe is not None or ".app/Contents/Resources" in str(SRC)
 sys.path.insert(0, str(SRC))
@@ -120,26 +134,40 @@ def watch_roots():
     # dirs that currently exist, since FSEvents needs existing paths.
     return [r for r in aht.watch_roots_config() if Path(r).is_dir()]
 
+def _need_watcher():
+    """aht imports this file to restart the watcher, also from a copy that is
+    not installed (the app, a checkout, brew's `aht` before `aht install`):
+    then there is no watcher program for a LaunchAgent to start."""
+    if __name__ != "__main__" and not (TOOLS / "watcher").is_file():
+        raise FileNotFoundError("the watcher is not installed on this Mac yet")
+
+def _x(value) -> str:
+    """A path or a name as plist text.  A watched folder such as ~/R&D, or a
+    home with a < in it, would otherwise make the plist invalid, and launchd
+    would not load it: the watcher would silently not run."""
+    return escape(str(value))
+
 def write_plist():
+    _need_watcher()
     LA_DIR.mkdir(parents=True, exist_ok=True)
-    roots = "".join(f"        <string>{r}</string>\n" for r in watch_roots())
+    roots = "".join(f"        <string>{_x(r)}</string>\n" for r in watch_roots())
     PLIST.write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{LABEL}</string>
+    <key>Label</key><string>{_x(LABEL)}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{TOOLS}/watcher</string>
+        <string>{_x(TOOLS / "watcher")}</string>
 {roots}    </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>ProcessType</key><string>Background</string>
-    <key>StandardOutPath</key><string>{HOME}/.aht/aht-watcher.log</string>
-    <key>StandardErrorPath</key><string>{HOME}/.aht/aht-watcher.err</string>
+    <key>StandardOutPath</key><string>{_x(HOME / ".aht/aht-watcher.log")}</string>
+    <key>StandardErrorPath</key><string>{_x(HOME / ".aht/aht-watcher.err")}</string>
 </dict>
 </plist>
-''')
+''', encoding="utf-8")
 
 def write_notices_plist():
     """Every half minute: did a session start waiting for you, or finish a
@@ -148,11 +176,11 @@ def write_notices_plist():
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>{NOTICES_LABEL}</string>
+    <key>Label</key><string>{_x(NOTICES_LABEL)}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{PY}</string>
-        <string>{SCRIPT}</string>
+        <string>{_x(PY)}</string>
+        <string>{_x(SCRIPT)}</string>
         <string>notices</string>
         <string>--quiet</string>
     </array>
@@ -160,10 +188,10 @@ def write_notices_plist():
     <key>RunAtLoad</key><true/>
     <key>ProcessType</key><string>Background</string>
     <key>LowPriorityIO</key><true/>
-    <key>StandardErrorPath</key><string>{HOME}/.aht/aht-notices.err</string>
+    <key>StandardErrorPath</key><string>{_x(HOME / ".aht/aht-notices.err")}</string>
 </dict>
 </plist>
-''')
+''', encoding="utf-8")
 
 def load_notices():
     uid = os.getuid()
@@ -192,11 +220,16 @@ def install_command():
             note = ('  ↳ add it to PATH:  echo \'export PATH="$HOME/.local/bin:$PATH"\' '
                     '>> ~/.zshrc  (then open a new terminal)')
     wrapper = target / "aht"
-    wrapper.write_text(f'#!/bin/bash\nexec {PY} "{SCRIPT}" "$@"\n')
+    wrapper.write_text(f'#!/bin/bash\nexec {shlex.quote(PY)} {shlex.quote(str(SCRIPT))} "$@"\n')
     wrapper.chmod(0o755)
     print(f"✓ `aht` command installed at {wrapper}")
     if note:
         print(note)
+
+def _is_our_hook(command: str) -> bool:
+    """Whether a hook command is aht's: as written now (its paths
+    shell-quoted) or as older versions wrote it (unquoted)."""
+    return command.replace("'", "").endswith(HOOK_TAIL)
 
 def install_hook():
     s = json.load(open(SETTINGS)) if SETTINGS.exists() else {}
@@ -205,7 +238,7 @@ def install_hook():
     hooks = s.setdefault("hooks", {})
     def ours_out(event):
         return [g for g in hooks.get(event, [])
-                if not any(h.get("command", "").endswith(HOOK_TAIL) for h in g.get("hooks", []))]
+                if not any(_is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
     groups = ours_out("SessionStart")
     for matcher in ("startup", "resume", "fork"):   # fork: /branch, --fork-session
         groups.append({"matcher": matcher,
@@ -222,6 +255,7 @@ def install_hook():
           "(backup: settings.json.bak-aht)")
 
 def load_agent():
+    _need_watcher()
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"], capture_output=True)
     r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST)],
@@ -250,11 +284,11 @@ def retarget_tray_autostart():
     TRAY_PLIST.write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>Label</key><string>{TRAY_LABEL}</string>
-    <key>ProgramArguments</key><array><string>{ARGS.tray_exe}</string></array>
+    <key>Label</key><string>{_x(TRAY_LABEL)}</string>
+    <key>ProgramArguments</key><array><string>{_x(ARGS.tray_exe)}</string></array>
     <key>RunAtLoad</key><true/>
 </dict></plist>
-''')
+''', encoding="utf-8")
     print("✓ tray autostart now launches the app")
 
 if __name__ == "__main__":
@@ -275,3 +309,6 @@ if __name__ == "__main__":
     print("Reconnect existing projects with:  aht adopt --apply")
     if not FROM_APP:
         print(f"Menu bar tray (optional):          {TOOLS}/aht-tray &")
+    if ARGS.tray_exe is None:    # from a terminal; the app shows the list itself
+        print()
+        aht.cmd_getting_started(argparse.Namespace(json=False))

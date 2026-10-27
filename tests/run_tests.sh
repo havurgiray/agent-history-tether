@@ -11,4 +11,7 @@ echo
 echo "=== linux layer (polling watcher + tray --check) ==="
 AHT_PY="$PY" "$PY" linux_test.py
 echo
+echo "=== Windows badge cache (any OS; its apply() part on Windows only) ==="
+"$PY" ../windows/tests/winbadge_test.py
+echo
 echo "✅ ALL AHT SUITES PASSED"

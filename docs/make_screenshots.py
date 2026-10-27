@@ -16,6 +16,7 @@ import tempfile
 REPO = Path(__file__).resolve().parent.parent
 APP = (sys.argv[sys.argv.index("--app") + 1] if "--app" in sys.argv
        else "/Applications/aht.app/Contents/MacOS/aht-tray")
+BUNDLED = Path(APP).parent.parent / "Resources" / "aht.py"
 args = [a for a in sys.argv[1:] if a not in ("--app", APP, "--dark")]
 OUT = Path(args[0])
 D = Path(os.path.realpath(args[1] if len(args) > 1 else tempfile.mkdtemp(prefix="aht-demo-")))
@@ -39,6 +40,8 @@ env.update({
     "AHT_ROOT_CLAUDE": str(claude / "projects"), "AHT_NO_NOTIFY": "1", "AHT_NO_ICONS": "1",
     "AHT_NO_BACKUP": "1", "AHT_NO_CHECKPOINT": "1", "AHT_TAILSCALE": str(fake_ts),
     "AHT_CLAUDE_VERSION": "2.1.286", "AHT_NO_MIRROR": "1", "AHT_MACHINE_NAME": "my-mac",
+    # the app's own core, not the one installed on this Mac
+    "AHT_CORE": str(BUNDLED if BUNDLED.is_file() else REPO / "aht.py"),
 })
 for b in ("GEMINI", "CURSOR", "OPENCODE", "CODEX", "COPILOT", "KIMI", "KIMI_CODE"):
     env[f"AHT_ROOT_{b}"] = str(D / "nope")
@@ -94,6 +97,36 @@ for i, (folder, tab, title, ask, answer, hours) in enumerate(PROJECTS):
         lines.append({"type": "custom-title", "customTitle": tab, "sessionId": sid})
     (store / f"{sid}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
     os.utime(store / f"{sid}.jsonl", (t, t))
+    if folder == "paper":
+        # Show Sessions: an older session, and two branches of this one (/branch
+        # copies the conversation, each copied entry marked forkedFrom), one of
+        # them branched again
+        def branch(n, of, name, hours_ago, ask2):
+            b = f"{0x5e5a0000 + n * 0x1111:08x}-0000-4000-8000-{n:012x}"
+            tb = now - hours_ago * 3600
+            src = (store / f"{of}.jsonl").read_text().splitlines()
+            copied = [dict(json.loads(x), sessionId=b, forkedFrom={"sessionId": of,
+                                                                   "messageUuid": f"m{k}"})
+                      for k, x in enumerate(src)]
+            own = [{"type": "custom-title", "customTitle": name, "sessionId": b},
+                   {"type": "user", "cwd": str(real), "timestamp": iso(tb), "entrypoint": "cli",
+                    "sessionId": b, "message": {"role": "user", "content": ask2}}]
+            (store / f"{b}.jsonl").write_text("".join(json.dumps(x, separators=(",", ":")) + "\n"
+                                                      for x in copied + own))
+            os.utime(store / f"{b}.jsonl", (tb + 300, tb + 300))
+            return b
+        b1 = branch(101, sid, "Shorter abstract", 26, "try an abstract of 150 words")
+        branch(102, b1, "Abstract for the poster", 3, "now a 60-word version for the poster")
+        branch(103, sid, "Related work as a table", 0.05, "turn the related work into a table")
+        old_sid = f"{0x5e5a0000 + 104 * 0x1111:08x}-0000-4000-8000-{104:012x}"
+        to = now - 75 * 3600
+        (store / f"{old_sid}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in [
+            {"type": "user", "cwd": str(real), "timestamp": iso(to - 900), "entrypoint": "cli",
+             "message": {"role": "user", "content": "outline the paper"}},
+            {"type": "ai-title", "aiTitle": "Outline the paper"},
+            {"type": "assistant", "cwd": str(real), "timestamp": iso(to), "message": {
+                "role": "assistant", "content": [{"type": "text", "text": "Here is an outline."}]}}]))
+        os.utime(store / f"{old_sid}.jsonl", (to, to))
     aht("tag", str(real), "--apply")
 
 # four open sessions in four iTerm2 tabs: working, waiting, idle, and one

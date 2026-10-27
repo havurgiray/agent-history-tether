@@ -87,6 +87,28 @@ has "$(W tidy --show=orphan-history)" "old work" "tidy --show did not show the h
 W tidy --remove-history=orphan-history --apply >/dev/null
 [ ! -d "$T/tools/claude/orphan-history" ] || fail "the history was not moved to the Trash"
 [ -d "$T/trash/orphan-history" ] || fail "the history is not in the Trash"
+if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then       # and once to the real Recycle Bin
+  mkdir -p "$T/tools/claude/orphan-recycled"
+  printf '%s\n' '{"type":"user","cwd":"/gone-too","message":{"role":"user","content":"older work"}}' \
+    > "$T/tools/claude/orphan-recycled/o2.jsonl"
+  OUT=$(unset AHT_TRASH; W tidy --remove-history=orphan-recycled --apply)
+  [ ! -d "$T/tools/claude/orphan-recycled" ] || fail "the history was not moved to the Recycle Bin: $OUT"
+  # it is in the Recycle Bin, deleted from the fake Claude store; then it goes
+  # for good (the $R… item and its $I… record), so no run leaves one behind
+  RB=$(powershell.exe -NoProfile -NonInteractive -Command '
+    $n = 0
+    foreach ($i in @((New-Object -ComObject Shell.Application).NameSpace(10).Items())) {
+      $was = [string]$i.ExtendedProperty("System.Recycle.DeletedFrom")
+      if ($i.Name -ne "orphan-recycled" -or $was.TrimEnd("\") -notlike "*\tools\claude") { continue }
+      $n++
+      $r = $i.Path
+      Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue
+      $meta = Join-Path (Split-Path $r) ("`$I" + (Split-Path $r -Leaf).Substring(2))
+      Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue
+    }
+    $n' | tr -d '\r')
+  [ "${RB:-0}" -ge 1 ] 2>/dev/null || fail "the history is not in the Recycle Bin (found: ${RB:-nothing}): $OUT"
+fi
 
 echo "== limits / sessions / tab names / workspace / checkup =="
 has "$(W limits --json)" '"limits": \[\]' "limits failed"
@@ -94,5 +116,15 @@ has "$(W sessions --json)" '"Heron deploy"' "sessions lacks the title"
 W tab-names --json >/dev/null || fail "tab-names failed"
 W workspace --json >/dev/null || fail "workspace failed"
 W checkup --json >/dev/null || fail "checkup failed"
+
+echo "== a project's sessions / setup / getting started / autostart =="
+has "$(W sessions "$PAPER" --json)" '"title": "Heron deploy"' "the project's sessions lack the title"
+has "$(W setup --json)" '"projects"' "setup gave no plan"
+W getting-started --json >/dev/null || fail "getting-started failed"
+W autostart --json >/dev/null || fail "autostart failed"
+
+echo "== aht's window: the doors, the page, one command =="
+OUT=$(W window --selftest) || fail "the window selftest failed: $OUT"
+has "$OUT" "WINDOW SELFTEST OK" "the window selftest did not pass"
 
 echo "FEATURES SMOKE OK"

@@ -43,9 +43,11 @@ CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 MUTEX_NAME = "Local\\aht-watcher"
+TRAY_MUTEX_NAME = "Local\\aht-tray"        # one tray per sign-in
 STOP_EVENT_NAME = "Local\\aht-watcher-stop"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "aht-watcher"
+# the launcher older versions put in the logon entry; removed where found
 VBS_NAME = "aht-watch.vbs"
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -241,6 +243,19 @@ def notify_user(title, message, info=None):
     try:
         if os.environ.get("AHT_NO_NOTIFY") or not aht.cfg_get("notifications", True):
             return
+        # while the tray runs it shows the notice as a balloon of its icon (a
+        # toast from an app Windows does not know may never show); a click
+        # on it opens aht's window
+        run = aht.aht_home() / "run"
+        try:
+            tray = time.time() - (run / "tray-alive").stat().st_mtime < 60
+        except OSError:
+            tray = False
+        if tray:
+            with open(run / "tray-notices.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"title": title, "message": message,
+                                     "info": info or {}, "at": time.time()}) + "\n")
+            return
         env = dict(os.environ, AHT_TOAST_TITLE=title, AHT_TOAST_MSG=message)
         # title/message travel via env vars so no quoting can break the script
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
@@ -344,13 +359,16 @@ def watcher_status() -> dict:
     return st
 
 
-def _reload_watcher():
+def _reload_watcher() -> bool:
+    """-> whether the watcher was restarted (the core reports it as
+    setup's "watcher_reloaded")."""
     if aht.cfg_get("watcher_owner", "agent") == "none":
         print("watching is off (watcher_owner=none) — nothing to reload")
-        return
+        return False
     stop_watcher()
     start_watcher_hidden()
     print("✓ watcher restarted with the current roots")
+    return True
 
 
 def hook_installed(event: str = "SessionStart") -> bool:
@@ -587,39 +605,214 @@ def cmd_watch(argv) -> int:
 SETTINGS = Path.home() / ".claude" / "settings.json"
 
 
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def aht_processes(in_dir: Path = None) -> list:
+    """This user's other aht.exe and aht-tray.exe processes (the tray, the
+    watcher, aht's window), only those started from `in_dir` when given:
+    [(pid, exe path)].  Never this process or the aht ones that started it:
+    Scoop's `aht` is an aht.exe too, and when it ends, the aht it started
+    ends with it (so `aht uninstall` would stop halfway); the same for a
+    Repair from the tray.  The walk up stops at the first program that is
+    not aht: the parent PID of a process whose parent ended may since have
+    gone to another one, such as the tray started at sign-in."""
+    k = _kernel32
+    k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                             wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    out, procs = [], []
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)                 # TH32CS_SNAPPROCESS
+    if not snap or snap == INVALID_HANDLE:
+        return out
+    try:
+        e = _PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = k.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            procs.append((e.th32ProcessID, e.th32ParentProcessID, e.szExeFile.lower()))
+            ok = k.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k.CloseHandle(snap)
+    ours = ("aht.exe", "aht-tray.exe")
+    parent = {pid: ppid for pid, ppid, _name in procs}
+    image = {pid: name for pid, _ppid, name in procs}
+    mine = {os.getpid()}
+    pid = parent.get(os.getpid())
+    while pid and pid not in mine and image.get(pid) in ours:   # its parent, theirs, …
+        mine.add(pid)
+        pid = parent.get(pid)
+    for pid, _ppid, name in procs:
+        if name not in ours or pid in mine:
+            continue
+        h = k.OpenProcess(0x1000, False, pid)                 # QUERY_LIMITED_INFORMATION
+        if h:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = wintypes.DWORD(1024)
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                if in_dir is None or _same_dir(str(Path(buf.value).parent), in_dir):
+                    out.append((pid, buf.value))
+            k.CloseHandle(h)
+    return out
+
+
+def stop_aht_processes(in_dir: Path = None) -> int:
+    """End the processes aht_processes() finds; how many there were."""
+    k = _kernel32
+    k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    found = aht_processes(in_dir)
+    for pid, _exe in found:
+        h = k.OpenProcess(0x0001 | SYNCHRONIZE, False, pid)  # TERMINATE
+        if h:
+            k.TerminateProcess(h, 1)
+            k.WaitForSingleObject(h, 3000)
+            k.CloseHandle(h)
+    return len(found)
+
+
+def _copy_app(src_dir: Path, dst_dir: Path) -> None:
+    """aht.exe, aht-tray.exe and the _internal folder they share."""
+    for name in ("aht.exe", "aht-tray.exe"):
+        if (src_dir / name).is_file():
+            shutil.copy2(src_dir / name, dst_dir / name)
+    if (src_dir / "_internal").is_dir():
+        shutil.rmtree(dst_dir / "_internal", ignore_errors=True)   # an older version's
+        shutil.copytree(src_dir / "_internal", dst_dir / "_internal", dirs_exist_ok=True)
+
+
 def _install_binary(copy: bool) -> str:
-    """Put a stable copy of the exe in %LOCALAPPDATA%\\aht so the Run key
-    and the hook keep working when the downloaded exe is moved or deleted.
+    """Put a stable copy of aht in %LOCALAPPDATA%\\aht so the Run key and the
+    hook keep working when the downloaded folder is moved or deleted.
     Returns the command path the autostart entry and hook should reference."""
     if not FROZEN:
         return ""                     # dev mode: reference the script via self_cmd
-    src = Path(sys.executable).resolve()
     if not copy:
-        return str(src)
+        # the path it was started by: Scoop's ...\apps\aht\current stays
+        # through `scoop update`, the version folder it leads to does not
+        return os.path.abspath(sys.executable)
+    src = Path(sys.executable).resolve()
     target = app_dir() / "aht.exe"
     if src == (target.resolve() if target.exists() else target):
         return str(target)
     app_dir().mkdir(parents=True, exist_ok=True)
-    stop_watcher()                    # the old watcher may hold the target open
+    stop_watcher()                    # the old watcher may hold the target open,
+    stop_aht_processes(app_dir())     # … and the tray or aht's window
     for attempt in range(10):
         try:
-            shutil.copy2(src, target)
+            _copy_app(src.parent, app_dir())
             break
-        except OSError:
+        except OSError as e:
             if attempt == 9:
-                print(f"⚠ could not copy the exe to {target} (file in use?) — "
+                print(f"⚠ could not copy aht to {app_dir()} ({e}) — "
                       f"using the current location instead")
                 return str(src)
             time.sleep(0.5)
-    print(f"✓ installed {target}")
-    tray_src = src.with_name("aht-tray.exe")
-    if tray_src.exists():
-        try:
-            shutil.copy2(tray_src, app_dir() / "aht-tray.exe")
-            print("✓ installed tray app (aht-tray.exe)")
-        except OSError:
-            pass                       # tray running from the target — keep old
+    print(f"✓ installed {app_dir()}")
     return str(target)
+
+
+def installed_in_place() -> bool:
+    """aht's installer or Scoop put this aht where it is, and it is used
+    there (as with `install --here`): a copy in %LOCALAPPDATA%\\aht would
+    outlive Settings > Apps > Uninstall and `scoop uninstall`."""
+    if not FROZEN:
+        return False
+    exe = os.path.abspath(sys.executable)
+    if any(Path(exe).parent.glob("unins*.exe")):
+        return True
+    scoop = (os.environ.get("SCOOP") or str(Path.home() / "scoop"),
+             os.environ.get("SCOOP_GLOBAL")
+             or os.path.join(os.environ.get("ProgramData") or "C:\\ProgramData", "scoop"))
+    return any(os.path.normcase(exe).startswith(
+        os.path.normcase(os.path.join(s, "apps", "aht", ""))) for s in scoop)
+
+
+def _retire_old_copy(exe: str) -> None:
+    """aht referenced where it is (its installer, `--here`): the copy an
+    earlier `aht install` made in %LOCALAPPDATA%\\aht goes, so no old aht
+    keeps running from there or answers `aht` in a terminal.  Its badge
+    icon cache (icons\\) stays."""
+    old = app_dir()
+    if not exe or _same_dir(str(Path(exe).parent), old) or not (old / "aht.exe").is_file():
+        return
+    stop_watcher()
+    stop_aht_processes(old)
+    for name in ("aht.exe", "aht-tray.exe", VBS_NAME):
+        try:
+            (old / name).unlink()
+        except OSError:
+            pass
+    shutil.rmtree(old / "_internal", ignore_errors=True)
+    try:
+        _user_path(old, add=False)
+    except OSError:
+        pass
+    print(f"✓ removed the older copy in {old}")
+
+
+def _put_on_path(exe: str, want: bool) -> None:
+    """`aht` in a terminal: the folder of `exe` on this user's PATH, unless
+    scoop or winget already put an aht there (or `want` is False)."""
+    if not exe:
+        return
+    d = Path(exe).parent
+    try:
+        if not want:
+            if _user_path(d, add=False):
+                print(f"✓ {d} taken out of your PATH")
+            return
+        # not shutil.which: on Windows it also looks in the current folder,
+        # which is this one when the installer runs us
+        for x in os.environ.get("PATH", "").split(os.pathsep):
+            if x and not _same_dir(x, d) and not _same_dir(x, app_dir()) and any(
+                    os.path.isfile(os.path.join(os.path.expandvars(x), "aht" + ext))
+                    for ext in (".exe", ".cmd", ".bat")):
+                return
+        if _user_path(d, add=True):
+            print(f"✓ added {d} to your PATH: `aht` works in new terminals")
+    except OSError as e:
+        print(f"⚠ could not change your PATH: {e}")
+
+
+def _same_dir(a: str, b: Path) -> bool:
+    return os.path.normcase(os.path.expandvars(a).rstrip("\\")) == \
+        os.path.normcase(str(b).rstrip("\\"))
+
+
+def _user_path(d: Path, add: bool) -> bool:
+    """Add `d` to (or take it out of) this user's PATH, the HKCU one, and
+    tell running programs; new terminals see it.  True when it changed."""
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+        try:
+            cur, kind = winreg.QueryValueEx(k, "Path")
+        except OSError:
+            cur, kind = "", winreg.REG_EXPAND_SZ
+        parts = [x for x in cur.split(";") if x]
+        has = any(_same_dir(x, d) for x in parts)
+        if add == has:
+            return False
+        parts = parts + [str(d)] if add else [x for x in parts if not _same_dir(x, d)]
+        winreg.SetValueEx(k, "Path", 0, kind, ";".join(parts))
+    try:
+        send = _user32.SendMessageTimeoutW
+        send.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPCWSTR,
+                         wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+        send(0xFFFF, 0x001A, 0, "Environment", 0x0002, 3000,      # WM_SETTINGCHANGE
+             ctypes.byref(ctypes.c_size_t()))
+    except Exception:
+        pass
+    return True
 
 
 def _hook_cmdline(exe: str) -> str:
@@ -648,7 +841,7 @@ def install_hook(hook_cmd: str) -> None:
     groups = [g for g in hooks.get("SessionStart", [])
               if not any(_is_our_hook(h.get("command", ""))
                          for h in g.get("hooks", []))]
-    for matcher in ("startup", "resume"):
+    for matcher in ("startup", "resume", "fork"):   # fork: /branch, --fork-session
         groups.append({"matcher": matcher,
                        "hooks": [{"type": "command", "command": hook_cmd,
                                   "timeout": 10}]})
@@ -681,22 +874,70 @@ def remove_hook() -> None:
         print("✓ SessionStart hook removed")
 
 
+def _watch_entry(exe: str) -> str:
+    """The logon entry's command for the watcher alone.  A console exe started
+    from a Run entry flashes a console window; aht-tray.exe is a windowed
+    program, so `aht-tray.exe --watch` runs the watcher with nothing on
+    screen.  No script in between: Windows Security takes a .vbs that starts
+    a hidden program from a Run entry for malware."""
+    tray = Path(exe).with_name("aht-tray.exe") if exe else None
+    if tray and tray.is_file():
+        return f'"{tray}" --watch'
+    return _watch_cmdline(exe)
+
+
+def _remove_old_launchers() -> None:
+    for base in {app_dir(), Path(sys.executable).parent}:
+        try:
+            (base / VBS_NAME).unlink()
+        except OSError:
+            pass
+
+
 def _write_autostart(exe: str) -> None:
-    """Autostart at logon via an HKCU Run entry.  A console exe started from a
-    Run entry flashes a console window, so when wscript.exe is available the
-    entry goes through a one-line .vbs that launches it fully hidden."""
-    watch_cmd = _watch_cmdline(exe)
-    wscript = shutil.which("wscript")
-    if wscript:
-        vbs = (Path(exe).parent if exe else app_dir()) / VBS_NAME
-        vbs.parent.mkdir(parents=True, exist_ok=True)
-        quoted = watch_cmd.replace('"', '""')
-        vbs.write_text('CreateObject("WScript.Shell").Run "%s", 0, False\r\n'
-                       % quoted, encoding="utf-8")
-        _run_key_set(f'"{wscript}" "{vbs}"')
-    else:
-        _run_key_set(watch_cmd)
+    """Autostart at logon via an HKCU Run entry."""
+    _run_key_set(_watch_entry(exe))
+    _remove_old_launchers()
     print("✓ watcher registered to start at logon (HKCU Run)")
+
+
+def is_tray_entry(entry) -> bool:
+    """The logon entry starts the tray (which keeps the watcher running), not
+    the watcher alone."""
+    v = (entry or "").lower()
+    return "aht-tray" in v and "--watch" not in v
+
+
+def _keep_tray_entry(exe: str):
+    """A logon entry that starts the tray stays one (whoever chose it: the
+    installer, aht's window, the tray), now for this aht's tray; returns
+    that tray, or None when the entry was not the tray's."""
+    tray = Path(exe).with_name("aht-tray.exe") if exe else None
+    if not (tray and tray.is_file() and is_tray_entry(_run_key_get())):
+        return None
+    _run_key_set(f'"{tray}"')
+    _remove_old_launchers()
+    print("✓ the tray still starts at logon (HKCU Run)")
+    return tray
+
+
+def tray_running() -> bool:
+    h = _kernel32.OpenMutexW(SYNCHRONIZE, False, TRAY_MUTEX_NAME)
+    if h:
+        _kernel32.CloseHandle(h)
+        return True
+    return False
+
+
+def _rewrite_old_entry() -> None:
+    """An entry an older version wrote (wscript.exe + aht-watch.vbs) is
+    rewritten the current way, so an upgrade alone gets rid of it."""
+    if VBS_NAME not in (_run_key_get() or ""):
+        return
+    exe = app_dir() / "aht.exe"
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()):
+        _write_autostart(str(exe) if exe.is_file() else self_cmd()[0] if FROZEN else "")
 
 
 def cmd_install(argv) -> int:
@@ -707,15 +948,24 @@ def cmd_install(argv) -> int:
     ap.add_argument("--no-watcher", action="store_true",
                     help="register only the SessionStart hook")
     ap.add_argument("--here", action="store_true",
-                    help="reference the exe where it is now instead of copying "
-                         "it to %%LOCALAPPDATA%%\\aht")
+                    help="reference aht where it is now instead of copying "
+                         "it to %%LOCALAPPDATA%%\\aht (always so when aht's "
+                         "installer or Scoop put it there)")
+    ap.add_argument("--no-path", action="store_true",
+                    help="do not put aht on your PATH")
     args = ap.parse_args(argv)
 
     aht.ensure_config()
-    exe = _install_binary(copy=not args.here)
+    here = args.here or installed_in_place()
+    exe = _install_binary(copy=not here)
+    if here:
+        _retire_old_copy(exe)
+    _put_on_path(exe, want=not args.no_path)
     install_hook(_hook_cmdline(exe))
     if not args.no_watcher:
-        _write_autostart(exe)
+        tray = _keep_tray_entry(exe)
+        if not tray:
+            _write_autostart(exe)
         stop_watcher()
         if exe:
             logf = open(watcher_log_path(), "a", encoding="utf-8", errors="replace")
@@ -728,6 +978,13 @@ def cmd_install(argv) -> int:
         time.sleep(0.5)
         print(f"✓ watcher {'running' if watcher_running() else 'started'} "
               f"(log: {watcher_log_path()})")
+        if tray and not tray_running():
+            # an upgrade stopped it (Scoop's, winget's), and nothing else
+            # starts it again before the next sign-in
+            subprocess.Popen([str(tray)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=CREATE_NEW_PROCESS_GROUP, close_fds=True)
+            print("✓ the tray started")
     roots = aht.watch_roots_config()
     print(f"\nWatching roots: {[r for r in roots if os.path.isdir(r)] or '(none exist yet)'}")
     print("Reconnect this machine's existing projects with:  aht adopt --apply")
@@ -748,14 +1005,18 @@ def cmd_uninstall(argv) -> int:
 
     stopped = stop_watcher()
     print("✓ watcher stopped" if stopped else "• no watcher was running")
+    if stop_aht_processes():
+        print("✓ the tray and aht's window closed")
     _run_key_delete()
-    for base in (app_dir(), Path(sys.executable).parent if FROZEN else app_dir()):
-        try:
-            (base / VBS_NAME).unlink()
-        except OSError:
-            pass
+    _remove_old_launchers()
     print("✓ logon entry removed")
     remove_hook()
+    for d in {str(app_dir()), str(Path(sys.executable).parent) if FROZEN else str(app_dir())}:
+        try:
+            if _user_path(Path(d), add=False):
+                print(f"✓ {d} taken out of your PATH")
+        except OSError:
+            pass
 
     if args.remove_icons:
         import winbadge
@@ -787,9 +1048,11 @@ def cmd_uninstall(argv) -> int:
             except OSError:
                 pass
         print("✓ markers + registry removed (history kept)")
-    print(f"\nHistory under {aht.projects_dir()} was not touched.")
-    if FROZEN:
-        print(f"Delete the exe itself by hand if you want it gone: {sys.executable}")
+    print("\nAutomation removed. No agent's history was touched.")
+    if FROZEN and aht.install_kind() == "installer":
+        print("Remove the program in Settings > Apps > aht.")
+    elif FROZEN:
+        print(f"Delete the program by hand if you want it gone: {Path(sys.executable).parent}")
     return 0
 
 
@@ -805,12 +1068,14 @@ WINDOWS COMMANDS (this build):
   aht watch                 run the watcher in the foreground
   aht uninstall             stop the automation (history kept)
   aht-tray.exe              system tray companion (status + actions)
+  aht-tray.exe --window     the tray, and aht's window (the Start menu's aht)
 
-Installed at: %LOCALAPPDATA%\\aht\\aht.exe
+Installed at: %LOCALAPPDATA%\\Programs\\aht (the installer) or
+              %LOCALAPPDATA%\\aht (`aht install` from the zip)
 Data:  %USERPROFILE%\\.aht\\registry.json,  config.json
 Logs:  %USERPROFILE%\\.aht\\aht.log,  aht-watcher.log
 Badges: folders get per-agent discs / a git "+" icon via a hidden
-        desktop.ini + .claude\\aht-badge.ico that travel with the folder;
+        desktop.ini + .aht\\aht-badge.ico that travel with the folder;
         refresh with `aht icons --refresh`, remove with
         `aht uninstall --remove-icons`.
 """
@@ -828,5 +1093,9 @@ def activate() -> None:
     aht._reload_watcher = _reload_watcher
     aht.hook_installed = hook_installed
     aht._default_watch_roots = _default_watch_roots
+    try:
+        _rewrite_old_entry()
+    except Exception as e:
+        aht.log(f"could not rewrite the old logon entry: {e}")
     aht.ABOUT = aht.ABOUT.rstrip("\n").rsplit("\nData:", 1)[0] \
         + "\n" + WIN_ABOUT_EXTRA

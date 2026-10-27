@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the standalone Windows aht.exe + aht-tray.exe from
+# Build the Windows aht (dist/aht: aht.exe, aht-tray.exe, _internal/) from
 # macOS/Linux via Docker + Wine (PyInstaller cannot cross-compile, so it runs
 # inside a Windows-Python-under-wine container), then smoke-test under wine.
 #
@@ -28,18 +28,16 @@ docker run --rm --platform linux/amd64 -v "$REPO":/repo -w /repo/windows "$IMAGE
       aht.spec
 '
 
-cp dist/aht.exe aht.exe
-cp dist/aht-tray.exe aht-tray.exe
-echo "built: $PWD/aht.exe + aht-tray.exe"
+echo "built: $PWD/dist/aht (aht.exe + aht-tray.exe)"
 
 if [ "$1" != "--no-test" ]; then
   echo "== smoke test (wine) =="
   docker run --rm --platform linux/amd64 -v "$REPO":/repo -w /repo/windows "$IMAGE" \
-    sh tests/wine_smoke.sh /repo/windows/aht.exe
+    sh tests/wine_smoke.sh /repo/windows/dist/aht/aht.exe
   echo "== watcher smoke test (wine) =="
   docker run --rm --platform linux/amd64 -v "$REPO":/repo -w /repo/windows "$IMAGE" \
-    sh tests/wine_watch_smoke.sh /repo/windows/aht.exe
+    sh tests/wine_watch_smoke.sh /repo/windows/dist/aht/aht.exe
   echo "== features smoke test (wine) =="
   docker run --rm --platform linux/amd64 -v "$REPO":/repo -w /repo/windows "$IMAGE" \
-    sh tests/features_smoke.sh /repo/windows/aht.exe
+    sh tests/features_smoke.sh /repo/windows/dist/aht/aht.exe
 fi

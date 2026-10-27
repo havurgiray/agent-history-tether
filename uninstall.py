@@ -18,7 +18,7 @@ NOTICES_LABEL = "com.aht.notices"
 NOTICES_PLIST = HOME / "Library/LaunchAgents" / f"{NOTICES_LABEL}.plist"
 REG = HOME / ".aht/registry.json"
 CONFIG = HOME / ".aht/config.json"
-HOOK_TAIL = "aht.py hook"
+HOOK_TAIL = "aht.py hook"         # with its quotes removed: install.py quotes the paths
 
 def remove_hook():
     """Remove OUR hook and nothing else.  Hooks are grouped by matcher, and a
@@ -36,7 +36,7 @@ def remove_hook():
         kept = []
         for g in s.get("hooks", {}).get(event, []):
             survivors = [h for h in g.get("hooks", [])
-                         if not h.get("command", "").endswith(HOOK_TAIL)]
+                         if not h.get("command", "").replace("'", "").endswith(HOOK_TAIL)]
             if survivors:
                 g["hooks"] = survivors
                 kept.append(g)
@@ -65,10 +65,11 @@ def remove_agent():
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{TRAY_LABEL}"], capture_output=True)
     if TRAY_PLIST.exists():
         TRAY_PLIST.unlink()
+        print("✓ tray autostart removed")
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{NOTICES_LABEL}"], capture_output=True)
     if NOTICES_PLIST.exists():
         NOTICES_PLIST.unlink()
-        print("✓ tray autostart removed")
+        print("✓ notices agent removed")
 
 def remove_command():
     for d in (HOME/".npm-global/bin", Path("/usr/local/bin"), HOME/".local/bin", HOME/"bin"):
@@ -108,6 +109,9 @@ def purge_markers():
           "(the agent CLIs' history stores are untouched)")
 
 if __name__ == "__main__":
+    if sys.platform != "darwin":
+        sys.exit("This uninstaller is for macOS. On Linux, run linux/uninstall.sh instead. "
+                 "On Windows, run aht.exe uninstall.")
     quit_app()
     remove_hook()
     remove_agent()

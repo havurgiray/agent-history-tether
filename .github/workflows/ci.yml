@@ -37,13 +37,20 @@ jobs:
         run: macos/build_app.sh --host-only --test
 
   windows:
-    name: Windows exe (x64)
-    runs-on: windows-latest
+    name: Windows exe (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          architecture: ${{ matrix.arch }}
       - name: build
         shell: bash
         run: |
@@ -56,6 +63,18 @@ jobs:
         env:
           AHT_SMOKE_NATIVE: "1"
         run: |
-          sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht.exe"
-          sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht.exe"
-          sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht.exe"
+          sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht/aht.exe"
+          sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht/aht.exe"
+          sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht/aht.exe"
+      - name: the badge cache, and a drawn badge replaced on the next refresh
+        shell: bash
+        run: python windows/tests/winbadge_test.py
+      - name: the installer, installed and removed
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path aht.py -Pattern '^VERSION = "(.*)"').Matches[0].Groups[1].Value
+          $iscc = windows/iscc.ps1
+          if (-not $iscc) { exit 1 }
+          & $iscc /Q "/DAppVersion=$v" "/DArch=${{ matrix.arch }}" windows/aht.iss
+          if ($LASTEXITCODE) { exit 1 }
+          windows/tests/installer_smoke.ps1 -Installer "windows/installer/aht-setup-$v-windows-${{ matrix.arch }}.exe" -Version $v

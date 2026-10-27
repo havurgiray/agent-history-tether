@@ -6,9 +6,11 @@ Copilot. Once it does that, it can do more with those histories. It can
 search them, continue a project in another agent, or hand a project over to
 another machine of yours.
 
-This guide shows aht on macOS, with its window. On Linux and Windows the
-core works the same, and many features work from the `aht` command; the
-README's *Platforms* table says which.
+This guide shows aht on macOS, with its window. On Windows and Linux, aht's
+window opens from the tray (**Open aht…**) or with `aht window`: the same
+tabs and dialogs, without what needs macOS (iTerm2, Spotlight, Finder, the
+session corner, chimes). See *On Windows and Linux*; the README's
+*Platforms* table lists every feature per system.
 
 This guide goes feature by feature, each with an example. Everything the
 window does can also be done with the `aht` command in a terminal. Each
@@ -39,6 +41,272 @@ acts only with `--apply`.
 - **Spotlight** finds your sessions by title, and **aht:// links** open
   parts of the window from the Shortcuts app or a script (see *Spotlight,
   Shortcuts and links*).
+
+## Setting up
+
+The first time you open aht, a welcome window sets it up. **Quick Setup**
+does it in one step; **Choose Each Step** lets you decide everything.
+
+> **Example.** You open aht for the first time. It found 14 projects with
+> agent history in Desktop and Documents, and your agents' histories show
+> that you also keep projects in ~/Developer. **Quick Setup** watches those
+> three folders, takes on the 14 projects and starts aht at login.
+
+- **Quick Setup** watches the folders where your projects are: Desktop and
+  Documents, folders such as ~/Code or ~/Projects if you have them (spelled
+  as they are on your disk), and any folder right under your home that your
+  agents' histories point to. It takes on every project there that already
+  has agent history, except one you told aht to forget (its page names
+  those: *Leave out …: you told aht to forget it*), and later each new
+  project as you work in it; when no project has history yet, its page
+  says just that: *Take on new projects as you work in them*.
+  The first time, it also asks before it relinks a folder that moved or
+  was copied, badges project folders, backs up the histories once a day
+  and starts at login; its page lists what it will do.
+- **Start at login keeps your answer.** Once you said whether aht starts
+  at login (the Windows installer asks; so do the switch in Settings and
+  the tray's own), Quick Setup keeps that answer. When it stays off, its
+  page says so, and a switch on that line (a box in aht's window) turns it
+  on right there. *Choose Each Step*'s *A few more* page has the same
+  switch.
+- **Never offered:** ~/Library (on Windows AppData and scoop), hidden
+  folders, and folders aht never looks into, such as `node_modules`,
+  `build` or `venv`. Projects there are listed as *outside these*: they
+  keep their history, but aht does not follow them when they move.
+- **When aht is not installed on this Mac yet** (the first time, and also
+  from **Run Setup Again…** or `aht://welcome`), setting up also installs
+  the watcher, the Claude Code hooks and the `aht` command; `aht uninstall`
+  undoes all of it.
+- **Choose Each Step:** the folders to watch (tick them, or add one), which
+  of the projects found to take on (one you told aht to forget is listed
+  unticked, marked *you told aht to forget it*), what to do when a folder
+  moves or is copied, and the extras: folder badges, backups, notices and
+  start at login. New projects are taken on as you work in them; there is
+  no setting for that.
+- **Stay up to date:** both end with a step of their own that asks whether
+  aht may tell you when a new version is out (**Yes, Tell Me** or **No
+  Thanks**; see *New versions*).
+- Nothing leaves your computer while aht sets up.
+- At the end the window shows *Getting started*: what lets aht do more,
+  such as iTerm2 and Remote Control.
+- **Not Now**, or closing the welcome window, sets nothing up. The welcome
+  then waits for the next version of the app; until then **Run Setup
+  Again…** under Settings → This Mac opens it.
+- To change any of it later: Settings (**Watched folders**, **When folders
+  change** and the rest), or **Run Setup Again…** under Settings → This Mac.
+  Run Setup Again (on a Mac also an `aht://setup` or `aht://welcome` link)
+  starts from your current settings: it keeps your rules for folders that
+  move, badges, backups and whether aht starts at login, and its page lists
+  what it will apply. Only a first setup before you answered (on a Mac,
+  also one that installs aht) switches start at login on by itself.
+
+**In the terminal:**
+
+- `aht setup` — show the folders aht would watch and the projects it found
+  there that it does not track yet, marking one you told aht to forget
+  (`--json` also lists the projects outside those folders, as `elsewhere`,
+  and gives a forgotten one `"forgotten": true`).
+- `aht setup --apply` — watch those folders and take on all those projects,
+  except ones you told aht to forget.
+- `aht setup --apply --roots ~/Desktop ~/Developer --adopt ~/Desktop/paper
+  --moves apply --badges off` — choose: the folders to watch, the projects
+  to take on (`--adopt` with nothing after it: none; a project you told aht
+  to forget is taken on again when you name it here), what to do when a
+  folder moves (`--copies` likewise), and the extras
+  (`--backups`, `--notifications`, `--update-check`, each `on` or `off`).
+  An option given twice adds up: `--adopt A --adopt B` is the same as
+  `--adopt A B`.
+- `aht adopt --only ~/Desktop/paper --apply` — take on one of the projects
+  found.
+
+## Getting started
+
+aht keeps your histories connected on its own once it is set up. A few
+steps let it do more on a Mac, mostly with iTerm2 and the Claude app on
+your phone. The first time aht starts while a main step is still to do, it
+opens its window with the list; after that the list is in **Settings →
+Getting started** (**Show the Steps…**). Each step says whether it is done
+and what it is for, with a button or a switch where aht can do it for you.
+
+> **Example.** You install aht on a new Mac. The list says iTerm2 is not
+> installed; **Get iTerm2…** opens its website. Once iTerm2 is there, the
+> list shows two more steps: switch on iTerm2's Python API, and let aht
+> control iTerm2 (**Ask Now**, then *OK*). You switch on **Start at login**
+> and **Sessions in the corner** in the same list.
+
+- **iTerm2.** aht works with any terminal, but session names from tab
+  titles, **Go to Tab**, *Restore my workspace* and a click in the corner
+  list that brings a session to the front need iTerm2 (free, from
+  iterm2.com).
+- **iTerm2's Python API** (iTerm2 → Settings → General → Magic → *Enable
+  Python API*). Without it, each session still takes its tab's title, but
+  a name you give a session does not reach its tab (see *Session names from
+  your iTerm2 tabs*).
+- **Permission to control iTerm2.** macOS asks once whether aht may control
+  iTerm2. **Ask Now** asks right away; it opens iTerm2 first, since macOS
+  asks only about an app that runs. If the answer was no, Go to Tab, clicks
+  in the corner list and Restore Workspace do nothing: **Open Privacy
+  Settings…** goes to System Settings → Privacy & Security → Automation,
+  where you can allow it.
+- **Start at login.** The corner list, the chimes and saving the iTerm2
+  layout work only while the app runs. Once you said no to it (with a
+  switch, or on Windows the installer's unticked box), the list shows it
+  as optional (○), not as a step still to do.
+- **Your sessions in the Claude app** (optional). Remote Control in Claude
+  Code (`/config` → *Enable Remote Control for all sessions*) puts every
+  session into the Claude app on your phone, under its tab's name.
+- **Sessions in the corner** and **Chimes** (optional; off until you switch
+  them on).
+- **iTerm2's blue dot** (optional). iTerm2 puts a blue dot on every tab that
+  printed something new. Once the corner list shows how each session is
+  doing, the dot tells you little; for calmer tabs, turn off iTerm2 →
+  Settings → Appearance → Tabs → *Show new-output indicator*.
+- **Tab colours for Restore Workspace** (optional). aht reads tab colours
+  from the window state iTerm2 keeps to bring its windows back. If iTerm2
+  keeps none, restored tabs open without their colours.
+
+aht reads these settings of iTerm2 and Claude Code but never changes them:
+the steps there are yours to take.
+
+**In the terminal:**
+
+- `aht getting-started` — the same list: ✓ done, ✗ a main step still to do,
+  ○ an optional one. `aht install` ends with it.
+- `open aht://getting-started` — open the list in the app.
+
+## On Windows and Linux
+
+aht's window on Windows and Linux is a page that aht serves to your own
+computer and shows in an app window of Edge or Chrome (or a tab of your
+browser when neither is there). It has the Mac window's tabs — Projects,
+Sessions, Search, Machines and Settings — and its dialogs: Show Sessions,
+What Changed, Undo a Session, the journal, project rules, secrets, loose
+ends, the report, Tidy Up, second opinion, the guide, the welcome window and
+Getting started.
+
+> **Example.** On Windows you click aht's icon in the taskbar's corner and
+> choose **Open aht…**. A window opens with your projects; you select
+> *paper*, then **More → Show Sessions…**, and **Continue** opens that
+> session in a console window.
+
+- **Only you get in:** the page is served at 127.0.0.1, so nothing outside
+  this computer reaches it. The tray opens it with a code that works once.
+  The code gives the page a cookie and a key of its own; the key comes
+  after the `#` in the address, a part no server ever receives. A second
+  window in the same browser uses the same cookie and key. Every request
+  that runs a command or reads the guide needs both (the page's own files
+  need only the cookie), so another website, or another server on this
+  computer (which gets the cookie too), cannot use it. On Linux the server
+  also refuses connections from other accounts of the computer. It runs
+  only the aht commands the window needs, and serves only its own page,
+  from where aht is installed.
+- **It stops by itself** 15 minutes after its last window closed; an open
+  window asks it once a minute, so it does not stop while you read. If it
+  stopped anyway, for example after an upgrade, the window says so: open it
+  again from aht's tray icon, or with `aht window`.
+- **Continue** and **Switch Agent** open a console window on Windows, in
+  the project's folder. On Linux they open the first terminal they find of
+  x-terminal-emulator, gnome-terminal, kgx, konsole, xfce4-terminal, tilix,
+  terminator, alacritty, kitty, foot and xterm. When none opens, the window
+  says *No terminal window opened* and shows the line to run by hand (for
+  Switch Agent, the summary is written already).
+- **Choosing a folder:** **Add Folder…**, Tidy Up's **Choose Its
+  Folder…** and **Choose…** under *Where each agent keeps its history*
+  open the system's folder chooser. **Cancel** just closes it; nothing more
+  is asked. On Windows the chooser is a tree with a *Folder:* field: type
+  or paste a full path there (in quotes or with `%VARIABLES%` too, also a
+  network path such as `\\server\share\…`) and press **OK**. Places that
+  are not folders on a disk, such as This PC, Libraries or Network, cannot
+  be chosen (**OK** greys out). A path with no folder behind it gets *That
+  is not a folder: There is no folder at …*, and nothing changes. On Linux
+  the chooser is zenity's or kdialog's. Only when no chooser can be shown
+  (Linux without zenity or kdialog, or with no desktop) does the window ask
+  you to type or paste the path.
+- **Notices** come from the tray: a session that waits for you, a long one
+  that is done, Claude's usage limit, a new version. On Windows a click on
+  one opens the window.
+- **Not on Windows:** handover, keeping in sync and the night shift need
+  ssh and rsync; the Machines tab says so.
+- **Start at login:** Settings → This computer → *Start aht's tray at
+  login* (on Windows the tray then also keeps the watcher running). On
+  Linux the switch can be turned on only when the tray can run there: it
+  needs PyGObject and an AppIndicator library. Until then *Getting started*
+  lists the packages to install (and, on GNOME, the AppIndicator Support
+  extension); an entry that is there already can still be switched off.
+  On Linux, when the path to Python holds a `%`, the login entry starts
+  the same Python by its real path, or `python3` on your PATH; when both
+  have a `%`, nothing can start at login from that Python.
+- **Getting started** lists what this computer still needs: start at
+  login (optional once you said no to it); on Linux the tray's packages,
+  notify-send for notices, and zenity or kdialog for questions (once one is
+  installed that step is done, even when you look over ssh); Edge or Chrome
+  to show the window as an app, and on Windows Windows Terminal (both
+  optional).
+- **Installing on Windows:** the installer from the releases page
+  (`aht-setup-…-windows-x64.exe`, or `-arm64` on an ARM computer) asks no
+  administrator password. It puts aht in your `AppData\Local\Programs\aht`,
+  sets up the hook and the watcher, which starts at sign-in, offers to put
+  `aht` on your PATH, and opens aht's window with the welcome. On the first
+  install only, it asks whether to *Show aht's tray icon when I sign in*;
+  the answer holds even over a tray entry that an earlier `aht install`
+  from the zip left (unchecked, only the watcher starts at sign-in), and
+  the welcome keeps it: unchecked, its Quick Setup shows the tray line
+  unticked and says why, and ticking it there turns it on. An
+  upgrade (the installer, **Upgrade**, Scoop, winget or `aht install`)
+  keeps what you set later in Settings or the tray. Start menu → **aht**
+  opens the window again. Settings → Apps → **aht** → *Uninstall* removes
+  it and leaves your history as it is.
+- **Installing on Linux:** from a checkout, `cd linux && ./install.sh`
+  (the `install.py` at the top of the checkout is the Mac's); the tray is
+  `python3 linux/tray.py`.
+
+**In the terminal:**
+
+- `aht window` — open aht's window (it starts the server when none runs).
+- `aht window --no-open` — only serve it and print the address to open.
+- `aht autostart on` — start aht's tray at login (`off` to stop; without
+  either, say whether it does). `on` or `off` also counts as your answer,
+  so the welcome keeps it, but only when the tray then starts at login, or
+  not, as you asked. On a Mac it changes nothing (the app has the switch).
+
+## New versions
+
+aht can tell you when a new version is out, show what's new and upgrade
+itself. Since that means asking GitHub, it is off until you say yes: in the
+*Stay up to date* step of the setup, or later under Settings → This Mac →
+*Tell me when a new version of aht is out*.
+
+> **Example.** One morning a notice says *aht 0.14.0 is out*. A click
+> shows what's new in 0.14.0. **Upgrade** opens a Terminal window that runs
+> `brew upgrade --cask aht`, sets aht up again and opens the new version.
+
+- **How:** once a day aht asks GitHub which release is the latest. GitHub
+  sees your computer's address and which version of aht you run; nothing
+  else is sent. With it off, aht asks only when you press **Check Now**.
+  When GitHub cannot be reached, Check Now says *GitHub did not answer*,
+  and why.
+- **Upgrade** goes the way you installed aht: Homebrew on a Mac (`brew
+  upgrade --cask aht`), Scoop on Windows (`scoop update aht`, then `aht
+  install --here`), each in a terminal window. Installed with aht's Windows
+  installer (or winget, which runs it), Upgrade downloads the new installer
+  from GitHub, checks it against the release's checksums and runs it; aht
+  starts again when it is done, and aht's window opens again if it was
+  open. A copy downloaded from the releases page opens that page instead
+  (**Open the Download Page**). On Linux, which installs from a checkout,
+  the button opens the release page too, and the update says what to do:
+  `git pull` in your copy of aht, then `linux/install.sh` again.
+- The ∞ menu says *aht 0.14.0 is out* until you upgrade, and leads to the
+  same page.
+
+**In the terminal:**
+
+- `aht update` — whether a newer version is known, from the last look.
+- `aht update --now` — ask GitHub now.
+- `aht update --upgrade` — upgrade the way aht was installed: Homebrew or
+  Scoop in a terminal window, aht's Windows installer downloaded, checked
+  and run; on Linux (a checkout) it says how to update and opens the
+  release page; otherwise, a Mac checkout too, the download page opens.
+- `aht config --set update_check=true` — look once a day.
 
 ## What uses tokens
 
@@ -80,6 +348,16 @@ and the agent starts empty there. aht notices and moves the history along.
   its own copy of the history (**Duplicate**) or starts fresh.
 - **Missed a move** because aht was not running? ∞ → **Find Moved Folders
   Now**.
+- **Only the case changed** (`proj` renamed to `Proj`, on a Mac or Windows,
+  where both name one folder): the folder keeps its history without a
+  question, unless Settings say to leave moves alone. Claude Code's start
+  hook does the same at the next session. A watched folder renamed only in
+  case (`~/code` to `~/Code` in Finder) is fine too: aht looks into watched
+  folders as they are spelled on disk, so its projects are not relinked
+  back and forth.
+- **Moved right after its first session**, before aht noted where Claude
+  Code keeps its history: the next session in the new place still brings
+  that history along.
 - **Settings → When folders change** decides whether aht asks, relinks on
   its own, or leaves things alone.
 
@@ -88,13 +366,14 @@ and the agent starts empty there. aht notices and moves the history along.
 - `aht reconcile` — look for folders that moved or were copied and say what
   it would relink, without changing anything.
 - `aht reconcile --notify` — act the way Settings say, asking where they
-  say "Ask me" (what **Find Moved Folders** does).
+  say "Ask me", and track new projects (what **Find Moved Folders** does).
 - `aht reconcile --apply` — act without asking: relink moved folders, give
-  copies their own history, track new projects.
+  copies their own history, track new projects. Neither takes on a project
+  you told aht to forget (see *Tidy up*).
 - `aht reconcile --only ~/Desktop/paper-2026 --apply` — look at that folder
   only.
 - `aht reconcile --notify --copies independent` — this once, treat copies
-  differently from Settings (`--moves` and `--news` work the same way).
+  differently from Settings (`--moves` works the same way).
 - `aht reconcile --clear-declines` — forget the moves you said no to, so aht
   asks about them again.
 - `aht projects` — list every folder aht tracks, with its agents and how
@@ -112,12 +391,15 @@ has history there.
 - Four agents or more: one disc with the number.
 - Grey ∞: tracked, but no agent has history there yet.
 - Blue →: the project is handed over to another machine right now.
-- A "+" in the middle: a git repository.
+- A "+" in the middle: a git repository. On Linux it is an emblem of its
+  own, a white disc with a dark "+", that the file manager places next to
+  the others.
 
 **In the terminal:**
 
 - `aht icons --refresh` — redraw the badges of every folder, for example
-  after you turned a kind of badge off.
+  after you turned a kind of badge off, or when a badge on Windows shows a
+  plain drawn folder instead of Windows' own.
 
 ## Backups, and bringing a session back
 
@@ -273,7 +555,10 @@ piece of work that took a while.
   been so, under the name the Claude app shows. The sessions working now
   come first, the one that started last on top; the rest follow by when
   they last worked. *Done* stays until you click that session there, which
-  brings its tab to the front, or until it starts working again. Drag the
+  brings its iTerm2 tab to the front, or until it starts working again.
+  When a click cannot do that (the session is not in an iTerm2 tab, or
+  macOS does not let aht control iTerm2), a line in the list says why for
+  a few seconds. Drag the
   list anywhere you like (it stays there); a double-click on its top line
   puts it back in the corner. Drag its left or right edge to make it wider
   or narrower (a name that does not fit ends in "…"), and its bottom edge
@@ -376,6 +661,44 @@ last answer, open to-dos and the files changed last.
 - `aht config --set informed_sessions=true` — turn it on.
 - `aht config --set informed_sessions=false` — turn it off again.
 
+## A project's sessions
+
+Every session in a project folder, so you can go back to any of them, not
+only the latest. **Projects → More → Show Sessions…**
+
+> **Example.** In *paper* you branched the session twice (`/branch` in
+> Claude Code): once to try a shorter abstract, once to turn the related
+> work into a table. Show Sessions lists the main session and, indented
+> under it, the two branches, each with the time it branched. **Continue**
+> on *Shorter abstract* opens that branch in a new terminal window, where
+> it stopped.
+
+- **Order:** the latest work first. A session counts as recent when it or
+  one of its branches was used lately, so a branch you worked on today
+  keeps the session it came from near the top.
+- **Branches** sit under the session they came from, a branch of a branch
+  one step further in. Each shows when it was branched and when it was
+  last active; other sessions show when they started. A branch whose
+  origin is gone (deleted, for example by Claude Code's clean-up of old
+  sessions) is listed with the others and says so.
+- **Open now:** a session that runs right now says *open now* and offers
+  **Go to Tab** instead of Continue, so it is not opened twice.
+- **Titles** are the names `/resume` shows: the one the session was given
+  (`/rename`, or its tab's title), else Claude's own. The short code on the
+  right is the start of the session's id; point at it to see it whole.
+  With more than six sessions, a field filters them by title.
+- Kimi Code and Codex sessions in the folder are listed too.
+- While the project is handed over, take it back before you continue a
+  session here.
+- No tokens.
+
+**In the terminal:**
+
+- `aht sessions ~/Desktop/paper` — the same list, branches indented.
+- `aht resume-here ~/Desktop/paper --session <id>` — continue that session
+  in a new terminal window (add `--agent kimi` or `--agent codex` for
+  theirs; `--print` only shows the command).
+
 ## What did a session change?
 
 Every file an agent edited in a Claude Code session, from how it looked
@@ -473,6 +796,8 @@ Hand a project's work from one agent to another, without losing the thread.
 
 - The earlier session stays as it was. The summary names the command that
   goes back to it.
+- When no terminal window can be opened, the summary is written all the
+  same, and aht shows the line to run in a terminal yourself.
 - Not possible while an agent is still working in that project.
 - Uses tokens: the new agent reads the summary. It happens only when you
   press the button.
@@ -501,7 +826,9 @@ Hand a project's work from one agent to another, without losing the thread.
 - `aht switch ~/Desktop/paper --to claude --session <id> --apply` —
   continue that session rather than the latest one of the other agent.
 - `aht switch ~/Desktop/paper --to kimi --no-window --apply` — prepare
-  everything and print the command, without opening a window.
+  everything and print the command, without opening a window. (Without
+  `--no-window`, when no window opens, it ends with an error that holds the
+  command.)
 
 ## A second opinion (uses tokens, off by default)
 
@@ -553,6 +880,8 @@ written for one agent are invisible to the others.
 
 - When both files exist and say different things, you choose: keep
   CLAUDE.md's, keep AGENTS.md's, or keep both (one after the other).
+- The sheet shows each file's size and whether `CLAUDE.md` already brings
+  in `AGENTS.md`.
 - The earlier files are kept in `~/.aht/rules-backups`.
 
 **In the terminal:**
@@ -678,21 +1007,62 @@ with suggestions. **Projects → Tidy Up…** appears when there is something.
   conversations as text (the last 40 messages of each session, keys
   masked), so you can decide; **Show in Finder** opens the history's own
   folder.
+- **On Windows and Linux** aht's window has no **Remove…** button yet:
+  `aht tidy --remove-history` (below) moves such a history to the Recycle
+  Bin on Windows, where *Restore* brings it back, and on Linux to the
+  desktop's Trash, which your file manager restores from.
+- **On Windows only to the Recycle Bin.** When a history cannot go there,
+  aht changes nothing and says why, already in the dry run: the drive has
+  no Recycle Bin (a network share, a `\\server\share` path, a `subst`
+  drive), that drive's bin is set to remove files at once (*Don't move
+  files to the Recycle Bin* in the bin's Properties, or the policy *Do not
+  move deleted files to the Recycle Bin*), or the history is bigger than
+  that bin holds. You can still delete it yourself. Should Windows delete
+  one for good all the same, aht says *deleted for good, since it could
+  not go to the Recycle Bin*.
+- **A link** in Claude's history folder (a link or junction to a folder
+  elsewhere) is listed and can be read (`aht tidy --show`), but it is not
+  a history folder: aht leaves it alone. Tidy Up has no **Remove…** for it
+  (on a Mac it reads *Claude Code, a link to a folder elsewhere*, with
+  **Read…**, **Show in Finder** and **Choose Folder…**).
+- **Forget sticks.** A forgotten project's folder, if it is still there,
+  keeps its `.aht/.project-id`, but aht's scans no longer take it on again.
+  It comes back only with a new Claude Code session in that folder,
+  `aht tag`, `aht adopt` (Adopt's question says you told aht to forget
+  it), or when you tick it while setting up again: **Run Setup Again**
+  lists it unticked, marked *you told aht to forget it*, and Quick Setup
+  leaves it out and says so. `aht forget --remove-marker` also deletes the
+  marker.
+- On a Mac and on Windows, histories are matched to their projects without
+  regard to case, as the disk does: a tracked project's history is never
+  listed as a history without its folder, and `aht tidy --remove-history`
+  refuses it.
+- Sessions you started in your home folder itself are not a project, so
+  Tidy Up does not list them (nor do `aht doctor` and `aht orphans`).
+- A folder listed twice, even under two spellings of its path (on a Mac or
+  Windows, where `~/Code` and `~/code` are one folder), shows in `aht tidy`
+  and `aht doctor`; `aht prune --apply` drops the extra entry.
 
 **In the terminal:**
 
 - `aht tidy` — list gone folders and histories without a folder, with
-  suggestions.
+  suggestions (`--json` marks a link with `"link": true`).
 - `aht tidy --relink <id> --to ~/Desktop/Projects/debug --apply` — connect
   a gone project's history to the folder where it is now.
 - `aht forget --uuid <id> --apply` — stop tracking a folder you deleted on
-  purpose; its history stays.
+  purpose; its history stays, and the next scan does not take it on again.
 - `aht tidy --show=<name or id>` — a listed history as text to read (the
   name or the project id is in the `aht tidy` list).
 - `aht tidy --remove-history=<name> --apply` — move a history without a
-  folder to the Trash (the name is in the `aht tidy` list; write it with
-  `=`, because it begins with a dash). Never one that a tracked project owns
-  or an open session uses; the daily backups keep it as well.
+  folder to the Trash (on Windows to the Recycle Bin, and only there; see
+  above). The name is one from the `aht tidy` list, written exactly as
+  there, with `=`, because it begins with a dash. A link from that list
+  gets *it is a link to a folder elsewhere, not a history folder: aht
+  leaves it alone*; anything else, such as a path, another spelling or a
+  file, gets *there is no such history*; `--show` also reads only a name
+  or id from that list. Never one that a tracked project owns or an open
+  session uses; the daily backups keep it as well. When aht refuses, it
+  prints the name and why, never what it would have done.
 
 ## Hand a project over to another machine
 
@@ -705,7 +1075,9 @@ the laptop or your phone.
 1. **Machines → Add a machine.** Pick one that aht found on your Tailscale
    network or in `~/.ssh/config`, check the `user@host`, and press **Check
    and Add**. aht lists what that machine still lacks, each with the command
-   that fixes it and a **Copy** button.
+   that fixes it and a **Copy** button. aht looks for machines when you open
+   the Machines tab (*Looking on your network and in ~/.ssh/config…*);
+   **Look Again** looks once more, for example after you switched one on.
 2. On that machine, create your home folder's path once, because a project
    keeps its exact path there:
    `sudo mkdir -p /Users/you && sudo chown $USER /Users/you`
@@ -802,8 +1174,10 @@ in the morning.
 - This Mac has to be awake at both times (a Mac asleep at the start time
   skips that night shift and tells you). If the session is still working
   at the take-back time, aht waits and tries again every five minutes.
-- **Cancel** stops a planned night shift; one that has started stays on the
-  other machine until you take it back.
+- **Cancel** stops a planned night shift. A night shift that has started
+  can be cancelled too, after a question (**Keep It** or **Cancel the
+  Shift**): aht then does not take the project back in the morning, and it
+  stays on the other machine until you take it back (**Take Back…**).
 
 **In the terminal:**
 
@@ -949,8 +1323,9 @@ glance when you steer it from the phone.
   first.
 - The links: `aht://search?q=parser`, `aht://sessions`, `aht://loose-ends`,
   `aht://report`, `aht://project?path=~/Desktop/paper` (and in the same form
-  `changes`, `journal` and `undo`), `aht://switch?path=~/Desktop/paper&to=kimi`
-  and `aht://resume?path=~/Desktop/paper&session=<id>`.
+  `changes`, `journal` and `undo`), `aht://switch?path=~/Desktop/paper&to=kimi`,
+  `aht://resume?path=~/Desktop/paper&session=<id>` and
+  `aht://getting-started`.
 - For everything else, the Shortcuts action *Run Shell Script* can call the
   `aht` command.
 
@@ -971,18 +1346,19 @@ a part opens its section; the **?** at the top opens the whole guide.
   **Sync Now** (copies every project you keep in sync to that machine now);
   **Find Moved Folders**; **Look Back** with *Loose Ends…* and *Report…*;
   **Tidy Up (n)…** when something needs a decision (with **Choose
-  Folder…**, **Reconnect**, **Forget** and, for a history without a folder,
-  **Remove…**).
+  Folder…**, **Reconnect**, **Forget** and, for a history without a folder
+  that is not a link, **Remove…**).
 - **The project list:** *Where* (here, handed over, missing, a session open,
   working or waiting for you), *In sync* (when the kept copy was last
   synced), *Last used*, *Agents* (whose history it has).
 - **Under the list, for the selected project:** **Hand Over…** or, while it
   is away, **Take Back…** and **Open Session**; **Keep in sync**;
   **Continue Session** (opens the latest session in a new terminal window);
-  **Switch Agent**; **More**, with *What Changed…*, *Undo a Session…*,
-  *Journal*, *AI-Use Statement*, *Share a Session…*, *Project Rules…*,
-  *Check for Secrets*, *Second Opinion…*, *Night Shift…* and *Show in
-  Finder*. Notes about the project, such as the usage limit, appear below.
+  **Switch Agent**; **More**, with *Show Sessions…*, *What Changed…*,
+  *Undo a Session…*, *Journal*, *AI-Use Statement*, *Share a Session…*,
+  *Project Rules…*, *Check for Secrets*, *Second Opinion…*, *Night Shift…*
+  and *Show in Finder*. Notes about the project, such as the usage limit,
+  appear below.
 - **Sessions tab:** the open sessions here and on your other machines,
   with each Claude session's name and **Rename…**, **Go to Tab**, and for
   one worth a look **Restart in Its Tab…** or **End It…**; at the top
@@ -993,14 +1369,24 @@ a part opens its section; the **?** at the top opens the whole guide.
 - **Machines tab:** the machines you added, with **Sync** (keep every
   project in sync with it, or stop), **Check**, **Use for Handover** and
   **Remove…**; **Add Another…**; machines aht found on your
-  Tailscale network or in `~/.ssh/config`, each with **Add…**.
+  Tailscale network or in `~/.ssh/config`, each with **Add…**, and **Look
+  Again**.
 - **Settings tab:** see *Settings* below.
 - **The bottom line:** what aht is doing right now (with a progress bar for
   transfers) and its version.
 
 ## Settings
 
-- **When folders change:** ask, relink automatically, or leave alone.
+- **Getting started:** the main steps still to do, and **Show the Steps…**
+  for the whole list (see *Getting started*).
+- **Watched folders:** the folders aht watches; **Add Folder…** (the
+  system's folder chooser; **Cancel** just closes it) and **Remove** (see
+  *Setting up*). Before aht is installed on this Mac (the
+  app alone, or Homebrew's `aht` before `aht install`), they still save the
+  folders but no watcher follows them yet, and the app says so.
+- **When folders change:** what to do when a folder moves or is copied:
+  ask, relink automatically, or leave alone. New projects are always taken
+  on as you work in them.
 - **Histories:** notifications, automatic backups, **Back Up Now**,
   **Check All for Secrets…**
 - **Notices:** waiting for you, done; also to your phone.
@@ -1010,6 +1396,8 @@ a part opens its section; the **?** at the top opens the whole guide.
   whether Remote Control is on for every session.
 - **Safety nets (no tokens):** a copy of the folder at each session start,
   the usage-limit notice, Spotlight.
+- **Restore my workspace:** how often the iTerm2 layout is saved, and how
+  many are kept.
 - **Uses tokens (off until you turn it on):** informed sessions, the offer
   of another agent at the usage limit, second opinions, the night shift.
 - **Folder badges:** on or off, per kind; **Refresh All**, **Clear All…**
@@ -1018,14 +1406,18 @@ a part opens its section; the **?** at the top opens the whole guide.
 - **Backups on another machine:** which machine keeps a copy; **Copy Now**.
 - **Where each agent keeps its history:** **Choose…** when aht did not find
   an agent's history folder itself; **Reset All to Defaults**.
-- **This Mac:** **Start aht in the menu bar at login**; **Open session
-  windows in** (iTerm or Terminal; automatic picks iTerm when it is
-  installed); **Adopt This Mac's
-  Projects…** (tracks every folder that already has agent history);
+- **This Mac:** **Start aht in the menu bar at login**; *Tell me when a new
+  version of aht is out* and **Check Now** (see *New versions*); **Open
+  session windows in** (iTerm or Terminal; automatic picks iTerm when it is
+  installed); **Run Setup Again…** (the welcome window, see *Setting up*);
+  **Adopt This Mac's Projects…** (tracks every folder that already has
+  agent history; its question names any you told aht to forget, since
+  adopting takes them on again);
   **Reinstall or Update aht…** (sets aht up again from the app, for example
-  after an update); **Restart Watcher**; **Run Diagnostics**; **Open Log**;
-  **Open Data Folder** (`~/.aht`); **Edit Config File** (every setting
-  below, as text).
+  after an update); **Restart Watcher** (before aht is installed it starts
+  nothing and says the watcher is not installed yet); **Run Diagnostics**;
+  **Open Log**; **Open Data Folder** (`~/.aht`); **Edit Config File**
+  (every setting below, as text).
 
 **In the terminal:**
 
@@ -1046,8 +1438,9 @@ all of them can be set with `aht config --set name=value` and put back with
   `decline` (never, and remember), `ignore`.
 - `copy_policy` (ask) — a folder was copied: `ask`, `duplicate` (the copy
   gets its own copy of the history), `independent` (a fresh start), `ignore`.
-- `new_policy` (apply) — a new project turned up: `apply` (track it), `ask`,
-  `ignore`.
+- A new project has no setting: aht always takes it on as you work in it.
+  An older config's `new_policy` is ignored, and `aht config --set
+  new_policy=…` says it is no longer used.
 - `watch_roots` (Desktop, Documents and the usual project folders) — the
   folders aht watches; change them with `aht roots`.
 - `scan_max_depth` (7) — how many folder levels below a watched folder aht
@@ -1075,7 +1468,9 @@ all of them can be set with `aht config --set name=value` and put back with
 - `icons_enabled` (on), `icons_agent` (on), `icons_git` (on) — badges at
   all, the agent discs, the git "+".
 - `linux_emblem_method`, `linux_agent_emblem`, `linux_git_emblem` — the
-  same on Linux.
+  same on Linux: how the emblems are set, and an emblem of your icon theme
+  to use instead of aht's own (the git one's default is `aht-git`, aht's
+  own "+").
 
 **Backups**
 
@@ -1103,6 +1498,9 @@ all of them can be set with `aht config --set name=value` and put back with
   Terminal) — the app that opens session windows; Settings → This Mac →
   *Open session windows in*. Another app name works only if that app runs
   the `.command` file aht hands it.
+- `update_check` (off) — once a day, ask GitHub whether a new version of aht
+  is out (see *New versions*); Settings → This Mac → *Tell me when a new
+  version of aht is out*.
 
 **Notices**
 
@@ -1161,7 +1559,9 @@ and act only with `--apply`; `install` and `uninstall` act at once.
 - `aht tag ~/Desktop/paper --apply` — start tracking a folder now, instead
   of waiting for aht to find it.
 - `aht adopt --apply` — track every folder under the watched folders that
-  already has agent history (the window's *Adopt This Mac's Projects…*).
+  already has agent history (the window's *Adopt This Mac's Projects…*),
+  also one you told aht to forget; the list marks those *(you told aht to
+  forget it)*.
 - `aht orphans` — list Claude histories that no tracked folder owns;
   `--match` suggests the folder each one belongs to.
 - `aht suggest-matches --store <name>` — the likeliest folders for one such
@@ -1170,11 +1570,18 @@ and act only with `--apply`; `install` and `uninstall` act at once.
   history to the folder.
 - `aht prune --apply` — stop tracking folders that are gone (their histories
   stay) and drop entries listed twice.
-- `aht forget ~/Desktop/paper --apply` — stop tracking a folder;
-  `--remove-marker` also removes its `.aht/.project-id`.
+- `aht forget ~/Desktop/paper --apply` — stop tracking a folder. It keeps
+  its `.aht/.project-id`, but aht's scans no longer take it on again (a
+  new Claude Code session there, `aht tag`, `aht adopt` or ticking it when
+  you set up again does); `--remove-marker` also removes the marker.
 - `aht roots` — the folders aht watches; `--add ~/code` and `--remove …`
   change them.
-- `aht reload` — make the watcher read its settings again.
+- `aht reload` — make the watcher read its settings again. On a Mac
+  before aht is installed (aht.app before setup, Homebrew's `aht` before
+  `aht install`), it changes no watcher, and neither do `aht roots
+  --add`/`--remove`, `aht config --set watch_roots=…` or `aht setup --apply
+  --roots …`: they say *the watcher is not installed yet — run 'aht
+  install' to set it up*. The folders are saved all the same.
 - `aht backends` — where each agent keeps its history on this Mac;
   `--set-root claude=/path` and `--clear-root claude` change it.
 - `aht keys ~/Desktop/paper` — under which name each agent files the
@@ -1197,6 +1604,10 @@ and act only with `--apply`; `install` and `uninstall` act at once.
   index up to date, `--no-update` searches without doing that first;
   `aht mirror --run --due` syncs only the copies that are due;
   `aht logs --lines 200` is the long form of `-n 200`.
+- An option that takes several values adds up when you give it twice:
+  `--adopt A --adopt B` is the same as `--adopt A B`, and
+  `aht config --set backup_keep=20 --set notify_finished=false` sets
+  both.
 - Options such as `--json`, `--quiet`, `--status-file`, `backup --auto`,
   `second-opinion --run`, `night-shift --step` and `tab-names --refresh` are
   what the app and aht's background jobs use; `--json` gives any command's

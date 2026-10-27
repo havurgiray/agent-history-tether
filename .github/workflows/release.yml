@@ -49,19 +49,57 @@ jobs:
         env:
           AHT_SMOKE_NATIVE: "1"
         run: |
-          sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht.exe"
-          sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht.exe"
-          sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht.exe"
+          sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht/aht.exe"
+          sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht/aht.exe"
+          sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht/aht.exe"
       - name: package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force pkg | Out-Null
-          Copy-Item windows/dist/aht.exe, windows/dist/aht-tray.exe, LICENSE, README.md pkg/
+          Copy-Item -Recurse windows/dist/aht/* pkg/
+          Copy-Item LICENSE, README.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath "aht-${{ steps.v.outputs.version }}-windows-${{ matrix.arch }}.zip"
       - uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}
           path: aht-*-windows-*.zip
+          if-no-files-found: error
+
+  installer:
+    name: Windows installers
+    needs: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: windows-*
+          path: zips
+          merge-multiple: true
+      - name: build both installers
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path aht.py -Pattern '^VERSION = "(.*)"').Matches[0].Groups[1].Value
+          "AHT_VERSION=$v" >> $env:GITHUB_ENV
+          $iscc = windows/iscc.ps1
+          if (-not $iscc) { exit 1 }
+          python windows/src/make_icons.py windows/app.ico
+          foreach ($arch in "x64", "arm64") {
+            Expand-Archive "zips/aht-$v-windows-$arch.zip" "build/$arch"
+            & $iscc /Q "/DAppVersion=$v" "/DArch=$arch" "/DSrc=$PWD\build\$arch" windows/aht.iss
+            if ($LASTEXITCODE) { exit 1 }
+          }
+          Get-ChildItem windows/installer
+      - name: install, check and remove the x64 installer
+        shell: pwsh
+        run: windows/tests/installer_smoke.ps1 -Installer "windows/installer/aht-setup-$env:AHT_VERSION-windows-x64.exe" -Version $env:AHT_VERSION
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installers
+          path: windows/installer/aht-setup-*.exe
           if-no-files-found: error
 
   macos:
@@ -79,7 +117,7 @@ jobs:
 
   publish:
     name: publish the release
-    needs: [windows, macos]
+    needs: [windows, installer, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

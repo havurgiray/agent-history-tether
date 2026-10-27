@@ -13,7 +13,7 @@ pause/resume it via its named stop event.
 Menu parity with the macOS menu bar app: status (tracked/missing/orphans/
 hook), reconcile now, pause/resume, recent projects, adopt (dry-run +
 confirmation first, like macOS), a Settings submenu for every shared policy
-(move/copy/new, notifications), a Badges submenu (toggles, refresh, clear),
+(move/copy, notifications), a Badges submenu (toggles, refresh, clear),
 diagnostics, log access, autostart toggle.  The macOS app's full windows
 (Projects browser, Orphan matcher, Preferences panes) have no menu
 equivalent — those flows live in the CLI (`aht projects`,
@@ -61,6 +61,7 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 WM_NULL, WM_DESTROY, WM_TIMER, WM_APP = 0x0, 0x2, 0x113, 0x8000
 WM_LBUTTONUP, WM_RBUTTONUP = 0x202, 0x205
 WM_TRAY = WM_APP + 1
+NIN_BALLOONUSERCLICK = 0x0405                   # WM_USER + 5: a click on a notice
 MF_STRING, MF_GRAYED, MF_CHECKED, MF_POPUP, MF_SEPARATOR = 0x0, 0x1, 0x8, 0x10, 0x800
 TPM_RIGHTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD = 0x2, 0x80, 0x100
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
@@ -123,6 +124,46 @@ gdi32.CreateBitmap.restype = wintypes.HBITMAP
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
                                       ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+# every call that takes or returns a handle says so: without argtypes ctypes
+# passes a Python int as a 32-bit C int, and handles on 64-bit Windows (seen
+# on ARM64) do not fit ("OverflowError: int too long to convert" at start)
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+gdi32.DeleteObject.restype = wintypes.BOOL
+user32.CreateIconIndirect.argtypes = [ctypes.POINTER(ICONINFO)]
+user32.CreatePopupMenu.argtypes = []
+user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                   wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                   wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.DestroyMenu.restype = wintypes.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                               wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = LRESULT
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
+user32.PostQuitMessage.restype = None
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
 
 CORAL = (217, 119, 87)          # the tray mark when watching
 GRAY = (140, 140, 140)          # paused
@@ -208,12 +249,74 @@ def refresh(force=False):
     shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
 
+def act_open_window():
+    """aht's window: a page aht.exe serves to this computer only, in an app
+    window of Edge or Chrome."""
+    subprocess.Popen(winlayer.self_cmd("window"), creationflags=winlayer.CREATE_NO_WINDOW,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+NOTICING = [False]
+NOTICE_QUEUE = aht.aht_home() / "run" / "tray-notices.jsonl"
+TRAY_ALIVE = aht.aht_home() / "run" / "tray-alive"
+QUEUE_AT = [0]
+
+
+def check_notices():
+    """A session that waits for you, a long one that is done, Claude's usage
+    limit, a new version: the core finds them and, while the tray runs,
+    hands them to it (see pump_notices)."""
+    if NOTICING[0]:
+        return
+    NOTICING[0] = True
+
+    def work():
+        try:
+            _run_cli("notices", "--quiet")
+        except Exception:
+            pass
+        finally:
+            NOTICING[0] = False
+    _in_thread(work)
+
+
+def pump_notices():
+    """Show what the core handed over (winlayer.notify_user) as balloons; the
+    file's mtime of tray-alive tells the core the tray is here to show them."""
+    try:
+        TRAY_ALIVE.parent.mkdir(parents=True, exist_ok=True)
+        TRAY_ALIVE.touch()
+        size = NOTICE_QUEUE.stat().st_size
+    except OSError:
+        return
+    if size < QUEUE_AT[0]:
+        QUEUE_AT[0] = 0                          # the file was started anew
+    if size == QUEUE_AT[0]:
+        return
+    with open(NOTICE_QUEUE, "rb") as fh:
+        fh.seek(QUEUE_AT[0])
+        data = fh.read()
+    QUEUE_AT[0] = size
+    for line in data.decode("utf-8", "replace").splitlines()[-3:]:
+        try:
+            n = json.loads(line)
+        except ValueError:
+            continue
+        balloon(n.get("title") or "aht", n.get("message") or "")
+
+
 def balloon(title, msg):
+    # the previous balloon goes first (an empty text takes it away): Windows
+    # shows a new one only then, not as an update of one it already showed
+    clear = _nid(NIF_INFO)
+    shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(clear))
     nid = _nid(NIF_INFO)
     nid.szInfo = str(msg)[:255]
     nid.szInfoTitle = str(title)[:63]
     nid.dwInfoFlags = NIIF_INFO
-    shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+    if not shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)):
+        aht.warn(f"TRAY Windows did not show the notice “{title}” "
+                 f"(error {ctypes.get_last_error()})")
 
 
 def msgbox(title, text, flags=MB_OK | MB_ICONINFORMATION):
@@ -291,10 +394,12 @@ def act_adopt():
                    f"{orphans} history folder(s) have no matching project — "
                    "reconnect those with:  aht orphans --match")
             return
+        note = aht.forgotten_note(d.get("planned", []))  # adopt takes those on again too
         text = (f"Start tracking {planned} existing project(s)?\n\n"
                 "Each folder gets a small marker file (.aht\\.project-id) "
                 "and a registry entry, so its histories follow it from now on.\n"
-                "Nothing is moved, renamed or deleted.")
+                "Nothing is moved, renamed or deleted."
+                + ("\n\n" + note if note else ""))
         if msgbox("Adopt existing projects",
                   text, MB_YESNO | MB_ICONQUESTION) != IDYES:
             return
@@ -458,7 +563,9 @@ def act_reset_backend_roots():
 
 def act_repair():
     def work():
-        r = _run_cli("install")
+        # as its installer or Scoop put it: where it is, with no second copy
+        r = _run_cli("install", "--here") if winlayer.installed_in_place() \
+            else _run_cli("install")
         balloon("Install", "Repair finished" if r.returncode == 0
                 else f"Repair failed (exit {r.returncode})")
         refresh(force=True)
@@ -466,12 +573,12 @@ def act_repair():
 
 
 def logon_is_tray():
-    v = winlayer._run_key_get() or ""
-    return "aht-tray" in v.lower()
+    return winlayer.is_tray_entry(winlayer._run_key_get())
 
 
 def act_toggle_logon():
-    if logon_is_tray():
+    want = not logon_is_tray()
+    if not want:
         exe = winlayer.self_cmd()[0] if FROZEN else ""
         winlayer._write_autostart(exe)
         balloon("Autostart", "The hidden watcher starts at logon (tray does not)")
@@ -483,6 +590,11 @@ def act_toggle_logon():
                 [sys.executable, str(Path(__file__).resolve())]))
         balloon("Autostart", "The tray starts at logon "
                 "(and keeps the watcher running)")
+    # an answer the welcome keeps, but only when the switch did what was asked
+    # (as `aht autostart`): from source the entry runs aht_tray.py, which
+    # is_tray_entry does not count as the tray
+    if logon_is_tray() == want:
+        aht.note_autostart_answer(want)
 
 
 def act_about():
@@ -536,7 +648,6 @@ MOVE_CHOICES = [("ask", "Ask me"), ("apply", "Relink automatically"),
 COPY_CHOICES = [("ask", "Ask me"), ("duplicate", "Duplicate the history"),
                 ("independent", "Fresh identity, no history"),
                 ("ignore", "Do nothing")]
-NEW_CHOICES = [("apply", "Start tracking it"), ("ignore", "Leave it alone")]
 
 
 def build_menu():
@@ -549,9 +660,7 @@ def build_menu():
     missing = sum(1 for e in projects.values()
                   if not os.path.isdir(e["real_path"]))
     try:
-        owned = aht.registered_history_dirs(reg)
-        orphans = sum(1 for d in aht._iter_history_dirs()
-                      if d.name not in owned)
+        orphans = len(aht.orphan_history_dirs(reg))   # as doctor, status, tidy
     except Exception:
         orphans = 0
     hook = winlayer.hook_installed()
@@ -590,6 +699,8 @@ def build_menu():
     add(root, line)
     sep(root)
 
+    add(root, "Open aht…", act_open_window)
+    sep(root)
     add(root, "Reconcile now", act_reconcile)
     add(root, "Pause watching" if running else "Resume watching",
         act_toggle_watch)
@@ -613,8 +724,7 @@ def build_menu():
     settings = submenu(root, "Settings")
     for key, choices, title, default in (
             ("move_policy", MOVE_CHOICES, "When a folder moves", "ask"),
-            ("copy_policy", COPY_CHOICES, "When a folder is copied", "ask"),
-            ("new_policy", NEW_CHOICES, "When a new project is found", "apply")):
+            ("copy_policy", COPY_CHOICES, "When a folder is copied", "ask")):
         cur = aht.cfg_get(key, default)
         m = submenu(settings, title)
         for val, label in choices:
@@ -655,7 +765,7 @@ def build_menu():
     sep(root)
 
     add(root, "Run diagnostics", act_doctor)
-    add(root, "Open data folder (.claude)", act_opendata)
+    add(root, "Open data folder (.aht)", act_opendata)
     add(root, "Open log", act_openlog)
     if not hook:
         add(root, "Repair install (hook + watcher)", act_repair)
@@ -692,9 +802,16 @@ def wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_TRAY:
         if lparam in (WM_RBUTTONUP, WM_LBUTTONUP):
             show_menu()
+        elif lparam == NIN_BALLOONUSERCLICK:      # a notice: open the window
+            act_open_window()
         return 0
     if msg == WM_TIMER:
-        refresh()
+        if wparam == 2:
+            check_notices()
+        elif wparam == 3:
+            pump_notices()
+        else:
+            refresh()
         return 0
     if msg == WM_TASKBARCREATED:        # explorer restarted: re-add the icon
         tray_add()
@@ -720,6 +837,7 @@ def selftest():
         for rgb in (CORAL, GRAY):
             px = mark_pixels(32, rgb)
             assert len(px) == 32 * 32 * 4 and any(px)
+            assert make_icon(rgb), "no icon was made"   # real GDI handles, as at start
         cmd = winlayer.self_cmd("version")
         assert cmd and cmd[0]
         aht.load_registry()
@@ -746,9 +864,13 @@ def main():
     if "--selftest" in sys.argv[1:]:
         return selftest()
     winlayer.activate()
+    if "--watch" in sys.argv[1:]:                 # the logon entry: the watcher
+        return winlayer.cmd_watch([])             # alone, with no window
+    if "--window" in sys.argv[1:]:                # the Start menu's aht: the
+        act_open_window()                         # window, and the tray below
 
     # single instance
-    kernel32.CreateMutexW(None, False, "Local\\aht-tray")
+    kernel32.CreateMutexW(None, False, winlayer.TRAY_MUTEX_NAME)
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         return 0
 
@@ -775,6 +897,13 @@ def main():
     tray_add()
     refresh(force=True)
     user32.SetTimer(HWND, 1, 15000, None)         # keep icon in sync
+    user32.SetTimer(HWND, 2, 30000, None)         # notices: look for them
+    try:                                          # … and show new ones only
+        QUEUE_AT[0] = NOTICE_QUEUE.stat().st_size
+    except OSError:
+        pass
+    pump_notices()
+    user32.SetTimer(HWND, 3, 3000, None)
 
     msg = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

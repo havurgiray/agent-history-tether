@@ -117,7 +117,9 @@ W config --set move_policy=apply --no-reload > /dev/null
 W config --json | grep -q '"move_policy": "apply"' || fail "config set/get"
 
 echo "== folder badges (desktop.ini + composited ico) =="
-env AHT_NO_ICONS= $RUN "$EXE" icons --refresh > /dev/null || fail "icons --refresh crashed"
+# the badges' icon cache goes to the sandbox too, not to this user's own
+env AHT_NO_ICONS= LOCALAPPDATA="$WT\\localappdata" $RUN "$EXE" icons --refresh > /dev/null ||
+  fail "icons --refresh crashed"
 [ -f "$T/roots/projC/.aht/aht-badge.ico" ] || fail "badge ico not written"
 [ -f "$T/roots/projC/desktop.ini" ] || fail "desktop.ini not written"
 grep -q 'aht-badge.ico' "$T/roots/projC/desktop.ini" || fail "IconResource not set"

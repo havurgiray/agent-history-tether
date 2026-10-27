@@ -1,7 +1,8 @@
 #!/bin/sh
 # Stop and remove aht's Linux automation. History is never touched.
 #   ./uninstall.sh                    stop the watcher + hook, keep the data
-#   ./uninstall.sh --remove-emblems   also clear file-manager emblems
+#   ./uninstall.sh --remove-icons     also clear file-manager emblems
+#                                     (--remove-emblems works too)
 #   ./uninstall.sh --purge            also remove markers + registry + config
 set -e
 SRC="$(cd "$(dirname "$0")" && pwd)"

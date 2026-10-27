@@ -28,6 +28,7 @@ the tray pauses/resumes it via systemctl.
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,9 @@ import aht  # noqa: E402
 CORAL = (217, 119, 87)
 GRAY = (140, 140, 140)
 ICON_ACTIVE, ICON_PAUSED = "aht-tray", "aht-tray-paused"
-AUTOSTART = Path.home() / ".config/autostart/aht-tray.desktop"
+# the same file the core's `aht autostart` writes (it honours AHT_AUTOSTART_DIR)
+AUTOSTART = (aht._linux_tray_autostart() if hasattr(aht, "_linux_tray_autostart")
+             else Path.home() / ".config/autostart/aht-tray.desktop")
 
 
 def run_cli(*args):
@@ -76,6 +79,40 @@ def notify(title, msg):
                            capture_output=True, timeout=10)
     except Exception:
         pass
+
+
+def desktop_arg(s) -> str:
+    """One argument of an Exec= line, in double quotes so that a path with a
+    space stays one argument.  The Desktop Entry spec reads Exec as a string
+    first (\\\\ is one backslash, \\n a newline) and then applies its quoting
+    rule (\\ " ` and $ take a backslash), so a literal $ is written \\\\$; a
+    literal % is %%.  The core and install.py write the same bytes."""
+    s = re.sub(r'([\\"`$])', r'\\\1', str(s))      # the Exec quoting rule: \ " ` $ get a backslash
+    s = s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")   # the string-value escapes
+    return '"' + s.replace("%", "%%") + '"'                 # %% for a literal %
+
+
+def exec_python(py) -> str:
+    """The Python an Exec= line starts.  GLib looks for the program before it
+    turns %% into %, so one whose path has a % never starts: then the same
+    Python by a path without one, if there is one.  The core and install.py
+    pick the same."""
+    py = str(py)
+    if "%" in py:
+        for other in (os.path.realpath(py), shutil.which("python3")):
+            if other and "%" not in other:
+                return other
+    return py
+
+
+def autostart_entry() -> str:
+    """The XDG autostart entry that starts this tray at login: byte for byte
+    what the core's tray_autostart writes, or `aht autostart on` would
+    rewrite it."""
+    return ("[Desktop Entry]\nType=Application\nName=aht tray\n"
+            f"Exec={desktop_arg(exec_python(sys.executable))} "
+            f"{desktop_arg(Path(__file__).resolve())}\n"
+            "X-GNOME-Autostart-enabled=true\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +179,11 @@ def watcher_state():
 
 
 def watcher_set(running: bool):
+    if running:
+        # a resume is asked for, not a crash loop: clear the unit's start
+        # limit first, as a reload does
+        subprocess.run(["systemctl", "--user", "reset-failed", aht.LINUX_UNIT],
+                       capture_output=True, timeout=20)
     subprocess.run(["systemctl", "--user",
                     "start" if running else "stop", aht.LINUX_UNIT],
                    capture_output=True, timeout=20)
@@ -162,6 +204,10 @@ class Tray:
         self.last_running = None
         self.refresh()
         GLib.timeout_add_seconds(15, self._tick)
+        # notices (a session waits for you, a long one is done, a new version):
+        # the core shows them with notify-send while the tray runs
+        self.noticing = False
+        GLib.timeout_add_seconds(30, self._notices)
 
     # ---- plumbing ----
 
@@ -174,6 +220,23 @@ class Tray:
     def _tick(self):
         self.refresh()
         return True
+
+    def _notices(self):
+        if not self.noticing:
+            self.noticing = True
+
+            def work():
+                try:
+                    run_cli("notices", "--quiet")
+                finally:
+                    self.noticing = False
+            self.in_thread(work)
+        return True
+
+    def act_open_window(self, _item=None):
+        """aht's window: a page the core serves to this computer only."""
+        subprocess.Popen([sys.executable, str(CORE), "window"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def refresh(self):
         running, _installed, _ = watcher_state()
@@ -243,6 +306,8 @@ class Tray:
         add(line)
         sep()
 
+        add("Open aht…", self.act_open_window)
+        sep()
         add("Reconcile now", self.act_reconcile)
         add("Pause watching" if running else "Resume watching",
             self.act_toggle_watch,
@@ -275,10 +340,7 @@ class Tray:
                  [("ask", "Ask me"), ("duplicate", "Duplicate the history"),
                   ("independent", "Fresh identity, no history"),
                   ("ignore", "Do nothing")],
-                 "When a folder is copied", "ask"),
-                ("new_policy",
-                 [("apply", "Start tracking it"), ("ignore", "Leave it alone")],
-                 "When a new project is found", "apply")):
+                 "When a folder is copied", "ask")):
             cur = aht.cfg_get(key, default)
             m = submenu(title, parent=settings)
             for val, label in choices:
@@ -317,7 +379,7 @@ class Tray:
         sep()
 
         add("Run diagnostics", self.act_doctor)
-        add("Open data folder (.claude)",
+        add("Open data folder (.aht)",
             self._open_path_cb(str(aht.aht_home())))
         add("Open log", self._open_path_cb(str(aht.log_path())))
         sep()
@@ -408,11 +470,13 @@ class Tray:
                         "orphan histor(ies) — reconnect those with:  "
                         "aht orphans --match")
             return
+        note = aht.forgotten_note(d.get("planned", []))      # adopt takes those on again too
         if not self.dialog(
                 f"Start tracking {planned} existing project(s)?",
                 "Each folder gets a marker file (.aht/.project-id) and a "
                 "registry entry so its history follows it from now on.\n"
-                "Nothing is moved, renamed or deleted.", question=True):
+                "Nothing is moved, renamed or deleted." + ("\n\n" + note if note else ""),
+                question=True):
             return
         def apply():
             r = run_cli("adopt", "--apply", "--json")
@@ -516,11 +580,11 @@ class Tray:
             notify("Autostart", "The tray no longer starts at logon")
         else:
             AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
-            AUTOSTART.write_text(
-                "[Desktop Entry]\nType=Application\nName=aht tray\n"
-                f"Exec={sys.executable} {Path(__file__).resolve()}\n"
-                "X-GNOME-Autostart-enabled=true\n")
+            AUTOSTART.write_text(autostart_entry())
             notify("Autostart", "The tray starts at logon")
+        # the switch answers the tray-at-login question, as `aht autostart
+        # on|off` does, so the welcome keeps it
+        aht.note_autostart_answer(AUTOSTART.is_file())
         self.refresh()
 
     def act_about(self, _item):

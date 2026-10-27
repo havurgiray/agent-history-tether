@@ -21,7 +21,8 @@
 ## The Mac app
 
 On macOS, aht is an app: an ∞ in the menu bar and a window.  On Linux and
-Windows it is a tray and the `aht` command (see *Platforms*).
+Windows it is a tray, aht's window (*Open aht…* in the tray) and the `aht`
+command (see *Platforms*).
 
 <p>
 <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/mac-projects-dark.png"><img src="docs/screenshots/mac-projects.png" width="49%" alt="The Projects tab: every tracked folder, where it is, when it was last used, and the actions for the selected one"></picture>
@@ -31,7 +32,8 @@ Windows it is a tray and the `aht` command (see *Platforms*).
 - **Projects** — every tracked folder: here or handed over, a session
   working or waiting for you, last used, which agents have history there.
   Select one to hand it over, keep it in sync, continue its session or
-  switch agent; **More** has What Changed, Undo a Session, Journal,
+  switch agent; **More** has Show Sessions (every session, branches under
+  the one they came from), What Changed, Undo a Session, Journal,
   AI-Use Statement, Share, Project Rules, Secrets, Second Opinion and Night
   Shift.  **Look Back** has Loose Ends and the Report; **Tidy Up** appears
   when something needs a decision.
@@ -81,32 +83,33 @@ instead of rewriting it.  Transcripts are never edited, and workspace
 
 aht runs on macOS, Linux and Windows.  The core — keeping every agent's
 history with its folder through moves and copies, backups, restore, badges,
-the tray — works on all three.  Since 0.11, new features are built and
-tested on macOS first: they reach Linux and Windows when they need nothing
-that only macOS has (the window, iTerm2, APFS copy-on-write, a LaunchAgent)
-and have been tested there.  Until then, many of them already work from the
-terminal.
+the tray — works on all three.  On a Mac the window is the app; on Windows
+and Linux it is **aht's window**, which the tray opens (*Open aht…*, or
+`aht window`): a page aht serves to your own computer only, shown in an app
+window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
+(iTerm2, Spotlight, Finder, APFS copy-on-write) stays there.
 
 | feature | macOS | Linux | Windows |
 |---|---|---|---|
 | Moves, copies and relinks; backups and restore; badges; the tray | ✓ | ✓ | ✓ |
 | The Claude Code hook (relinks when a session starts) | ✓ | ✓ | ✓ |
-| Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy | window and terminal | terminal | terminal |
-| Switch agent | window and terminal | terminal | terminal, untested |
-| Handover, keep in sync, backups on another machine | ✓ | terminal; also as the machine projects go to | — |
-| Notices (waiting for you, done, usage limit) | every 30 s; a click goes to the session | `aht notices` from your own timer | — |
-| Night shift | ✓ | needs `aht notices` on a timer | — |
+| The window: projects, sessions, search, settings, the guide | ✓ (the app) | ✓ (aht's window) | ✓ (aht's window) |
+| Welcome and setup, Getting started, new versions (opt-in) | ✓ | ✓ | ✓ |
+| Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy, show sessions | ✓ | ✓ | ✓ |
+| Switch agent, second opinion, informed sessions (use tokens; off by default) | ✓ | ✓ | ✓, not yet tried on Windows |
+| Handover, keep in sync, backups on another machine, night shift | ✓ | ✓ | — (needs ssh and rsync) |
+| Notices (waiting for you, done, usage limit, new version) | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
-| Second opinion, informed sessions (use tokens; off by default) | window and terminal | terminal | untested |
-| Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab, checkup | ✓ (iTerm2) | — | — |
-| The window, the session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut, in-app guide | ✓ | — | — |
+| Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab | ✓ (iTerm2) | — | — |
+| The session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
 
-"terminal" means the `aht` command does it; the guide gives each one.  CI
-runs the whole test suite on Linux and macOS for every push, and on real
+CI runs the whole test suite on Linux and macOS for every push, including
+aht's window (its doors, its page and a command through it), and on real
 Windows it smoke-tests the exe: moves and relinks, the watcher, backups,
-and search, journal, report, share, secrets, rules, loose ends, undo and
-tidy.  "untested" means the feature is in the Windows build but no test
-has run it on Windows yet.
+search, journal, report, share, secrets, rules, loose ends, undo, tidy,
+setup and the window.  The window's pages were tried in a browser on a
+Mac and on Windows 11; on Linux, `linux/tests/vm_check.sh` checks its server
+on a real machine.
 
 ## Install
 
@@ -116,15 +119,25 @@ or a package manager:
 
 | platform | how |
 |---|---|
-| **macOS 13+** (Apple Silicon and Intel) | `brew install --cask havurgiray/tap/aht` then `aht install` — or download `aht-<version>-macos-universal.zip`, drag `aht.app` to Applications, open it and accept *Set Up aht on This Mac* (first launch: see the note on unsigned builds below).  The app **is** the menu bar tray (look for the ∞ icon) and carries the core, the FSEvents watcher and the badge tool prebuilt, so no compiler is needed |
-| **Windows 11** (x64 and ARM64) | `scoop bucket add havurgiray https://github.com/havurgiray/scoop-bucket` then `scoop install aht` — or `winget install havurgiray.aht` — or download the zip for your CPU; then `aht install` (registers the logon watcher + hook; `aht-tray.exe` is the tray) |
+| **macOS 13+** (Apple Silicon and Intel) | `brew install --cask havurgiray/tap/aht` then `aht install` — or download `aht-<version>-macos-universal.zip`, drag `aht.app` to Applications, open it and choose *Quick Setup* in the welcome window (*Not Now* or closing it waits for the next version of the app; Settings → This Mac → *Run Setup Again…* has it meanwhile; first launch: see the note on unsigned builds below).  The app **is** the menu bar tray (look for the ∞ icon) and carries the core, the FSEvents watcher and the badge tool prebuilt, so no compiler is needed |
+| **Windows 11** (x64 and ARM64) | download and run `aht-setup-<version>-windows-<x64\|arm64>.exe`: it installs aht for you (no admin prompt), sets up the hook and the watcher (which starts at sign-in), puts `aht` on your PATH, asks whether to show the tray when you sign in (on the first install only, and the answer holds, also in the welcome's Quick Setup and over a tray entry an earlier `aht install` from the zip left: unchecked, only the watcher starts at sign-in, until you tick it in the welcome or turn it on later; an upgrade keeps what you set later), starts the tray and opens aht's window; Start menu → *aht* opens it again, Settings → Apps removes it (your history stays) — or `winget install havurgiray.aht` (the same installer) — or `scoop bucket add havurgiray https://github.com/havurgiray/scoop-bucket` then `scoop install aht`, or the zip for your CPU, then `aht install` |
 | **Linux** | from a checkout: `cd linux && ./install.sh` (systemd user watcher + hook + `aht`); tray: `python3 linux/tray.py` (needs PyGObject + AppIndicator; GNOME also needs the AppIndicator shell extension) |
+
+**On a Mac, aht works best with [iTerm2](https://iterm2.com):** session
+names from tab titles, Go to Tab, Restore Workspace and clicks in the
+session corner need it.  After installing, the app lists what is left to
+switch on, with a button or a switch for each step (Settings → *Getting
+started*; `aht getting-started` in a terminal, which `aht install` also
+prints).
 
 **From source** (needs Python 3.9+): clone the repo, then `./install.sh` on
 macOS (compiles the Swift watcher, badge tool and tray — needs the Xcode
-Command Line Tools), `cd linux && ./install.sh` on Linux, or build the exes
-on Windows (`windows\build_windows.bat`; or `windows/build.sh` via
-Docker+Wine from macOS/Linux) and run `aht.exe install`.
+Command Line Tools), `cd linux && ./install.sh` on Linux (the `install.py`
+at the top of the repo is the Mac's and stops elsewhere; `aht install` from
+a Linux checkout runs `linux/install.sh`), or build the exes on Windows
+(`windows\build_windows.bat`, which also builds the installer when Inno
+Setup 6 is there; or `windows/build.sh` via Docker+Wine from macOS/Linux)
+and run `aht.exe install`.
 
 > **Unsigned builds.**  The macOS app is ad-hoc signed (no Apple Developer
 > ID yet), so Gatekeeper blocks the first launch of a downloaded *or*
@@ -165,19 +178,20 @@ command.  No agent's history is EVER touched by uninstalling:
 | platform | command |
 |---|---|
 | macOS | `aht uninstall` (or `./uninstall.sh` from a checkout); then drag `aht.app` to the Trash, or `brew uninstall --cask aht` |
-| Linux | `cd linux && ./uninstall.sh` |
-| Windows | `aht uninstall` |
+| Linux | `aht uninstall` (or `cd linux && ./uninstall.sh` from a checkout) |
+| Windows | installed with the installer or winget: Settings → Apps → aht → *Uninstall* (it runs `aht uninstall` first), or `winget uninstall havurgiray.aht`; Scoop: `aht uninstall`, then `scoop uninstall aht`; the zip: `aht uninstall` |
 
-Optional flags (macOS/Windows; Linux clears emblems via the tray's *Clear all
-emblems* instead):
+Optional flags (every platform):
 
-- `--remove-icons` — also clear the folder badges aht applied
+- `--remove-icons` — also clear the folder badges aht applied (on Linux
+  also the emblem images aht drew in `~/.local/share/icons/hicolor`)
 - `--purge` — also remove the `.aht/.project-id` markers and aht's own
   registry/config under `~/.aht` (every agent's history still stays intact)
 
 Leftovers by design: the histories themselves, backups under `~/.aht/backups`
-(delete by hand if unwanted), and on Windows the exe files (delete them
-yourself — a running exe can't remove itself).
+(delete by hand if unwanted), and on Windows after a zip install the exe
+folder (delete it yourself — a running exe can't remove itself).
+[PRIVACY.md](PRIVACY.md#deleting-your-data) lists everything else aht kept.
 
 ## How it works
 
@@ -208,11 +222,13 @@ yourself — a running exe can't remove itself).
   tethered still gets its disc.  **1 agent** → one
   full-size disc (lower right); **2** → two smaller, side by side; **3** →
   three smaller still; **4 or more** → a single slate disc showing the
-  *count*.  The git "+" (center) is independent and unaffected.  Rendered as
-  composited folder icons on macOS/Windows (the icon files live inside the
-  folder, so they travel with it) and as generated per-agent emblems on Linux
-  (installed into the user icon theme; ≤3 emblems, a count emblem for 4+ —
-  KDE's `.directory` fallback can show only one icon).
+  *count*.  The git "+" (center on macOS and Windows) is independent and
+  unaffected.  Rendered as composited folder icons on macOS/Windows (the
+  icon files live inside the folder, so they travel with it) and as
+  generated emblems on Linux (installed into the user icon theme; ≤3 agent
+  emblems, a count emblem for 4+, and for git aht's own `aht-git` emblem, a
+  white disc with a dark "+", which the file manager places like the
+  others — KDE's `.directory` fallback can show only one icon).
 
 ## Handover: continue on another machine
 
@@ -354,7 +370,14 @@ behave the same.
 - **Share** — `aht share <folder> --format html`: a session as a page without
   keys, e-mail addresses or local paths.
 - **Tidy up** — `aht tidy`: gone folders and histories without a folder,
-  with suggestions; `--relink <id> --to <folder> --apply`.
+  with suggestions; `--relink <id> --to <folder> --apply`, or
+  `--remove-history=<name> --apply` to move such a history to the Trash
+  (the Recycle Bin on Windows), where it can be restored.  On Windows it
+  goes only to the Recycle Bin: when it cannot go there (the drive has no
+  bin, the bin deletes at once, or it is too big for the bin), aht changes
+  nothing and says why.  The name must be one from the `aht tidy` list,
+  written exactly as there; a link there (to a folder elsewhere) is listed
+  but never removed.
 - **Backups elsewhere** — `offsite_backup = <machine>` copies the history
   backups there after each daily pass; `aht backup --fetch-offsite` brings
   them back on a new Mac.
@@ -460,7 +483,7 @@ hook and all three trays — set with `aht config --set k=v`:
 `watch_roots`, `backends`, `backend_roots` (where each CLI's store lives,
 for installs not found automatically — set with `aht backends --set-root
 name=/path`, or point-and-click via every tray's *Settings ▸ Agent CLI
-Locations* page), `move_policy`, `copy_policy`, `new_policy`,
+Locations* page), `move_policy`, `copy_policy`,
 `notifications`, `icons_enabled` / `icons_agent` / `icons_git`,
 `debounce_seconds`, `scan_max_depth`, `extra_prune_dirs`, `dialog_timeout`,
 `watcher_owner`, `log_level`, `backup_enabled` / `backup_interval_hours` / `backup_keep` /
@@ -523,28 +546,85 @@ click: a row is selected first, a button pressed second.
 `search` · `board` · `switch` · `journal` · `rules` · `secrets` · `notices` ·
 `changes` · `report` · `share` · `tidy` · `limits` · `checkpoint` · `undo` ·
 `loose-ends` · `second-opinion` · `night-shift` · `sessions` · `tab-names` ·
-`workspace` · `goto` · `checkup` · `guide`.
+`workspace` · `goto` · `checkup` · `getting-started` · `setup` · `update` ·
+`window` · `autostart` · `guide`.
 Run `aht` with no arguments for the full help screen; every `--json` output is
 a stable machine interface (it's what the trays use).
 
 ## Tests
 
 ```sh
-tests/run_tests.sh        # multi-backend core + Linux layer (any OS, fake stores)
+tests/run_tests.sh        # multi-backend core + Linux layer + Windows badge cache (any OS, fake stores)
 windows/build.sh          # builds the exes, then runs the smoke suites under wine
 macos/build_app.sh --test # builds aht.app, then runs the tray's headless selftest
+windows/tests/vm_check.sh USER@HOST [-i KEY] [--installer]   # a real Windows machine over ssh
+linux/tests/vm_check.sh HOST                     # a real Linux machine over ssh
 ```
+
+`windows/tests/vm_check.sh` copies the checkout to a Windows machine
+(OpenSSH Server with key login, Python 3.12 and Git for Windows there,
+someone logged in at the desktop), builds both exes, runs the smoke suites
+and the badge-cache suite natively, then drives the desktop (leave the
+machine alone for about four minutes): the tray and its menu, aht's window
+(and that its API refuses calls without the window's key), setup, the folder
+picker (a real click on *Add Folder…* in the window, on a server about 110 s
+old; the chooser must come up in front, and the folder chosen in it, Music,
+must show in the welcome's list; **Cancel** in the chooser must ask nothing
+more and leave the page usable; a path put into the chooser's *Folder:*
+field must show in the welcome's list too), Continue's console (checked by
+the folder it runs in, and closed afterwards), notices and a click on one,
+Show in Explorer and start at login.  It keeps the display awake while it
+runs, and before the notice checks it closes any notice still on screen; one
+that stays up is reported as a failed check.  It brings back a report with
+screenshots and uses a throwaway aht home.  The machine's own aht tray and
+watcher, if they run, stop for the desktop check and start again after it,
+and the login entry is put back as it was.  `--installer` also builds aht's
+installer there (installing Inno Setup 6 when it is missing) and runs it for
+real: it first removes an aht that aht's installer put there before
+(silently, so the first install is a real one), installs aht, checks the
+hook, the sign-in entry, PATH, the Start menu and the Apps list, upgrades
+over it twice (start at login on, then off: each must stay as set), and
+removes aht again.  Then it installs once more as a first install with the
+tray box unchecked, over a tray entry an earlier `aht install` left, checks
+that only the watcher starts at sign-in, and removes aht again (an aht
+installed there before is gone afterwards). After each first install it also
+checks that aht recorded the tray box's answer, and at the end it puts
+`~/.aht/run/autostart.json` back as it was.
+
+`linux/tests/vm_check.sh` does the same for a Linux machine: it runs the
+suites there, then the desktop on an invisible screen of its own (the
+tray, aht's window server, setup, the folder picker and its **Cancel**,
+which must ask nothing more and leave no chooser, Continue's terminal,
+notices, Show in Files, start at login, and that nothing crashed).  Show in
+Files waits until README.md shows in the Files window before it takes the
+screenshot, and fails if it never does.  "Nothing crashed" looks for new
+reports in `/var/crash` and also reads apport's log (`/var/log/apport.log`,
+readable by the `adm` group), where apport notes every crash, even one it
+writes no report for.  The machine needs the packages the script lists
+(Xvfb, a window manager, a tray, xdotool, zenity, gir1.2-atspi-2.0 for
+AT-SPI, a terminal and a few more); it names any that are missing.  The
+desktop part runs with a throwaway home (HOME with its XDG config, data,
+cache and state folders, the autostart folder and aht's home) and a
+stand-in `systemctl`, so the desktop someone is logged in to, their home
+(autostart entries, settings, recent files, caches), their systemd user
+services and the machine's own `~/.aht` are not touched; a check, "the
+logged-in user's home was not touched", confirms that their autostart
+entries and systemd user units are as they were (changes elsewhere in
+`~/.config`, which a logged-in desktop makes all the time, do not count).
+At the end it stops what
+its private session bus started (the file indexer, gvfs, the accessibility
+bus), so nothing it started is left running.
 
 The suites fake every agent's store via `AHT_ROOT_*` env overrides, so they
 never touch real agent data; the handover tests use a folder that stands in
 for the other machine (they need rsync 3 and are skipped without it).  GitHub Actions runs the core suites (Linux and
 macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
-smoke-tests the Windows exe natively on every push; tagging `vX.Y.Z` builds
-the release artifacts (Windows x64 and ARM64 on native runners, the universal
+smoke-tests the Windows exes, the badge cache and the installer (x64 and ARM64) natively on every push; tagging `vX.Y.Z` builds
+the release artifacts (Windows installers and zips for x64 and ARM64, the universal
 macOS app) and publishes them with checksums.  Honest limits: the
 Cursor/OpenCode/Copilot layouts are implemented from best-effort knowledge and
-self-verify at runtime (they no-op rather than guess); the tray UIs need a
-real desktop of each OS for full exercise.
+self-verify at runtime (they no-op rather than guess); the Linux tray needs a
+real desktop for full exercise.
 
 ## Privacy
 

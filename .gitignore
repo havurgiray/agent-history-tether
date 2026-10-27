@@ -10,6 +10,7 @@ windows/*.exe
 windows/app.ico
 windows/dist/
 windows/build/
+windows/installer/
 macos/build/
 badge_icon
 watcher

@@ -28,6 +28,13 @@ else echo "cannot find aht.py (expected at $ROOT/aht.py)"; exit 1; fi
 
 mkdir -p "$DEST"
 cp "$CORE" "$DEST/aht.py"
+# aht's window (`aht window`, "Open aht…" in the tray): the server, its page
+# and the guide it shows
+CORE_DIR="$(dirname "$CORE")"
+for f in aht_web.py GUIDE.md; do
+  [ -f "$CORE_DIR/$f" ] && cp "$CORE_DIR/$f" "$DEST/$f"
+done
+if [ -d "$CORE_DIR/web" ]; then rm -rf "$DEST/web"; cp -R "$CORE_DIR/web" "$DEST/web"; fi
 for f in watcher.py tray.py install.py uninstall.py README.md; do
   [ -f "$SRC/$f" ] && cp "$SRC/$f" "$DEST/$f"
 done

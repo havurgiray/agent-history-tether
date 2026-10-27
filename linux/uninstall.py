@@ -6,11 +6,15 @@ Default: stop and remove the watcher service + the SessionStart hook + the
 touched, and neither are the folder markers or the registry unless you ask.
 
   python3 uninstall.py                  stop the automation, keep the data
-  python3 uninstall.py --remove-emblems also clear the file-manager emblems
+  python3 uninstall.py --remove-icons   also clear the file-manager emblems
+                                        and remove the emblem images aht drew
+                                        (--remove-emblems works too)
   python3 uninstall.py --purge          also remove markers + registry + config
 """
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,7 +28,7 @@ UNIT_NAME = "aht-watcher.service"
 UNIT = HOME / ".config/systemd/user" / UNIT_NAME
 AUTOSTART = HOME / ".config/autostart/aht-watcher.desktop"
 TRAY_AUTOSTART = HOME / ".config/autostart/aht-tray.desktop"
-HOOK_TAIL = "aht.py hook"
+HOOK_TAIL = "aht.py hook"         # with its quotes removed: install.py quotes the paths
 
 
 def stop_service():
@@ -58,7 +62,7 @@ def remove_hook():
     groups = []
     for g in s.get("hooks", {}).get("SessionStart", []):
         keep = [h for h in g.get("hooks", [])
-                if not h.get("command", "").endswith(HOOK_TAIL)]
+                if not h.get("command", "").replace("'", "").endswith(HOOK_TAIL)]
         if keep:
             g["hooks"] = keep
             groups.append(g)
@@ -104,6 +108,36 @@ def clear_emblems(aht):
     print(f"✓ cleared emblems on {n} folder(s)")
 
 
+# the emblem images the core draws into the user icon theme
+# (aht._ensure_linux_emblems), and its stamp; other icons there stay
+EMBLEM_FILE = re.compile(r"aht-(?:agent-[a-z]+|agents-\d+|git)\.png")
+
+
+def remove_emblem_files():
+    base = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "icons" / "hicolor"
+    n = 0
+    for size in ("24x24", "48x48"):
+        d = base / size / "emblems"
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            try:
+                if EMBLEM_FILE.fullmatch(f.name) and (f.is_file() or f.is_symlink()):
+                    f.unlink()
+                    n += 1
+            except OSError:
+                pass
+    for stamp in base.glob(".aht-emblems-v*"):
+        try:
+            stamp.unlink()
+        except OSError:
+            pass
+    if n and shutil.which("gtk-update-icon-cache"):
+        subprocess.run(["gtk-update-icon-cache", "-f", "-t", str(base)], capture_output=True)
+    if n:
+        print(f"✓ removed aht's emblem images ({n})")
+
+
 def purge(aht):
     reg = aht.load_registry()
     n = 0
@@ -129,7 +163,9 @@ def purge(aht):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--remove-emblems", action="store_true", dest="emblems")
+    # --remove-icons is what `aht uninstall` passes, as on macOS and Windows
+    ap.add_argument("--remove-icons", "--remove-emblems", action="store_true", dest="emblems",
+                    help="also clear the file-manager emblems")
     ap.add_argument("--purge", action="store_true",
                     help="also remove markers, registry and config")
     a = ap.parse_args()
@@ -139,6 +175,8 @@ if __name__ == "__main__":
     core = load_core()
     if core and a.emblems:
         clear_emblems(core)
+    if a.emblems:
+        remove_emblem_files()
     if core and a.purge:
         purge(core)
     if TOOLS.is_dir() and a.purge:

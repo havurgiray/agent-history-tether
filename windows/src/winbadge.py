@@ -8,14 +8,16 @@ Mechanism: Explorer shows a custom icon for a folder that carries a hidden
 provided the folder has its read-only attribute set (Windows' standard
 "this folder is customised" marker — it does not make the folder read-only
 for actual file operations).  The .ico is written INSIDE the folder at
-`.claude\\aht-badge.ico` and referenced RELATIVELY, so the badge travels
+`.aht\\aht-badge.ico` and referenced RELATIVELY, so the badge travels
 with the folder on move/copy exactly like the macOS icon file does.
 
 The icon itself is the real system folder icon (resolved via
 SHGetStockIconInfo and extracted at several sizes with PrivateExtractIconsW)
 composited with a coral agent sparkle (lower-right) and/or a dark git "+"
 (centre).  If the system icon cannot be extracted (unusual setups, wine),
-a drawn fallback folder is used so badging never hard-fails.
+a drawn fallback folder is used so badging never hard-fails; such a badge
+is never cached, so the next one made where the system icon can be read
+gets the real folder, and the folder's copy is replaced on its next refresh.
 
 Safety: a desktop.ini that already sets someone ELSE's icon (a user's custom
 IconResource/IconFile, OneDrive's, …) is left completely alone, and removal
@@ -27,6 +29,7 @@ the app icon with the same rasterisers); the Win32 calls live inside
 functions and only run on Windows.
 """
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -36,7 +39,7 @@ INK = (28, 26, 25)              # the git "+"
 SIZES = (16, 32, 48, 256)
 BADGE_REL = ".aht\\aht-badge.ico"
 ICON_LINE = f"IconResource={BADGE_REL},0"
-CACHE_VERSION = 4
+CACHE_VERSION = 5                # 5: no cached badge has a drawn folder
 
 FILE_ATTRIBUTE_READONLY = 0x01
 FILE_ATTRIBUTE_HIDDEN = 0x02
@@ -199,6 +202,25 @@ def system_folder_bgra(s):
                         ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wt.DWORD),
                         ("biClrImportant", wt.DWORD)]
 
+        # handles are 64-bit: undeclared, ctypes would pass and return them
+        # as 32-bit ints (a cut-off HDC, and this whole function failing)
+        shell32.SHGetStockIconInfo.argtypes = [ctypes.c_int, wt.UINT,
+                                               ctypes.POINTER(SHSTOCKICONINFO)]
+        shell32.SHGetStockIconInfo.restype = ctypes.c_long
+        user32.GetIconInfo.argtypes = [wt.HICON, ctypes.POINTER(ICONINFO)]
+        user32.GetIconInfo.restype = wt.BOOL
+        user32.GetDC.argtypes = [wt.HWND]
+        user32.GetDC.restype = wt.HDC
+        user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        user32.ReleaseDC.restype = ctypes.c_int
+        user32.DestroyIcon.argtypes = [wt.HICON]
+        user32.DestroyIcon.restype = wt.BOOL
+        gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p,
+                                    ctypes.c_void_p, wt.UINT]
+        gdi32.GetDIBits.restype = ctypes.c_int
+        gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+        gdi32.DeleteObject.restype = wt.BOOL
+
         info = SHSTOCKICONINFO()
         info.cbSize = ctypes.sizeof(info)
         SIID_FOLDER, SHGSI_ICONLOCATION = 3, 0
@@ -254,6 +276,7 @@ def system_folder_bgra(s):
 # --------------------------------------------------------------------------- #
 
 _MEM_CACHE = {}
+_OLD_CACHE_GONE = False
 
 
 def _cache_file(key):
@@ -261,6 +284,27 @@ def _cache_file(key):
     if not base:
         return None
     return Path(base) / "aht" / "icons" / f"badge-{key}-v{CACHE_VERSION}.ico"
+
+
+def _drop_old_cache(folder) -> None:
+    """Badges an older aht cached (a lower CACHE_VERSION) are never read
+    again: remove them, once per run.  Only files named as _cache_file names
+    them; a newer aht's, and one still open elsewhere, stay."""
+    global _OLD_CACHE_GONE
+    if _OLD_CACHE_GONE:
+        return
+    _OLD_CACHE_GONE = True
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        m = re.fullmatch(r"badge-.+-v(\d+)\.ico", name)
+        if m and int(m.group(1)) < CACHE_VERSION:
+            try:
+                os.unlink(os.path.join(folder, name))
+            except OSError:
+                pass
 
 
 def _blit_rgba(base, s, tile, d, cx, cy):
@@ -313,14 +357,20 @@ def badge_ico_bytes(marks):
     if key in _MEM_CACHE:
         return _MEM_CACHE[key]
     cf = _cache_file(key)
-    if cf is not None and cf.is_file():
-        data = cf.read_bytes()
-        _MEM_CACHE[key] = data
-        return data
+    if cf is not None:
+        _drop_old_cache(cf.parent)
+        if cf.is_file():
+            data = cf.read_bytes()
+            _MEM_CACHE[key] = data
+            return data
     import aht as _core
     images = {}
+    drawn = False                   # a size has the drawn folder
     for s in SIZES:
-        base = system_folder_bgra(s) or folder_fallback(s)
+        base = system_folder_bgra(s)
+        if base is None:
+            base = folder_fallback(s)
+            drawn = True
         if "git" in marks:
             composite(base, plus_overlay(s), s)
         if agents:
@@ -336,6 +386,9 @@ def badge_ico_bytes(marks):
                            d, 0.7775, 0.7775)
         images[s] = base
     data = ico_bytes(images)
+    if drawn:
+        # kept nowhere: the next badge of this kind tries the real folder again
+        return data
     _MEM_CACHE[key] = data
     if cf is not None:
         try:
@@ -459,6 +512,24 @@ def _shell_refresh(path) -> None:
         pass
 
 
+def _shell_image_changed(ico) -> None:
+    """Explorer keeps the picture of an icon file it has drawn: tell it the
+    one in `ico` changed (the file keeps its name), so it draws it again."""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.Shell_GetCachedImageIndexW.argtypes = [wt.LPCWSTR, ctypes.c_int, wt.UINT]
+        shell32.Shell_GetCachedImageIndexW.restype = ctypes.c_int
+        shell32.SHUpdateImageW.argtypes = [wt.LPCWSTR, ctypes.c_int, wt.UINT, ctypes.c_int]
+        shell32.SHUpdateImageW.restype = None
+        i = shell32.Shell_GetCachedImageIndexW(str(ico), 0, 0)
+        if i >= 0:
+            shell32.SHUpdateImageW(str(ico), 0, 0, i)
+    except Exception:
+        pass
+
+
 def apply(path, marks) -> str:
     """Set or clear the badge on one folder.  Returns a status string."""
     path = Path(path)
@@ -499,8 +570,12 @@ def apply(path, marks) -> str:
         return "foreign-icon-kept"         # never clobber a custom icon
     data = badge_ico_bytes(marks)
     ico.parent.mkdir(parents=True, exist_ok=True)
-    if not ico.is_file() or ico.read_bytes() != data:
+    had = ico.is_file()
+    # different bytes also replace a badge drawn with the stand-in folder
+    if not had or ico.read_bytes() != data:
         ico.write_bytes(data)
+        if had:
+            _shell_image_changed(ico)
     if merged != text:
         _write_ini(ini, merged, codec)
     a = _get_attrs(path)

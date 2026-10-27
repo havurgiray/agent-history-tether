@@ -85,8 +85,61 @@ def _default_watch_roots() -> list:
     roots = [str(home / "Desktop"), str(home / "Documents")]
     extra = [home / "code", home / "src", home / "source", home / "Projects",
              home / "projects", home / "dev", home / "workspace", home / "git"]
-    roots += [str(p) for p in extra if p.is_dir()]
-    return roots
+    roots += [_disk_case(str(p)) for p in extra if p.is_dir()]
+    return _distinct_dirs(roots)
+
+# a Mac and Windows ignore case: ~/code opens ~/Code there
+CASE_BLIND = IS_MAC or os.name == "nt"
+
+def _disk_case(p: str) -> str:
+    """`p` spelled as it is on disk.  Where case does not matter ~/code also
+    opens ~/Code, and realpath keeps the case it was given; the agents record
+    the name as it is on disk, so a path spelled otherwise names no project."""
+    if not CASE_BLIND or not os.path.isdir(p):
+        return p
+    parts = Path(p).parts
+    try:
+        cur = Path(parts[0])
+        for name in parts[1:]:
+            names = os.listdir(cur)
+            if name not in names:
+                name = next((n for n in names if n.casefold() == name.casefold()), name)
+            cur = cur / name
+        return str(cur)
+    except (OSError, IndexError):
+        return p
+
+def _folder_key(p: str):
+    """What tells folders apart: the file system's own id where there is
+    one, so two spellings of one folder are one folder."""
+    try:
+        st = os.stat(p)
+        return (st.st_dev, st.st_ino) if st.st_ino else os.path.normcase(os.path.realpath(p))
+    except OSError:
+        return p
+
+def _same_folder(a: str, b: str) -> bool:
+    """One folder under two spellings.  The file ids say so only where the
+    file system has them: some Windows drives give every file id 0, and
+    then the paths are compared, as _folder_key does."""
+    try:
+        s1, s2 = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    if s1.st_ino and s2.st_ino:
+        return s1.st_ino == s2.st_ino and s1.st_dev == s2.st_dev
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+def _distinct_dirs(paths: list) -> list:
+    """Each folder once: on a Mac or Windows ~/Projects and ~/projects are one
+    folder, which only the file system can tell."""
+    seen, out = set(), []
+    for p in paths:
+        key = _folder_key(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
 
 def _expand(p: str) -> str:
     return str(Path(os.path.expanduser(os.path.expandvars(p))))
@@ -99,7 +152,6 @@ CONFIG_DEFAULTS = {
                                      #    automatically — set via `aht backends`)
     "move_policy":      "ask",       # ask | apply | decline | ignore
     "copy_policy":      "ask",       # ask | duplicate | independent | ignore
-    "new_policy":       "apply",     # ask | apply | ignore
     "notifications":    True,
     "icons_enabled":    True,
     "icons_agent":      True,        # badge tethered projects
@@ -116,7 +168,7 @@ CONFIG_DEFAULTS = {
     "backup_dir":       None,        # None -> <aht_home>/backups
     "linux_emblem_method": "auto",   # auto | gio | kde | both | none
     "linux_agent_emblem": "emblem-favorite",
-    "linux_git_emblem":   "emblem-symbolic-link",
+    "linux_git_emblem":   "aht-git",     # aht's own "+", drawn like the agent emblems
     # handover: run a project on another machine of yours (see `aht remote`)
     "remotes":          None,        # {name: {"ssh": "user@host"}}
     "default_remote":   None,
@@ -137,6 +189,8 @@ CONFIG_DEFAULTS = {
     "report_areas":     None,        # {"Work": "~/Desktop/Workspace/Work", …}
     "hotkey":           "ctrl+opt+cmd+a",   # opens the search from anywhere
     "terminal_app":     None,        # macOS: app that opens a session window
+    "update_check":     False,       # once a day, ask GitHub for the latest
+                                     #   release (off until turned on)
     # before and after a session.  USES TOKENS = off until turned on
     "informed_sessions": False,      # USES TOKENS: a new session learns where the
                                      #   last one in its folder stopped
@@ -170,8 +224,11 @@ CONFIG_DEFAULTS = {
 POLICY_CHOICES = {
     "moves":  ("ask", "apply", "decline", "ignore"),
     "copies": ("ask", "duplicate", "independent", "ignore"),
-    "news":   ("ask", "apply", "ignore"),
 }
+
+# settings aht no longer has: an old config may still hold them, and they
+# are ignored and not shown; `config --set` says why and goes on
+RETIRED_KEYS = {"new_policy": "aht always takes on a new project"}
 
 def cfg_get(key, default=None):
     cfg = load_config()
@@ -274,6 +331,8 @@ def load_config() -> dict:
             data = json.load(fh)
         if not isinstance(data, dict):
             raise ValueError("config is not a JSON object")
+        for k in RETIRED_KEYS:
+            data.pop(k, None)
     except Exception as e:
         warn(f"config load failed ({e}); using defaults")
         data = {}
@@ -300,11 +359,12 @@ def ensure_config() -> dict:
 
 def watch_roots_config() -> list:
     env = os.environ.get("AHT_ROOTS")
-    if env:
-        return [_expand(p) for p in env.split(os.pathsep) if p]
+    if env:                         # each once, spelled as on disk, as below
+        return _distinct_dirs([_disk_case(os.path.realpath(_expand(p)))
+                               for p in env.split(os.pathsep) if p])
     roots = load_config().get("watch_roots")
-    if roots:
-        return [_expand(r) for r in roots if r]
+    if roots:                       # each once, spelled as on disk
+        return _distinct_dirs([_disk_case(_expand(r)) for r in roots if r])
     return _default_watch_roots()
 
 def default_roots() -> list:
@@ -1145,6 +1205,7 @@ REGISTRY_KEEP = ("mirror", "away", "returned", "extras")   # handover's records
 
 def _register(reg: dict, uid: str, real_path: str, stores=None) -> None:
     prev = reg["projects"].get(uid) or {}
+    (reg.get("forgotten") or {}).pop(uid, None)     # taken on again
     reg["projects"][uid] = {
         "real_path": real_path,
         "stores": stores if stores is not None
@@ -1163,10 +1224,23 @@ def _iter_history_dirs():
         if d.is_dir() and not d.name.startswith(STAGING_PREFIX):
             yield d
 
+def _fold_name(n: str) -> str:
+    """A file name as the file system compares it (a Mac and Windows ignore case)."""
+    return n.casefold() if CASE_BLIND else n
+
 def registered_history_dirs(reg: dict) -> set:
     return {(e.get("stores") or {}).get("claude")
             for e in reg["projects"].values()
             if (e.get("stores") or {}).get("claude")}
+
+def orphan_history_dirs(reg: dict) -> list:
+    """Claude stores no tracked folder owns.  The home folder's own store is
+    not one: the hook never tracks the home folder, it is no project.  Names
+    compare as the file system compares them: where case does not matter, a
+    store recorded as ...-code-App is the folder ...-code-app on disk."""
+    skip = {_fold_name(n) for n in registered_history_dirs(reg)}
+    skip.add(_fold_name(_key_claude(os.path.realpath(str(Path.home())))))
+    return [d for d in _iter_history_dirs() if _fold_name(d.name) not in skip]
 
 # --------------------------------------------------------------------------- #
 # Markers
@@ -1262,7 +1336,9 @@ def find_markers(roots: list) -> tuple:
     uuid_to_paths: dict = {}
     pruned = prune_dirs()
     for root in roots:
-        root = os.path.realpath(root)
+        # as spelled on disk: a Mac keeps the case a path is given in, and
+        # ~/code/app found under a root typed ~/code is no move of ~/Code/app
+        root = _disk_case(os.path.realpath(root))
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, _files in os.walk(root):
@@ -1278,8 +1354,9 @@ def find_markers(roots: list) -> tuple:
                         break
             if uid:
                 rp = os.path.realpath(dirpath)
+                if rp not in path_to_uuid:      # under two roots, one folder still
+                    uuid_to_paths.setdefault(uid, []).append(rp)
                 path_to_uuid[rp] = uid
-                uuid_to_paths.setdefault(uid, []).append(rp)
             dirnames[:] = [d for d in dirnames
                            if not d.startswith(".") and d not in pruned]
     return path_to_uuid, uuid_to_paths
@@ -1290,7 +1367,7 @@ def list_real_dirs(roots: list, max_depth: int = None) -> list:
     out = []
     pruned = prune_dirs()
     for root in roots:
-        root = os.path.realpath(root)
+        root = _disk_case(os.path.realpath(root))
         if not os.path.isdir(root):
             continue
         base_depth = os.path.normpath(root).rstrip(os.sep).count(os.sep)
@@ -1367,6 +1444,10 @@ AGENT_BADGES = {
     "away":     ((37, 99, 235),   "arrow"),
 }
 COUNT_BADGE_RGB = (51, 58, 66)
+# the git "+" on Linux, where a file manager shows emblems beside the folder,
+# not drawn into it: the agents' disc turned round (white, its ring and "+"
+# in the ink of the Mac and Windows "+"), so it passes for no agent
+GIT_BADGE = ((255, 255, 255), "plus", (28, 26, 25))
 
 _DIGITS = {
     "0": ("111", "101", "101", "101", "111"),
@@ -1385,10 +1466,14 @@ def _c01(v):
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
 def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
-    """d×d straight-alpha RGBA: a white-ringed disc for one agent (name) or a
-    slate count disc with the number drawn in (int, for 4+ agents)."""
+    """d×d straight-alpha RGBA: a white-ringed disc for one agent (name), a
+    slate count disc with the number drawn in (int, for 4+ agents), or the
+    git "+" ("git", dark on white)."""
+    ink = (255, 255, 255)           # the ring and the glyph
     if isinstance(agent_or_count, int):
         rgb, glyph = COUNT_BADGE_RGB, str(min(agent_or_count, 9))
+    elif agent_or_count == "git":
+        rgb, glyph, ink = GIT_BADGE
     else:
         rgb, glyph = AGENT_BADGES.get(str(agent_or_count), AGENT_BADGES["aht"])
     buf = bytearray(d * d * 4)
@@ -1405,7 +1490,7 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
             if a <= 0.0:
                 continue
             if dist > r_in:
-                col = (255, 255, 255)          # halo ring
+                col = ink                      # halo ring
             else:
                 col = rgb
                 g = 0.0
@@ -1422,6 +1507,10 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
                     g = _c01(d * 0.26 - (abs(dx) + abs(dy)) + 0.5)
                 elif glyph == "square":
                     g = _c01(d * 0.19 - max(abs(dx), abs(dy)) + 0.5)
+                elif glyph == "plus":                   # arms whole pixels wide
+                    arm, half = d * 0.25, d / 12.0
+                    g = max(_c01(min(half - abs(dy), arm - abs(dx)) + 0.5),
+                            _c01(min(half - abs(dx), arm - abs(dy)) + 0.5))
                 elif glyph == "bar":
                     if abs(dx) <= d * 0.22:
                         g = _c01(d * 0.075 - abs(dy) + 0.5)
@@ -1448,9 +1537,9 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
                     if 0 <= gy < 5 and 0 <= gx < 3 and rows[gy][gx] == "1":
                         g = 1.0
                 if g > 0.0:
-                    col = (int(col[0] + (255 - col[0]) * g),
-                           int(col[1] + (255 - col[1]) * g),
-                           int(col[2] + (255 - col[2]) * g))
+                    col = (int(col[0] + (ink[0] - col[0]) * g),
+                           int(col[1] + (ink[1] - col[1]) * g),
+                           int(col[2] + (ink[2] - col[2]) * g))
             i = (y * d + x) * 4
             buf[i], buf[i + 1], buf[i + 2] = col
             buf[i + 3] = int(a * 255)
@@ -1544,10 +1633,11 @@ def app_icon_png(d: int) -> bytes:
     return _png_bytes(d, infinity_rgba(d, (255, 255, 255), bg=APP_ICON_RGB,
                                        span=0.34, thickness=0.058))
 
-EMBLEM_VERSION = 3
+EMBLEM_VERSION = 4
 
 def _ensure_linux_emblems() -> bool:
-    """Generate the per-agent + count emblems into the user icon theme once.
+    """Generate the per-agent, count and git "+" emblems into the user icon
+    theme once.
     Best-effort: file managers that honour hicolor user emblems pick them up
     (a cache refresh / re-login may be needed the first time)."""
     base = _xdg_data() / "icons" / "hicolor"
@@ -1564,6 +1654,7 @@ def _ensure_linux_emblems() -> bool:
             for n in range(4, 10):
                 (d / f"aht-agents-{n}.png").write_bytes(
                     _png_bytes(sz, badge_disc_rgba(sz, n)))
+            (d / "aht-git.png").write_bytes(_png_bytes(sz, badge_disc_rgba(sz, "git")))
         stamp.write_text("ok\n")
         if _have("gtk-update-icon-cache"):
             subprocess.run(["gtk-update-icon-cache", "-f", "-t", str(base)],
@@ -1623,7 +1714,10 @@ def _badge_linux(path, marks) -> None:
                     embs.append(f"aht-agents-{min(len(agents), 9)}")
             else:
                 embs.append(str(cfg_get("linux_agent_emblem")))
-        if "git" in marks:
+        # aht's own "+", or the emblem the config names; none rather than
+        # one that means something else, should aht's not be there
+        if "git" in marks and ("linux_git_emblem" in load_config()
+                               or _ensure_linux_emblems()):
             embs.append(str(cfg_get("linux_git_emblem")))
         if embs:
             subprocess.run(["gio", "set", "-t", "stringv", str(path),
@@ -1658,7 +1752,7 @@ def find_git_repos(roots: list) -> set:
     found = set()
     pruned = prune_dirs()
     for root in roots:
-        root = os.path.realpath(root)
+        root = _disk_case(os.path.realpath(root))
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, _files in os.walk(root):
@@ -2064,6 +2158,12 @@ def safe_relink(old_store: Path, new_store: Path) -> str:
         return "no-history"
     if old_store.resolve() == new_store.resolve():
         return "same"
+    if new_store.exists() and _same_folder(old_store, new_store):
+        try:                        # one store, two spellings (a Mac ignores case):
+            os.rename(str(old_store), str(new_store))   # take the new one, merge nothing
+        except OSError:
+            pass
+        return "same"
     if not new_store.exists():
         new_store.parent.mkdir(parents=True, exist_ok=True)
         os.rename(str(old_store), str(new_store))
@@ -2094,12 +2194,14 @@ def safe_copy_tree(src: Path, dst: Path) -> str:
 def compute_actions(reg: dict, uuid_to_paths: dict,
                     respect_declines: bool = True) -> tuple:
     declined = reg.get("declined_moves", {}) if respect_declines else {}
+    # a project the user forgot keeps its marker: the scan leaves it alone
+    forgotten = reg.get("forgotten") or {}
     moves, copies, news, missing = [], [], [], []
     for uid, paths in uuid_to_paths.items():
         entry = reg["projects"].get(uid)
         if entry is None:
-            for p in paths:
-                news.append({"uuid": uid, "path": p})
+            if uid not in forgotten:
+                news += [{"uuid": uid, "path": p} for p in paths]
             continue
         old_path = entry["real_path"]
         if len(paths) == 1:
@@ -2111,7 +2213,8 @@ def compute_actions(reg: dict, uuid_to_paths: dict,
                 moves.append({"uuid": uid, "from": old_path, "to": p})
         else:
             originals = [p for p in paths
-                         if os.path.realpath(p) == os.path.realpath(old_path)]
+                         if os.path.realpath(p) == os.path.realpath(old_path)] \
+                or [p for p in paths if _same_folder(p, old_path)]
             keep = originals[0] if originals else paths[0]
             for p in paths:
                 if p == keep:
@@ -2163,7 +2266,7 @@ def _apply_dir_moves(b: DirBackend, reg: dict, moves: list) -> None:
         own = owner.get(tgt.name)
         if (tcount[tgt.name] > 1
                 or (own is not None and own != m["uuid"] and own not in moving)
-                or (own is None and tgt.exists()
+                or (own is None and tgt.exists() and not _same_folder(src, tgt)
                     and not (tgt.is_dir() and not _dir_has_entries(tgt)))):
             m["stores"][b.name] = "conflict-target-occupied"
             error(f"CONFLICT [{b.name}] {m['from']} -> {m['to']}: target "
@@ -2390,11 +2493,11 @@ def cmd_tag(args):
     print(f"   uuid={uid}  stores={sorted(stores) or '(none yet)'}")
     return 0
 
-def cmd_adopt(args):
+def plan_adoption(roots: list) -> tuple:
     """Store-corroborated adoption: a folder is planned when it carries a
     marker (current or legacy form) OR any backend provably has history for its
-    exact path.  ADD-ONLY."""
-    roots = args.roots or default_roots()
+    exact path.  -> (planned [{real, uuid, stores}], how many are tracked
+    already)."""
     reg = load_registry()
     known = {os.path.realpath(e["real_path"]) for e in reg["projects"].values()}
     path_to_uuid, _ = find_markers(roots)
@@ -2432,22 +2535,49 @@ def cmd_adopt(args):
             planned.append({"real": rp, "uuid": path_to_uuid.get(rp),
                             "stores": [b.name]})
             planned_paths.add(rp)
+    return planned, already
 
+def apply_adoption(planned: list) -> list:
+    """Track the planned folders (ADD-ONLY) -> what was adopted."""
     applied = []
-    if args.apply and planned:
-        with Lock():
-            reg = load_registry()
-            for a in planned:
-                uid = a["uuid"] or read_marker(a["real"]) or new_uuid()
-                write_marker(a["real"], uid)
-                _register(reg, uid, a["real"])
-                applied.append({**a, "uuid": uid})
-            save_registry(reg)
-        for a in applied:
-            apply_badge(a["real"], desired_marks(a["real"], True))
+    if not planned:
+        return applied
+    with Lock():
+        reg = load_registry()
+        for a in planned:
+            uid = a["uuid"] or read_marker(a["real"]) or new_uuid()
+            write_marker(a["real"], uid)
+            _register(reg, uid, a["real"])
+            applied.append({**a, "uuid": uid})
+        save_registry(reg)
+    for a in applied:
+        apply_badge(a["real"], desired_marks(a["real"], True))
+    return applied
 
-    owned = registered_history_dirs(load_registry())
-    orphans_claude = sum(1 for d in _iter_history_dirs() if d.name not in owned)
+def forgotten_note(planned: list) -> str:
+    """For the trays' adopt question: which of the `adopt --json` planned
+    folders the user told aht to forget ("" when none)."""
+    n, k = len(planned), sum(1 for a in planned if a.get("forgotten"))
+    if not k:
+        return ""
+    whom = ("it" if n == 1 else "all of them" if k == n
+            else "one of them" if k == 1 else f"{k} of them")
+    return f"You told aht to forget {whom}: adopting takes {'it' if k == 1 else 'them'} on again."
+
+def cmd_adopt(args):
+    roots = args.roots or default_roots()
+    planned, already = plan_adoption(roots)
+    if args.only:
+        only = {os.path.realpath(os.path.expanduser(p)) for p in args.only}
+        planned = [a for a in planned if a["real"] in only]
+    # adopt takes on a project the user told aht to forget, too (a way back);
+    # it says which ones, so a front-end can say so before it asks
+    forgot = load_registry().get("forgotten") or {}
+    for a in planned:
+        a["forgotten"] = bool(a["uuid"]) and a["uuid"] in forgot
+    applied = apply_adoption(planned) if args.apply else []
+
+    orphans_claude = len(orphan_history_dirs(load_registry()))
 
     result = {"applied": bool(args.apply), "planned": planned,
               "adopted": applied, "already": already,
@@ -2458,13 +2588,156 @@ def cmd_adopt(args):
         print(f"{'APPLIED' if args.apply else 'DRY-RUN'} adoption over roots: {roots}\n")
         print(f"  planned : {len(planned)}")
         for a in planned:
-            print(f"      + {a['real']}   [{', '.join(a['stores']) or 'marker only'}]")
+            print(f"      + {a['real']}   [{', '.join(a['stores']) or 'marker only'}]"
+                  + ("   (you told aht to forget it)" if a["forgotten"] else ""))
         print(f"  already tracked : {already}")
         print(f"  claude orphan histories (no matching folder) : {orphans_claude}")
         if orphans_claude:
             print("      match them with:  aht orphans --match")
         if args.apply:
             print(f"\n  APPLIED {len(applied)} adoption(s).")
+    return 0
+
+# ---- first-time setup: the folders to watch, the projects to take on -------- #
+
+SETUP_SWITCHES = {"badges": "icons_enabled", "backups": "backup_enabled",
+                  "notifications": "notifications", "update_check": "update_check"}
+
+def tilde_path(p: str) -> str:
+    home = str(Path.home())
+    return "~" + p[len(home):] if p == home or p.startswith(home + os.sep) else p
+
+def _setup_done_path() -> Path:
+    return aht_home() / "run" / "setup.json"
+
+def history_projects() -> list:
+    """The folders the agents' histories say they worked in, those that still
+    exist: Claude Code's stores and the session files of the agents that
+    record their folder."""
+    out = set()
+    for d in _iter_history_dirs():
+        cwd = transcript_cwd(d)
+        if cwd and os.path.isdir(cwd):
+            out.add(os.path.realpath(cwd))
+    for b in enabled_backends():
+        if b.kind != "files" or not b.available():
+            continue
+        try:
+            out.update(os.path.realpath(c) for c in b.collect_cwds() if os.path.isdir(c))
+        except Exception as e:
+            warn(f"SETUP {b.name}: {e}")
+    return sorted(out)
+
+def setup_plan(roots: list = None) -> dict:
+    """What a first-time setup offers: the folders to watch (the ones watched
+    now, the usual ones, and wherever the histories say projects live), the
+    projects found in the chosen ones, and the settings it asks about."""
+    # where case does not matter, ~/code/app is inside ~/Code
+    fold = (lambda p: os.path.normcase(p).casefold()) if CASE_BLIND else (lambda p: p)
+    under = lambda p, r: fold(p) == fold(r) or fold(p).startswith(fold(r).rstrip(os.sep) + os.sep)
+    home = os.path.realpath(str(Path.home()))
+    now = [os.path.realpath(r) for r in default_roots()]
+    chosen = [_disk_case(os.path.realpath(os.path.expanduser(r))) for r in roots] if roots else now
+    found = history_projects()
+    offer = _distinct_dirs(list(dict.fromkeys(now + chosen + [os.path.realpath(r)
+                                                              for r in _default_watch_roots()])))
+    # never offered: hidden folders, ones the scan skips, and where the system
+    # and the package managers keep their files (~/Library, ~/AppData, ~/scoop)
+    skip = {n.casefold() for n in prune_dirs() | {"Library", "AppData", "scoop"}}
+    for p in found:                     # a folder right under home that holds projects
+        if fold(p) == fold(home) or not under(p, home) or any(under(p, r) for r in offer):
+            continue
+        top = os.path.join(home, os.path.relpath(p, home).split(os.sep)[0])
+        name = os.path.basename(top)
+        try:                            # Windows: hidden or system by attribute
+            hidden = getattr(os.stat(top), "st_file_attributes", 0) & 0x6
+        except OSError:
+            hidden = 0
+        if not name.startswith(".") and name.casefold() not in skip and not hidden:
+            offer = _distinct_dirs(offer + [top])
+    planned, already = plan_adoption(chosen)
+    # a project the user told aht to forget is offered, but not ticked
+    forgot = load_registry().get("forgotten") or {}
+    is_in = lambda r, rs: any(fold(r) == fold(x) for x in rs)
+    return {"roots": [{"path": r, "watched": is_in(r, now), "chosen": is_in(r, chosen),
+                       "projects": sum(under(p, r) for p in found), "exists": os.path.isdir(r)}
+                      for r in offer],
+            "projects": [{"path": a["real"], "agents": [BY_NAME[x].label if x in BY_NAME
+                                                        else x for x in a["stores"]],
+                          "forgotten": bool(a["uuid"]) and a["uuid"] in forgot}
+                         for a in sorted(planned, key=lambda a: a["real"].lower())],
+            "tracked": already, "elsewhere": [p for p in found
+                                              if not any(under(p, r) for r in offer)
+                                              and fold(p) != fold(home)],
+            "policies": {"moves": cfg_get("move_policy"), "copies": cfg_get("copy_policy")},
+            "switches": {k: bool(cfg_get(v)) for k, v in SETUP_SWITCHES.items()},
+            "done": _setup_done_path().is_file()}
+
+def cmd_setup(args):
+    if args.dismiss:                    # "Not Now" in the window: do not offer it again
+        f = aht_home() / "run" / "setup-later"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(str(time.time()))
+        return 0
+    if not args.apply:
+        plan = setup_plan(args.roots)
+        if args.json:
+            print(json.dumps(plan, indent=2))
+            return 0
+        print("Folders to watch (✓ = chosen):")
+        for r in plan["roots"]:
+            print(f"  {'✓' if r['chosen'] else ' '} {tilde_path(r['path'])}"
+                  f"   {r['projects']} project(s) with history"
+                  + ("" if r["exists"] else "   (missing)"))
+        print(f"Projects found there that aht does not track yet: {len(plan['projects'])}")
+        for p in plan["projects"]:
+            print(f"    + {tilde_path(p['path'])}   [{', '.join(p['agents'])}]"
+                  + ("   (you told aht to forget it: only --adopt takes it on again)"
+                     if p["forgotten"] else ""))
+        print("Apply:  aht setup --apply [--roots FOLDER …] [--adopt PATH …] "
+              "[--moves ask|apply|…] [--badges on|off] …")
+        return 0
+    roots = [_disk_case(os.path.realpath(os.path.expanduser(r))) for r in args.roots or []]
+    with Lock():
+        cfg = load_config()
+        before = default_roots()
+        if args.roots is not None:
+            usual = [os.path.realpath(r) for r in _default_watch_roots()]
+            if sorted(roots) == sorted(usual) and not cfg.get("watch_roots"):
+                pass                    # the usual ones: they stay automatic
+            else:
+                cfg["watch_roots"] = roots
+        for flag, key in (("moves", "move_policy"), ("copies", "copy_policy")):
+            if getattr(args, flag):
+                cfg[key] = getattr(args, flag)
+        for flag, key in SETUP_SWITCHES.items():
+            if getattr(args, flag) is not None:
+                cfg[key] = getattr(args, flag) == "on"
+        save_config(cfg)
+    planned, _ = plan_adoption(default_roots())
+    if args.adopt is not None and args.adopt:
+        only = {os.path.realpath(os.path.expanduser(p)) for p in args.adopt}
+        planned = [a for a in planned if a["real"] in only]
+    elif args.adopt is not None:
+        planned = []                    # --adopt with nothing: take on none
+    else:                               # all, but not one the user told aht to forget
+        forgot = load_registry().get("forgotten") or {}
+        planned = [a for a in planned if not (a["uuid"] and a["uuid"] in forgot)]
+    adopted = apply_adoption(planned)
+    _setup_done_path().parent.mkdir(parents=True, exist_ok=True)
+    _write_json(_setup_done_path(), {"at": time.time(), "version": VERSION})
+    reloaded = False
+    if default_roots() != before:       # with --json only the JSON goes to stdout
+        reloaded = _reload_quietly(args.json)
+    res = {"roots": default_roots(), "adopted": [a["real"] for a in adopted],
+           "policies": {"moves": cfg_get("move_policy"), "copies": cfg_get("copy_policy")},
+           "switches": {k: bool(cfg_get(v)) for k, v in SETUP_SWITCHES.items()},
+           "watcher_reloaded": reloaded}
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"watching: {', '.join(tilde_path(r) for r in res['roots'])}")
+        print(f"took on {len(adopted)} project(s)")
     return 0
 
 def score_candidates(store_dir: str, roots: list, limit: int = 8,
@@ -2537,15 +2810,17 @@ def cmd_bind(args):
     return 0
 
 def resolve_policies(args) -> dict:
+    """What reconcile does with moves and copies.  A new project is always
+    taken on when it acts (--apply, --notify); --news is still accepted
+    from old scripts and changes nothing."""
     if getattr(args, "apply", False):
-        pol = {"moves": "apply", "copies": "duplicate", "news": "apply"}
+        pol = {"moves": "apply", "copies": "duplicate"}
     elif getattr(args, "notify", False):
         pol = {"moves":  cfg_get("move_policy", "ask"),
-               "copies": cfg_get("copy_policy", "ask"),
-               "news":   cfg_get("new_policy", "apply")}
+               "copies": cfg_get("copy_policy", "ask")}
     else:
-        pol = {"moves": "ignore", "copies": "ignore", "news": "ignore"}
-    for k in ("moves", "copies", "news"):
+        pol = {"moves": "ignore", "copies": "ignore"}
+    for k in ("moves", "copies"):
         v = getattr(args, k, None)
         if v:
             pol[k] = v
@@ -2557,11 +2832,14 @@ def resolve_policies(args) -> dict:
 def _selected(items: list, key: str, only: list) -> list:
     if not only:
         return items
-    want = {os.path.realpath(p) for p in only}
+    want = {_disk_case(os.path.realpath(p)) for p in only}   # the scan's spelling
     return [i for i in items if os.path.realpath(i[key]) in want]
 
 def cmd_reconcile(args):
-    roots = args.roots or default_roots()
+    # the watcher passes the roots its LaunchAgent was written with, which a
+    # case-only rename in Finder leaves spelled the old way
+    roots = _distinct_dirs([_disk_case(os.path.realpath(r))
+                            for r in args.roots or default_roots()])
     pol = resolve_policies(args)
     only = getattr(args, "only", None) or []
 
@@ -2582,6 +2860,12 @@ def cmd_reconcile(args):
     moves = _selected(moves, "to", only)
     copies = _selected(copies, "copy_path", only)
     news = _selected(news, "path", only)
+    # the same folder under another spelling (a Mac ignores case: ~/code is
+    # ~/Code) moved nowhere: relinked without asking, as the hook does
+    respell = lambda ms: [m for m in ms if _same_folder(m["from"], m["to"])]
+    respelled = respell(moves)
+    moves = [m for m in moves if m not in respelled]
+    do_respell = pol["moves"] != "ignore"
 
     def _stores_tag(uid, keyed_path):
         # stores are keyed by the path the project had when they were written,
@@ -2613,17 +2897,15 @@ def cmd_reconcile(args):
                          % (len(copies), names, extra),
                          ["Skip", "Duplicate"], "Duplicate")
         pol["copies"] = {"Duplicate": "duplicate", "Skip": "independent"}.get(ans, "ignore")
-    if pol["news"] == "ask":
-        pol["news"] = "apply"
 
     do_moves = pol["moves"] == "apply"
     decline_moves = list(moves) if pol["moves"] == "decline" else []
     do_copies = pol["copies"] in ("duplicate", "independent")
-    do_news = pol["news"] == "apply"
+    do_news = bool(args.apply) or getattr(args, "notify", False)
 
     conflicts, applied_moves, applied_copies = [], [], []
     if ((do_moves and moves) or (do_copies and copies)
-            or (do_news and news) or decline_moves):
+            or (do_news and news) or decline_moves or (do_respell and respelled)):
         with Lock():
             reg = load_registry()
             _, uuid_to_paths = find_markers(roots)
@@ -2632,9 +2914,13 @@ def cmd_reconcile(args):
             moves2 = _selected(moves2, "to", only)
             copies2 = _selected(copies2, "copy_path", only)
             news2 = _selected(news2, "path", only)
+            same2 = respell(moves2)
+            moves2 = [m for m in moves2 if m not in same2]
+            same2 = same2 if do_respell else []
             declined = reg.setdefault("declined_moves", {})
-            if do_moves:
-                applied_moves, conflicts = apply_moves(reg, moves2)
+            if do_moves or same2:
+                applied_moves, conflicts = apply_moves(
+                    reg, (moves2 if do_moves else []) + same2)
                 for m in applied_moves:
                     declined.pop(m["uuid"], None)
             for m in decline_moves:
@@ -2657,13 +2943,18 @@ def cmd_reconcile(args):
         with Lock():
             reg = load_registry()
             age = time.time() - float(reg.get("git_scan_at", 0) or 0)
-            if bool(args.apply) or age > GIT_SCAN_INTERVAL:
+            # Linux: new emblems (a version of aht's own "+") go on every git
+            # folder once, not only on the ones that changed
+            redo = IS_LINUX and reg.get("git_emblems") != EMBLEM_VERSION
+            if bool(args.apply) or age > GIT_SCAN_INTERVAL or redo:
                 tpaths = tethered_paths(reg)
                 git_now = find_git_repos(roots)
                 git_prev = set(reg.get("git_repos", []))
                 changed_git = [(p, desired_marks(p, p in tpaths))
-                               for p in (git_now ^ git_prev)]
+                               for p in ((git_now | git_prev) if redo else (git_now ^ git_prev))]
                 reg["git_scan_at"] = time.time()
+                if redo:
+                    reg["git_emblems"] = EMBLEM_VERSION
                 if git_now != git_prev:
                     reg["git_repos"] = sorted(git_now)
                 save_registry(reg)
@@ -2712,6 +3003,7 @@ def cmd_reconcile(args):
                       "applied_moves": applied_moves,
                       "applied_copies": applied_copies,
                       "moves": moves, "copies": copies, "news": news,
+                      "respelled": respelled,
                       "missing": missing, "conflicts": conflicts},
                      indent=2, default=str))
     return 0
@@ -2748,7 +3040,9 @@ def cmd_hook(args):
                 entry = reg["projects"][uid]
                 old_real = os.path.realpath(entry["real_path"])
                 if old_real != cwd:
-                    if os.path.isdir(old_real):
+                    # the old path still there is a copy, unless it is this
+                    # very folder spelled otherwise (a Mac ignores case)
+                    if os.path.isdir(old_real) and not _same_folder(old_real, cwd):
                         nu = new_uuid()
                         write_marker(cwd, nu)
                         _register(reg, nu, cwd)
@@ -2756,6 +3050,11 @@ def cmd_hook(args):
                         log(f"HOOK copy-detected, new id for {cwd}")
                     else:
                         old_store = (entry.get("stores") or {}).get("claude")
+                        if not (old_store and (croot / old_store).is_dir()):
+                            # not recorded yet (moved after its first session,
+                            # before anything looked): it is under the old path
+                            hit = claude_backend().find(old_real)
+                            old_store = hit[1].name if hit else old_store
                         st = "no-old-store"
                         if old_store:
                             st = safe_relink(croot / old_store, croot / new_name)
@@ -2793,6 +3092,13 @@ def cmd_hook(args):
                     _register(reg, nu, cwd)
                     save_registry(reg)
                     log(f"HOOK tag-new {cwd}")
+            # the store this session writes to, from Claude's own transcript
+            # path, once Claude made it: its name need not be the path's key
+            mine = reg["projects"].get(read_marker(cwd) or "")
+            if mine is not None and tpath and not (mine.get("stores") or {}).get("claude") \
+                    and _dir_has_entries(croot / new_name):
+                mine.setdefault("stores", {})["claude"] = new_name
+                reg["_dirty"] = True
             refresh_stores(reg, only_paths=[cwd])
             if reg.get("_dirty"):
                 save_registry(reg)
@@ -2935,8 +3241,8 @@ def cmd_status(args):
     reg = load_registry()
     projects = reg.get("projects", {})
     alive = [u for u, e in projects.items() if os.path.isdir(e["real_path"])]
-    owned = registered_history_dirs(reg)
-    orphan_dirs = [d.name for d in _iter_history_dirs() if d.name not in owned]
+    orphan_dirs = [d.name for d in orphan_history_dirs(reg)]
+    installed = [t for t in TERMINALS if app_installed(t)] if IS_MAC else []
     st = {
         "version": VERSION, "platform": sys.platform,
         "python": platform.python_version(),
@@ -2947,6 +3253,10 @@ def cmd_status(args):
         "orphan_claude_stores": len(orphan_dirs),
         "declined_moves": len(reg.get("declined_moves", {})),
         "watch_roots": default_roots(),
+        "setup_done": _setup_done_path().is_file(),
+        "setup_dismissed": (aht_home() / "run" / "setup-later").is_file(),
+        "home": str(Path.home()),
+        "autostart": tray_autostart(),
         "backends": backend_status(),
         "watcher": watcher_status(),
         "backups": backup_status(),
@@ -2958,14 +3268,15 @@ def cmd_status(args):
         "prompt_hook_installed": hook_installed("UserPromptSubmit"),
         "claude_remote_control": claude_remote_control(),
         "iterm_api": iterm_api_on() if IS_MAC else None,
+        "getting_started": getting_started("iTerm" in installed),
+        "update": check_update(fetch=False),
         "claude_auto_continue": claude_auto_continue(),
-        "terminals": {"installed": [t for t in TERMINALS if app_installed(t)],
-                      "chosen": cfg_get("terminal_app"), "used": terminal_choice()}
+        "terminals": {"installed": installed, "chosen": cfg_get("terminal_app"),
+                      "used": terminal_choice()}
         if IS_MAC else {},
         "gui_dialogs": gui_dialogs_available(),
         "policies": {"moves": cfg_get("move_policy"),
-                     "copies": cfg_get("copy_policy"),
-                     "news": cfg_get("new_policy")},
+                     "copies": cfg_get("copy_policy")},
     }
     if args.json:
         print(json.dumps(st, indent=2))
@@ -2996,15 +3307,21 @@ def cmd_status(args):
         print(f"  SessionStart hook: {'yes' if st['hook_installed'] else 'NO'} "
               f"(Claude Code — the only agent CLI with hooks)")
         print(f"  watched roots    : {', '.join(st['watch_roots'])}")
+        gs = st["getting_started"]
+        if gs:
+            left = [g["title"] for g in gs if not g["ok"] and not g["optional"]]
+            print(f"  getting started  : {sum(g['ok'] for g in gs)} of {len(gs)} done"
+                  + (f"; to do: {', '.join(left)}" if left else "")
+                  + "   (aht getting-started)")
         print(f"  policies         : moves={st['policies']['moves']} "
-              f"copies={st['policies']['copies']} news={st['policies']['news']}")
+              f"copies={st['policies']['copies']}")
     return 0
 
 def cmd_projects(args):
     reg = load_registry()
     out = []
     try:
-        live = running_sessions() if handover_supported() else []
+        live = running_sessions()
     except Exception:
         live = []
     try:
@@ -3061,12 +3378,9 @@ def cmd_orphans(args):
     those from backups (aht restore) instead."""
     roots = args.roots or default_roots()
     reg = load_registry()
-    owned = registered_history_dirs(reg)
     dirs = list_real_dirs(roots) if args.match else None
     rows = []
-    for d in _iter_history_dirs():
-        if d.name in owned:
-            continue
+    for d in orphan_history_dirs(reg):
         cwd = transcript_cwd(d)
         row = {"store": d.name, "orig_path": cwd,
                "orig_exists": bool(cwd) and os.path.isdir(cwd)}
@@ -3096,18 +3410,20 @@ def stale_doubles(reg: dict) -> list:
     """Entries that list a folder ANOTHER entry owns — what is left when a
     folder was removed and made anew at the same path.  The folder's own
     marker names the owner; without that verdict nothing counts as stale."""
-    by = {}
+    by = {}                             # one folder, however it is spelled
     for u, e in reg.get("projects", {}).items():
-        by.setdefault(os.path.realpath(e["real_path"]), []).append(u)
+        path = os.path.realpath(e["real_path"])
+        by.setdefault(_folder_key(path), []).append((path, u))
     out = []
-    for path, ids in sorted(by.items()):
+    for items in sorted(by.values()):
+        path, ids = items[0][0], [u for _p, u in items]
         if len(ids) < 2 or not os.path.isdir(path):
             continue
         owner = read_marker(path)
         if owner in ids:
-            out += [{"uuid": u, "real_path": path, "owner": owner,
+            out += [{"uuid": u, "real_path": p, "owner": owner,
                      "stores": sorted(reg["projects"][u].get("stores") or {})}
-                    for u in ids if u != owner and not reg["projects"][u].get("away")]
+                    for p, u in items if u != owner and not reg["projects"][u].get("away")]
     return out
 
 def cmd_prune(args):
@@ -3154,6 +3470,10 @@ def cmd_forget(args):
             for u, e in hits:
                 reg["projects"].pop(u, None)
                 reg.get("declined_moves", {}).pop(u, None)
+                # its folder may still be somewhere with its marker: the
+                # scan must not take it on again (a session there, tag or
+                # adopt does)
+                reg.setdefault("forgotten", {})[u] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 if args.remove_marker and os.path.isdir(e["real_path"]):
                     for rel in (MARKER_REL, LEGACY_MARKER_REL):
                         try:
@@ -3180,6 +3500,9 @@ def cmd_config(args):
                 return 2
             k, v = kv.split("=", 1)
             k = k.strip()
+            if k in RETIRED_KEYS:       # an old script must not fail on it
+                print(f"{k} is no longer used: {RETIRED_KEYS[k]}", file=sys.stderr)
+                continue
             if k not in CONFIG_DEFAULTS:
                 print(f"unknown key {k!r}; known: {', '.join(sorted(CONFIG_DEFAULTS))}",
                       file=sys.stderr)
@@ -3199,6 +3522,7 @@ def cmd_config(args):
     eff["watch_roots"] = default_roots()
     eff["backends"] = cfg_get("backends") or BACKEND_NAMES
     eff.update({k: v for k, v in load_config().items() if v is not None})
+    eff["watch_roots"] = default_roots()    # each once, spelled as on disk
     if args.json:
         print(json.dumps({"path": str(config_path()), "effective": eff,
                           "explicit": load_config(), "defaults": CONFIG_DEFAULTS},
@@ -3212,7 +3536,7 @@ def cmd_config(args):
         print("\n  * = set explicitly; others are defaults")
     if changed and any(k.startswith("watch_roots") for k in (args.set or [])) \
             and not args.no_reload:
-        _reload_watcher()
+        _reload_quietly(args.json)
     return 0
 
 def cmd_doctor(args):
@@ -3293,8 +3617,7 @@ def cmd_doctor(args):
     twice = stale_doubles(reg)
     ck("no folder is listed twice", not twice,
        f"{len(twice)} — remove with:  aht prune --apply")
-    owned = registered_history_dirs(reg)
-    orph = [d.name for d in _iter_history_dirs() if d.name not in owned]
+    orph = [d.name for d in orphan_history_dirs(reg)]
     ck("no orphan claude stores", not orph, f"{len(orph)} orphan(s)")
     if args.json:
         print(json.dumps({"checks": checks,
@@ -3571,10 +3894,16 @@ def cmd_version(args):
 
 def _installer_script(name: str):
     """The platform installer shipped next to this core — in a checkout, in
-    the installed tools dir, or in aht.app's Resources folder."""
+    the installed tools dir, or in aht.app's Resources folder.  On Linux the
+    one next to aht.py counts only in the tools dir: in a checkout that is
+    the Mac installer, and the Linux one is in linux/."""
     here = Path(__file__).resolve().parent
-    for c in (here / f"{name}.py", here / "linux" / f"{name}.py"):
-        if c.is_file():
+    if not IS_LINUX:
+        c = here / f"{name}.py"
+        return c if c.is_file() else None
+    for c, ok in ((here / "linux" / f"{name}.py", True),
+                  (here / f"{name}.py", here.name == "agent-history-tether")):
+        if ok and c.is_file():
             return c
     return None
 
@@ -3587,6 +3916,8 @@ def cmd_install(args):
         print("no installer found next to aht.py — run install.sh from a checkout")
         return 2
     cmd = [sys.executable, str(script)]
+    if script.parent.name == "linux" and (script.parent / "install.sh").is_file():
+        cmd = ["sh", str(script.parent / "install.sh")]   # a checkout: copy the files first
     # launched through aht.app's `aht` command: install from the bundle so the
     # watcher and hook get that (possibly newer) core and its prebuilt binaries
     src = args.src or os.environ.get("AHT_BUNDLE_RESOURCES")
@@ -3713,16 +4044,23 @@ def cmd_about(_args):
     print(ABOUT)
     return 0
 
-def _reload_watcher():
+def _reload_watcher() -> bool:
+    """Restart the watcher with the current roots, through the platform's
+    installer.  -> whether it was restarted."""
     if cfg_get("watcher_owner", "agent") == "none":
         print("watching is off (watcher_owner=none) — nothing to reload")
-        return
+        return False
+    if IS_MAC and not (Path.home() / ".aht/tools/agent-history-tether/watcher").is_file():
+        # aht.app or Homebrew's aht before `aht install`: no LaunchAgent may
+        # start a watcher that is not there
+        print("the watcher is not installed yet — run 'aht install' to set it up")
+        return False
     here = Path(__file__).resolve().parent
-    search = [here]
-    if IS_LINUX:
-        search.append(here / "linux")
-    elif IS_MAC:
-        search.append(here / "macos")
+    if IS_LINUX:                        # a checkout's install.py is the Mac one
+        script = _installer_script("install")
+        search = [script.parent] if script else []
+    else:
+        search = [here, here / "macos"]
     old = list(sys.path)
     try:
         for d in search:
@@ -3737,12 +4075,21 @@ def _reload_watcher():
                     writer()
                     install.load_agent()
                     print("✓ watcher reloaded with the current roots")
-                    return
+                    return True
                 finally:
                     sys.path[:] = old
         raise FileNotFoundError("install.py not found next to aht.py")
-    except Exception as e:
-        print(f"⚠ could not reload the watcher ({e}); re-run the installer")
+    except (Exception, SystemExit) as e:    # an installer may exit while it loads
+        why = e if isinstance(e, Exception) else f"the installer stopped with {e.code}"
+        print(f"⚠ could not reload the watcher ({why}); re-run the installer")
+        return False
+
+def _reload_quietly(json_out: bool) -> bool:
+    """_reload_watcher for a command that prints JSON: what the reload says
+    goes to stderr then, so the JSON is all there is on stdout."""
+    import contextlib
+    with contextlib.redirect_stdout(sys.stderr) if json_out else contextlib.nullcontext():
+        return _reload_watcher() is not False
 
 def cmd_roots(args):
     cfg = load_config()
@@ -6281,6 +6628,8 @@ TERMINALS = ("iTerm", "Terminal")         # apps that run a .command file they o
 def app_installed(name: str) -> bool:
     """Whether macOS knows an app of that name, wherever it is installed
     (/Applications, ~/Applications, an external disk): asks LaunchServices."""
+    if "AHT_APPS" in os.environ:                        # tests: a stand-in
+        return name in os.environ["AHT_APPS"].split(",")
     if not IS_MAC:
         return False
     try:
@@ -6294,29 +6643,59 @@ def terminal_choice() -> str:
     iTerm when installed, else Terminal."""
     return cfg_get("terminal_app") or ("iTerm" if app_installed("iTerm") else "Terminal")
 
-def open_terminal(command: str, name: str) -> int:
-    """Run `command` in a new terminal window (the front-ends use this)."""
+def open_terminal(command: str, name: str, cwd: str = None, echo: bool = True) -> int:
+    """Run `command` in a new terminal window (the front-ends use this), in
+    the folder `cwd` when one is given.  When no window opens, the line to
+    run by hand is printed (echo False: the caller tells it) -> 1."""
+    full = (cd_then(cwd) if cwd else "") + command
     run = aht_home() / "run"
     run.mkdir(parents=True, exist_ok=True)
     if os.environ.get("AHT_TERMINAL_LOG"):          # tests: note it, open nothing
         with open(os.environ["AHT_TERMINAL_LOG"], "a") as fh:
-            fh.write(command + "\n")
+            fh.write(full + "\n")
         return 0
-    if IS_MAC:
+    if os.environ.get("AHT_NO_TERMINAL"):           # tests: a computer without one
+        pass
+    elif IS_MAC:
         f = run / (re.sub(r"[^A-Za-z0-9_.-]+", "-", name) + ".command")
         f.write_text("#!/bin/bash\n"
                      'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\n'
-                     "clear\n" + command + "\n")
+                     "clear\n" + full + "\n")
         os.chmod(f, 0o755)
         return subprocess.call(["open", "-a", terminal_choice(), str(f)])
-    for term, flag in (("x-terminal-emulator", "-e"), ("gnome-terminal", "--"),
-                       ("konsole", "-e"), ("xterm", "-e")):
-        if _have(term):
-            subprocess.Popen([term, flag, "/bin/sh", "-c", command],
-                             start_new_session=True)
+    elif os.name == "nt":
+        # a console of its own (Windows Terminal when it is the default
+        # terminal) that starts in the folder: its path never goes through
+        # cmd's parser, where & ^ or %…% in a folder's name would run.
+        # /s /k "…": cmd drops the outer quotes and runs the rest as it is
+        try:
+            subprocess.Popen('cmd.exe /s /k "' + command + '"', cwd=cwd,
+                             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
             return 0
-    print(command)
+        except OSError:
+            pass
+    else:
+        sh = ["/bin/sh", "-c", full]
+        # how each one takes a command: the words after a flag, or (tilix) one
+        # string it splits itself
+        for term, argv in (("x-terminal-emulator", ["-e"] + sh), ("gnome-terminal", ["--"] + sh),
+                           ("kgx", ["--"] + sh), ("konsole", ["-e"] + sh),
+                           ("xfce4-terminal", ["-x"] + sh), ("tilix", ["-e", shlex.join(sh)]),
+                           ("terminator", ["-x"] + sh), ("alacritty", ["-e"] + sh),
+                           ("kitty", sh), ("foot", sh), ("xterm", ["-e"] + sh)):
+            if _have(term):
+                # detached from our output: a terminal that keeps it (Ubuntu's
+                # x-terminal-emulator is gnome-terminal --wait) would hold up
+                # whoever reads it, such as aht's window, until it is closed
+                subprocess.Popen([term] + argv,
+                                 start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return 0
+    if echo:
+        print(full)
     return 1
+
+_SESSION_ID = re.compile(r"[A-Za-z0-9._-]+")
 
 def cmd_resume_here(args):
     """Continue a project's session in a new terminal window: the one used
@@ -6324,25 +6703,25 @@ def cmd_resume_here(args):
     real = os.path.realpath(args.path)
     _uid, entry = _entry_for(load_registry(), real)
     back = (entry or {}).get("returned") or {}
-    if args.agent and args.agent != "claude":
-        if not args.session:
-            print("name the session with --session", file=sys.stderr)
-            return 2
-        cmd = resume_command(args.agent, args.session, real)
-        if args.print:
-            print(cmd)
-            return 0
-        return open_terminal(cmd, f"resume-{os.path.basename(real)}")
+    other = args.agent and args.agent != "claude"
+    if other and not args.session:
+        print("name the session with --session", file=sys.stderr)
+        return 2
     sid = args.session or latest_session(_store_of(real))
-    if args.handed_over:
+    if args.handed_over and not other:
         sid = back.get("handed_over") or back.get("session") or sid
-    exe = find_claude() or "claude"
-    cmd = f"cd {shlex.quote(real)} && exec {shlex.quote(exe)}" \
-        + (f" --resume {sid}" if sid else "")
+    if sid and not _SESSION_ID.fullmatch(sid):         # it goes on a command line
+        print(f"not a session id: {sid}", file=sys.stderr)
+        return 2
+    if other:
+        line = resume_command(args.agent, sid)
+    else:
+        line = ("" if os.name == "nt" else "exec ") + shell_quote(find_claude() or "claude") \
+            + (" --resume " + shell_quote(sid) if sid else "")
     if args.print:
-        print(cmd)
+        print(cd_then(real) + line)
         return 0
-    return open_terminal(cmd, "resume-" + os.path.basename(real))
+    return open_terminal(line, "resume-" + os.path.basename(real), cwd=real)
 
 def handover_status() -> dict:
     reg = load_registry()
@@ -6611,10 +6990,22 @@ def list_sessions(project: str = None, agents=None) -> list:
     out.sort(key=lambda s: s["updated"] or 0, reverse=True)
     return out
 
-def resume_command(agent: str, sid: str, project: str) -> str:
+def shell_quote(s) -> str:
+    """One word for this system's shell: cmd.exe on Windows, sh elsewhere.
+    cmd.exe takes & | < > ^ as plain text only inside double quotes, and a
+    Windows path cannot hold one."""
+    return '"' + str(s).replace('"', "") + '"' if os.name == "nt" else shlex.quote(str(s))
+
+def cd_then(project: str) -> str:
+    return f"cd /d {shell_quote(project)} && " if os.name == "nt" \
+        else f"cd {shell_quote(project)} && "
+
+def resume_command(agent: str, sid: str, project: str = None) -> str:
+    """The line that continues a session: in `project` (it goes there
+    first), or with no project the line to run in the session's folder."""
     exe = agent_cli(agent) or agent
     args = {"claude": ["--resume", sid], "kimi": ["-S", sid], "codex": ["resume", sid]}[agent]
-    return f"cd {shlex.quote(project)} && " + " ".join(shlex.quote(a) for a in [exe] + args)
+    return (cd_then(project) if project else "") + " ".join(shell_quote(a) for a in [exe] + args)
 
 # ---- search -------------------------------------------------------------------- #
 
@@ -7544,15 +7935,21 @@ def cmd_switch(args):
                             + ((r.stderr or r.stdout or "").strip()[-300:] or "no session"))
             return _emit(args, out, lines)
         out["session"] = sid
-        cmd = resume_command("kimi", sid, real)
+        line = resume_command("kimi", sid)
     else:
-        cmd = f"cd {shlex.quote(real)} && {shlex.quote(exe)} {shlex.quote(ask)}"
+        line = " ".join(shell_quote(a) for a in (exe, ask))
+    cmd = cd_then(real) + line                       # the same line, to run anywhere
     out["command_line"] = cmd
-    if not args.no_window:
-        open_terminal(cmd, f"switch-{os.path.basename(real)}-{target}")
+    lines.append(f"   summary {brief}")
+    # nothing but the JSON on stdout: the line to run by hand goes in the error
+    if not args.no_window and open_terminal(line, f"switch-{os.path.basename(real)}-{target}",
+                                            cwd=real, echo=False) != 0:
+        out["error"] = f"No terminal window opened. Run this in a terminal:\n\n{cmd}"
+        log(f"SWITCH {real}: {src['agent']} {src['id']} -> {target}, but no terminal opened")
+        return _emit(args, out, lines)
     out["applied"] = True
     log(f"SWITCH {real}: {src['agent']} {src['id']} -> {target}")
-    lines += [f"   summary {brief}", f"   opened  {cmd}"]
+    lines.append(f"   opened  {cmd}")
     return _emit(args, out, lines)
 
 # ---- the session board ----------------------------------------------------------- #
@@ -7823,20 +8220,226 @@ def check_notices(remotes: bool = None) -> list:
                         "message": msg, "info": {"kind": "limit", "session": h.get("session"),
                                                  "project": h.get("project")}})
     out += night_shift_tick()
+    update_told = st.get("update_told")
+    if cfg_get("update_check"):
+        try:
+            u = check_update()
+        except Exception as e:
+            warn(f"UPDATE {e}")
+            u = {}
+        if u.get("newer") and u.get("latest") != update_told:
+            update_told = u["latest"]
+            out.append({"kind": "update", "title": f"aht {u['latest']} is out",
+                        "message": "open aht to see what's new and to upgrade",
+                        "info": {"kind": "update", "version": u["latest"]}})
     notices_state().parent.mkdir(parents=True, exist_ok=True)
     tmp = notices_state().with_suffix(".new")
     tmp.write_text(json.dumps({"seen": fresh, "remote_at": last_remote, "at": now,
-                               "limits_told": told[-200:]}))
+                               "limits_told": told[-200:], "update_told": update_told}))
     os.replace(tmp, notices_state())
     for n in out:
         _notify(n["title"], n["message"], n.get("info"))
         log(f"NOTICE {n['title']}: {n['message']}")
     return out
 
+# ---- a new version of aht: off until turned on, since it asks GitHub -------- #
+
+RELEASES_API = "https://api.github.com/repos/havurgiray/agent-history-tether/releases/latest"
+RELEASES_PAGE = "https://github.com/havurgiray/agent-history-tether/releases/latest"
+RELEASES_DOWNLOAD = "https://github.com/havurgiray/agent-history-tether/releases/download"
+
+def update_state_path() -> Path:
+    return aht_home() / "run" / "update.json"
+
+def _version_tuple(v) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:3])
+
+def install_kind() -> str:
+    """How this aht was installed, which says how to upgrade it: "brew",
+    "scoop", "winget", "installer" (aht's Windows installer, also what winget
+    runs now), "download" (a zip from the releases page) or "source" (a
+    checkout)."""
+    if os.environ.get("AHT_INSTALL_KIND"):              # tests: a stand-in
+        return os.environ["AHT_INSTALL_KIND"]
+    if IS_MAC:
+        return "brew" if any(os.path.isdir(c) for c in ("/opt/homebrew/Caskroom/aht",
+                                                        "/usr/local/Caskroom/aht")) \
+            else "download"
+    if os.name == "nt":
+        if getattr(sys, "frozen", False) and any(Path(sys.executable).parent.glob("unins*.exe")):
+            return "installer"
+        scoop = Path(os.environ.get("SCOOP") or Path.home() / "scoop")
+        if (scoop / "apps" / "aht").is_dir():
+            return "scoop"
+        pk = Path(os.environ.get("LOCALAPPDATA") or "") / "Microsoft" / "WinGet" / "Packages"
+        try:
+            if any(d.name.lower().startswith("havurgiray.aht") for d in pk.iterdir()):
+                return "winget"
+        except OSError:
+            pass
+        return "download"
+    return "source"
+
+# Windows cannot replace an exe that runs: the tray and the window stop first,
+# and `aht install` starts the watcher again
+_WIN_STOP = "taskkill /im aht-tray.exe /f >nul 2>&1 & taskkill /im aht.exe /f >nul 2>&1 & "
+UPGRADE_COMMANDS = {"brew": "brew upgrade --cask aht && aht install && open -a aht",
+                    "scoop": _WIN_STOP + "scoop update aht && aht install --here",
+                    "winget": _WIN_STOP + "winget upgrade --id havurgiray.aht && aht install"}
+
+def installer_asset(version: str) -> str:
+    """The name of the Windows installer of `version` for this computer's CPU."""
+    arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+    return f"aht-setup-{version}-windows-{arch}.exe"
+
+def _window_serving() -> bool:
+    """Whether aht's window runs now: its run/window.json names a live process."""
+    try:
+        st = json.loads((aht_home() / "run" / "window.json").read_text())
+        return _pid_alive(int(st["pid"]))
+    except Exception:
+        return False
+
+def _upgrade_with_installer(version: str) -> int:
+    """Download the release's installer, check it against the release's
+    SHA256SUMS.txt and run it: it closes aht, puts the new one in its place
+    and starts it again."""
+    import urllib.request
+    name = installer_asset(version)
+    base = os.environ.get("AHT_RELEASES_DOWNLOAD") or RELEASES_DOWNLOAD
+    for old in (aht_home() / "run").glob("aht-setup-*.exe"):   # earlier upgrades'
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    def get(url: str) -> bytes:
+        req = urllib.request.Request(url, headers={"User-Agent": f"aht/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.read()
+    try:
+        sums = get(f"{base}/v{version}/SHA256SUMS.txt").decode("utf-8")
+        want = next((ln.split()[0].lower() for ln in sums.splitlines()
+                     if ln.split()[1:] and ln.split()[1].lstrip("*") == name), None)
+        if not want:
+            print(f"{name} is not part of aht {version}; the download page has it: "
+                  f"{RELEASES_PAGE}")
+            return 1
+        data = get(f"{base}/v{version}/{name}")
+    except Exception as e:
+        print(f"could not download aht {version}: {e}")
+        return 1
+    if hashlib.sha256(data).hexdigest() != want:
+        print(f"the download of {name} does not match its checksum; nothing was run")
+        return 1
+    dest = aht_home() / "run" / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    # its own process: the installer closes this aht too
+    kw = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" \
+        else {"start_new_session": True}                  # DETACHED, NEW_PROCESS_GROUP
+    if os.name != "nt":
+        dest.chmod(0o755)                                  # the tests' stand-in
+    # the installer stops aht's window too: it opens it again when it was open
+    subprocess.Popen([str(dest), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]
+                     + (["/OPENWINDOW=1"] if _window_serving() else []),
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, close_fds=True, **kw)
+    print(f"the installer of aht {version} runs now; aht starts again when it is done")
+    return 0
+
+def check_update(force: bool = False, fetch: bool = True) -> dict:
+    """The newest release and whether it is newer than this aht.  GitHub is
+    asked at most once a day and only when update_check is on, or when
+    `force` (someone asked just now); it sees this computer's address and
+    "aht/<version>", nothing else.  `fetch` False: only what is known."""
+    try:
+        st = json.loads(update_state_path().read_text())
+    except Exception:
+        st = {}
+    on = bool(cfg_get("update_check"))
+    due = time.time() - float(st.get("checked") or 0) >= 86400
+    if fetch and (force or (on and due)):
+        import urllib.request
+        url = os.environ.get("AHT_UPDATE_URL") or RELEASES_API
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": f"aht/{VERSION}", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                rel = json.loads(r.read().decode("utf-8"))
+            st.update({"latest": str(rel.get("tag_name") or "").lstrip("v") or None,
+                       "notes": str(rel.get("body") or ""),
+                       "url": rel.get("html_url") or RELEASES_PAGE,
+                       "published": rel.get("published_at"), "error": None})
+        except Exception as e:
+            st["error"] = str(e)[:300]
+            warn(f"UPDATE check: {st['error']}")
+        st["checked"] = time.time()
+        _write_json(update_state_path(), st)
+    kind = install_kind()
+    latest = st.get("latest")
+    return {"enabled": on, "current": VERSION, "latest": latest,
+            "newer": bool(latest) and _version_tuple(latest) > _version_tuple(VERSION),
+            "notes": st.get("notes") or "", "url": st.get("url") or RELEASES_PAGE,
+            "published": st.get("published"), "checked": st.get("checked"),
+            "error": st.get("error"), "how": kind, "upgrade": UPGRADE_COMMANDS.get(kind),
+            "installer": installer_asset(latest) if kind == "installer" and latest else None}
+
+def _open_page(url: str) -> bool:
+    """Open a web page in the browser: an https one only."""
+    if not str(url).startswith("https://"):
+        return False
+    if os.environ.get("AHT_OPEN_LOG"):              # tests: note it, open nothing
+        with open(os.environ["AHT_OPEN_LOG"], "a") as fh:
+            fh.write(url + "\n")
+        return True
+    import webbrowser
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
+
+def cmd_update(args):
+    u = check_update(force=args.now or args.upgrade)
+    if args.upgrade:
+        if not u["newer"]:
+            print(f"aht {VERSION} is the latest" if u["latest"] else
+                  f"could not learn the latest version: {u['error']}")
+            return 0 if u["latest"] else 1
+        if u["upgrade"]:
+            return open_terminal(u["upgrade"], "upgrade-aht")
+        if u["how"] == "installer":
+            return _upgrade_with_installer(u["latest"])
+        page = u["url"] if str(u["url"]).startswith("https://") else RELEASES_PAGE
+        if u["how"] == "source":            # install.sh copies the new files in
+            step = "linux/install.sh" if IS_LINUX else "install.sh"
+            print(f"aht {u['latest']} is out. In your checkout: git pull, then run "
+                  f"{step} again.  {page}")
+            _open_page(page)
+            return 0
+        print(f"opened {page}" if _open_page(page) else f"the download page: {page}")
+        return 0
+    if args.json:
+        print(json.dumps(u, indent=2))
+    elif u["newer"]:
+        print(f"aht {u['latest']} is out (this is {VERSION}): {u['url']}")
+        if u["upgrade"]:
+            print(f"Upgrade:  aht update --upgrade   ({u['upgrade']})")
+        elif u["installer"]:
+            print(f"Upgrade:  aht update --upgrade   (downloads and runs {u['installer']})")
+    elif u["latest"]:
+        print(f"aht {VERSION} is the latest")
+    elif u["error"]:
+        print(f"could not ask GitHub: {u['error']}")
+    else:
+        print("aht does not look for new versions: `aht update --now` asks GitHub once, "
+              "`aht config --set update_check=true` once a day")
+    return 0
+
 def cmd_notices(args):
     if args.test:
         _notify("aht", "This is how a notice from aht looks.")
-        print("sent to this Mac" + ("" if not cfg_get("notify_phone")
+        print(("sent to this Mac" if IS_MAC else "sent to this computer") + ("" if not cfg_get("notify_phone")
                                     else f" and to {cfg_get('notify_phone')}"))
         return 0
     got = check_notices()
@@ -7889,9 +8492,11 @@ def tidy_history_text(key: str, max_sessions: int = 10, per_session: int = 40) -
         store = (e.get("stores") or {}).get("claude") or _key_claude(path)
         sessions += claude_files(root / store)
         sessions += list_sessions(path, agents=["kimi", "codex"])
-    elif key and "/" not in key and (root / key).is_dir():
-        path = transcript_cwd(root / key) or key
-        sessions += claude_files(root / key)
+    elif key and (d := _history_entry(root, key, links=True)) is not None:
+        # one of the history folder's own entries, as Tidy Up lists them:
+        # never "..", a backslash or a drive letter that leads out of it
+        path = transcript_cwd(d) or key
+        sessions += claude_files(d)
     else:
         return {"key": key, "error": "no such history"}
     sessions.sort(key=lambda x: x.get("updated") or 0, reverse=True)
@@ -7965,10 +8570,10 @@ def tidy_report(roots: list = None) -> dict:
                         if latest else None,
                         "history": str(claude_backend().root() / store) if store else None,
                         "candidates": cands[:5]})
-    owned = registered_history_dirs(reg)
     orphans = []
-    for d in _iter_history_dirs():
-        if d.name in owned or d.name in gone_stores or not _dir_has_entries(d):
+    gone_stores = {_fold_name(n) for n in gone_stores}
+    for d in orphan_history_dirs(reg):
+        if _fold_name(d.name) in gone_stores or not _dir_has_entries(d):
             continue                        # (a gone folder's history is listed with it)
         sess = [f for f in d.glob("*.jsonl") if f.is_file()]
         last = max((f.stat().st_mtime for f in sess), default=None)
@@ -7978,6 +8583,7 @@ def tidy_report(roots: list = None) -> dict:
         sc = score_candidates(d.name, roots, 5, dirs=dirs)
         latest = _latest_jsonl(d)
         orphans.append({"store": d.name, "was": cwd, "sessions": len(sess),
+                        "link": _is_link(d),            # aht never removes one
                         "bytes": sum(f.stat().st_size for f in d.rglob("*") if f.is_file()),
                         "title": _session_title({"agent": "claude", "file": str(latest)})
                         if latest else None, "history": str(d),
@@ -7998,8 +8604,12 @@ def cmd_tidy(args):
         return 0 if res.get("markdown") else 1
     if args.remove_history:
         res = remove_orphan_history(args.remove_history, args.apply)
-        lines = [f"{'moved to the Trash' if res['applied'] else 'would move to the Trash'}: "
-                 f"{res['store']}"]
+        bin_ = _trash_name()
+        done = ("deleted for good, since it could not go to the Recycle Bin"
+                if res.get("deleted") else f"moved to the {bin_}")
+        # refused: the name and why, never what it would have done
+        lines = [res["store"] if res["blockers"] else
+                 f"{done if res['applied'] else 'would move to the ' + bin_}: {res['store']}"]
         if res.get("was"):
             lines.append(f"   the history of {res['was']} ({res.get('sessions', 0)} session(s))")
         if not args.apply and not res["blockers"]:
@@ -8038,43 +8648,314 @@ def cmd_tidy(args):
         for c in o["candidates"]:
             print(f"     maybe: {c['path']}  ({', '.join(c['reasons'])})")
             print(f"        aht bind --store={o['store']} --to={shlex.quote(c['path'])} --apply")
-        print(f"     or move it to the Trash:  aht tidy --remove-history={o['store']} --apply")
+        if o["link"]:
+            print(f"     {LINK_ENTRY}")
+        else:
+            print(f"     or move it to the {_trash_name()}:  "
+                  f"aht tidy --remove-history={o['store']} --apply")
     if rep["doubles"]:
         print("\n  listed twice: remove the stale entries with  aht prune --apply")
     return 0
 
-def _to_trash(path: Path) -> bool:
-    """Move a file or folder to the Trash (Finder's Put Back works for it)."""
+def _to_recycle_bin(path: Path) -> str:
+    """Windows: the Recycle Bin, through the shell (its Restore works) ->
+    "trash"; "deleted" when Windows deleted it for good instead (what
+    _bin_refusal could not foresee); "" when it is still there.  The shell
+    says only that the item is gone, so the bin itself tells which: it holds
+    one item more, or the item."""
+    before, t0 = _bin_items(path), time.time()
+    if not _shell_delete(path):
+        return ""
+    after = _bin_items(path)
+    if (before is not None and after is not None and after > before) \
+            or _in_recycle_bin(path, t0):
+        return "trash"
+    return "deleted"
+
+_BITBUCKET = r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket"
+_EXPLORER_POLICY = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+
+def _trash_refusal(path: Path, size: int) -> str:
+    """Why `path` (`size` bytes) would not go to the Trash but be deleted for
+    good, as far as aht can tell before it tries; "" when it would go there.
+    Only Windows deletes for good what its Recycle Bin does not take."""
+    if os.name != "nt" or os.environ.get("AHT_TRASH"):
+        return ""
+    return _bin_refusal(path, size)
+
+def _bin_refusal(path: Path, size: int) -> str:
+    """Windows: why `path` would not go to the Recycle Bin: that drive has
+    none, its bin is set to remove files at once, or `size` is more than
+    that bin holds; "" when it would go there, or when aht cannot read the
+    settings (the check after the delete still tells)."""
+    left = "so Windows would delete it for good (you can still delete it yourself)"
+    if _bin_items(path) is None:
+        return f"that drive has no Recycle Bin, {left}"
+    nuke, cap = _bin_settings(path)
+    if nuke:
+        return f"the Recycle Bin of that drive is set to remove files at once, {left}"
+    if cap is not None and size > cap:
+        return (f"it is bigger ({_human(size)}) than the Recycle Bin of that drive holds "
+                f"({_human(cap)}), {left}")
+    return ""
+
+def _bin_default_cap(total: int) -> int:
+    """The most a Recycle Bin holds when nobody set it: 10% of the first
+    40 GB of the drive and 5% of the rest."""
+    first = 40 * 1024 ** 3
+    return min(total, first) // 10 + max(total - first, 0) // 20
+
+def _bin_settings(path: Path) -> tuple:
+    """Windows: the settings of the Recycle Bin of the drive `path` is on, as
+    Windows applies them -> (removes files at once, the most it holds in
+    bytes), None for what aht cannot read.  The policy "Do not move deleted
+    files to the Recycle Bin" comes first, then that volume's own values
+    (the bin's Properties), then BitBucket's own, then Windows' defaults."""
+    import ctypes
+    import winreg
+
+    def dword(hive, key, name):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                v, kind = winreg.QueryValueEx(k, name)
+            return v if kind == winreg.REG_DWORD else None
+        except OSError:
+            return None
+    k32 = ctypes.windll.kernel32
+    mount, vol = ctypes.create_unicode_buffer(1024), ctypes.create_unicode_buffer(64)
+    try:
+        ok = k32.GetVolumePathNameW(os.path.abspath(str(path)), mount, 1024) \
+            and k32.GetVolumeNameForVolumeMountPointW(mount.value, vol, 64)
+    except Exception:
+        ok = False
+    guid = re.search(r"\{[0-9A-Fa-f-]{36}\}", vol.value) if ok else None
+    if not guid:
+        return None, None
+    hkcu, own = winreg.HKEY_CURRENT_USER, _BITBUCKET + "\\Volume\\" + guid.group(0)
+    if any(dword(h, _EXPLORER_POLICY, "NoRecycleFiles") == 1
+           for h in (winreg.HKEY_LOCAL_MACHINE, hkcu)):
+        nuke = True
+    else:
+        v = dword(hkcu, own, "NukeOnDelete")
+        nuke = bool(dword(hkcu, _BITBUCKET, "NukeOnDelete") if v is None else v)
+    mb = dword(hkcu, own, "MaxCapacity")
+    if mb is None:
+        mb = dword(hkcu, _BITBUCKET, "MaxCapacity")
+    if mb is not None:
+        return nuke, mb * 1024 * 1024
+    total = ctypes.c_ulonglong(0)
+    try:
+        if k32.GetDiskFreeSpaceExW(mount.value, None, ctypes.byref(total), None):
+            return nuke, _bin_default_cap(total.value)
+    except Exception:
+        pass
+    return nuke, None
+
+def _bin_items(path: Path):
+    """Windows: how many items the Recycle Bin of the drive `path` is on
+    holds; None where Windows does not say (that drive has no bin)."""
+    import ctypes
+
+    class Info(ctypes.Structure):                        # SHQUERYRBINFO
+        _pack_ = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 1
+        _fields_ = [("cbSize", ctypes.c_uint32), ("i64Size", ctypes.c_int64),
+                    ("i64NumItems", ctypes.c_int64)]
+    info = Info(ctypes.sizeof(Info), 0, 0)
+    root = os.path.splitdrive(os.path.abspath(str(path)))[0] + "\\"
+    try:
+        r = ctypes.windll.shell32.SHQueryRecycleBinW(root, ctypes.byref(info))
+    except Exception:
+        return None
+    return int(info.i64NumItems) if r == 0 else None
+
+def _in_recycle_bin(path: Path, since: float) -> bool:
+    """Windows: whether the Recycle Bin of the drive `path` was on took it in
+    since `since` (for when a full bin let older items go).  Each item there
+    has a $I file that says where it came from: after 24 bytes, the path in
+    260 characters (before Windows 10) or its length and then the path."""
+    want = os.path.normcase(os.path.abspath(str(path)))
+    top = Path(os.path.splitdrive(want)[0] + "\\$Recycle.Bin")
+    try:
+        bins = [b for b in top.iterdir() if b.is_dir()]
+    except OSError:
+        return False
+    for b in bins:                                       # one per user: only ours opens
+        try:
+            infos = [f for f in b.glob("$I*") if f.stat().st_mtime >= since - 5]
+        except OSError:
+            continue
+        for f in infos:
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            if int.from_bytes(data[:8], "little") == 2:
+                raw = data[28:28 + 2 * int.from_bytes(data[24:28], "little")]
+            else:
+                raw = data[24:24 + 520]
+            was = raw.decode("utf-16-le", "replace").split("\0")[0]
+            if was and os.path.normcase(was) == want:
+                return True
+    return False
+
+def _shell_delete(path: Path) -> bool:
+    """Windows: the shell's delete to the Recycle Bin -> whether `path` is gone."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Op(ctypes.Structure):                          # SHFILEOPSTRUCTW
+        _pack_ = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 1
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+    # FO_DELETE; FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+    # | FOF_WANTNUKEWARNING.  What its bin does not take the shell deletes for
+    # good, on a drive with no bin without asking: so aht refuses that before
+    # (_bin_refusal) and checks after (_to_recycle_bin), and counts on no
+    # question; the list of paths ends in two NULs (ctypes adds the second)
+    op = Op(None, 3, os.path.abspath(str(path)) + "\0", None,
+            0x0040 | 0x0010 | 0x0004 | 0x0400 | 0x4000, False, None, None)
+    try:
+        r = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    except Exception:
+        return False
+    return r == 0 and not op.fAnyOperationsAborted and not path.exists()
+
+def _freedesktop_trash(path: Path) -> bool:
+    """Linux: the desktop's Trash (~/.local/share/Trash), where the file
+    manager can restore it from: the item in files/, where it came from in
+    info/<name>.trashinfo."""
+    import urllib.parse
+    home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "Trash"
+    try:
+        for d in (home / "files", home / "info"):
+            d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        name, n = path.name, 1
+        while True:                                     # a name free in both folders
+            info = home / "info" / f"{name}.trashinfo"
+            if not (home / "files" / name).exists():
+                try:
+                    fd = os.open(str(info), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    break
+                except FileExistsError:
+                    pass
+            n += 1
+            name = f"{path.name}.{n}"
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("[Trash Info]\nPath=" + urllib.parse.quote(os.path.abspath(str(path)))
+                     + "\nDeletionDate=" + time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+        try:
+            shutil.move(str(path), str(home / "files" / name))
+        except OSError:
+            info.unlink()
+            return False
+        return True
+    except OSError:
+        return False
+
+def _trash_name() -> str:
+    """What this system calls the place a removed history goes to."""
+    return "Recycle Bin" if os.name == "nt" else "Trash"
+
+def _to_trash(path: Path) -> str:
+    """Move a file or folder to the Trash: Finder's Put Back, the Recycle
+    Bin's Restore or the Linux desktop's Trash works for it -> "trash";
+    "deleted" when Windows deleted it for good instead; "" when it stayed."""
     if os.environ.get("AHT_TRASH"):                     # tests: a stand-in Trash
         dst = Path(os.environ["AHT_TRASH"]) / path.name
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(dst))
-        return True
-    if IS_MAC and os.path.exists("/usr/bin/trash"):
+        return "trash"
+    if os.name == "nt":
+        return _to_recycle_bin(path)
+    if not IS_MAC:
+        if _have("gio"):
+            try:
+                subprocess.run(["gio", "trash", str(path)], capture_output=True, timeout=120,
+                               cwd="/")
+            except (OSError, subprocess.SubprocessError):
+                pass
+            if not path.exists():
+                return "trash"
+        return "trash" if _freedesktop_trash(path) else ""
+    if os.path.exists("/usr/bin/trash"):
         r = subprocess.run(["/usr/bin/trash", str(path)], capture_output=True, timeout=120,
                            cwd="/")
         if r.returncode == 0 and not path.exists():
-            return True
+            return "trash"
     bin_ = Path.home() / ".Trash"
     if not bin_.is_dir():
-        return False
+        return ""
     dst = bin_ / path.name
     if dst.exists():
         dst = bin_ / f"{path.name} {_stamp()}"
     shutil.move(str(path), str(dst))
-    return True
+    return "trash"
+
+def _history_entry(root: Path, name: str, links: bool = False):
+    """The folder `name` in Claude's history folder, only when it is one of
+    that folder's own entries as listed on disk, spelled exactly so, and a
+    real folder (no link, junction or other reparse point; with `links`, to
+    only read it, a link to a folder will do).  Separators, "..", drive
+    letters and other spellings then name nothing."""
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                if e.name != name:
+                    continue
+                if links:
+                    return root / e.name if e.is_dir() else None
+                st = e.stat(follow_symlinks=False)
+                if e.is_symlink() or not stat.S_ISDIR(st.st_mode) \
+                        or getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                    return None
+                return root / e.name
+    except OSError:
+        pass
+    return None
+
+LINK_ENTRY = "it is a link to a folder elsewhere, not a history folder: aht leaves it alone"
+
+def _is_link(p) -> bool:
+    """A symbolic link, or on Windows a junction or another reparse point."""
+    try:
+        st = os.lstat(str(p))
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) \
+        or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+def _history_link(root: Path, name: str) -> bool:
+    """Whether `name` is one of the entries of Claude's history folder,
+    spelled exactly so, that is a link: Tidy Up lists it (it can be read),
+    but aht never removes it."""
+    try:
+        with os.scandir(root) as it:
+            return any(e.name == name and _is_link(root / e.name) for e in it)
+    except OSError:
+        return False
 
 def remove_orphan_history(store: str, apply: bool = False) -> dict:
     """A Claude Code history that no tracked folder owns goes to the Trash —
     only when the user asks, and never one a tracked project owns or a
-    session uses.  The daily history backups keep it as well."""
+    session uses.  The daily history backups keep it as well.  On Windows
+    it goes only to the Recycle Bin: what would be deleted for good (that
+    drive has no bin, its bin removes files at once, too big for it) is
+    refused before; should Windows still delete it for good, "deleted" is
+    true as well as "applied"."""
     root = claude_backend().root()
-    d = root / store
+    d = _history_entry(root, store)
     res = {"store": store, "applied": False, "blockers": []}
-    if not store or "/" in store or store in (".", "..") or not d.is_dir():
-        res["blockers"].append("there is no such history")
+    if d is None:
+        res["blockers"].append(LINK_ENTRY if _history_link(root, store)
+                               else "there is no such history")
         return res
-    if store in registered_history_dirs(load_registry()):
+    owned = registered_history_dirs(load_registry())
+    # the name as the file system compares it, or the very folder under
+    # another name: Windows records ...-code-App for the folder ...-code-app
+    if _fold_name(store) in {_fold_name(n) for n in owned} \
+            or any(_same_folder(d, root / n) for n in owned):
         res["blockers"].append("a tracked project owns this history; use Forget for the "
                                "project instead")
         return res
@@ -8085,12 +8966,20 @@ def remove_orphan_history(store: str, apply: bool = False) -> dict:
     if was and any(os.path.realpath(x["cwd"]) == os.path.realpath(was)
                    for x in running_sessions()):
         res["blockers"].append("a Claude Code session is open in that folder")
+    why = _trash_refusal(d, res["bytes"])
+    if why:
+        res["blockers"].append(why)
     if not apply or res["blockers"]:
         return res
-    res["applied"] = _to_trash(d)
+    how = _to_trash(d)
+    res["applied"] = bool(how)
+    if how == "deleted":
+        res["deleted"] = True
     if not res["applied"]:
-        res["blockers"].append("it could not be moved to the Trash")
-    log(f"TIDY history {store} (was {was}) to the Trash: {res['applied']}")
+        res["blockers"].append(f"it could not be moved to the {_trash_name()}")
+    log(f"TIDY history {store} (was {was}) "
+        + ("deleted for good: it could not go to the Recycle Bin" if how == "deleted"
+           else f"to the {_trash_name()}: {res['applied']}"))
     return res
 
 def _tidy_relink(dst: str, as_json: bool) -> int:
@@ -8103,7 +8992,7 @@ def _tidy_relink(dst: str, as_json: bool) -> int:
     with contextlib.redirect_stdout(io.StringIO()):
         cmd_reconcile(argparse.Namespace(
             roots=roots, apply=True, notify=False,
-            moves="apply", copies="ignore", news="ignore", only=[dst], clear_declines=False))
+            moves="apply", copies="ignore", only=[dst], clear_declines=False))
     uid, e = _entry_for(load_registry(), dst)
     if as_json:
         print(json.dumps({"relinked": bool(e), "path": dst, "uuid": uid}, indent=2))
@@ -8228,6 +9117,11 @@ def session_changes(project: str, sid: str = None) -> dict:
     return {"project": real, "session": sid, "title": title, "worked_in": was,
             "sessions": _sessions_of(store)[:12], "files": files}
 
+def _kept_path(keep, path):
+    """Where a copy of `path` goes in the folder `keep`: its whole path below
+    the root or drive (keep / C:\\x would be C:\\x itself)."""
+    return keep / path.relative_to(path.anchor)
+
 def revert_file(project: str, sid: str, path: str, apply: bool) -> dict:
     """Put one file back the way it was before the session changed it; what
     is there now is kept aside first."""
@@ -8240,7 +9134,7 @@ def revert_file(project: str, sid: str, path: str, apply: bool) -> dict:
         return res
     keep = aht_home() / "changes-backups" / _stamp()
     if os.path.exists(f["path"]):
-        dst = keep / f["path"].lstrip("/")
+        dst = _kept_path(keep, Path(f["path"]))
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f["path"], dst)
         res["kept"] = str(dst)
@@ -8267,6 +9161,9 @@ def cmd_changes(args):
     except HandoverError as e:
         print(str(e), file=sys.stderr)
         return 3
+    except OSError as e:
+        print(f"the file could not be put back: {e}", file=sys.stderr)
+        return 1
     ch = session_changes(real, args.session)
     if args.json:
         print(json.dumps(ch, indent=2))
@@ -9735,8 +10632,136 @@ def cmd_night_shift(args):
 
 # ---- sessions for Spotlight and other front-ends ---------------------------- #
 
+_FORKED_RE = re.compile(rb'"forkedFrom"\s*:\s*\{[^{}]*?"sessionId"\s*:\s*"([0-9A-Za-z-]{8,64})"')
+
+def _branch_of(transcript):
+    """Claude Code's /branch starts a session with a copy of the one it
+    branches from, each copied entry marked {"forkedFrom": {"sessionId": …}}
+    (a top-level key: the same words inside a message are escaped).
+    -> (that session's id, when the branch was made), or (None, None) for a
+    session that is no branch.  When: its first entry of its own, else when
+    its file was made."""
+    try:
+        fh = open(transcript, "rb")
+    except OSError:
+        return None, None
+    parent, when = None, None
+    with fh:
+        # the copies come first, and the mark is the last key of each entry:
+        # the whole first entry, however big (a pasted picture)
+        first = fh.readline()
+        while first and not first.strip():
+            first = fh.readline()
+        m = _FORKED_RE.search(first)
+        if not m:
+            return None, None
+        parent = m.group(1).decode()
+        for line in fh:
+            m = _FORKED_RE.search(line)
+            if m:
+                parent = m.group(1).decode()
+                continue
+            try:
+                when = _when(json.loads(line).get("timestamp"))
+            except Exception:
+                continue
+            if when:
+                break
+    if when is None:
+        st = _stat(transcript)
+        when = st and (getattr(st, "st_birthtime", None) or st.st_mtime)
+    return parent, when
+
+def project_sessions(project: str) -> list:
+    """Every session of one project, newest first, each branch (/branch in
+    Claude Code) right under the session it came from: rows in that order,
+    with "depth".  Newest means the latest work in a session or in any of
+    its branches.  Titles and times come from the search index."""
+    real = os.path.realpath(project)
+    found = list_sessions(real)
+    try:
+        update_search_index()
+    except Exception as e:
+        warn(f"SESSIONS index: {e}")
+    known = {}
+    keys = [f"{s['agent']}:{s['id']}" for s in found]
+    if keys:
+        try:
+            db = _open_search_db()
+            for i in range(0, len(keys), 500):
+                part = keys[i:i + 500]
+                known.update({r[0]: r[1:] for r in db.execute(
+                    "select key, title, started, updated from sessions where key in (%s)"
+                    % ",".join("?" * len(part)), part)})
+            db.close()
+        except Exception as e:
+            warn(f"SESSIONS index: {e}")
+    try:
+        open_now = {r["session"]: r for r in running_sessions() if r.get("session")}
+    except Exception:
+        open_now = {}
+    rows = {}
+    for s in found:
+        key = f"{s['agent']}:{s['id']}"
+        title, started, updated = known.get(key) or (None, None, None)
+        if key not in known:
+            title = _session_title(s)
+        parent, branched = _branch_of(s["file"]) if s["agent"] == "claude" else (None, None)
+        live = open_now.get(s["id"]) if s["agent"] == "claude" else None
+        rows[key] = {"agent": s["agent"], "id": s["id"],
+                     "title": redact(title) if title else s.get("title"),
+                     "started": started, "updated": max(s["updated"] or 0, updated or 0),
+                     "branched": branched, "parent": parent and f"claude:{parent}",
+                     "open": live is not None, "pid": live and live["pid"],
+                     "parent_gone": False}
+    kids = {}
+    for key, r in rows.items():
+        if r["parent"] in rows and r["parent"] != key:
+            kids.setdefault(r["parent"], []).append(key)
+        else:
+            r["parent_gone"] = r["parent"] is not None
+            r["parent"] = None
+
+    def latest(key, seen=()):
+        return max([rows[key]["updated"]] + [latest(k, seen + (key,)) for k in
+                                             kids.get(key, []) if k not in seen])
+    out = []
+
+    def walk(keys, depth, seen):
+        for key in sorted(keys, key=lambda k: -latest(k)):
+            if key in seen:
+                continue
+            out.append(dict(rows[key], depth=depth,
+                            parent=rows[key]["parent"] and rows[key]["parent"].split(":", 1)[1]))
+            walk(kids.get(key, []), depth + 1, seen | {key})
+    walk([k for k, r in rows.items() if r["parent"] is None], 0, frozenset())
+    return out
+
 def cmd_sessions(args):
-    """Every indexed session, newest first: what the app puts in Spotlight."""
+    """Every indexed session, newest first: what the app puts in Spotlight.
+    With a project: that project's sessions, branches under their origin."""
+    if args.project:
+        rows = project_sessions(args.project)
+        if args.json:
+            print(json.dumps({"project": os.path.realpath(args.project), "sessions": rows},
+                             indent=2))
+            return 0
+        day = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "—"
+        n = sum(1 for r in rows if r["branched"])
+        print(f"{len(rows)} session(s) in {os.path.realpath(args.project)}"
+              + (f", {n} of them branches" if n else ""))
+        for r in rows:
+            mark = "⑂ " if r["branched"] else ""
+            when = (f"branched {day(r['branched'])}" if r["branched"]
+                    else f"started {day(r['started'])}")
+            print("  " + "    " * r["depth"] + mark + (r["title"] or "(no title)")
+                  + ("   [open now]" if r["open"] else ""))
+            print("  " + "    " * r["depth"] + f"  {AGENT_NAMES.get(r['agent'], r['agent'])}, "
+                  f"{when}, last {day(r['updated'])}, {r['id']}")
+        if rows:
+            print("Continue one:  aht resume-here <project> --session <id> "
+                  "[--agent kimi|codex]")
+        return 0
     update_search_index()
     rows = []
     try:
@@ -9973,6 +10998,24 @@ def iterm_api_on() -> bool:
         return stat.S_ISSOCK(iterm_api_socket().stat().st_mode)
     except OSError:
         return False
+
+def iterm_pref(key: str):
+    """One of iTerm2's settings as `defaults` prints it ("1", "0", …), or
+    None when it was never set (iTerm2 then uses its default).  Only read."""
+    if os.environ.get("AHT_ITERM_PREFS"):               # tests: a stand-in
+        try:
+            v = json.loads(Path(os.environ["AHT_ITERM_PREFS"]).read_text()).get(key)
+        except Exception:
+            return None
+        return None if v is None else str(v)
+    if not IS_MAC:
+        return None
+    try:
+        r = subprocess.run(["/usr/bin/defaults", "read", "com.googlecode.iterm2", key],
+                           capture_output=True, text=True, timeout=10, cwd="/")
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
 
 def _pb_varint(n: int) -> bytes:
     out = bytearray()
@@ -10591,21 +11634,30 @@ on run argv
 end run
 """
 
-def _iterm_session(tty: str, what: str, text: str = "") -> bool:
+ITERM_REFUSED = ("macOS does not let aht control iTerm2 (System Settings → Privacy & "
+                 "Security → Automation → aht → iTerm2)")
+
+def _iterm_do(tty: str, what: str, text: str = "") -> str:
     """Do something with the iTerm2 session on `tty`: bring it to the front
-    ("goto") or type a line into it ("write")."""
+    ("goto") or type a line into it ("write").  "ok", "none" (no such
+    session in iTerm2), or "refused" (macOS does not let aht control it)."""
     if os.environ.get("AHT_ITERM_LOG"):                 # tests: note it, touch nothing
         with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
             fh.write(json.dumps({"tty": tty, "what": what, "text": text}) + "\n")
-        return True
+        return os.environ.get("AHT_ITERM_ANSWER", "ok")
     if not IS_MAC or not _iterm_running():
-        return False
+        return "none"
     try:
         r = subprocess.run(["/usr/bin/osascript", "-", tty, what, text], input=_FIND_SESSION,
                            capture_output=True, text=True, timeout=20, cwd="/")
     except Exception:
-        return False
-    return r.stdout.strip() == "ok"
+        return "none"
+    if "(-1743)" in r.stderr:                           # errAEEventNotPermitted
+        return "refused"
+    return "ok" if r.stdout.strip() == "ok" else "none"
+
+def _iterm_session(tty: str, what: str, text: str = "") -> bool:
+    return _iterm_do(tty, what, text) == "ok"
 
 def _resolve_open(target: str):
     """An open Claude session by pid, session id or project folder."""
@@ -10627,8 +11679,9 @@ def goto_session(target: str) -> dict:
     tty = _ttys().get(s["pid"])
     if not tty:
         return {"ok": False, "why": "it runs in the background, not in a terminal tab"}
-    ok = _iterm_session(tty, "goto")
-    return {"ok": ok, "tty": tty, "why": None if ok else "it is not in an iTerm2 tab"}
+    got = _iterm_do(tty, "goto")
+    return {"ok": got == "ok", "tty": tty,
+            "why": {"ok": None, "refused": ITERM_REFUSED}.get(got, "it is not in an iTerm2 tab")}
 
 def cmd_goto(args):
     res = goto_session(args.target)
@@ -11390,6 +12443,331 @@ def cmd_workspace(args):
               + ", ".join(r["titles"][:8]))
     return 0
 
+# ---- getting started: what lets aht do more on this computer ---------------- #
+
+def tray_starts_at_login() -> bool:
+    """The menu bar app starts at login (the LaunchAgent the app writes)."""
+    d = os.environ.get("AHT_LAUNCH_AGENTS") or Path.home() / "Library" / "LaunchAgents"
+    return (Path(d) / "com.aht.tray.plist").is_file()
+
+def _linux_tray_autostart() -> Path:
+    d = os.environ.get("AHT_AUTOSTART_DIR") or Path.home() / ".config" / "autostart"
+    return Path(d) / "aht-tray.desktop"
+
+def desktop_arg(s) -> str:
+    """One argument of a Desktop Entry's Exec= line, in double quotes.  The
+    spec's quoting rule comes first (\\ " ` and $ get a backslash), then the
+    string escapes that a reader undoes before it (every backslash doubled,
+    a newline, tab or carriage return written \\n, \\t, \\r), so a $ in a path
+    is written \\\\$; and a % is written %%, since a lone % starts a field
+    code.  linux/tray.py and linux/install.py write the same."""
+    s = re.sub(r'([\\"`$])', r'\\\1', str(s))      # the Exec quoting rule: \ " ` $ get a backslash
+    s = s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")   # the string-value escapes
+    return '"' + s.replace("%", "%%") + '"'                 # %% for a literal %
+
+def exec_python(py) -> str:
+    """The Python an Exec= line starts.  GLib looks for the program before it
+    turns %% into %, so one whose path has a % never starts: then the same
+    Python by a path without one, its real path or else python3 on PATH;
+    failing both, the path as it is.  linux/tray.py and linux/install.py
+    pick the same."""
+    py = str(py)
+    if "%" in py:
+        for other in (os.path.realpath(py), shutil.which("python3")):
+            if other and "%" not in other:
+                return other
+    return py
+
+def _autostart_answer_path() -> Path:
+    """There once the tray-at-login question was answered (`aht autostart
+    on|off`: the Windows installer, the window, a tray's switch), so the
+    welcome keeps that answer instead of asking again."""
+    return aht_home() / "run" / "autostart.json"
+
+def note_autostart_answer(on: bool) -> None:
+    """Record that the user chose whether the tray starts at login."""
+    try:
+        _write_json(_autostart_answer_path(), {"at": time.time(), "on": bool(on)})
+    except OSError as e:
+        warn(f"AUTOSTART answer not kept: {e}")
+
+def tray_autostart(on: bool = None) -> dict:
+    """Whether aht's tray starts at login; with `on`, make it so (and keep
+    that the question was answered: "answered").  Windows: the HKCU Run
+    entry, which starts either the tray (it keeps the watcher running) or
+    the hidden watcher alone.  Linux: an XDG autostart entry, as the tray
+    writes it.  A Mac: the app writes its own LaunchAgent.  The answer is
+    kept only when the tray now does what was asked: a terminal's `on` on
+    a Mac, where the app has the switch, changes nothing and is no answer."""
+    res = _tray_autostart(on)
+    if on is not None and res["on"] == bool(on):
+        note_autostart_answer(res["on"])
+    res["answered"] = _autostart_answer_path().is_file()
+    return res
+
+def _tray_autostart(on: bool = None) -> dict:
+    if IS_MAC and not os.environ.get("AHT_AUTOSTART_DIR"):
+        return {"supported": False, "on": tray_starts_at_login()}
+    if os.name == "nt":
+        try:
+            import winlayer
+        except ImportError:
+            return {"supported": False, "on": False}
+        tray = Path(sys.executable).with_name("aht-tray.exe")
+        have = getattr(sys, "frozen", False) and tray.is_file()
+        is_on = winlayer.is_tray_entry(winlayer._run_key_get())
+        if on is not None and on != is_on and (have or not on):
+            if on:
+                winlayer._run_key_set(f'"{tray}"')
+            else:
+                import contextlib, io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    winlayer._write_autostart(winlayer.self_cmd()[0] if have else "")
+            is_on = bool(on)
+        return {"supported": bool(have or is_on), "on": is_on}
+    f = _linux_tray_autostart()
+    # installed, the tray sits next to aht.py; in a checkout, in linux/
+    here = Path(__file__).resolve().parent
+    tray = next((t for t in (here / "tray.py", here / "linux" / "tray.py") if t.is_file()),
+                here / "tray.py")
+    if on:
+        # the Desktop Entry spec splits Exec at spaces: each argument quoted
+        # whole (an entry written another way is redone)
+        text = ("[Desktop Entry]\nType=Application\nName=aht tray\n"
+                f"Exec={desktop_arg(exec_python(sys.executable))} {desktop_arg(tray)}\n"
+                "X-GNOME-Autostart-enabled=true\n")
+        try:
+            same = f.read_text() == text
+        except OSError:
+            same = False
+        if not same:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(text)
+    elif on is not None and f.is_file():
+        f.unlink()
+    runs = tray.is_file() and _linux_tray_runs(tray)
+    return {"supported": runs or f.is_file(), "on": f.is_file(), "runs": runs}
+
+def _linux_tray_runs(tray: Path) -> bool:
+    """Whether the Linux tray can run here: it needs PyGObject and an
+    AppIndicator library, which `tray.py --check` looks for.  The answer is
+    kept per tray file and Python; a no is asked again after a minute, since
+    the user may just have installed them."""
+    try:
+        key = [str(tray), tray.stat().st_mtime, sys.executable]
+    except OSError:
+        return False
+    f = aht_home() / "run" / "tray-check.json"
+    try:
+        c = json.loads(f.read_text())
+        if c.get("key") == key and (c.get("ok") or time.time() - c.get("at", 0) < 60):
+            return bool(c.get("ok"))
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        ok = subprocess.run([sys.executable, str(tray), "--check"], capture_output=True,
+                            stdin=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    try:
+        _write_json(f, {"key": key, "ok": ok, "at": time.time()})
+    except OSError:
+        pass
+    return ok
+
+def cmd_autostart(args):
+    res = tray_autostart(None if args.state is None else args.state == "on")
+    if args.json:
+        print(json.dumps(res))
+    else:
+        print("aht's tray " + ("starts" if res["on"] else "does not start") + " at login"
+              + ("" if res["supported"] else " (switched in the app on a Mac)"))
+    return 0
+
+def _steps_for() -> str:
+    """Which computer's steps Getting started lists."""
+    return os.environ.get("AHT_STEPS") or ("mac" if IS_MAC or "AHT_APPS" in os.environ
+                                           else "windows" if os.name == "nt"
+                                           else "linux" if IS_LINUX else "")
+
+def _other_steps(kind: str, step) -> list:
+    """Getting started on Windows and Linux: the tray at login, notices, the
+    window's browser, a terminal, and the switches every system has."""
+    out = []
+    auto = tray_autostart()
+    # the user said no (the installer's box, a switch): a choice, not a step left
+    said_no = bool(auto.get("answered")) and not auto["on"]
+    if auto.get("runs") is False and kind == "linux":
+        out.append(step("login", False, "Start at login",
+                        "aht's tray cannot run here: it needs PyGObject and an AppIndicator "
+                        "library, so it shows no notices.",
+                        "Install them: sudo apt install python3-gi "
+                        "gir1.2-ayatanaappindicator3-0.1 (Debian, Ubuntu), sudo dnf install "
+                        "python3-gobject libayatana-appindicator-gtk3 (Fedora), or sudo "
+                        "pacman -S python-gobject libayatana-appindicator (Arch). GNOME also "
+                        "needs the AppIndicator Support extension to show the tray.",
+                        optional=said_no))
+    elif auto["supported"]:
+        out.append(step("login", auto["on"], "Start at login",
+                        "aht's tray starts when you log in." if auto["on"] else
+                        "aht's tray does not start at login, so it shows no notices until "
+                        "you open it.", "Settings → This computer → Start aht's tray at login.",
+                        optional=said_no))
+    if kind == "linux":
+        ns = bool(_have("notify-send"))
+        out.append(step("notify_send", ns, "Notices on the desktop",
+                        "notify-send is there, so aht can show its notices." if ns else
+                        "notify-send is missing, so aht cannot show notices.",
+                        "Install it: sudo apt install libnotify-bin (Debian, Ubuntu), or "
+                        "libnotify on other systems."))
+        # installed is what counts: over ssh or on a text console there is no
+        # screen to ask on, and installing changes nothing
+        dl = next((c for c in ("zenity", "kdialog", "yad") if _have(c)), None)
+        out.append(step("dialogs", dl, "Questions in a window",
+                        ("zenity or kdialog is there, so aht can ask before it relinks a "
+                         "folder." if _linux_has_display() else
+                         f"{dl} is there; aht asks in a window when it runs in your desktop "
+                         "session.") if dl else "Neither zenity nor kdialog is there, so aht "
+                        "cannot ask before it relinks a folder that moved.",
+                        "Install one: sudo apt install zenity (or kdialog on KDE)."))
+    try:
+        import aht_web
+        br = bool(aht_web.app_browser())
+    except Exception:
+        br = False
+    out.append(step("app_window", br, "aht's window as an app",
+                    "Edge or Chrome opens aht's window as an app of its own." if br else
+                    "aht's window opens in your browser, as a tab: Edge or Chrome would "
+                    "open it as an app of its own.",
+                    "Install Microsoft Edge or Google Chrome.", optional=True))
+    if kind == "windows":
+        wt = bool(shutil.which("wt"))
+        out.append(step("terminal", wt, "Windows Terminal",
+                        "Windows Terminal is there for the sessions aht opens." if wt else
+                        "Sessions open in a plain console window.",
+                        "Install Windows Terminal from the Microsoft Store.", optional=True))
+    rc = claude_remote_control()
+    out.append(step("remote_control", rc, "Your sessions in the Claude app",
+                    "Remote Control is on, so every session is in the Claude app on your "
+                    "phone." if rc else "Remote Control is off, so your sessions are not "
+                    "in the Claude app on your phone.",
+                    "In Claude Code: /config → Enable Remote Control for all sessions.",
+                    optional=True))
+    up = bool(cfg_get("update_check"))
+    out.append(step("update_check", up, "New versions",
+                    "aht tells you when a new version is out (it asks GitHub once a day)."
+                    if up else "Off: aht does not look for new versions.",
+                    "Settings → This computer → Tell me when a new version of aht is out.",
+                    optional=True))
+    return out
+
+def getting_started(iterm=None) -> list:
+    """The steps that let aht do more here, each with whether it is done:
+    iTerm2 and its settings, the app's own switches, and Remote Control in
+    Claude Code.  "optional" ones are a matter of taste.  The app
+    adds one only it can see: whether macOS lets it control iTerm2.  Windows
+    and Linux have their own list (_other_steps)."""
+    kind = _steps_for()
+    if not kind:
+        return []
+
+    def step(id_, ok, title, text, how="", optional=False):
+        return {"id": id_, "ok": bool(ok), "optional": optional, "title": title,
+                "text": text, "how": "" if ok else how}
+    if kind != "mac":
+        return _other_steps(kind, step)
+    if iterm is None:
+        iterm = app_installed("iTerm")
+    out = [step("iterm", iterm, "iTerm2", "Installed." if iterm else
+                "Not installed. aht works with any terminal, but session names from tab "
+                "titles, Go to Tab, Restore Workspace and a click in the corner list going "
+                "to its session need iTerm2.", "Free, from https://iterm2.com.")]
+    if iterm:
+        api = iterm_pref("EnableAPIServer") == "1"
+        out.append(step("iterm_api", api, "iTerm2's Python API",
+                        "On: a name you give a session (/rename, in the Claude app, or "
+                        "Rename… in aht) reaches its tab too." if api else
+                        "Off: each session takes its tab's title, but a name you give a "
+                        "session does not reach its tab.",
+                        "iTerm2 → Settings → General → Magic → Enable Python API."))
+    login = tray_starts_at_login()
+    out.append(step("login", login, "Start at login",
+                    "aht starts in the menu bar when you log in." if login else
+                    "aht does not start at login. The corner list, the chimes and saving "
+                    "the iTerm2 layout work only while the app runs.",
+                    "Settings → This Mac → Start aht in the menu bar at login.",
+                    optional=not login and _autostart_answer_path().is_file()))
+    rc = claude_remote_control()
+    out.append(step("remote_control", rc, "Your sessions in the Claude app",
+                    "Remote Control is on, so every session is in the Claude app on "
+                    "your phone, under its tab's name." if rc else
+                    "Remote Control is off, so your sessions are not in the Claude app on "
+                    "your phone.", "In Claude Code: /config → Enable Remote Control for all "
+                    "sessions.", optional=True))
+    corner = cfg_get("session_corner")
+    click = (" A click brings a session's iTerm2 tab to the front." if iterm else
+             " Without iTerm2, a click cannot bring a session to the front.")
+    out.append(step("corner", corner, "Sessions in the corner",
+                    ("On: the open Claude sessions are listed in the screen's top-right "
+                     "corner, as working, waiting for you or done." if corner else
+                     "Off. It lists the open Claude sessions in the screen's top-right "
+                     "corner, as working, waiting for you or done.") + click,
+                    "∞ menu → Sessions in the Corner.", optional=True))
+    chimes = cfg_get("chimes")
+    out.append(step("chimes", chimes, "Chimes",
+                    ("On: a" if chimes else "Off. A") + " short sound when a session is "
+                    "done or waits for you.", "∞ menu → Chimes.", optional=True))
+    if iterm:
+        dot = iterm_pref("ShowNewOutputIndicator") != "0"      # iTerm2's default: on
+        out.append(step("new_output_dot", not dot, "iTerm2's blue dot",
+                        "Off: no blue dot on tabs with new output." if not dot else
+                        "iTerm2 puts a blue dot on every tab that printed something new, "
+                        "which tells little once the corner list shows how each session "
+                        "is doing.", "For calmer tabs: iTerm2 → Settings → Appearance → "
+                        "Tabs → turn off Show new-output indicator.", optional=True))
+        kept = _iterm_state_path().is_file()
+        out.append(step("tab_colours", kept, "Tab colours for Restore Workspace",
+                        "iTerm2 keeps its window state, where aht reads tab colours from."
+                        if kept else "iTerm2 has kept no window state on this Mac, which "
+                        "is where aht reads tab colours from, so Restore Workspace opens "
+                        "tabs without their colours.", "iTerm2 keeps it to bring its "
+                        "windows back: iTerm2 → Settings → General → Startup → Window "
+                        "restoration policy.", optional=True))
+    return out
+
+def cmd_getting_started(args):
+    steps = getting_started()
+    if args.json:
+        print(json.dumps({"steps": steps}, indent=2))
+        return 0
+    if not steps:
+        print("Nothing to set up beyond `aht install` on this system.")
+        return 0
+    import textwrap
+    print("Getting started: what lets aht do more here")
+    for s in steps:
+        mark = "✓" if s["ok"] else "○" if s["optional"] else "✗"
+        line = (f"{mark} {s['title']}" + (" (optional)" if s["optional"] and not s["ok"] else "")
+                + " — " + s["text"] + (" " + s["how"] if s["how"] else ""))
+        print(textwrap.fill(line, 78, initial_indent="  ", subsequent_indent="    "))
+    print(textwrap.fill("aht's window shows this list with a switch where it can (Settings → "
+                        "Getting started)" + (", and also checks whether macOS lets it control "
+                        "iTerm2." if _steps_for() == "mac" else "."), 78))
+    return 0
+
+def cmd_window(args):
+    """aht's window on Windows and Linux: a page served to this computer only,
+    in an app window of the browser (aht_web.py)."""
+    sys.modules.setdefault("aht", sys.modules[__name__])
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import aht_web
+    except ImportError:
+        print("the window is not next to this copy of aht (aht_web.py and web/); on a Mac, "
+              "open aht.app", file=sys.stderr)
+        return 2
+    return aht_web.main(args)
+
 def build_parser():
     p = argparse.ArgumentParser(prog="aht")
     p.set_defaults(fn=cmd_about)
@@ -11407,12 +12785,39 @@ def build_parser():
     s = sub.add_parser("adopt")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--roots", nargs="*")
+    # every list option: a flag given twice adds up (--only A --only B)
+    s.add_argument("--roots", nargs="*", action="extend")
+    s.add_argument("--only", nargs="*", action="extend", metavar="PATH",
+                   help="only these of the folders found")
     s.set_defaults(fn=cmd_adopt)
+
+    s = sub.add_parser("setup", help="first-time setup: which folders to watch, which "
+                       "projects to take on, what to do when a folder moves")
+    s.add_argument("--roots", nargs="*", action="extend", metavar="FOLDER",
+                   help="the folders to watch")
+    s.add_argument("--adopt", nargs="*", action="extend", metavar="PATH",
+                   help="take on these projects found (default with --apply: all of them "
+                   "but those you told aht to forget)")
+    s.add_argument("--moves", choices=POLICY_CHOICES["moves"])
+    s.add_argument("--copies", choices=POLICY_CHOICES["copies"])
+    s.add_argument("--news", help=argparse.SUPPRESS)      # old scripts: no longer used
+    for flag in ("badges", "backups", "notifications", "update-check"):
+        s.add_argument("--" + flag, choices=("on", "off"))
+    s.add_argument("--dismiss", action="store_true", help="the window: not now, do not offer "
+                   "the setup again")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("autostart", help="whether aht's tray starts at login (Windows, "
+                       "Linux; on a Mac the app has the switch)")
+    s.add_argument("state", nargs="?", choices=("on", "off"))
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_autostart)
 
     s = sub.add_parser("suggest-matches")
     s.add_argument("--store", required=True, dest="store")
-    s.add_argument("--roots", nargs="*")
+    s.add_argument("--roots", nargs="*", action="extend")
     s.add_argument("--limit", type=int, default=8)
     s.set_defaults(fn=cmd_suggest)
 
@@ -11428,10 +12833,10 @@ def build_parser():
     s.add_argument("--notify", action="store_true")
     s.add_argument("--moves", choices=POLICY_CHOICES["moves"])
     s.add_argument("--copies", choices=POLICY_CHOICES["copies"])
-    s.add_argument("--news", choices=POLICY_CHOICES["news"])
-    s.add_argument("--only", nargs="*", metavar="PATH")
+    s.add_argument("--news", help=argparse.SUPPRESS)      # old scripts: no longer used
+    s.add_argument("--only", nargs="*", action="extend", metavar="PATH")
     s.add_argument("--clear-declines", action="store_true", dest="clear_declines")
-    s.add_argument("--roots", nargs="*")
+    s.add_argument("--roots", nargs="*", action="extend")
     s.set_defaults(fn=cmd_reconcile)
 
     s = sub.add_parser("hook")
@@ -11448,7 +12853,7 @@ def build_parser():
     s = sub.add_parser("orphans")
     s.add_argument("--match", action="store_true")
     s.add_argument("--json", action="store_true")
-    s.add_argument("--roots", nargs="*")
+    s.add_argument("--roots", nargs="*", action="extend")
     s.add_argument("--limit", type=int, default=8)
     s.set_defaults(fn=cmd_orphans)
 
@@ -11465,8 +12870,8 @@ def build_parser():
     s.set_defaults(fn=cmd_forget)
 
     s = sub.add_parser("config")
-    s.add_argument("--set", nargs="*", metavar="KEY=VALUE")
-    s.add_argument("--unset", nargs="*", metavar="KEY")
+    s.add_argument("--set", nargs="*", action="extend", metavar="KEY=VALUE")
+    s.add_argument("--unset", nargs="*", action="extend", metavar="KEY")
     s.add_argument("--reset", action="store_true")
     s.add_argument("--no-reload", action="store_true", dest="no_reload")
     s.add_argument("--json", action="store_true")
@@ -11487,9 +12892,9 @@ def build_parser():
     s = sub.add_parser("backends",
                        help="each agent CLI's store location (override with "
                             "--set-root when not found automatically)")
-    s.add_argument("--set-root", nargs="*", metavar="NAME=PATH",
+    s.add_argument("--set-root", nargs="*", action="extend", metavar="NAME=PATH",
                    dest="set_root")
-    s.add_argument("--clear-root", nargs="*", metavar="NAME",
+    s.add_argument("--clear-root", nargs="*", action="extend", metavar="NAME",
                    dest="clear_root")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_backends)
@@ -11514,8 +12919,8 @@ def build_parser():
     s.set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("roots")
-    s.add_argument("--add", nargs="*")
-    s.add_argument("--remove", nargs="*")
+    s.add_argument("--add", nargs="*", action="extend")
+    s.add_argument("--remove", nargs="*", action="extend")
     s.add_argument("--no-reload", action="store_true")
     s.set_defaults(fn=cmd_roots)
 
@@ -11524,7 +12929,7 @@ def build_parser():
 
     s = sub.add_parser("icons")
     s.add_argument("--refresh", action="store_true")
-    s.add_argument("--roots", nargs="*")
+    s.add_argument("--roots", nargs="*", action="extend")
     s.set_defaults(fn=cmd_icons)
 
     s = sub.add_parser("backup")
@@ -11580,7 +12985,7 @@ def build_parser():
     s.add_argument("--to", metavar="NAME")
     s.add_argument("--session", help="the session to resume there "
                    "(default: the most recent one)")
-    s.add_argument("--include", nargs="*", metavar="PATH",
+    s.add_argument("--include", nargs="*", action="extend", metavar="PATH",
                    help="files or folders outside the project that travel along "
                         "(remembered for this project)")
     s.add_argument("--no-start", action="store_true", dest="no_start",
@@ -11696,7 +13101,8 @@ def build_parser():
     s = sub.add_parser("tidy", help="tracked folders that are gone, histories without "
                        "a folder, folders listed twice — with suggestions")
     s.add_argument("--remove-history", metavar="STORE", dest="remove_history",
-                   help="move a history that no folder owns to the Trash")
+                   help="move a history that no folder owns to the Trash (on Windows, "
+                   "the Recycle Bin)")
     s.add_argument("--show", metavar="KEY", help="a listed history as text to read (the "
                    "project id, or the history's name: --show=-Users-…)")
     s.add_argument("--relink", metavar="UUID", help="a gone project found again …")
@@ -11807,7 +13213,9 @@ def build_parser():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_night_shift)
 
-    s = sub.add_parser("sessions", help="every session aht knows, newest first")
+    s = sub.add_parser("sessions", help="every session aht knows, newest first; with a "
+                       "project, its sessions with each branch under its origin")
+    s.add_argument("project", nargs="?", help="only this project's sessions, as a tree")
     s.add_argument("--limit", type=int, default=500)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_sessions)
@@ -11856,6 +13264,29 @@ def build_parser():
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_workspace)
+
+    s = sub.add_parser("update", help="whether a new version of aht is out (asks GitHub "
+                       "once a day when update_check is on), what's new, and the upgrade")
+    s.add_argument("--now", action="store_true", help="ask GitHub now")
+    s.add_argument("--upgrade", action="store_true", help="upgrade the way aht was "
+                   "installed: Homebrew, Scoop or winget in a terminal; aht's Windows "
+                   "installer is downloaded, checked and run; a checkout says how to "
+                   "update it; else the download page opens")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("getting-started", help="what lets aht do more on this computer: "
+                       "iTerm2 and the app's switches on a Mac; the tray at login, notices "
+                       "and the window's browser on Windows and Linux; Remote Control")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_getting_started)
+
+    s = sub.add_parser("window", help="aht's window on Windows and Linux: a page served to "
+                       "this computer only, in an app window of the browser")
+    s.add_argument("--no-open", action="store_true", help="only serve; print the address")
+    s.add_argument("--port", type=int, default=0)
+    s.add_argument("--selftest", action="store_true")
+    s.set_defaults(fn=cmd_window)
 
     s = sub.add_parser("_agent")           # the far end of a handover (stdin: JSON)
     s.set_defaults(fn=cmd_agent)

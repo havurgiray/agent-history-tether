@@ -132,7 +132,17 @@ def remove_emblem_files():
             stamp.unlink()
         except OSError:
             pass
-    if n and shutil.which("gtk-update-icon-cache"):
+    # the icon cache gtk-update-icon-cache wrote there lists every image:
+    # it goes with the last of them, else it is written again without aht's
+    cache = base / "icon-theme.cache"
+    others = base.is_dir() and any(p != cache and (p.is_file() or p.is_symlink())
+                                   for p in base.rglob("*"))
+    if not others:
+        try:
+            cache.unlink()
+        except OSError:
+            pass
+    elif n and shutil.which("gtk-update-icon-cache"):
         subprocess.run(["gtk-update-icon-cache", "-f", "-t", str(base)], capture_output=True)
     if n:
         print(f"✓ removed aht's emblem images ({n})")

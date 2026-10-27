@@ -8,8 +8,16 @@ Mechanism: Explorer shows a custom icon for a folder that carries a hidden
 provided the folder has its read-only attribute set (Windows' standard
 "this folder is customised" marker — it does not make the folder read-only
 for actual file operations).  The .ico is written INSIDE the folder at
-`.aht\\aht-badge.ico` and referenced RELATIVELY, so the badge travels
-with the folder on move/copy exactly like the macOS icon file does.
+`.aht\\aht-badge-<8 hex>.ico` and referenced RELATIVELY, so the badge
+travels with the folder on move/copy exactly like the macOS icon file does.
+The name carries a checksum of the picture: Explorer keeps the picture of
+an icon file it has drawn, so a changed badge gets a new name, which it
+draws afresh, and the old file goes.  Older versions wrote the fixed name
+`.aht\\aht-badge.ico`; such a desktop.ini line and file are still ours.
+The line is written through the shell (SHGetSetFolderCustomSettings, as
+the folder's Customize tab does), which also makes Explorer drop what it
+has cached of desktop.ini: after a plain file write an open window keeps
+the old line, and once the old file is gone shows a plain folder.
 
 The icon itself is the real system folder icon (resolved via
 SHGetStockIconInfo and extracted at several sizes with PrivateExtractIconsW)
@@ -28,6 +36,7 @@ Everything above module level is POSIX-import-safe (the build host generates
 the app icon with the same rasterisers); the Win32 calls live inside
 functions and only run on Windows.
 """
+import hashlib
 import os
 import re
 import struct
@@ -37,14 +46,17 @@ from pathlib import Path
 CORAL = (217, 119, 87)          # the agent sparkle
 INK = (28, 26, 25)              # the git "+"
 SIZES = (16, 32, 48, 256)
-BADGE_REL = ".aht\\aht-badge.ico"
-ICON_LINE = f"IconResource={BADGE_REL},0"
+# the badge file in a folder's .aht: aht-badge-<8 hex>.ico, or the fixed
+# name older versions wrote
+BADGE_FILE = re.compile(r"aht-badge(-[0-9a-f]{8})?\.ico", re.I)
 CACHE_VERSION = 5                # 5: no cached badge has a drawn folder
 
 FILE_ATTRIBUTE_READONLY = 0x01
 FILE_ATTRIBUTE_HIDDEN = 0x02
 FILE_ATTRIBUTE_SYSTEM = 0x04
 FILE_ATTRIBUTE_NORMAL = 0x80
+FCSM_ICONFILE = 0x10             # SHGetSetFolderCustomSettings: the icon
+FCS_FORCEWRITE = 0x02
 
 
 def _clamp01(v):
@@ -419,17 +431,24 @@ def _read_ini(p: Path):
         return raw.decode("cp1252", "replace"), "cp1252"
 
 
+def badge_name(data: bytes) -> str:
+    """The badge file's name: it changes whenever the picture does."""
+    return f"aht-badge-{hashlib.sha256(data).hexdigest()[:8]}.ico"
+
+
+def icon_line(name: str) -> str:
+    return f"IconResource=.aht\\{name},0"
+
+
 def _is_ours(line: str) -> bool:
     low = line.strip().lower()
-    return low.startswith("iconresource=") and "aht-badge.ico" in low
+    return low.startswith("iconresource=") and bool(BADGE_FILE.search(low))
 
 
-def _merge_icon(text: str):
-    """Insert/replace our IconResource under [.ShellClassInfo].
-    Returns None when the folder already has someone else's icon."""
-    lines = text.splitlines()
+def _foreign_icon(text: str) -> bool:
+    """desktop.ini already sets someone else's icon."""
     in_sec = False
-    for ln in lines:
+    for ln in text.splitlines():
         st = ln.strip()
         low = st.lower()
         if st.startswith("["):
@@ -437,17 +456,40 @@ def _merge_icon(text: str):
             continue
         if in_sec and not _is_ours(ln) and \
                 (low.startswith("iconresource=") or low.startswith("iconfile=")):
-            return None
-    lines = [ln for ln in lines if not _is_ours(ln)]
+            return True
+    return False
+
+
+def _merge_icon(text: str, name: str):
+    """Insert/replace our IconResource under [.ShellClassInfo], pointing at
+    the badge file `name`.  Returns None when the folder already has
+    someone else's icon."""
+    if _foreign_icon(text):
+        return None
+    lines = [ln for ln in text.splitlines() if not _is_ours(ln)]
     idx = next((i for i, ln in enumerate(lines)
                 if ln.strip().lower() == "[.shellclassinfo]"), None)
     if idx is None:
         if lines and lines[-1].strip():
             lines.append("")
-        lines += ["[.ShellClassInfo]", ICON_LINE]
+        lines += ["[.ShellClassInfo]", icon_line(name)]
     else:
-        lines.insert(idx + 1, ICON_LINE)
+        lines.insert(idx + 1, icon_line(name))
     return "\r\n".join(lines) + "\r\n"
+
+
+def _sections(text: str):
+    """desktop.ini as {section: its lines}, to compare two of them: the
+    order of the lines in a section, case and blank lines aside."""
+    out, sec = {}, ""
+    for ln in text.splitlines():
+        st = ln.strip().lower()
+        if st.startswith("["):
+            sec = st
+            out.setdefault(sec, [])
+        elif st:
+            out.setdefault(sec, []).append(st)
+    return {k: sorted(v) for k, v in out.items()}
 
 
 def _remove_icon(text: str):
@@ -512,22 +554,58 @@ def _shell_refresh(path) -> None:
         pass
 
 
-def _shell_image_changed(ico) -> None:
-    """Explorer keeps the picture of an icon file it has drawn: tell it the
-    one in `ico` changed (the file keeps its name), so it draws it again."""
+def _shell_set_icon(path, icon: str) -> bool:
+    """Point the folder's icon at `icon` (relative to the folder) through
+    SHGetSetFolderCustomSettings, as the folder's Customize tab does: it
+    writes the IconResource line, marks the folder customised and makes
+    Explorer drop what it has cached of desktop.ini, which a plain write of
+    the file does not.  False when that did not work (and off Windows)."""
+    if os.name != "nt":
+        return False
     try:
         import ctypes
         import ctypes.wintypes as wt
-        shell32 = ctypes.WinDLL("shell32")
-        shell32.Shell_GetCachedImageIndexW.argtypes = [wt.LPCWSTR, ctypes.c_int, wt.UINT]
-        shell32.Shell_GetCachedImageIndexW.restype = ctypes.c_int
-        shell32.SHUpdateImageW.argtypes = [wt.LPCWSTR, ctypes.c_int, wt.UINT, ctypes.c_int]
-        shell32.SHUpdateImageW.restype = None
-        i = shell32.Shell_GetCachedImageIndexW(str(ico), 0, 0)
-        if i >= 0:
-            shell32.SHUpdateImageW(str(ico), 0, 0, i)
+
+        class SHFOLDERCUSTOMSETTINGS(ctypes.Structure):
+            _fields_ = [("dwSize", wt.DWORD), ("dwMask", wt.DWORD),
+                        ("pvid", ctypes.c_void_p),
+                        ("pszWebViewTemplate", wt.LPWSTR),
+                        ("cchWebViewTemplate", wt.DWORD),
+                        ("pszWebViewTemplateVersion", wt.LPWSTR),
+                        ("pszInfoTip", wt.LPWSTR), ("cchInfoTip", wt.DWORD),
+                        ("pclsid", ctypes.c_void_p), ("dwFlags", wt.DWORD),
+                        ("pszIconFile", wt.LPWSTR), ("cchIconFile", wt.DWORD),
+                        ("iIconIndex", ctypes.c_int),
+                        ("pszLogo", wt.LPWSTR), ("cchLogo", wt.DWORD)]
+
+        fn = ctypes.WinDLL("shell32").SHGetSetFolderCustomSettings
+        fn.argtypes = [ctypes.POINTER(SHFOLDERCUSTOMSETTINGS), wt.LPCWSTR,
+                       wt.DWORD]
+        fn.restype = ctypes.c_long
+        fcs = SHFOLDERCUSTOMSETTINGS()
+        fcs.dwSize = ctypes.sizeof(fcs)
+        fcs.dwMask = FCSM_ICONFILE
+        fcs.pszIconFile = icon
+        fcs.cchIconFile = len(icon) + 1
+        fcs.iIconIndex = 0
+        return fn(ctypes.byref(fcs), str(path), FCS_FORCEWRITE) >= 0
     except Exception:
-        pass
+        return False
+
+
+def _drop_badges(folder: Path, keep: str = None) -> None:
+    """Remove the badge files in `folder` (.aht), all but `keep`: those of
+    earlier pictures and the fixed name older versions wrote."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if name != keep and BADGE_FILE.fullmatch(name):
+            try:
+                os.unlink(folder / name)
+            except OSError:
+                pass
 
 
 def apply(path, marks) -> str:
@@ -536,7 +614,7 @@ def apply(path, marks) -> str:
     if not path.is_dir():
         return "no-folder"
     ini = path / "desktop.ini"
-    ico = path / ".aht" / "aht-badge.ico"
+    dot = path / ".aht"
 
     if not marks:
         text, codec = _read_ini(ini)
@@ -553,31 +631,35 @@ def apply(path, marks) -> str:
                 _set_attrs(path, a & ~FILE_ATTRIBUTE_READONLY)
         elif res is not None:
             _write_ini(ini, res, codec)
+        _drop_badges(dot)
         try:
-            ico.unlink()
-        except OSError:
-            pass
-        try:
-            ico.parent.rmdir()             # only succeeds if nothing else lives there
+            dot.rmdir()                    # only succeeds if nothing else lives there
         except OSError:
             pass
         _shell_refresh(path)
         return "cleared"
 
     text, codec = _read_ini(ini)
-    merged = _merge_icon(text)
-    if merged is None:
+    if _foreign_icon(text):
         return "foreign-icon-kept"         # never clobber a custom icon
     data = badge_ico_bytes(marks)
-    ico.parent.mkdir(parents=True, exist_ok=True)
-    had = ico.is_file()
-    # different bytes also replace a badge drawn with the stand-in folder
-    if not had or ico.read_bytes() != data:
+    name = badge_name(data)
+    merged = _merge_icon(text, name)
+    ico = dot / name
+    dot.mkdir(parents=True, exist_ok=True)
+    # a new picture gets a new name: Explorer draws a file it has not seen
+    # afresh, where it would keep showing what it drew of the old one.  The
+    # file first, then desktop.ini points at it, then the old one goes
+    if not ico.is_file() or ico.read_bytes() != data:
         ico.write_bytes(data)
-        if had:
-            _shell_image_changed(ico)
-    if merged != text:
-        _write_ini(ini, merged, codec)
+    if _sections(merged) != _sections(text):
+        # through the shell, so an open window draws the new file at once.
+        # Our own write when that fails or leaves anything but what we
+        # meant (an IconFile= line would read as someone else's next time)
+        if not (_shell_set_icon(path, f".aht\\{name}")
+                and _sections(_read_ini(ini)[0]) == _sections(merged)):
+            _write_ini(ini, merged, codec)
+    _drop_badges(dot, keep=name)
     a = _get_attrs(path)
     if not a & FILE_ATTRIBUTE_READONLY:
         _set_attrs(path, a | FILE_ATTRIBUTE_READONLY)

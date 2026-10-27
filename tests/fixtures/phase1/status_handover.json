@@ -1,0 +1,16 @@
+{
+  "handover": {
+    "supported": true,
+    "can_reach": true,
+    "remotes": {
+      "box": {
+        "ssh": "me@box",
+        "system": "Linux"
+      }
+    },
+    "default_remote": "box",
+    "rsync": "3.4.1",
+    "away": [],
+    "mirrored": []
+  }
+}

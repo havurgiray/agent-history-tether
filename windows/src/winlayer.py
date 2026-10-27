@@ -1075,7 +1075,7 @@ Installed at: %LOCALAPPDATA%\\Programs\\aht (the installer) or
 Data:  %USERPROFILE%\\.aht\\registry.json,  config.json
 Logs:  %USERPROFILE%\\.aht\\aht.log,  aht-watcher.log
 Badges: folders get per-agent discs / a git "+" icon via a hidden
-        desktop.ini + .aht\\aht-badge.ico that travel with the folder;
+        desktop.ini + .aht\\aht-badge-*.ico that travel with the folder;
         refresh with `aht icons --refresh`, remove with
         `aht uninstall --remove-icons`.
 """

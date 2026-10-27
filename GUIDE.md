@@ -225,8 +225,9 @@ Getting started.
 - **Notices** come from the tray: a session that waits for you, a long one
   that is done, Claude's usage limit, a new version. On Windows a click on
   one opens the window.
-- **Not on Windows:** handover, keeping in sync and the night shift need
-  ssh and rsync; the Machines tab says so.
+- **Not on Windows:** handover, keeping in sync, backups on another
+  machine and the night shift need ssh and rsync; the Machines tab says
+  so.
 - **Start at login:** Settings → This computer → *Start aht's tray at
   login* (on Windows the tray then also keeps the watcher running). On
   Linux the switch can be turned on only when the tray can run there: it
@@ -331,8 +332,9 @@ Uses tokens**, or when you first use them:
 Two more spend tokens only when you ask for them, each time: **Switch
 Agent** (the new agent reads a summary) and **Hand Over** with a task (the
 session starts on it). A handed-over project also puts one sentence into a
-new Claude session in its folder, so the session knows the project is away
-or has just come back.
+new Claude session in its folder, so the session knows the project is away,
+that a handover of it did not finish yet, or that it has just come back or
+was released.
 
 ## Folders that move keep their history
 
@@ -416,8 +418,28 @@ Every day aht zips each project's histories, of all agents, into
   `"cleanupPeriodDays": 36500` in `~/.claude/settings.json`.
 - **A second copy on another machine.** **Settings → Backups on another
   machine**: pick one of your machines, and after each daily backup aht
-  copies the backups there too, so a lost or broken Mac does not take the
-  histories with it.
+  adds the new backups to a folder of this computer's own there, named by
+  a random id, so a lost or broken Mac does not take the histories with it.
+  Copying only adds: a backup there goes only after aht removed it here,
+  and at least 3 per project always stay. The copies aht makes before it
+  rewrites a history go there too, and aht never removes those there.
+  **Copy Now** copies at once.
+- **Fetch Backups From…** (in the same group) brings backups back, for
+  example on a new computer. It lists every computer's folder of backups on
+  that machine, with its name, system (macOS, Linux or Windows), last
+  update, projects, backups and size; this computer's own is marked, and so
+  is one an older aht made. **Fetch** adds what is missing here (backups,
+  and copies made before a rewrite) and replaces nothing: a backup that
+  differs from one of the same name here arrives next to it
+  under a new name (`<stamp>-from-<name>.zip`). Search then finds the
+  sessions in them, and **Restore…** on a result brings one back.
+- **An older aht's folder** there (named after this computer, from before
+  each computer got an id) becomes this computer's own only when every
+  backup in it, and every copy made before a rewrite, is here too; one with
+  nothing left in it is removed. Otherwise it stays as it is, listed as
+  *older aht*, and **Copy Now** says so: **Fetch Backups From…** can bring
+  its backups here.
+- On Windows, aht's window has no *Backups on another machine* yet.
 
 **In the terminal:**
 
@@ -434,8 +456,17 @@ Every day aht zips each project's histories, of all agents, into
 - `aht backup --prune` — delete the backups beyond the number kept
   (`backup_keep`, 10).
 - `aht backup --offsite` — copy the backups to your other machine now.
-- `aht backup --fetch-offsite` — on a new Mac, bring the backups back from
+- `aht backup --offsite-list` — list every computer's folder of backups on
   that machine.
+- `aht backup --fetch-offsite` — on a new computer, bring backups back from
+  that machine: this computer's own folder, or the only one there (with
+  several, it asks for `--from`). It adds what is missing and never
+  overwrites.
+- `aht backup --fetch-offsite --from studio` — fetch from that computer's
+  folder. `--from` takes an id first, then a folder's name (an older aht's
+  folder is named after its computer), then a computer's name; a name that
+  two computers share asks for the id. The window and the Mac app pass the
+  id, or the folder for an older aht's row.
 
 ## Search every session
 
@@ -450,7 +481,13 @@ that were deleted since and live on only in a backup.
 
 - Every word has to appear. Put "a phrase" in quotes. The last word may be
   the start of a word: `deplo` also finds deploy and deployment.
-- Keys and passwords never reach the search index; they are masked first.
+- What aht recognises as a key or a password (see *Secrets check*) is
+  masked whole before it reaches the search index: in messages, in the
+  commands, file paths and web addresses of tool calls, and in session
+  titles.
+- After an update from an earlier version, the index is built anew once,
+  by itself, at its next update. A session whose history file is gone and
+  that no history backup holds is then no longer found.
 
 **In the terminal:**
 
@@ -519,6 +556,9 @@ something or offering a next step. **Projects → Look Back → Loose Ends…**
 
 - Nothing is sent anywhere and no agent is asked: aht reads the end of each
   project's latest session and runs `git status`.
+- The agent's last message is masked whole before the question is picked
+  out of it, so a key in it shows masked, and a private key as *[private
+  key: BEGIN RSA PRIVATE KEY]*. Session titles are masked too.
 
 **In the terminal:**
 
@@ -549,6 +589,11 @@ piece of work that took a while.
 - **Claude's usage limit:** when a session stops because the limit is
   reached, a notice says so, with the time it resets (Settings → Safety
   nets → *Tell me when Claude stops at its usage limit*).
+- **A handover cut off halfway** gets notices of its own: how it ended,
+  and after an hour without an answer from the other machine, that you can
+  release the project (see *Hand a project over to another machine*).
+- What a session waits for is shown with the keys and passwords aht
+  recognises masked (see *Secrets check*), here and on your phone.
 - **Sessions in the corner:** a small list in the screen's top-right
   corner shows every open Claude session on this Mac: **working** (blue),
   **waiting for you** (orange) or **done** (green), with how long it has
@@ -653,7 +698,8 @@ last answer, open to-dos and the files changed last.
 - **Off until you turn it on** (Settings → Uses tokens), because those
   lines go into the session's context: a few hundred tokens per new
   session. A resumed session gets nothing; it has its own history.
-- Keys and passwords are masked in the note, as everywhere aht writes.
+- The keys and passwords aht recognises are masked in the note (see
+  *Secrets check*).
 - Only Claude Code has a start hook, so only its new sessions get the note.
 
 **In the terminal:**
@@ -941,19 +987,26 @@ work, and a draft of the paragraph that papers and theses now ask for.
 
 ## Share a session
 
-A session as a clean page for a colleague, a student or a paper's appendix.
+A session as a page to share with a colleague, a student or a paper's
+appendix.
 
 > **Example.** A student asks how you set up the experiment scripts. **More
 > → Share a Session…** saves the latest session as a web page: your messages
-> and the agent's replies, without keys, passwords, e-mail addresses or
-> your Mac's paths and names.
+> and the agent's replies, with the keys and passwords aht recognises
+> masked, and without e-mail addresses, local network addresses, your home
+> folder's path or your user and computer names. The page says so under
+> its title.
 
-- Look through the page before you pass it on: names in the conversation
-  itself, such as a repository, stay.
+- Look through the page before you pass it on: masking is best effort.
+  Names in the conversation itself, such as a repository, stay, and so do
+  paths outside your home folder (an external disk, `/opt/…`) and a secret
+  aht does not recognise (see *Secrets check*). With `--tools`, the
+  commands and files of the tools are masked before they are shortened.
+
 **In the terminal:**
 
 - `aht share ~/Desktop/paper --format html --out session.html` — save the
-  paper project's latest session as a clean web page.
+  paper project's latest session as a web page.
 - `aht share ~/Desktop/paper --format md` — print it as Markdown instead.
 - `aht share ~/Desktop/paper --session <id> --agent kimi` — an earlier
   session, or one of another agent.
@@ -961,7 +1014,7 @@ A session as a clean page for a colleague, a student or a paper's appendix.
 
 ## Secrets check
 
-Lists what looks like a key, a token or a password in the agents'
+Lists what aht recognises as a key, a token or a password in the agents'
 histories. Values are only ever shown masked.
 
 > **Example.** Months ago you pasted an API key into a prompt. **Settings →
@@ -970,18 +1023,72 @@ histories. Values are only ever shown masked.
 > message, a tool's output) and when. Replace that key where it was issued.
 
 - For one project: **More → Check for Secrets**.
-- aht never changes the agents' histories. It masks such values in
-  everything it writes itself: the search index, journals and summaries.
+- **What it recognises:** keys of a known kind (Anthropic, OpenAI, Groq,
+  GitHub, GitLab, AWS access keys, Google API keys and OAuth tokens, Slack,
+  Stripe live keys, SendGrid, Hugging Face, npm, PyPI, age, Vault,
+  DigitalOcean, Shopify, Docker Hub, Atlassian, Tailscale, JSON web tokens,
+  the secret part of a Slack webhook address, the token in a Telegram bot
+  address); `Bearer` tokens, `Basic` credentials and what follows
+  `Authorization:` with any other scheme or none; the value given to a name
+  that holds a password, a secret, a token or a key (`DB_PASSWORD=`,
+  `AWS_SECRET_ACCESS_KEY=`, `SECRET_KEY=`, `JWT_SECRET=`, `client_secret`,
+  `GITHUB_TOKEN=`, `x-api-key:`, `RAILS_MASTER_KEY=`, camelCase names such
+  as `dbPassword`, `accessToken` and `SecretAccessKey`, in a `.env` file or
+  an `export` line too, on any line of a tool's output) when the value looks
+  generated, a value in quotes to its closing quote; passwords on a command
+  line (`--password X`, `--token X`, `mysql -pX`, `docker login -p X`,
+  `curl -u user:X`), in a cookie whose name holds sess, sid, token or auth,
+  and in XML (`<password>X</password>`); and the password in a web or
+  database address, whatever the host (`@localhost`, an IP address, a
+  container's name such as `@db`, `[::1]`), also with an `@` in it or in
+  Go's form (`user:…@tcp(host:3306)/db`), with the rest of the address left
+  readable. Names that say they hold something else do not count:
+  `TOKEN_URL`, `password_hash`, `token_type`, `max_tokens`,
+  `accessTokenUrl`, `token_sha256`.
+- **Private keys** are listed, masked and taken out as their header, their
+  lines of key and their END line, also inside JSON (and JSON inside
+  JSON), in a Read tool's output with line numbers, encrypted ones, PGP
+  private-key blocks and PuTTY `.ppk` files, and private keys in base64 (a
+  kubeconfig's `client-key-data`, a Kubernetes `tls.key`), shown as
+  *BEGIN RSA PRIVATE KEY (in base64)*. A guide or code that only names
+  the BEGIN and END lines is left alone. A key the history holds twice
+  (the Read tool's numbered copy and the file's text) is listed once, and
+  a key of a known kind is not listed again as *password or token*.
+- **Left alone:** placeholders and references to a secret store
+  (`${DB_PASSWORD}`, `<token>`, `changeme`, `op://…`, `vault:…`),
+  ordinary code that uses the words token, password, secret or auth
+  (`token = tokenizer.encode(text)`, `password: Optional[str]`), names
+  (`MAX_RETRIES`, `spring.datasource.password`), paths and web addresses,
+  ARNs, fingerprints and hashes, test names (`test_auth.py::test_token`,
+  `--- PASS:`) and plain words.
+- **Not every secret:** masking is best effort, and aht cannot recognise
+  all of them. A value with no name or form it knows stays in clear, and
+  so can a short one, one after a camelCase name it does not know
+  (`dbPass`, `tokenValue`), one in quotes with a space in it, or one that
+  does not look random enough (small letters only, say). The privacy
+  policy lists the known limits. Keep secrets out of agent chats.
+- aht never changes the agents' histories on its own. In everything it
+  copies out of them it masks what it recognises, whole (a key of any
+  length, up to 64 KB): the search index, journals, summaries, notices and
+  what a session waits for, shared pages, Tidy Up's preview, What Changed,
+  the notes for informed sessions, loose ends and second opinions,
+  `aht limits`, and session titles and names and tab titles wherever aht
+  lists them (the Sessions tab, loose ends, handovers, What Changed, Undo
+  a Session, the tab names). It masks before it shortens a text, so a cut
+  never leaves part of a key it recognises, also in the commands of tool
+  calls. Names stay as they are only on this computer: in the session
+  corner, the tab titles aht sets, aht's own files about tabs, the tab
+  titles of saved layouts, and aht's log.
 - A handover tells you when such values travel along with a project.
 - **Take one out:** **Remove…** next to a find replaces it with
   `[removed by aht]` in every history file that holds it. The files are
   copied to `~/.aht/redacted` first, and it waits until no agent session is
   open in those projects. Backups still hold the old files, so replace the
-  key where it was issued anyway.
+  key where it was issued anyway. A new check then no longer lists it.
 
 **In the terminal:**
 
-- `aht secrets` — list what looks like a key or password in every
+- `aht secrets` — list what aht recognises as a key or password in every
   project's histories, masked.
 - `aht secrets ~/Desktop/paper` — the same for one project.
 - `aht secrets --redact <fingerprint>` — say in how many places and history
@@ -1027,12 +1134,14 @@ with suggestions. **Projects → Tidy Up…** appears when there is something.
   **Read…**, **Show in Finder** and **Choose Folder…**).
 - **Forget sticks.** A forgotten project's folder, if it is still there,
   keeps its `.aht/.project-id`, but aht's scans no longer take it on again.
-  It comes back only with a new Claude Code session in that folder,
-  `aht tag`, `aht adopt` (Adopt's question says you told aht to forget
-  it), or when you tick it while setting up again: **Run Setup Again**
-  lists it unticked, marked *you told aht to forget it*, and Quick Setup
-  leaves it out and says so. `aht forget --remove-marker` also deletes the
-  marker.
+  It comes back when you take it on yourself: a new Claude Code session in
+  that folder; `aht tag`; **Adopt This Mac's Projects…** or `aht adopt`
+  (the question names up to three such folders, then *and N more*); ticking
+  it when you set up again (**Run Setup Again** lists it unticked, marked
+  *you told aht to forget it*, and Quick Setup leaves it out and says so);
+  Tidy Up's **Reconnect** or **Choose Folder…** onto that folder
+  (`aht bind`); `aht restore` into it; handing it over; or keeping it in
+  sync. `aht forget --remove-marker` also deletes the marker.
 - On a Mac and on Windows, histories are matched to their projects without
   regard to case, as the disk does: a tracked project's history is never
   listed as a history without its folder, and `aht tidy --remove-history`
@@ -1101,13 +1210,109 @@ the laptop or your phone.
   version.
 - **Keep in sync:** tick it for a project, and aht copies it in the
   background every 30 minutes, so a handover only sends the last changes.
+  A Release pauses it (see below). A sync run checks each project again
+  right before it sends it: one released, handed over or switched off
+  while the run is under way is not sent, and the run lists it as
+  *paused*, or as *skipped* with why (*Keep in sync is off for it now*).
 - **Every project at once:** Machines → **Sync** → *Keep All Projects in
   Sync…*. aht first adds up what the first copy sends (projects inside
   another project travel with it; rebuilt folders such as `node_modules`
   stay behind) and asks. The first copy runs in the background and can
   take hours for tens of gigabytes; after that only changes travel.
-- **Nothing is lost:** whatever a transfer replaces is set aside first, in
-  `~/.aht/handover/<project id>/replaced/`.
+- **Nothing is lost:** whatever a transfer replaces is set aside first: in
+  `~/.aht/handover/<project id>/replaced/` here, and in
+  `~/.aht/remote/replaced/` on the other machine (Claude's checkpoints and
+  plans too). The newest 5 of those folders and every one younger than 30
+  days are kept.
+- **Names whose case changed** there (`readme.md` → `README.md`) come back
+  as renamed on a Mac, whose disk takes both for one name; the old one is
+  set aside. Two names that differ only in case are both kept, one under
+  the conflict name. Empty folders made there (a packed git repo's
+  `refs`) come back too.
+- **Summaries:** each handover and each switch of agent leaves a summary in
+  the project's `.aht/handover/`; the newest 12 are kept, of both kinds.
+- **A Windows PC** cannot be the other machine yet. **Check and Add**
+  (`aht remote add`, `aht remote check`) stops with *aht cannot ask a
+  Windows machine yet*, and nothing is made on the PC.
+
+**A handover cut off halfway.** When the link drops or this Mac sleeps
+during a handover, aht cannot tell at once whether the session there
+started. It asks that machine at its next check, within a few minutes, and
+a notice says how it ended: *Handover of paper to homebox finished: the
+session there runs (the link had dropped at 01:02)* (or *the copy there
+was worked on*), and the project is on homebox as after any handover; or
+*The handover of paper to homebox did not finish. The project stays here;
+nothing runs there*. It counts as finished when anything happened there: a
+session runs there, the copy there was worked on, *the conversation went
+on there*, or *the session there started, and has ended since*. Only when
+nothing happened there does it say *did not finish*. A handover that fails
+before the session there starts says *did not finish* at once.
+
+- **Meanwhile** the project shows a note, *Handover to homebox
+  unfinished: checking…*, or *Handover to homebox did not finish* when
+  homebox does not answer, with **Check Now** and **Release…** (aht's
+  window says *under way* while the handover still runs). The list's
+  *Where* says *handing over to homebox*, the ∞ menu lists the project,
+  and **Continue Session**, **Switch Agent**, **Hand Over** and **Keep in
+  sync** wait until it is settled. A click on the notice opens the
+  project.
+- **Check Now** asks homebox at once, then finishes the handover or undoes
+  it.
+- **Release…** lets the project count as here again, with its files here
+  as they are. The copy on homebox is not touched, and the work done there
+  stays there; Release asks first, and names what stays there, the files
+  and the conversation: *The work done on homebox since 14:10 stays on
+  homebox: 3 files and the conversation. It does not come here.* (on a
+  Mac: *3 files and the conversation stay there*). It says *Nothing
+  changed on homebox since 14:10, so nothing stays behind there* only when
+  neither the project's files nor its conversation (Claude's history, its
+  /rewind checkpoints and plans) changed there. After an hour without an
+  answer, Release is the main button, and a notice says so once: *paper:
+  handover unfinished: homebox has not answered since 14:10. To work on
+  paper here, release it in aht; the work on homebox stays there.*
+- **Release… for a handed-over project**, for a machine that is gone for
+  good: on a Mac it sits next to **Take Back…**; in aht's window it is
+  **More → Release from homebox…**, named as you added the machine. To
+  bring the work done there home, use Take Back instead.
+- **Release and Keep in sync:** releasing a project kept in sync with that
+  machine pauses Keep in sync, so the next sync does not overwrite the copy
+  left there. Release's question says so: in aht's window *Keep in sync
+  with homebox will be paused, so the copy there stays as it is. You can
+  turn it back on later.*, on a Mac *Release pauses Keep in sync with
+  homebox, so the copy there stays as it is until you turn sync back on.*
+  Its result says *Keep in sync with homebox is paused, so the copy there
+  stays as it is.* The project then shows *Keep in sync with homebox is
+  paused* with **Turn Sync Back On…**; the list says *sync paused* in aht's window (its switch
+  reads *Keep in sync with homebox (paused)*) and *paused* in the Mac's
+  *In sync* column. **Turn Sync Back On…** asks first: the next sync makes
+  the copy there the same as this one and replaces the work left there,
+  which is set aside on homebox first (in `~/.aht/remote/replaced/`).
+  Once aht has switched the sync back on, a note says *Kept in sync with
+  homebox again; the next copy runs in the background.* If it could not,
+  the note says *The sync was not turned back on:* and aht's reason (for
+  example, that no other machine is set up yet). On a Mac, if the list
+  still shows the sync paused afterwards, the note says *The sync with
+  homebox did not come back on; see the log (Settings).*
+  Unticking **Keep in sync** also ends the pause, and *Keep All Projects
+  in Sync…* leaves a paused project paused.
+- **Handing it over again** to that machine ends the pause by itself (so
+  does a Take Back from it). Hand Over says so first: *the copy that
+  Release left on homebox is replaced by this one (aht sets it aside there
+  first); Keep in sync with homebox goes on again once the project is back
+  here*.
+- **A session started here** while a handover is unfinished is warned.
+  After a Release, the next session here is told once that the work done
+  there did not come here.
+- **Take Back refuses** when the saved list of what left belongs to another
+  handover attempt, since it would count the wrong files as changed; it
+  points to Release.
+- **Removing a machine** that still holds a project is refused, and says
+  why: take the project back first, or release it if that machine is gone
+  for good.
+- **On Linux** the tray shows these notices as *paper is on homebox:
+  Handover of paper to homebox finished: …*, *paper stays here: The handover
+  of paper to homebox did not finish. …*, and the one after an hour. With
+  **Also send them to my phone** set, they reach your phone too.
 
 **In the terminal:**
 
@@ -1123,7 +1328,8 @@ the laptop or your phone.
   session there instead of the latest.
 - `aht handover ~/Desktop/paper --include ~/notes/paper.md --apply` — take
   a file or folder from outside the project along (remembered for the
-  project).
+  project). Take Back brings it back, also after a handover that finished
+  once the link had dropped.
 - `aht handover ~/Desktop/paper --no-start --apply` — send it without
   starting the session; `--attach` opens the session in this terminal right
   after.
@@ -1133,7 +1339,14 @@ the laptop or your phone.
 - `aht attach ~/Desktop/paper` — open the session running on the other
   machine, in this terminal.
 - `aht reclaim ~/Desktop/paper --apply` — take the project back: its files
-  and history return to this Mac.
+  and history return to this Mac. For a handover cut off halfway it first
+  asks the other machine what happened, also without `--apply` (that is
+  **Check Now**).
+- `aht reclaim ~/Desktop/paper --release` — say what releasing the project
+  leaves on the other machine (*What stays there: 1 file and the
+  conversation.*) and whether it pauses Keep in sync, without changing
+  anything; `--apply` releases it: it counts as here again, its files here
+  stay as they are, and the copy there is left alone.
 - `aht reclaim ~/Desktop/paper --stop --apply` — end the session over there
   first, if it is idle.
 - `aht reclaim ~/Desktop/paper --prefer there --apply` — for files changed on
@@ -1147,15 +1360,20 @@ the laptop or your phone.
   in a new terminal window here; `--handed-over` picks the session the last
   handover sent, `--session <id>` any other.
 - `aht mirror ~/Desktop/paper --on` — keep a copy of the project on the
-  other machine, updated every 30 minutes.
+  other machine, updated every 30 minutes. After a Release,
+  `aht mirror ~/Desktop/paper --on --to homebox` turns the paused sync back
+  on.
 - `aht mirror ~/Desktop/paper --off` — stop that; `aht mirror --run` syncs
-  every kept copy now.
+  every kept copy now, and lists a paused one as *paused since the project
+  was released; turn Keep in sync on again to send it*. `aht mirror` lists
+  the kept copies, a paused one with *[paused: it was released]*.
 - `aht mirror --all --on --to homebox` — show what keeping every project in
   sync with homebox would send; `--apply` does it. `aht mirror --all --off
   --apply` stops it for all of them.
 - `aht remote default homebox` — make homebox the machine the window uses;
-  `aht remote remove homebox` forgets it; `aht remote check all` checks every
-  machine.
+  `aht remote remove homebox` forgets it (while it holds a handed-over
+  project it refuses, and names `aht reclaim … --release` for each);
+  `aht remote check all` checks every machine.
 
 ## The night shift (uses tokens, off by default)
 
@@ -1273,10 +1491,13 @@ glance when you steer it from the phone.
   *Paper @ homebox*, so you can tell it from one on this Mac.
 - **See and change the names** in the **Sessions** tab: under each Claude
   session its name, where the name came from (*from its tab*, *named by
-  you*, *named in aht*, *Claude's own title*) and the tab's title.
-  **Rename…** gives a session a name of your choice and gives its tab that
-  name too. It stays until you rename the tab, or until **Follow the Tab
-  Again**.
+  you*, *named in aht*, *Claude's own title*) and the tab's title when it
+  differs from the name. A key in a name or a tab's title shows masked
+  there. **Rename…** gives a session a name of your choice and gives its
+  tab that name too. It stays until you rename the tab, or until **Follow
+  the Tab Again**. When the current name holds a masked key, **Rename…**
+  starts with an empty field and shows that name greyed as a hint, so the
+  masked text never becomes the name by accident.
 - **Name Sessions After Their Tabs…** (Sessions tab, when iTerm2 is
   installed) gives every open session its tab's title at once, also the ones
   you named yourself. It shows the list of changes first.
@@ -1348,11 +1569,15 @@ a part opens its section; the **?** at the top opens the whole guide.
   **Tidy Up (n)…** when something needs a decision (with **Choose
   Folder…**, **Reconnect**, **Forget** and, for a history without a folder
   that is not a link, **Remove…**).
-- **The project list:** *Where* (here, handed over, missing, a session open,
-  working or waiting for you), *In sync* (when the kept copy was last
-  synced), *Last used*, *Agents* (whose history it has).
+- **The project list:** *Where* (here, handed over, handing over, missing,
+  a session open, working or waiting for you), *In sync* (when the kept
+  copy was last synced; *paused* while the project is handed over or after
+  a Release), *Last used*,
+  *Agents* (whose history it has).
 - **Under the list, for the selected project:** **Hand Over…** or, while it
-  is away, **Take Back…** and **Open Session**; **Keep in sync**;
+  is away, **Take Back…**, **Open Session** and **Release…**; while a
+  handover is unfinished, a note with **Check Now** and **Release…** (see
+  *Hand a project over to another machine*); **Keep in sync**;
   **Continue Session** (opens the latest session in a new terminal window);
   **Switch Agent**; **More**, with *Show Sessions…*, *What Changed…*,
   *Undo a Session…*, *Journal*, *AI-Use Statement*, *Share a Session…*,
@@ -1368,7 +1593,8 @@ a part opens its section; the **?** at the top opens the whole guide.
   *Show Project* on each result.
 - **Machines tab:** the machines you added, with **Sync** (keep every
   project in sync with it, or stop), **Check**, **Use for Handover** and
-  **Remove…**; **Add Another…**; machines aht found on your
+  **Remove…** (refused, with the reason, while the machine holds a
+  project); **Add Another…**; machines aht found on your
   Tailscale network or in `~/.ssh/config`, each with **Add…**, and **Look
   Again**.
 - **Settings tab:** see *Settings* below.
@@ -1403,7 +1629,8 @@ a part opens its section; the **?** at the top opens the whole guide.
 - **Folder badges:** on or off, per kind; **Refresh All**, **Clear All…**
 - **Handover:** reachable from the Claude app, compression, mosh, trust
   carried over.
-- **Backups on another machine:** which machine keeps a copy; **Copy Now**.
+- **Backups on another machine:** which machine keeps a copy; **Copy Now**;
+  **Fetch Backups From…** (see *Backups, and bringing a session back*).
 - **Where each agent keeps its history:** **Choose…** when aht did not find
   an agent's history folder itself; **Reset All to Defaults**.
 - **This Mac:** **Start aht in the menu bar at login**; *Tell me when a new
@@ -1411,8 +1638,8 @@ a part opens its section; the **?** at the top opens the whole guide.
   session windows in** (iTerm or Terminal; automatic picks iTerm when it is
   installed); **Run Setup Again…** (the welcome window, see *Setting up*);
   **Adopt This Mac's Projects…** (tracks every folder that already has
-  agent history; its question names any you told aht to forget, since
-  adopting takes them on again);
+  agent history; its question names up to three you told aht to forget,
+  then *and N more*, since adopting takes them on again);
   **Reinstall or Update aht…** (sets aht up again from the app, for example
   after an update); **Restart Watcher** (before aht is installed it starts
   nothing and says the watcher is not installed yet); **Run Diagnostics**;
@@ -1475,9 +1702,11 @@ all of them can be set with `aht config --set name=value` and put back with
 **Backups**
 
 - `backup_enabled` (on), `backup_interval_hours` (24), `backup_keep` (10) —
-  the daily backup, how often, how many per project.
+  the daily backup, how often, how many per project (copies on the other
+  machine follow `backup_keep`, keeping at least 3).
 - `backup_dir` (`~/.aht/backups`) — where they go.
-- `offsite_backup` (none) — the machine that keeps a copy of them.
+- `offsite_backup` (none) — the machine that keeps a copy of them, in a
+  folder of this computer's own.
 
 **Handover**
 
@@ -1571,9 +1800,9 @@ and act only with `--apply`; `install` and `uninstall` act at once.
 - `aht prune --apply` — stop tracking folders that are gone (their histories
   stay) and drop entries listed twice.
 - `aht forget ~/Desktop/paper --apply` — stop tracking a folder. It keeps
-  its `.aht/.project-id`, but aht's scans no longer take it on again (a
-  new Claude Code session there, `aht tag`, `aht adopt` or ticking it when
-  you set up again does); `--remove-marker` also removes the marker.
+  its `.aht/.project-id`, but aht's scans no longer take it on again
+  (*Tidy up* lists every way it comes back); `--remove-marker` also removes
+  the marker.
 - `aht roots` — the folders aht watches; `--add ~/code` and `--remove …`
   change them.
 - `aht reload` — make the watcher read its settings again. On a Mac
@@ -1593,8 +1822,10 @@ and act only with `--apply`; `install` and `uninstall` act at once.
   Claude hooks and the `aht` command; `--src` installs from another folder
   (the app uses this).
 - `aht uninstall` — remove all of that again; histories are never touched.
-  `--remove-icons` also clears the badges; `--purge` also removes aht's
-  markers, list of projects and settings.
+  `--remove-icons` also clears the badges (on Linux also aht's emblem
+  images, and their icon cache when no other icons are left there; when
+  others are, the cache is written again without aht's); `--purge` also
+  removes aht's markers, list of projects and settings.
 - `aht hook` — what Claude Code runs when a session starts and at each
   prompt; not for typing yourself.
 - More options: `--roots ~/code ~/src` (for `adopt`, `orphans`,
@@ -1616,7 +1847,9 @@ and act only with `--apply`; `install` and `uninstall` act at once.
 ## Where things are
 
 - `~/.aht/` holds aht's own data: `registry.json` (which folder is which
-  project), `config.json`, `backups/`, `search.db`, `aht.log`, `handover/`,
+  project), `config.json`, `machine.json` (this computer's random id),
+  `offsite.json` (which backups went to which machine), `backups/`,
+  `search.db`, `aht.log`, `handover/`,
   `rules-backups/`, `changes-backups/`, `redacted/`, `checkpoints/` (the
   copies to undo a session with), `undo/` (what an undo set aside),
   `opinions/` (second opinions) and `night-shift.json`.

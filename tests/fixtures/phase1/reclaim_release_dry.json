@@ -1,0 +1,15 @@
+{
+  "command": "reclaim",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/api",
+  "remote": "box",
+  "released": false,
+  "pauses_sync": "box",
+  "would_lose": {
+    "files": 2,
+    "history": 1,
+    "since": "2026-10-26T14:10:00"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "notices": [
+    {
+      "kind": "handover",
+      "title": "api is on box",
+      "message": "Handover of api to box finished: the session there runs (the link had dropped at 01:02)",
+      "info": {
+        "kind": "handover",
+        "project": "/Users/me/code/api",
+        "remote": "box"
+      }
+    },
+    {
+      "kind": "handover",
+      "title": "api stays here",
+      "message": "The handover of api to box did not finish. The project stays here; nothing runs there",
+      "info": {
+        "kind": "handover",
+        "project": "/Users/me/code/api",
+        "remote": "box"
+      }
+    },
+    {
+      "kind": "handover",
+      "title": "api: handover unfinished",
+      "message": "box has not answered since 15:20. To work on api here, release it in aht; the work on box stays there.",
+      "info": {
+        "kind": "handover",
+        "project": "/Users/me/code/api",
+        "remote": "box"
+      }
+    }
+  ]
+}

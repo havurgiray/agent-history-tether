@@ -4,7 +4,7 @@
 # container) or natively on Windows from Git Bash with AHT_SMOKE_NATIVE=1.
 # A project folder is renamed while `aht watch --once` runs; the watcher must
 # notice, reconcile (forced Relink via AHT_ASSUME) and relink the fake claude
-# store.
+# store.  It works in /tmp/aht-watch (AHT_SMOKE_DIR in place of /tmp).
 set -e
 
 EXE="$1"
@@ -12,7 +12,7 @@ EXE="$1"
 export WINEDEBUG=-all
 fail() { echo "WATCH FAIL: $*"; exit 1; }
 
-T=/tmp/aht-watch
+T="${AHT_SMOKE_DIR:-/tmp}/aht-watch"
 if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then RUN=""; else RUN="wine"; fi
 W() { $RUN "$EXE" "$@" | tr -d '\r'; }
 
@@ -23,7 +23,7 @@ run_case() {
     if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
         WT="$(cygpath -w -l "$T")"       # long form: the runner's TEMP is 8.3
     else
-        WT='Z:\tmp\aht-watch'
+        WT="Z:$(printf '%s' "$T" | tr '/' '\\')"   # wine maps / to Z:
     fi
     export AHT_HOME="$WT\\home\\.aht"
     export AHT_ROOTS="$WT\\roots"

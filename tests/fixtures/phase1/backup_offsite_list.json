@@ -1,0 +1,41 @@
+{
+  "remote": "box",
+  "folders": [
+    {
+      "id": "43fde83ff31b",
+      "folder": "43fde83ff31b",
+      "name": "mac",
+      "system": "Darwin",
+      "updated": "2026-10-26T17:15:35",
+      "projects": 11,
+      "files": 17,
+      "bytes": 22074,
+      "legacy": false,
+      "mine": true
+    },
+    {
+      "id": "8e2c1d71d05b",
+      "folder": "8e2c1d71d05b",
+      "name": "pc",
+      "system": "Windows",
+      "updated": "2026-10-25T09:02:11",
+      "projects": 1,
+      "files": 1,
+      "bytes": 13,
+      "legacy": false,
+      "mine": false
+    },
+    {
+      "id": null,
+      "folder": "mac",
+      "name": "mac",
+      "system": null,
+      "updated": "2026-09-30T22:00:05",
+      "projects": 4,
+      "files": 9,
+      "bytes": 18032,
+      "legacy": true,
+      "mine": false
+    }
+  ]
+}

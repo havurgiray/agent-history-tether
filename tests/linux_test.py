@@ -8,7 +8,13 @@ its own has one), the installer quotes the watcher unit and the hook (and
 finds the hook entries older versions wrote) and puts the unit's start limit
 where systemd reads it, a reload and the tray's resume clear that limit
 before they start the watcher, and the uninstaller takes `aht uninstall`'s
-flags (with --remove-icons it removes the emblem images aht drew)."""
+flags (with --remove-icons it removes the emblem images aht drew, and the
+icon cache with the last icon there), and the tray's notices say what became
+of a handover cut off halfway (finished, undone, or Release offered after an
+hour without an answer) and mask a key in what a session waits for, and
+vm_check.sh copies no DEVNOTES file to the machine it checks, works there in
+a folder of its own in /tmp (not in the home folder) and removes it at the
+end."""
 import hashlib, json, os, re, shlex, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
@@ -294,26 +300,50 @@ ck(r.returncode == 0 and all(f in r.stdout for f in ("--remove-icons", "--remove
                                                        "--purge")),
    "uninstall.py knows --remove-icons, --remove-emblems and --purge")
 # with --remove-icons it also removes the emblem images the core drew and
-# their stamp (a new install draws them again); other icons there stay
+# their stamp (a new install draws them again); other icons there stay.  A
+# stand-in gtk-update-icon-cache writes the icon cache as the real one does
+# on a Linux desktop (the cache numbers its calls): the cache is written
+# again while other icons are left, and goes with the last of them
+icons_bin = sb / "bin-icons"
+icons_bin.mkdir()
+(icons_bin / "gtk-update-icon-cache").write_text(
+    '#!/bin/sh\nfor a; do last="$a"; done\necho "$*" >> "%s"\n'
+    'wc -l < "%s" | tr -d " " > "$last/icon-theme.cache"\n'
+    % (sb / "icon-cache.log", sb / "icon-cache.log"))
+(icons_bin / "gtk-update-icon-cache").chmod(0o755)
+xenv = dict(env, XDG_DATA_HOME=str(sb / "xdg-data"),
+            PATH=str(icons_bin) + os.pathsep + env.get("PATH", ""))
 r = subprocess.run([PY, "-c",
                     "import json, sys; sys.path[:0] = sys.argv[1:3]; import aht, uninstall\n"
                     "base = aht._xdg_data() / 'icons' / 'hicolor'\n"
                     "names = lambda: sorted(str(p.relative_to(base)) for p in base.rglob('*') if p.is_file())\n"
+                    "mine = [base / '24x24' / 'emblems' / 'emblem-mine.png',\n"
+                    "        base / '48x48' / 'emblems' / 'aht-gitx.png']\n"
                     "ok = aht._ensure_linux_emblems()\n"
-                    "(base / '24x24' / 'emblems' / 'emblem-mine.png').write_bytes(b'x')\n"
-                    "(base / '48x48' / 'emblems' / 'aht-gitx.png').write_bytes(b'x')\n"
-                    "made = names(); uninstall.remove_emblem_files()\n"
-                    "print(json.dumps([ok, made, names()]))",
+                    "for f in mine: f.write_bytes(b'x')\n"
+                    "made = names(); uninstall.remove_emblem_files(); left = names()\n"
+                    "cache = (base / 'icon-theme.cache').read_text().strip()\n"
+                    "again = aht._ensure_linux_emblems()\n"
+                    "for f in mine: f.unlink()\n"
+                    "uninstall.remove_emblem_files()\n"
+                    "print(json.dumps([ok and again, made, left, cache, names()]))",
                     str(ROOT / "linux"), str(ROOT)],     # linux's uninstall.py, not the Mac's
-                   env=dict(env, XDG_DATA_HOME=str(sb / "xdg-data")), capture_output=True, text=True)
+                   env=xenv, capture_output=True, text=True)
 try:
-    ok, made, left = json.loads(r.stdout.splitlines()[-1])
+    ok, made, left, cache, gone = json.loads(r.stdout.splitlines()[-1])
 except (ValueError, IndexError):
-    ok, made, left = False, [], r.stderr[-400:]
+    ok, made, left, cache, gone = False, [], r.stderr[-400:], None, None
+calls = ((sb / "icon-cache.log").read_text().splitlines()
+         if (sb / "icon-cache.log").is_file() else [])
+ck(shutil.which("gtk-update-icon-cache", path=xenv["PATH"]) == str(icons_bin / "gtk-update-icon-cache"),
+   "the stand-in gtk-update-icon-cache comes first on PATH")
 ck(ok and "24x24/emblems/aht-git.png" in made and "48x48/emblems/aht-agent-claude.png" in made
-   and any(n.startswith(".aht-emblems-v") for n in made)
-   and left == ["24x24/emblems/emblem-mine.png", "48x48/emblems/aht-gitx.png"],
+   and any(n.startswith(".aht-emblems-v") for n in made) and "icon-theme.cache" in made
+   and left == ["24x24/emblems/emblem-mine.png", "48x48/emblems/aht-gitx.png", "icon-theme.cache"],
    f"--remove-icons removes the emblem images aht drew and their stamp, nothing else ({left})")
+ck(cache == "2", f"the icon cache is written again while other icons are left ({cache})")
+ck(gone == [] and len(calls) == 3,
+   f"the icon cache goes with the last icon there ({gone}, {len(calls)} call(s))")
 
 print("\n[5] the installer quotes the watcher unit and the hook")
 # under the same odd home; stand-ins for systemctl (it says a user manager
@@ -405,6 +435,222 @@ else:
        f"a reload clears the start limit before it starts the watcher ({asked(by_reload)})")
     ck(asked(by_tray) == ["stop " + u, "reset-failed " + u, "start " + u],
        f"the tray's resume clears it too, its pause only stops ({asked(by_tray)})")
+
+print("\n[6] the tray shows what became of a handover cut off halfway")
+# every 30 s the tray asks the core (`aht notices --quiet`), which shows what
+# it finds with notify-send when there is a screen: on Linux a stand-in
+# notify-send, elsewhere AHT_NOTIFY_LOG notes it.  Three projects
+# were being handed over to "box" (a folder stands in for it) when the link
+# dropped ten minutes ago: on api the session there runs, on web nothing
+# ran, and docs went to a machine that has not answered for over an hour
+LINUX = sys.platform.startswith("linux")
+nb = Path(os.path.realpath(str(sb))) / "notices"
+box = nb / "box"
+for d in (nb / "home", nb / "claude", nb / "roots", nb / "bin",
+          box / "home" / ".claude" / "sessions"):
+    d.mkdir(parents=True)
+(nb / "bin" / "notify-send").write_text(   # one line per notice, its words between tabs
+    '#!/bin/sh\nfor a; do printf "%%s\\t" "$a"; done >> "%s"\necho >> "%s"\n'
+    % (nb / "notify-send.log", nb / "notify-send.log"))
+(nb / "bin" / "osascript").write_text("#!/bin/sh\nexit 0\n")      # never a Mac notice
+for f in (nb / "bin").iterdir():
+    f.chmod(0o755)
+nenv = dict(env, HOME=str(nb / "home"), AHT_HOME=str(nb / ".aht"),
+            AHT_ROOTS=str(nb / "roots"), AHT_ROOT_CLAUDE=str(nb / "claude"),
+            PATH=str(nb / "bin") + os.pathsep + env.get("PATH", ""))
+if LINUX:
+    nenv.pop("AHT_NO_NOTIFY", None)
+    nenv.pop("WAYLAND_DISPLAY", None)
+    nenv["DISPLAY"] = ":0"
+else:
+    nenv["AHT_NOTIFY_LOG"] = str(nb / "notices.jsonl")
+
+def shown():
+    """(title, message) of each notice shown so far."""
+    if LINUX:
+        f = nb / "notify-send.log"
+        rows = [l.split("\t") for l in (f.read_text(encoding="utf-8").splitlines()
+                                         if f.is_file() else [])]
+        return [(r[2], r[3]) for r in rows if r[:2] == ["-a", "aht"] and len(r) > 3]
+    f = nb / "notices.jsonl"
+    return [(n["title"], n["message"]) for n in
+            (json.loads(l) for l in (f.read_text(encoding="utf-8").splitlines()
+                                     if f.is_file() else []))]
+
+def tray_tick(**more):
+    """The tray's notices timer, once, as it runs it."""
+    r = subprocess.run([PY, "-c",
+                        "import sys; sys.path.insert(0, sys.argv[1]); import tray\n"
+                        "class Shown:\n"
+                        "    noticing = False\n"
+                        "    def in_thread(self, fn): fn()\n"
+                        "tray.Tray._notices(Shown())",
+                        str(ROOT / "linux")], env=dict(nenv, **more),
+                       capture_output=True, text=True)
+    if r.returncode:
+        print(r.stderr[-600:])
+
+def project_rows():
+    r = subprocess.run([PY, str(ROOT / "aht.py"), "projects", "--json"],
+                       env=nenv, capture_output=True, text=True)
+    try:
+        return {os.path.basename(p["real_path"]): p for p in json.loads(r.stdout)["projects"]}
+    except (ValueError, KeyError):
+        print(r.stdout[-400:], r.stderr[-400:])
+        return {}
+
+# the record a handover writes before anything travels; for api also the
+# record of what left, the copy there and a session open in it (this test's
+# own process stands in for it)
+HANDING = (
+    "import json, os, sys, time\n"
+    "sys.path.insert(0, sys.argv[1]); import aht\n"
+    "box, pid, how = sys.argv[2], int(sys.argv[3]), json.loads(sys.argv[4])\n"
+    "now = time.time()\n"
+    "for p, kind in how.items():\n"
+    "    uid = aht.read_marker(p)\n"
+    "    h = {'v': 2, 'attempt': '20261026-010000-' + os.urandom(2).hex(), 'remote': 'box',\n"
+    "         'holder': 'box', 'host': 'box', 'driven_by': 'here', 'path': p,\n"
+    "         'remote_path': box + p, 'since': aht._now(), 'agent': 'claude',\n"
+    "         'step': 'starting', 'at': now - 600}\n"
+    "    if kind == 'runs':\n"
+    "        hd = aht.handover_dir(uid); hd.mkdir(parents=True, exist_ok=True)\n"
+    "        (hd / 'manifest.json').write_text(json.dumps({'v': 2, 'attempt': h['attempt']}))\n"
+    "        os.makedirs(box + p)\n"
+    "        with open(box + '/home/.claude/sessions/%d.json' % pid, 'w') as fh:\n"
+    "            json.dump({'pid': pid, 'cwd': box + p, 'status': 'busy', 'sessionId': 's1'}, fh)\n"
+    "    if kind == 'silent':\n"
+    "        h.update(unreachable_since=now - 3700, checked_at=now - 120, error='no answer')\n"
+    "    if kind == 'told':\n"
+    "        h = dict(aht.load_registry()['projects'][uid]['handing'], checked_at=now - 120)\n"
+    "    aht._update_entry(uid, handing=h)\n")
+
+def handing(**how):
+    paths = {os.path.realpath(str(nb / "roots" / n)): k for n, k in how.items()}
+    r = subprocess.run([PY, "-c", HANDING, str(ROOT), str(box), str(os.getpid()),
+                        json.dumps(paths)], env=nenv, capture_output=True, text=True)
+    if r.returncode:
+        print(r.stderr[-600:])
+
+subprocess.run([PY, str(ROOT / "aht.py"), "config", "--set",
+                "remotes=" + json.dumps({"box": {"root": str(box)}})],
+               env=nenv, capture_output=True)
+for n in ("api", "web", "docs"):
+    (nb / "roots" / n).mkdir()
+    subprocess.run([PY, str(ROOT / "aht.py"), "tag", str(nb / "roots" / n), "--apply"],
+                   env=nenv, capture_output=True)
+if LINUX and shutil.which("notify-send", path=nenv["PATH"]) != str(nb / "bin" / "notify-send"):
+    ck(False, "the stand-in notify-send comes first on PATH")
+else:
+    handing(api="runs", web="none")
+    tray_tick()
+    got = shown()
+    clock = r"(\d{4}-\d\d-\d\d )?\d\d:\d\d"
+    ck(any(t == "api is on box" and re.fullmatch(
+               r"Handover of api to box finished: the session there runs "
+               r"\(the link had dropped at %s\)" % clock, m) for t, m in got),
+       f"a handover whose session runs there is finished, and the tray says so ({got})")
+    ck(("web stays here", "The handover of web to box did not finish. "
+        "The project stays here; nothing runs there") in got,
+       "a handover that started nothing there is undone, and the tray says so")
+    rows = project_rows()
+    ck(rows.get("api", {}).get("away_remote") == "box" and not rows["api"].get("handing")
+       and rows.get("web") and not rows["web"].get("away") and not rows["web"].get("handing"),
+       "api is now on box, web stays here; neither handover is unfinished")
+
+    # the machine docs went to does not answer (the link drops after its
+    # probe): after an hour, once, the tray offers Release
+    n0 = len(shown())
+    handing(docs="silent")
+    tray_tick(AHT_TEST_DROP="probe")
+    got = shown()[n0:]
+    ck(any(t == "docs: handover unfinished" and re.fullmatch(
+               r"box has not answered since %s\. To work on docs here, release it in aht; "
+               r"the work on box stays there\." % clock, m) for t, m in got),
+       f"no answer for an hour: the tray offers Release ({got})")
+    h = project_rows().get("docs", {}).get("handing") or {}
+    ck(h.get("state") == "unreachable" and h.get("release") is True,
+       f"the project row offers Release too ({h})")
+    handing(docs="told")
+    tray_tick(AHT_TEST_DROP="probe")
+    ck(not [n for n in shown()[n0:] if n[0].startswith("docs")][1:],
+       "the tray says it once, not at every check")
+
+    # what a waiting session waits for may quote a key: the tray shows it
+    # masked (this test's own process stands in for the session)
+    key = "gh" + "p_" + "Zq7" * 12                 # built from pieces: no key in this file
+    srec = nb / "sessions" / ("%d.json" % os.getpid())
+    srec.parent.mkdir(exist_ok=True)
+    for status, waiting in (("busy", None),
+                            ("waiting", "curl -H 'Authorization: token %s'" % key)):
+        srec.write_text(json.dumps(dict({"pid": os.getpid(), "sessionId": "w1", "status": status,
+                                         "cwd": os.path.realpath(str(nb / "roots" / "web"))},
+                                        **({"waitingFor": waiting} if waiting else {}))))
+        tray_tick()
+    got = [m for t, m in shown() if t == "web waits for you"]
+    ck(len(got) == 1 and key not in got[0] and "[GitHub token: " in got[0],
+       f"a session that waits for you: what it waits for is masked ({got})")
+
+print("\n[7] vm_check.sh works in a folder of its own in /tmp there, copies no DEVNOTES "
+      "file and leaves no copy behind")
+# a checkout of its own (DEVNOTES files at the top and further down) and
+# stand-ins for ssh and scp that run each command here, in a "far" home
+# whose /tmp is far/tmp (the far machine's /tmp in what they are given and
+# what they answer); after each command the stand-in ssh notes what that
+# /tmp holds
+vc = Path(os.path.realpath(str(sb))) / "vmcheck"
+repo, far, vbin = vc / "repo", vc / "far", vc / "bin"
+for d in (repo / "linux" / "tests", repo / "tests", repo / "docs", far / "tmp", vbin):
+    d.mkdir(parents=True)
+shutil.copy2(str(ROOT / "linux" / "tests" / "vm_check.sh"), str(repo / "linux" / "tests"))
+(repo / "README.md").write_text("# demo\n")
+for n in ("DEVNOTES.md", "DEVNOTES-notes.md", "docs/DEVNOTES-old.md"):
+    (repo / n).write_text("private notes\n")
+(repo / "tests" / "vm_report.py").write_text("")         # the report is not checked here
+q = {"far": shlex.quote(str(far)), "log": shlex.quote(str(vc / "far.log"))}
+(vbin / "ssh").write_text(
+    "#!/bin/bash\n"
+    "set -o pipefail\n"
+    'while [ $# -gt 0 ]; do case "$1" in -o|-i) shift 2;; -*) shift;; *) break;; esac; done\n'
+    "shift\n"                                            # the host
+    "F=%(far)s\n"
+    'c=$(printf "%%s" "$*" | sed "s#/tmp/#$F/tmp/#g")\n'
+    'cd "$F" && HOME="$F" bash -c "$c" | sed "s#$F/tmp/#/tmp/#g"; s=$?\n'
+    '(cd "$F/tmp" && find . -type f 2>/dev/null; echo --) >> %(log)s\n'
+    "exit $s\n" % q)
+(vbin / "scp").write_text(
+    '#!/bin/bash\n[ "$1" = -q ] && shift\nF=%(far)s\n'
+    'cd "$F" && cp $(printf "%%s" "${1#*:}" | sed "s#^/tmp/#$F/tmp/#") "$2"\n' % q)
+for f in vbin.iterdir():
+    f.chmod(0o755)
+venv = dict(env, PATH=str(vbin) + os.pathsep + env.get("PATH", ""))
+if [shutil.which(c, path=venv["PATH"]) for c in ("ssh", "scp")] != [str(vbin / "ssh"), str(vbin / "scp")]:
+    ck(False, "the stand-in ssh and scp come first on PATH")
+else:
+    def vm_check(*more):
+        (vc / "far.log").write_text("")
+        r = subprocess.run(["bash", str(repo / "linux" / "tests" / "vm_check.sh"), "box",
+                            "--no-suites", "--out", str(vc / "out")] + list(more),
+                           env=venv, capture_output=True, text=True, timeout=120)
+        return r, (vc / "far.log").read_text().splitlines()
+    def copies():
+        return sorted((far / "tmp").glob("aht-sbx-check.*"))
+    r, held = vm_check()
+    made = {l.split("/")[1] for l in held if l.startswith("./aht-sbx-check.")}
+    ck(len(made) == 1 and re.fullmatch(r"aht-sbx-check\.[A-Za-z0-9]{6}", min(made))
+       and {f"./{min(made)}/README.md", f"./{min(made)}/linux/tests/vm_check.sh"} <= set(held),
+       f"the checkout is copied into a folder of its own in /tmp there ({sorted(made)} "
+       f"{r.stdout[-300:]}{r.stderr[-300:]})")
+    ck(not [l for l in held if "DEVNOTES" in l],
+       f"no DEVNOTES file goes there ({[l for l in held if 'DEVNOTES' in l]})")
+    ck(r.returncode == 0 and not copies() and os.listdir(str(far)) == ["tmp"],
+       f"the copy there is gone at the end, and nothing went into the home folder there "
+       f"({copies()}, {os.listdir(str(far))}, {r.returncode})")
+    r, _held = vm_check("--keep")
+    kept = copies()
+    ck(len(kept) == 1 and (kept[0] / "README.md").is_file()
+       and f"/tmp/{kept[0].name}" in r.stdout,
+       f"--keep leaves the copy there and says where ({kept}, {r.stdout[-200:]!r})")
 
 shutil.rmtree(sb, ignore_errors=True)
 print("\nLINUX RESULT:", "ALL PASS" if not FAILS else "%d FAIL" % len(FAILS))

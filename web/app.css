@@ -101,6 +101,12 @@ table.list tbody tr.picked { background: var(--pick); }
 .badge.working { color: var(--accent); }
 .badge.waiting { color: var(--warn); }
 .badge.ok { color: var(--ok); }
+/* something that needs a decision, such as a handover that did not finish */
+.callout {
+  border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px;
+  background: var(--panel); background: color-mix(in srgb, var(--warn) 8%, var(--panel));
+}
+.callout strong { color: var(--warn); }
 
 .menu { position: relative; display: inline-block; }
 .menu > .items {

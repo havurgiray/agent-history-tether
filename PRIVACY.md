@@ -50,7 +50,7 @@ your user profile):
 | Cursor Agent CLI | `~/.cursor/chats/` |
 | OpenCode | `$XDG_DATA_HOME/opencode/` |
 | GitHub Copilot CLI | `~/.copilot/history-session-state/` |
-| Kimi Code | `~/.kimi/sessions/` and `~/.kimi/user-history/` |
+| Kimi Code | in `~/.kimi-code/` (or `$KIMI_CODE_HOME`): `sessions/`, and for each project its prompt history (`user-history/`), `file-history/`, `workspaces.json` and `session_index.jsonl`; for the older Kimi CLI 1.x, `~/.kimi/sessions/` and `~/.kimi/user-history/` |
 
 These histories can contain anything you or an agent wrote: code, file
 contents, command output, and personal information or secrets.  You can
@@ -121,13 +121,20 @@ switch agents off (`backends`) or point aht at other folders
 - `.aht/.project-id`, a random identifier that lets aht recognise the
   folder after it moves;
 - folder badges (`icons_enabled`): a custom folder icon stored inside the
-  folder on macOS, `desktop.ini` and `.aht\aht-badge.ico` on Windows, an
-  emblem on Linux;
-- only when you use the feature: handover summaries in `.aht/handover/`
-  and journals in `.aht/journal/` (both carry their own `.gitignore`), the
-  project's instruction files with `aht rules --unify --apply`, and files
-  put back with `aht undo --apply` or `aht changes --revert --apply`.
-  Whatever these replace is set aside in `~/.aht` first.
+  folder on macOS, `desktop.ini` and `.aht\aht-badge-<8 hex>.ico` on
+  Windows, an emblem on Linux.  On Windows the file's name follows the
+  picture: a changed badge gets a new file, and the old one (also the
+  `.aht\aht-badge.ico` that older versions wrote) is removed;
+- only when you use the feature: handover and switch summaries in
+  `.aht/handover/` (the newest 12 are kept) and journals in `.aht/journal/`
+  (both carry their own `.gitignore`), the project's instruction files with
+  `aht rules --unify --apply`, and files put back with `aht undo --apply`
+  or `aht changes --revert --apply`.  Whatever these replace is set aside
+  in `~/.aht` first;
+- during a take-back that brings files back, aht briefly makes and removes
+  a `.aht-case-…` file in the project folder (and in its Claude Code
+  history folder), to learn whether the disk takes `readme.md` and
+  `README.md` for one name.
 
 **Elsewhere on your computer:**
 
@@ -149,7 +156,9 @@ switch agents off (`backends`) or point aht at other folders
 - on Linux, the emblem images for the folder badges in
   `~/.local/share/icons/hicolor` (`24x24/emblems` and `48x48/emblems`, with
   a stamp file, and that folder's icon cache when `gtk-update-icon-cache`
-  is installed); `aht uninstall --remove-icons` removes the images;
+  is installed); `aht uninstall --remove-icons` removes the images, and
+  that icon cache too when aht's were the last icons there (when others
+  remain, it writes the cache again without aht's);
 - the `aht` command (macOS and Linux);
 - on macOS: Spotlight entries for your session titles (`spotlight`, on by
   default) and Time Machine exclusions for aht's folder copies.
@@ -162,18 +171,21 @@ encrypt it.
 
 | What | What it holds | How long it is kept |
 |---|---|---|
-| `config.json` | your settings | until you delete it, or `aht uninstall --purge` |
-| `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, when it was last updated, and which machine a handed-over project is on; also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
-| `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names, session identifiers, the names of your other machines (and, when aht reached one by its Tailscale address, that address), the notices it showed (for example "input needed" or "the agent finished after 4 minute(s)"), warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one, so about 10 MB at most |
+| `config.json` | your settings, also the machines you added and each one's system (`remotes.<name>.system`) | until you delete it, or `aht uninstall --purge` |
+| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder.  Not in `config.json`, so a copied config does not clone it | until you delete it |
+| `offsite.json` | which backups were sent to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched; it replaces `run/offsite.json`, which older versions wrote and aht removes | rewritten at each copy and fetch |
+| `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync and with which machine (and, when a release paused that, why, when and for which machine), and how the last take-back or release went (how many files changed, and the names of those kept in both versions); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
+| `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session identifiers, the names of your other machines (and, when aht reached one by its Tailscale address, that address), the notices it showed (for example "input needed" or "the agent finished after 4 minute(s)"), warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one, so about 10 MB at most |
 | `aht-watcher.log` (macOS, Windows), `aht-watcher.err` and `aht-notices.err` (macOS) | the background watcher's and the notices check's own output, including any errors, which can name project folders; on Linux the watcher's goes to your user journal instead (`journalctl --user -u aht-watcher`) | not rotated; delete them any time |
 | `backups/` | see [Backups](#backups) | the newest 10 snapshots per project; copies made before a rewrite, until you delete them |
-| `search.db` | a search index: the text of messages (up to 4,000 characters each) with anything that looks like a key, token or password masked, plus session titles, agents, project paths and times | until you delete it; it is rebuilt when needed |
+| `search.db` | a search index: the text of messages (up to 4,000 characters each), what each tool call worked on (its command, file path, web address or search, up to 400 characters) and session titles, with what aht recognises as a key, token or password masked whole before any of it is cut (see [Security](#security)), plus agents, project paths and times | until you delete it; it is rebuilt when needed.  An index made by an earlier version of aht is built anew once, at its first update, and nothing of its old rows stays in the file; a session whose history file is gone and that no history backup holds is then no longer in it |
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`, on by default), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`) |
-| `workspaces/` | macOS: saved iTerm2 layouts (windows, tab titles and colours, profiles, folders, session identifiers) | the newest 40 (`workspace_keep`) |
-| `undo/`, `changes-backups/`, `redacted/`, `rules-backups/`, `handover/` | files aht set aside before replacing them at your request, and records of handovers | until you delete them |
+| `workspaces/` | macOS: saved iTerm2 layouts (this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session identifiers, each Claude session's name, with keys masked, and the options it was started with that it keeps when it starts again: permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, and `--verbose`, never a first prompt; the tab titles are kept as iTerm2 has them, so that restoring a layout sets them back) | the newest 40 (`workspace_keep`) |
+| `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
+| `handover/<project id>/` | for a project handed over: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files), and in `replaced/` what a take-back replaced or removed here | the list until the project is back or released, then the newest 5 earlier lists; in `replaced/` the newest 5 folders and every one younger than 30 days |
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
-| `run/` | short-lived state: notices already shown, open sessions, tab names, when setup ran, the last answer about new versions (version number and release notes) | overwritten as aht runs |
-| `run/autostart.json` | that you answered whether aht's tray starts at login: the answer (on or off) and when.  Written only when your answer took effect, that is when the tray then starts at login, or not, as you chose: by `aht autostart on` or `off` (on a Mac the command itself changes nothing, since the app has the switch), the Windows installer's first install, the start-at-login switches in aht's window, the Mac app and the trays, and the welcome when setting up changes whether aht starts at login (a first setup that turns it on counts); the welcome then keeps that answer | rewritten at your next answer |
+| `run/` | short-lived state: notices already shown, open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs | overwritten as aht runs |
+| `run/autostart.json` | that you answered whether aht's tray starts at login: the answer (on or off) and when.  Written only when your answer took effect, that is when the tray then starts at login, or not, as you chose: by `aht autostart on` or `off` (on a Mac the command itself changes nothing, since the app has the switch), the Windows installer's first install, the start-at-login switches in aht's window, the Mac app and the trays, and the welcome, when setting up changes whether aht starts at login or you changed its switch: so a first setup's no counts even when the tray did not start at login anyway (on a Mac too, where *Getting started* then marks the login step optional); the welcome then keeps that answer | rewritten at your next answer |
 | `run/window.json` | Windows and Linux: the process id and port of aht's window server, and the key a second `aht window` uses to reach it | removed when the server stops (on Linux also when it is stopped at logout) |
 | `run/window-<id>.json` | Windows and Linux: the progress of a handover or a take-back started in aht's window | deleted when the job ends; one left behind is removed after 6 hours, the next time the window starts |
 | `run/aht-setup-<version>-windows-<arch>.exe` | Windows, installed with aht's installer: the installer *Upgrade* downloaded | the latest only: earlier ones are deleted before the next upgrade downloads a new one |
@@ -195,7 +207,10 @@ encrypt it.
   only when the project's histories changed since the last snapshot.
 - **Retention.**  The newest 10 snapshots per project are kept
   (`backup_keep`); older ones are deleted automatically.  The copies in
-  `rewrites/` are kept until you delete them.
+  `rewrites/` are kept until you delete them.  The copies on another
+  machine (`offsite_backup`) follow `backup_keep`, keeping at least 3 per
+  project; the copies of `rewrites/` there are never removed by aht (see
+  [What can leave your device](#what-can-leave-your-device)).
 - **After uninstalling.**  Backups stay until you delete them, so that
   removing aht never costs you a history.  `backup_enabled = false` stops
   new backups.
@@ -219,10 +234,10 @@ connections made by another account of this computer.  Windows has no such
 check; there, an account without administrator rights cannot read another
 account's command lines, where the launch code appears.  The server stops
 15 minutes after its last window closed (an open window asks it once a
-minute).  On Windows, the window's folder chooser is a few lines of C# that
-PowerShell compiles each time the chooser opens; PowerShell writes
-temporary files for that in `%TEMP%` and removes them.  Nothing is sent
-anywhere.
+minute).  On Windows, the window's folder chooser is Windows' own folder
+dialog, which aht shows itself in a second aht process (`aht.exe
+_pick-folder`): no PowerShell, no compiled code and no temporary files in
+`%TEMP%`.  Nothing is sent anywhere.
 
 ## What can leave your device
 
@@ -230,45 +245,96 @@ aht itself never sends anything to the author or to any server the author
 runs.  With its default settings it makes no network connections.  The
 features below send data, and only after you set them up.
 
-1. **Your other machines** (handover, `aht mirror`, `offsite_backup`,
-   `aht night-shift`, and the session list and notices for those machines;
-   macOS and Linux).  aht connects over SSH, or mosh if both machines have
-   it, to the machines you add with `aht remote add`.  It sends the project
-   folder, its agent history, Claude Code's checkpoints for it and a
-   readable handover summary; with `offsite_backup`, copies of the backups
-   go to `~/.aht/offsite/` on that machine.  aht also puts a copy of itself
-   in `~/.aht/remote/` there, and installs this computer's version of
-   Claude Code there, downloaded from Anthropic.  When Claude Code trusts
-   the project folder here, a handover with `handover_carry_trust` (on by
-   default) marks it as trusted in Claude Code's `~/.claude.json` there,
-   keeping a copy of that file as `~/.claude.json.bak-aht`.  When your home
-   folder's path differs between the two machines, aht links `.claude`
-   under this computer's home path there to that machine's `~/.claude`,
-   since the history names that path.  With
-   `handover_remote_control` (on by default for handovers), the session on
-   that machine can be reached from the Claude app through Claude Code's
-   Remote Control.  Copies on those machines stay there until you remove
-   them.
+1. **Your other machines** (handover, `aht mirror`, `offsite_backup` and
+   fetching backups, `aht night-shift`, and the session list and notices
+   for those machines; macOS and Linux).  aht connects over SSH, or mosh if
+   both machines have it, to the machines you add with `aht remote add`.
+   Before its first command to a new machine, `aht remote add` and `aht
+   remote check` ask which system answers there (`echo aht-os %OS%
+   $env:OS`); aht cannot ask a Windows PC yet, so for one it stops right
+   there and makes nothing on it.  The machine's system is kept in
+   `config.json` (`remotes.<name>.system`).  aht sends the project folder,
+   its agent history, Claude Code's checkpoints and plans for it and a
+   readable handover summary.  aht also puts a copy of itself there,
+   `~/.aht/remote/aht-<checksum>.py`, named after its checksum: the newest
+   3 are kept, and the `~/.aht/remote/aht.py` that older versions put there
+   is removed.  It installs this computer's version of Claude Code there,
+   downloaded from Anthropic.  To learn whether a folder can be written
+   there, aht briefly makes and removes a `.aht-write-test-…` file in the
+   project folder there, and, when it checks the machine, in the path of
+   this computer's home folder there (or in the nearest existing parent of
+   either).  When Claude
+   Code trusts the project folder here, a handover with
+   `handover_carry_trust` (on by default) marks it as trusted in Claude
+   Code's `~/.claude.json` there, keeping a copy of that file as
+   `~/.claude.json.bak-aht`.  When your home folder's path differs between
+   the two machines, aht links `.claude` under this computer's home path
+   there to that machine's `~/.claude`, since the history names that path.
+   With `handover_remote_control` (on by default for handovers), the
+   session on that machine can be reached from the Claude app through
+   Claude Code's Remote Control.  Whatever a handover or a sync replaces or removes there
+   (also Claude Code's checkpoints and plans) is set aside first, in
+   `~/.aht/remote/replaced/` there; for each project the newest 5 of those
+   folders and every one younger than 30 days are kept.  To start the
+   session there, aht writes a few small files in
+   `~/.aht/remote/run/aht-<project name>-<6 characters of its id>/` there:
+   the note the session reads first, its settings, the command it runs
+   (with your task, if you gave one), and when this handover's session was
+   started (so that aht can tell later, should the link drop, whether it
+   started).  What a session there waits
+   for (the "waiting for" text) is masked before it leaves that machine.
+   Copies on those machines stay there until you remove them.
+
+   **Backups there** (`offsite_backup`): copies of the backups go into
+   `~/.aht/offsite/<a random id of this computer>/` on that machine, with
+   a `machine.json` naming this computer (its id, name and system, and
+   when it last copied).  The copies aht made before it rewrote a history
+   (`backups/<project id>/rewrites/`) go there too.  aht only adds there,
+   and removes a backup there only after this computer pruned it here,
+   keeping at least 3 per project; it never removes the copies made
+   before a rewrite there.  A folder that an older aht named after this
+   computer is taken over only when everything in it (its backups and
+   copies made before a rewrite) is here too: they move into this
+   computer's folder (one that is there already, with the same size, is
+   deleted), and the older folder is removed once nothing is left in it;
+   otherwise it stays as it is.  Fetching backups (*Fetch Backups From…*,
+   `aht backup --fetch-offsite`) reads the list of folders there (each
+   computer's name and system, its last update, how many projects and
+   backups, their size) and copies the backups and the copies made before
+   a rewrite that are missing here from one of them into this computer's
+   backups (`~/.aht/backups`, or `backup_dir`); it never replaces a file
+   here.
 2. **Notices on your phone** (`notify_phone`, off by default).  Each
    notice's title and text, meaning a project or session name and a short
-   status such as "input needed", go either through Apple's Messages app as
-   an iMessage to the address you give, or to the ntfy server you name
-   (ntfy.sh unless you give your own URL).  Anyone who knows an ntfy.sh
+   status such as "input needed" (what a session waits for, with keys
+   masked as under [Security](#security)), go either through Apple's
+   Messages app as an iMessage to the address you give, or to the ntfy
+   server you name (ntfy.sh unless you give your own URL).  Anyone who knows an ntfy.sh
    topic's name can read it, so choose a name that is hard to guess, or use
-   your own server.
+   your own server.  The notices about a handover that was cut off (it
+   finished, it did not finish, or the other machine has not answered for
+   an hour) go there too, and name the project and the machine.
 3. **Features that start an AI agent**, all off until you turn them on or
    ask for them: informed sessions, going on in another agent at Claude's
    usage limit, second opinion, night shift, switching agents, and a
    handover with a task.  aht hands the agent a summary of earlier sessions
-   (with keys masked) or your task, and the agent sends it to its provider
-   under your account, as it does with anything you type into it.
+   (with keys masked as under [Security](#security)) or your task, and the
+   agent sends it to its provider under your account, as it does with
+   anything you type into it.
 4. **What an agent does with its own files.**  The session names aht
    records become part of the agent's history.  An agent may sync that
    history; Claude Code, for example, shows session names in the Claude app
    through Remote Control.
 5. **Files you choose to send.**  `aht share` and `aht journal --write`
    write pages and journals to your disk; they leave your computer only if
-   you send them.
+   you send them.  A shared page has the keys and passwords aht recognises
+   masked (as under [Security](#security)), and its e-mail addresses,
+   local network addresses (10/8, 172.16/12, 192.168/16, 100.64/10 as
+   Tailscale uses, 169.254/16, and the IPv6 ones in fd00::/8 and
+   fe80::/10), your home folder's path and your user and computer names
+   removed.  Paths outside your home folder (an external disk, `/opt/…`)
+   stay, and masking is best effort, so the page says under its title to
+   look it through before you share it.
 6. **Looking for new versions** (`update_check`, off by default; also once
    each time you press *Check Now* or run `aht update --now`).  Once a day
    aht asks GitHub's public API (`api.github.com`) which release of aht is
@@ -299,6 +365,7 @@ access to them and no control over them.
   |---|---|
   | `move_policy`, `copy_policy` | whether aht asks before relinking (moves and copies: asks by default) |
   | `backup_enabled`, `backup_interval_hours`, `backup_keep`, `backup_dir` | whether, how often, how many and where backups are kept |
+  | `offsite_backup` | which of your machines keeps a copy of the backups (none by default) |
   | `checkpoints`, `checkpoint_keep`, `checkpoint_excludes` | folder copies at session start |
   | `icons_enabled` | folder badges |
   | `tab_names`, `spotlight`, `workspace_keep` | session names from iTerm2 tabs, Spotlight entries, saved layouts (macOS) |
@@ -332,17 +399,147 @@ access to them and no control over them.
    → *Uninstall* (it runs `aht uninstall` first), `winget uninstall
    havurgiray.aht` or `scoop uninstall aht`, and the `%LOCALAPPDATA%\aht`
    folder.
-4. If you used other machines: delete `~/.aht` there too, any project
-   copies you no longer want, and `~/.claude.json.bak-aht` if a handover
-   left one.
+4. If you used other machines: delete `~/.aht` there too (it holds this
+   computer's backups in `~/.aht/offsite/<id>/` and the copies of aht in
+   `~/.aht/remote/aht-*.py`), any project copies you no longer want, and
+   `~/.claude.json.bak-aht` if a handover left one.  Here, deleting
+   `~/.aht` also removes `machine.json` and `offsite.json`.
 
 ## Security
 
 aht's files are protected only by your user account, like the agents' own
-histories.  aht masks keys, tokens and passwords in the search index,
-journals and summaries it writes, but backups and checkpoints are exact
-copies and contain whatever the originals contain.  Disk encryption
-(FileVault, BitLocker, LUKS) protects them if your computer is lost.
+histories.
+
+**What aht masks.**  Wherever aht copies text out of a history, it masks
+what it recognises as a key, a token or a password.  This is best effort:
+aht works from the forms and names below, and it cannot recognise every
+secret (see *Known limits*).
+
+- keys of a known kind: Anthropic, OpenAI, Groq, GitHub, GitLab (`glpat-`,
+  `glrt-`, `gldt-`, `glptt-`), AWS access keys, Google API keys and OAuth
+  tokens (`ya29.…`), Slack tokens, Stripe live keys, SendGrid, Hugging
+  Face, npm and PyPI tokens, age secret keys, Vault (`hvs.`), DigitalOcean
+  (`dop_v1_`), Shopify, Docker Hub (`dckr_pat_`), Atlassian (`ATATT3…`)
+  and Tailscale keys, JSON web tokens, the secret part of a Slack webhook
+  address, and the token in a Telegram bot address
+  (`api.telegram.org/bot…`);
+- private keys: PEM (also encrypted, with `Proc-Type` and `DEK-Info`
+  lines), PGP private-key blocks and PuTTY `.ppk` files, also inside JSON
+  (and JSON inside JSON) or in a Read tool's output with line numbers.  A
+  key is masked as its header, its lines of key and its END line, and
+  nothing else: a guide or code that names the BEGIN and END lines stays as
+  it is, and a header with no key under it is not a find.  A key cut off
+  before its END line is masked as far as its lines go.  A private key in
+  base64 (a kubeconfig's `client-key-data`, a Kubernetes `tls.key`, the
+  output of `base64`) is masked too;
+- `Bearer` tokens (16 characters or more), `Basic` credentials, and what
+  follows `Authorization:` with any other scheme or none (16 characters or
+  more);
+- the value given to a name that holds a password, a secret, a token or a
+  key: a name with a part (between `_`, `.` or `-`) that is password,
+  pass, passwd, passphrase, pwd, secret, token, auth, credential(s) or pat,
+  or api, access, private, secret, app, master, encryption, signing, hmac,
+  jwt, account or shared followed by key (`API_KEY`, `apiKey`,
+  `SECRETKEY`, `RAILS_MASTER_KEY`, `x-api-key`), client secret
+  (`client_secret`, `clientSecret`) and `PGPASSWORD`; in camelCase and
+  PascalCase also Password, Passwd, Passphrase, Pwd, Secret, Token, Auth
+  or Credential(s), or one of Api, Access, Private, App, Master,
+  Encryption, Signing, Hmac, Jwt, Account, Shared or Secret followed by
+  Key, after a small letter or a digit (`dbPassword`, `accessToken`,
+  `SessionToken`, `SecretAccessKey`, `SharedAccessKey`).  This also holds
+  in a `.env` file, an `export` line, YAML or JSON, on any line of a tool's
+  output and in JSON inside JSON.  Names whose last part says they hold
+  something else do not count, such as an id, a URL, a name, a type, a
+  hash, a count, a length, a path, a file, a digest or a fingerprint
+  (`TOKEN_URL`, `password_hash`, `token_type`, `max_tokens`,
+  `accessTokenUrl`, `token_sha256`), nor does a name next to `::`
+  (`test_auth.py::test_token`, `auth::verify`), nor a test runner's
+  `PASS:` line.  The value must have 8 or more characters and look
+  generated: not a placeholder or a reference to a secret store
+  (`${DB_PASSWORD}`, `<token>`, `changeme`, `%{X}`, `op://…`, `vault:…`),
+  code, a name (`MAX_RETRIES`, or a dotted name whose every part reads as
+  one, such as `spring.datasource.password`), a path or a web address
+  whose parts read as names, an ARN, a fingerprint or a hash, a port or
+  an image's tag, or words.  A value of capital letters and digits counts
+  as a name only when it has an `_`, reads as words, or has 12 characters
+  or fewer and no digit.  A value that starts with `~` or `.` counts as a
+  path only as `~/…`, `./…` or `../…` (or as a dotfile such as `.env`).
+  After a password, passwd, pwd or passphrase name, three or more words
+  joined by `-` are masked as a passphrase; after a secret or token name
+  they stay.  A value in quotes is masked to its closing quote, so `,` `;`
+  `'` `(` `)` `&` and escaped quotes in it are masked too (one with a space
+  in it is not masked at all).  A value without quotes ends at a space, a
+  quote, a backslash, `,`, `;`, `<` or `>`, at a closing bracket with
+  nothing of it after that, and at an `&` before another parameter
+  (`&page=2`);
+- where no name stands before the value: `--password`, `--token`,
+  `--secret`, `--with-token`, `--auth-token`, `--access-token` and
+  `--api-key` (also `--pass` and `--passwd`) followed by a value;
+  `mysql -pX` (also `mysqldump`, `mysqladmin`, `mariadb`); `-p` or
+  `--password` after `docker login` or `twine`; `sshpass -p`;
+  `redis-cli -a`; the password in `curl -u user:password`; a cookie whose
+  name holds sess, sid, token or auth (`Cookie:`, `Set-Cookie:`); XML
+  `<password>…</password>` (also `pass`, `passwd`, `passphrase`, `pwd`,
+  `secret`, `token`); and settings written `key="…Password" value="…"`
+  (also a name that ends in Secret, Token or Key).  The value must look
+  generated, as above;
+- the password in a web or database address (`postgres://app:…@db:5432`),
+  whatever the host (a name, a container's name, an IPv4 or `[IPv6]`
+  address), with or without a user name, also when percent-encoded or
+  when it holds an `@`, and in Go's form (`user:…@tcp(host:3306)/db`),
+  unless it is too plain (`postgres:postgres`) or a placeholder.  The rest
+  of the address stays readable.
+
+It masks each find whole, however long (up to 64 KB), and it masks before
+it shortens a text, so a cut never leaves part of one.  A masked value
+keeps its kind and at most its first four and last two characters
+(`[Groq API key: gsk_…o8]`); a private key keeps only what kind it is
+(`BEGIN RSA PRIVATE KEY`, or `BEGIN RSA PRIVATE KEY (in base64)`).
+
+**Known limits.**  aht cannot recognise every secret.  These stay in
+clear: a value with no name and no form aht knows (a token of no known
+kind pasted alone into a message); a value under 8 characters after a
+name, or one that does not look random enough (small letters only; a short
+one of only two kinds of character, such as a short hex string; one with
+two or more letters outside A to Z); a value in quotes with a space in it
+(and a value without quotes is masked only up to where it ends, a space,
+`,` or `;` in it, say, and not at all when that leaves fewer than 8
+characters); a value after a camelCase name other than those above
+(`dbPass`, `stripeKey`, `tokenValue`) or after a key name other than those
+above (`STRIPE_KEY`); a private key seen only from its middle (its end, a
+part a Read tool showed from an offset or a diff showed), or as the lines
+a diff removes; a password in a base64 Docker config
+(`.dockerconfigjson`); a web address with a password, percent-encoded
+inside another web address; and a secret split across lines or messages.
+Secrets are best kept out of agent chats.  `aht secrets` lists what aht
+recognises in the histories, and `aht secrets --redact` takes it out (a
+private key as its header, its lines of key and its END line, and nothing
+around it).
+
+**Where.**  The search index (messages; what tool calls worked on: their
+commands, file paths and web addresses; session titles), handover and
+switch summaries, journals, notices (also those sent to your phone) and
+what a session waits for (masked before it leaves another machine),
+shared session pages (also the tools they list), Tidy Up's preview of a
+history, What Changed, the notes for informed sessions, loose ends and
+second opinions, `aht limits` (the usage-limit text), and session titles
+and names, tab titles and names waiting for a session's next prompt
+wherever aht lists them or sends them on: the session board (also what
+other machines receive, and other machines' boards), Show Sessions and
+Spotlight, reports, loose ends, a handover's dry run and result, Take
+Back, What Changed, `aht undo --list`, `aht checkup` (also the plan of
+`--restart`), `aht tab-names` (its list, `--json` and its sync plan), and
+the session names in saved workspaces.
+
+On this computer only, session names and tab titles stay as they are: in
+the Mac app's session corner, in the iTerm2 tab titles aht sets from a
+session's name, in `run/tab-names.json` and `run/iterm-tabs.json`, in the
+tab titles of saved workspaces (restoring a layout sets them back), and in
+`aht.log`.
+
+Backups and checkpoints, though, are exact copies and contain whatever
+the originals contain.  Disk encryption (FileVault, BitLocker, LUKS)
+protects them if your computer is lost.
 
 ## No warranty
 

@@ -25,7 +25,6 @@ can read.
     aht window --no-open    serve, print the address to open
     aht window --selftest   start, check the doors and one command, stop
 """
-import base64
 import json
 import os
 import secrets
@@ -494,7 +493,7 @@ def _raise_dialog(proc) -> None:
                     return False
             return True
         each_cb = EACH(each)
-        end = time.time() + 30                              # PowerShell can be slow to start
+        end = time.time() + 30                              # aht can be slow to start
         while not found and proc.poll() is None and time.time() < end:
             u.EnumWindows(each_cb, 0)
             if not found:
@@ -525,48 +524,83 @@ def _raise_dialog(proc) -> None:
 
 # Windows: the shell's folder chooser (SHBrowseForFolder), a tree with a
 # Folder: field to type or paste a path in (BIF_RETURNONLYFSDIRS, EDITBOX,
-# VALIDATE, NEWDIALOGSTYLE).  Through Shell.Application it gives the folder
-# chosen in the tree when what was typed is no folder, so it runs here with a
-# callback that hears of that.  It answers "+folder", "-" for Cancel, or
-# "?what": a path that is no folder, or a place such as This PC.
-WIN_CHOOSER = r"""$ErrorActionPreference='Stop'
-[Console]::OutputEncoding=[Text.Encoding]::UTF8
-Add-Type -TypeDefinition @'
-using System; using System.IO; using System.Runtime.InteropServices; using System.Text;
-public static class AhtChooser {
-  delegate int Back(IntPtr h, uint m, IntPtr l, IntPtr d);
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-  struct Info { public IntPtr owner, root, name; public string title; public uint flags; public Back back; public IntPtr param; public int image; }
-  [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SHBrowseForFolderW(ref Info i);
-  [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern bool SHGetPathFromIDListEx(IntPtr p, StringBuilder s, int n, int f);
-  [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SHGetNameFromIDList(IntPtr p, int how, out IntPtr name);
-  [DllImport("ole32.dll")] static extern void CoTaskMemFree(IntPtr p);
-  static string typed;
-  // what was typed in Folder: when it is no folder there (BFFM_VALIDATEFAILEDW); the chooser closes
-  static int Told(IntPtr h, uint m, IntPtr l, IntPtr d) { if (m == 4) typed = Marshal.PtrToStringUni(l); return 0; }
-  public static string Pick(string prompt) {
-    Back told = Told;
-    var i = new Info { title = prompt, flags = 0x71, back = told };
-    IntPtr p = SHBrowseForFolderW(ref i);
-    GC.KeepAlive(told);
-    string got = "-";
-    if (p != IntPtr.Zero) {   // a folder on a disk, or a place such as This PC
-      var s = new StringBuilder(32768); IntPtr n;
-      if (SHGetPathFromIDListEx(p, s, s.Capacity, 0)) got = "+" + s;
-      else if (SHGetNameFromIDList(p, 0, out n) == 0) { got = "?" + Marshal.PtrToStringUni(n); CoTaskMemFree(n); }
-      else got = "?";
-      CoTaskMemFree(p);
-    }
-    if (typed == null) return got;
-    // a path pasted in quotes, or with %VARIABLES% in it, is a folder too
-    string t = Environment.ExpandEnvironmentVariables(typed.Trim().Trim('"').Trim());
-    bool full = t.StartsWith(@"\\") || (t.Length > 2 && t[1] == ':' && (t[2] == '\\' || t[2] == '/'));
-    return full && Directory.Exists(t) ? "+" + Path.GetFullPath(t) : "?" + typed;
-  }
-}
-'@
-[Console]::Out.Write([AhtChooser]::Pick($env:AHT_PROMPT))
-"""
+# VALIDATE, NEWDIALOGSTYLE).  aht shows it itself, in a process of its own
+# (`aht _pick-folder`, which windows/src/aht_main.py hands to
+# pick_folder_here), so the window's server can bring it to the front.  It
+# gives the folder chosen in the tree when what was typed is no folder, so a
+# callback hears of that.  It answers "+folder", "-" for Cancel, or "?what": a
+# path that is no folder, or a place such as This PC.
+
+def _typed_answer(typed: str, expand=None) -> str:
+    """The chooser's answer for what was typed in its Folder: field: a path
+    pasted in quotes, or with %VARIABLES% in it, is a folder too."""
+    t = typed.strip().strip('"').strip()
+    t = expand(t) if expand else t
+    full = t.startswith("\\\\") or (len(t) > 2 and t[1] == ":" and t[2] in "\\/")
+    return "+" + os.path.abspath(t) if full and os.path.isdir(t) else "?" + typed
+
+
+def pick_folder_here(argv=None) -> int:
+    """`aht _pick-folder` (Windows): show the folder chooser with the prompt
+    in AHT_PROMPT (or the first argument) and write its answer to stdout."""
+    import ctypes
+    from ctypes import wintypes
+    prompt = (argv or [""])[0] or os.environ.get("AHT_PROMPT") or "Choose a folder"
+    sh, ole, k = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32"), ctypes.WinDLL("kernel32")
+    BACK = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HWND, wintypes.UINT, wintypes.LPARAM,
+                              wintypes.LPARAM)
+
+    class Info(ctypes.Structure):                       # BROWSEINFOW
+        _fields_ = [("owner", wintypes.HWND), ("root", ctypes.c_void_p),
+                    ("name", wintypes.LPWSTR), ("title", wintypes.LPCWSTR),
+                    ("flags", wintypes.UINT), ("back", BACK), ("param", wintypes.LPARAM),
+                    ("image", ctypes.c_int)]
+    sh.SHBrowseForFolderW.argtypes = [ctypes.POINTER(Info)]
+    sh.SHBrowseForFolderW.restype = ctypes.c_void_p
+    sh.SHGetPathFromIDListEx.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD,
+                                         wintypes.DWORD]
+    sh.SHGetNameFromIDList.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                       ctypes.POINTER(ctypes.c_void_p)]
+    sh.SHGetNameFromIDList.restype = ctypes.c_long
+    ole.OleInitialize.argtypes = [ctypes.c_void_p]
+    ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    k.ExpandEnvironmentStringsW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    k.ExpandEnvironmentStringsW.restype = wintypes.DWORD
+    typed = []
+
+    def told(hwnd, msg, lparam, data):
+        # what was typed in Folder: when it is no folder there
+        # (BFFM_VALIDATEFAILEDW); the chooser closes
+        if msg == 4 and lparam:
+            typed.append(ctypes.wstring_at(lparam))
+        return 0
+
+    def expand(text):
+        n = k.ExpandEnvironmentStringsW(text, None, 0)
+        buf = ctypes.create_unicode_buffer(max(n, 1))
+        return buf.value if n and k.ExpandEnvironmentStringsW(text, buf, n) else text
+    back = BACK(told)                                   # kept alive while the chooser shows
+    ole.OleInitialize(None)                             # the new dialog style needs OLE
+    name = ctypes.create_unicode_buffer(260)
+    info = Info(name=ctypes.cast(name, wintypes.LPWSTR), title=prompt, flags=0x71, back=back)
+    p = sh.SHBrowseForFolderW(ctypes.byref(info))
+    got = "-"
+    if p:                                               # a folder on a disk, or a place such as This PC
+        path = ctypes.create_unicode_buffer(32768)
+        shown = ctypes.c_void_p()
+        if sh.SHGetPathFromIDListEx(p, path, len(path), 0):
+            got = "+" + path.value
+        elif sh.SHGetNameFromIDList(p, 0, ctypes.byref(shown)) == 0 and shown.value:
+            got = "?" + ctypes.wstring_at(shown.value)
+            ole.CoTaskMemFree(shown)
+        else:
+            got = "?"
+        ole.CoTaskMemFree(p)
+    if typed:
+        got = _typed_answer(typed[-1], expand)
+    sys.stdout.buffer.write(got.encode("utf-8"))
+    sys.stdout.flush()
+    return 0
 
 
 def _choosers(prompt: str, plat: str) -> list:
@@ -589,7 +623,7 @@ def _chooser_said(kind: str, code: int, out: str, err: str) -> dict:
     chooser that was shown is a Cancel."""
     out = (out or "").lstrip("\ufeff").rstrip("\r\n")
     none, cancel = {"path": "", "chooser": False}, {"path": "", "chooser": True}
-    if kind == "powershell":                            # WIN_CHOOSER's answer
+    if kind == "windows":                               # pick_folder_here's answer
         if code != 0 or out[:1] not in ("+", "-", "?"):
             return none
         if out[0] != "+":
@@ -618,13 +652,13 @@ def pick_folder(prompt: str, plat: str = None) -> dict:
     plat = plat or sys.platform
     if plat == "win32":
         try:
-            # the prompt goes in through the environment: in the script's text,
-            # PowerShell would run $(…) in a folder's name and garble “ ”
-            p = subprocess.Popen(["powershell", "-NoProfile", "-STA", "-EncodedCommand",
-                                  base64.b64encode(WIN_CHOOSER.encode("utf-16-le")).decode()],
+            # aht itself (pick_folder_here), in a process of its own; the
+            # prompt goes in through the environment, whatever it holds
+            p = subprocess.Popen(cli_prefix() + ["_pick-folder"],
                                  env=dict(os.environ, AHT_PROMPT=prompt or "Choose a folder"),
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                                 encoding="utf-8", errors="replace", **_no_window())
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                 errors="replace", **_no_window())
         except OSError:
             return {"path": "", "chooser": False}
         _raise_dialog(p)
@@ -634,7 +668,7 @@ def pick_folder(prompt: str, plat: str = None) -> dict:
             p.kill()
             p.communicate()
             return {"path": "", "chooser": True}
-        return _chooser_said("powershell", p.returncode, out, "")
+        return _chooser_said("windows", p.returncode, out, "")
     for kind, cmd in _choosers(prompt, plat):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -890,12 +924,46 @@ def selftest() -> int:
     # that do what AHT_TEST_CHOOSER says.
     with tempfile.TemporaryDirectory() as tmp:
         cancel = {"path": "", "chooser": True}
-        ck(_chooser_said("powershell", 0, "+" + tmp, "") == {"path": tmp, "chooser": True}
-           and _chooser_said("powershell", 0, "-", "") == cancel
-           and _chooser_said("powershell", 0, "?C:\\nope", "") == dict(cancel, not_folder="C:\\nope")
-           and _chooser_said("powershell", 0, "?This PC", "") == dict(cancel, not_folder="This PC")
-           and _chooser_said("powershell", 1, "", "")["chooser"] is False,
+        ck(_chooser_said("windows", 0, "+" + tmp, "") == {"path": tmp, "chooser": True}
+           and _chooser_said("windows", 0, "-", "") == cancel
+           and _chooser_said("windows", 0, "?C:\\nope", "") == dict(cancel, not_folder="C:\\nope")
+           and _chooser_said("windows", 0, "?This PC", "") == dict(cancel, not_folder="This PC")
+           and _chooser_said("windows", 1, "", "")["chooser"] is False,
            "Windows' chooser: a folder, Cancel, a path that is no folder, none shown")
+        # Windows' chooser is aht itself in a process of its own (`aht
+        # _pick-folder`), never PowerShell; when it cannot start, the window
+        # asks for the path as text
+        seen, real_popen = [], subprocess.Popen
+
+        class Chooser:
+            pid, returncode = 0, 0
+
+            def __init__(self, cmd, **kw):
+                seen.append((cmd, (kw.get("env") or {}).get("AHT_PROMPT")))
+                if "fail" in seen[-1][1]:
+                    raise OSError("cannot start")
+
+            def poll(self):
+                return 0
+
+            def communicate(self, timeout=None):
+                return "+" + tmp, ""
+        try:
+            subprocess.Popen = Chooser
+            got = [pick_folder("aht selftest “$(x)”", "win32"), pick_folder("fail", "win32")]
+        finally:
+            subprocess.Popen = real_popen
+        cmd = seen[0][0] if seen else []
+        ck(got == [{"path": tmp, "chooser": True}, {"path": "", "chooser": False}]
+           and cmd == cli_prefix() + ["_pick-folder"] and seen[0][1] == "aht selftest “$(x)”"
+           and not any("powershell" in str(a).lower() for a in cmd),
+           f"Windows' chooser runs as `aht _pick-folder`, no PowerShell ({cmd}, {got})")
+        tq = '"' + tmp + '"'
+        ck(_typed_answer("C:\\no\\such\\folder") == "?C:\\no\\such\\folder"
+           and _typed_answer("Documents") == "?Documents"
+           and _typed_answer(tq) == ("+" + os.path.abspath(tmp) if os.name == "nt" else "?" + tq)
+           and _typed_answer("%X%", lambda t: t.replace("%X%", "C:\\gone")) == "?%X%",
+           "what is typed in Windows' chooser: a missing or partial path is no folder")
         if os.name != "nt":
             pick, ran = Path(tmp) / "a folder", Path(tmp) / "ran"
             pick.mkdir()

@@ -53,12 +53,15 @@ COMMON = dict(
 )
 
 # aht.exe also serves aht's window (`aht window`, aht_web.py): its page and
-# the guide travel inside the exe
+# the guide travel inside the exe.  So does the core's own text, as
+# core\aht.py: the copy aht places on another machine, named after its
+# checksum (`aht _core --id`), is that file byte for byte
 a = Analysis(
     [os.path.join(SPECPATH, 'src', 'aht_main.py')],
     hiddenimports=['winlayer', 'win_fcntl', 'winbadge', 'aht_web'],
     datas=[(os.path.join(SPECPATH, os.pardir, 'web'), 'web'),
-           (os.path.join(SPECPATH, os.pardir, 'GUIDE.md'), '.')],
+           (os.path.join(SPECPATH, os.pardir, 'GUIDE.md'), '.'),
+           (os.path.join(SPECPATH, os.pardir, 'aht.py'), 'core')],
     **COMMON,
 )
 pyz = PYZ(a.pure)

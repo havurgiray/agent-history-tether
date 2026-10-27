@@ -142,22 +142,34 @@ func byteText(_ any: Any?) -> String {
     return ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
 }
 
-/// "3 hours ago" for the core's timestamps (ISO text or seconds since 1970).
-func ago(_ any: Any?) -> String {
-    var date: Date?
+/// One of the core's timestamps (ISO text or seconds since 1970) as a date.
+func moment(_ any: Any?) -> Date? {
     if let n = any as? NSNumber, n.doubleValue > 0 {
-        date = Date(timeIntervalSince1970: n.doubleValue)
+        return Date(timeIntervalSince1970: n.doubleValue)
     } else if let s = any as? String, !s.isEmpty {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        date = f.date(from: String(s.prefix(19)))
+        return f.date(from: String(s.prefix(19)))
     }
-    guard let d = date else { return "" }
+    return nil
+}
+
+/// "3 hours ago" for the core's timestamps (ISO text or seconds since 1970).
+func ago(_ any: Any?) -> String {
+    guard let d = (any as? Date) ?? moment(any) else { return "" }
     if abs(d.timeIntervalSinceNow) < 60 { return "just now" }
     let r = RelativeDateTimeFormatter()
     r.unitsStyle = .full
     return r.localizedString(for: d, relativeTo: Date())
+}
+
+/// "14:10" for a time today, "Oct 25, 14:10" for another day.
+func clock(_ any: Any?) -> String {
+    guard let d = (any as? Date) ?? moment(any) else { return "" }
+    let f = DateFormatter()
+    f.setLocalizedDateFormatFromTemplate(Calendar.current.isDateInToday(d) ? "jmm" : "MMMdjmm")
+    return f.string(from: d)
 }
 
 /// A path under the home folder as ~/…, shorter and the way Finder thinks of it.
@@ -220,6 +232,7 @@ struct Project: Identifiable, Hashable {
     let mirror: String?
     let syncedAt: Double?
     let syncStatus: String?
+    let syncPaused: SyncPause?      // Keep in sync is on, but waits for the user
     let agents: [String]
     let sessions: Int
     let bytes: Int64
@@ -227,6 +240,7 @@ struct Project: Identifiable, Hashable {
     let open: String?               // "waiting" | "working" | "idle": a session is open
     let limitSession: String?       // a Claude session stopped at its usage limit
     let limitResets: String?
+    let handing: Handing?           // a handover that did not finish (yet)
 
     var id: String { path }
     var name: String { (path as NSString).lastPathComponent }
@@ -235,6 +249,7 @@ struct Project: Identifiable, Hashable {
     }
     var place: String {
         if let host = away { return "on " + host }
+        if let h = handing { return "handing over to " + h.machine }
         if !exists { return "missing" }
         switch open {
         case "idle": return "here · session open"
@@ -245,7 +260,7 @@ struct Project: Identifiable, Hashable {
     }
     var sync: String {
         guard mirror != nil else { return "–" }
-        if away != nil { return "paused" }
+        if away != nil || syncPaused != nil { return "paused" }
         if let s = syncStatus, s != "ok" { return "⚠ " + s }
         return syncedAt == nil ? "waiting" : ago(NSNumber(value: syncedAt!))
     }
@@ -259,6 +274,7 @@ struct Project: Identifiable, Hashable {
         mirror = d["mirror"] as? String
         syncedAt = (d["mirror_synced_at"] as? NSNumber)?.doubleValue
         syncStatus = d["mirror_status"] as? String
+        syncPaused = (d["mirror_paused"] as? [String: Any]).map(SyncPause.init)
         agents = d["agents"] as? [String] ?? d["stores"] as? [String] ?? []
         open = d["open"] as? String
         let lim = d["limit"] as? [String: Any]
@@ -267,7 +283,215 @@ struct Project: Identifiable, Hashable {
         sessions = d["sessions"] as? Int ?? 0
         bytes = (d["bytes"] as? NSNumber)?.int64Value ?? 0
         lastActivity = d["last_activity"] as? String ?? ""
+        handing = (d["handing"] as? [String: Any]).map(Handing.init)
     }
+}
+
+/// `projects --json`'s `handing`: the record a handover writes at home before
+/// anything travels. Left behind when the link drops (or this Mac sleeps),
+/// it stays until the other machine answers: the notices check then finishes
+/// the handover or undoes it. Release drops it.
+struct Handing: Hashable {
+    let machine: String             // home's own name for the machine, else its own
+    let since: Date?                // when the handover started
+    let state: String               // "running" (now) | "checking" | "unreachable"
+    let silentSince: Date?          // unreachable: no answer since then
+    let release: Bool               // no answer for an hour: Release is offered
+
+    init(_ d: [String: Any]) {
+        machine = [d["remote"], d["holder"], d["host"]].compactMap { $0 as? String }
+            .first { !$0.isEmpty } ?? "the other machine"
+        since = moment(d["since"])
+        state = d["state"] as? String ?? "checking"
+        silentSince = moment(d["unreachable_since"])
+        release = d["release"] as? Bool ?? false
+    }
+}
+
+/// `projects --json`'s `mirror_paused`: Keep in sync stays on but sends
+/// nothing until the user turns it back on. Release pauses it ("released"),
+/// so the next sync does not overwrite the work left on that machine.
+struct SyncPause: Hashable {
+    let reason: String              // "released"
+    let at: Date?
+    let machine: String?            // the machine the copy is on
+
+    init(_ d: [String: Any]) {
+        reason = d["reason"] as? String ?? ""
+        at = moment(d["at"])
+        machine = d["remote"] as? String
+    }
+}
+
+/// What Check Now found: the check's own words (`reclaim --json`'s
+/// `checked`) when it settled the handover, else what the row says now.
+func handingNote(_ name: String, _ h: Handing, after p: Project?, checked: [String]) -> String {
+    if !checked.isEmpty { return checked.joined(separator: "\n") }
+    guard let now = p?.handing else {
+        return p?.away != nil
+            ? "The handover of \(name) to \(h.machine) finished: the project is on "
+              + "\(h.machine) now."
+            : "The handover of \(name) to \(h.machine) did not finish. The project stays "
+              + "here; nothing runs there."
+    }
+    switch now.state {
+    case "running": return "The handover is under way right now."
+    case "unreachable":
+        return "\(now.machine) did not answer. aht asks again every minute; Release… lets "
+            + "the project go on here."
+    default:
+        return "aht could not tell yet whether the handover finished. It asks "
+            + "\(now.machine) again in a minute."
+    }
+}
+
+/// A count in the core's JSON: a number, true or false (1 or 0), or a list of
+/// names; nil when the core could not tell.
+func tally(_ v: Any?) -> Int? {
+    return (v as? Int) ?? (v as? Bool).map { $0 ? 1 : 0 } ?? (v as? [Any])?.count
+}
+
+/// Release's question, from `reclaim --release --json`: what stays over there
+/// (`would_lose`: the project's files changed there, and `history`: the
+/// conversation's, each when it could tell, and since when). With `sync`,
+/// Release also pauses Keep in sync with that machine.
+func releaseText(_ d: [String: Any], _ there: String, away: Bool, sync: Bool = false) -> String {
+    let lose = (d["would_lose"] as? [String: Any]) ?? [:]
+    let since = clock(lose["since"])
+    let files = (lose["files"] as? [String]) ?? []
+    let n = tally(lose["files"]), talk = tally(lose["history"])
+    var s = "The work done on \(there)" + (since.isEmpty ? "" : " since \(since)")
+        + " stays on \(there). It does not come here."
+    if n == 0 && talk == 0 {
+        s = "Nothing changed on \(there)" + (since.isEmpty ? "" : " since \(since)")
+            + ", so nothing stays behind there."
+    } else {
+        // what stays there, named: "3 files and the conversation"
+        var what: [String] = []
+        if let n = n, n > 0 { what.append(n == 1 ? "1 file" : "\(n) files") }
+        if let t = talk, t > 0 { what.append("the conversation") }
+        if !what.isEmpty {
+            let line = what.joined(separator: " and ")
+            let one = what == ["1 file"] || what == ["the conversation"]
+            s += "\n\n" + line.prefix(1).uppercased() + line.dropFirst()
+                + (one ? " stays" : " stay") + " there" + (files.isEmpty ? "." : ":\n"
+                    + files.prefix(6).map { "• " + $0 }.joined(separator: "\n")
+                    + (files.count > 6 ? "\n• …" : ""))
+        }
+    }
+    s += "\n\nThe files here stay as they are, and the copy on \(there) is not touched."
+    if sync {
+        s += " Release pauses Keep in sync with \(there), so the copy there stays as it is "
+            + "until you turn sync back on."
+    }
+    if away { s += " To bring that work here, use Take Back instead." }
+    return s
+}
+
+/// Turn Sync Back On's note, once `mirror <path> --on` has run: what aht said
+/// when it failed; else the project's row after it (`now`), so the note says
+/// the sync is on only when the row does.
+func resumedText(_ to: String, ok: Bool, out: String, err: String, now: Project?) -> String {
+    guard ok else {
+        // its error first, then anything else it said
+        let said = [err, out].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        return "The sync was not turned back on:\n\n"
+            + (said.isEmpty ? "aht gave no answer — see the log (Settings)." : said)
+    }
+    if let now = now, now.mirror == nil || now.syncPaused != nil {
+        return "The sync with \(to) did not come back on; see the log (Settings)."
+    }
+    return "Kept in sync with \(to) again; the next copy runs in the background."
+}
+
+/// One computer's folder of backups on the machine that keeps them
+/// (`backup --offsite-list --json`'s `folders`).
+struct OffsiteFolder: Identifiable, Hashable {
+    let id: String                  // what `--fetch-offsite --from` takes
+    let name: String
+    let system: String
+    let updated: Date?
+    let projects: Int
+    let files: Int                  // backups (zip files)
+    let bytes: Int64
+    let mine: Bool                  // this Mac's own folder
+    let legacy: Bool                // an older aht's folder, under the computer's name
+
+    /// What the row says after the name: system, last update, projects, size.
+    var detail: String {
+        var bits = [["Darwin": "macOS"][system] ?? system]
+        if legacy { bits.append("from an older aht") }
+        if let u = updated { bits.append("updated " + ago(u)) }
+        bits.append("\(projects) project" + (projects == 1 ? "" : "s"))
+        bits.append("\(files) backup" + (files == 1 ? "" : "s"))
+        bits.append(byteText(NSNumber(value: bytes)))
+        return bits.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+}
+
+/// An older aht's folder has no id: `--from` takes its folder's name then.
+func offsiteFolders(_ d: [String: Any]) -> [OffsiteFolder] {
+    ((d["folders"] as? [[String: Any]]) ?? []).map { f in
+        let name = f["name"] as? String ?? f["folder"] as? String ?? ""
+        return OffsiteFolder(id: f["id"] as? String ?? f["folder"] as? String ?? name,
+                             name: name.isEmpty ? "?" : name,
+                             system: f["system"] as? String ?? "", updated: moment(f["updated"]),
+                             projects: f["projects"] as? Int ?? 0, files: f["files"] as? Int ?? 0,
+                             bytes: (f["bytes"] as? NSNumber)?.int64Value ?? 0,
+                             mine: f["mine"] as? Bool ?? false, legacy: f["legacy"] as? Bool ?? false)
+    }
+}
+
+/// The fetch sheet: the folders on the machine that keeps the backups.
+struct OffsiteView: Identifiable {
+    let id = UUID()
+    let machine: String
+    var loading = true
+    var folders: [OffsiteFolder] = []
+    var error: String?              // asking that machine failed: what aht said
+    var pick: String?               // the folder to fetch from
+    var fetching = false
+    var result: String?             // how the last fetch went
+}
+
+/// The folder the fetch sheet picks first: another computer's, the one
+/// updated last (a new Mac fetches what the old one left there).
+func firstPick(_ folders: [OffsiteFolder]) -> String? {
+    let order = folders.sorted { ($0.updated ?? .distantPast) > ($1.updated ?? .distantPast) }
+    return (order.first { !$0.mine && $0.files > 0 } ?? order.first)?.id
+}
+
+/// How a fetch went, from `backup --fetch-offsite --from ID --json` (or what
+/// aht said instead of its JSON).
+func fetchedText(_ d: [String: Any]?, _ f: OffsiteFolder, said: String) -> String {
+    guard let d = d, !(d["error"] is String) else {
+        let why = (d?["error"] as? String ?? said).trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Nothing was fetched" + (why.isEmpty ? "; see the log (Settings)." : ": " + why)
+    }
+    let n = d["files"] as? Int ?? 0
+    if n == 0 { return "Nothing to fetch: every backup in \(f.name)'s folder is here already." }
+    let renamed = ((d["renamed"] as? [String]) ?? []).filter { $0.hasSuffix(".zip") }.count
+    return "Fetched \(n) backup(s), \(byteText(d["bytes"])), from \(f.name)'s folder. Nothing "
+        + "here was replaced" + (renamed == 0 ? "." : "; \(renamed) differed from a backup of "
+        + "the same name here and " + (renamed == 1 ? "sits" : "sit") + " next to it under a "
+        + "new name.") + " Search finds the "
+        + "sessions in them, and Restore… on a result brings one back."
+}
+
+/// The adopt question's note on folders the user told aht to forget: the
+/// first three by name, then how many more ("" when none). The trays' text
+/// (the core's forgotten_note) says the same.
+func forgottenNote(_ planned: [[String: Any]]) -> String {
+    let gone = planned.filter { $0["forgotten"] as? Bool ?? false }
+        .map { tilde($0["real"] as? String ?? $0["path"] as? String ?? "") }
+    guard let last = gone.last else { return "" }
+    let (n, k) = (planned.count, gone.count)
+    let named = gone.contains("") ? (n == 1 ? "it" : k == n ? "all of them"
+                                     : k == 1 ? "one of them" : "\(k) of them")
+        : k > 3 ? gone.prefix(3).joined(separator: ", ") + " and \(k - 3) more"
+        : k == 1 ? last : gone.dropLast().joined(separator: ", ") + " and " + last
+    return "You told aht to forget \(named): adopting takes \(k == 1 ? "it" : "them") on again."
 }
 
 struct Machine: Identifiable, Hashable {
@@ -692,6 +916,7 @@ final class AppModel: ObservableObject {
     @Published var showGettingStarted = false
     @Published var sessionList: SessionListView?
     @Published var showUpdate = false
+    @Published var offsite: OffsiteView?        // Fetch Backups From…
     var openWelcome: (() -> Void)?              // the welcome window, again
     var openWelcomeFirst: ((String) -> Void)?   // … to install aht (this app's version)
     @Published var itermControl = "closed"      // itermControlState(ask: false)
@@ -787,6 +1012,9 @@ final class AppModel: ObservableObject {
 
     var handover: [String: Any] { (status["handover"] as? [String: Any]) ?? [:] }
     var supported: Bool { handover["supported"] as? Bool ?? true }
+    /// Other machines can be asked (an ssh client is there): fetching
+    /// backups. Sending projects (and Check Now) needs `supported`.
+    var canReach: Bool { handover["can_reach"] as? Bool ?? supported }
     var machines: [Machine] {
         ((handover["remotes"] as? [String: Any]) ?? [:]).map { k, v in
             Machine(name: k, target: ((v as? [String: Any])?["ssh"] as? String) ?? "")
@@ -1012,6 +1240,95 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Check Now on an unfinished handover: Take Back's dry run asks the other
+    /// machine first whether the handover finished, and settles it either way
+    /// (`checked`); the plan it goes on to make is not needed here.
+    func checkHanding(_ p: Project) {
+        guard let h = p.handing else { return }
+        note(p.path, nil)
+        DispatchQueue.main.async {
+            self.working = "asking \(h.machine) about \(p.name)…"
+            self.percent = nil
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["reclaim", p.path, "--json"]) ?? [:]
+            self.refresh {
+                self.working = nil
+                let now = self.projects.first { $0.path == p.path }
+                self.note(p.path, handingNote(p.name, h, after: now,
+                                              checked: (d["checked"] as? [String]) ?? []))
+            }
+        }
+    }
+
+    /// Release: stop waiting for a project that went to another machine and
+    /// does not come back from there. The files here stay as they are and the
+    /// copy there is not touched; the dry run says what stays there. Keep in
+    /// sync with that machine pauses, or its next sync would overwrite that copy.
+    func release(_ p: Project) {
+        note(p.path, nil)
+        busy("checking \(p.name)…") {
+            let plan = ahtJSON(["reclaim", p.path, "--release", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    self.note(p.path, "Cannot be released now:\n\n" + why)
+                    return
+                }
+                let there = plan["remote"] as? String ?? p.handing?.machine ?? p.away
+                    ?? "the other machine"
+                // the core's `pauses_sync` (the machine, or null) when it sends
+                // one; an older core's answer has none: the row says it then
+                let pauses = plan.keys.contains("pauses_sync")
+                    ? plan["pauses_sync"] is String : p.mirror != nil && p.mirror == there
+                guard alert("Release “\(p.name)” from \(there)?",
+                            releaseText(plan, there, away: p.away != nil, sync: pauses),
+                            confirm: "Release") else { return }
+                self.busy("releasing \(p.name)…") {
+                    let d = ahtJSON(["reclaim", p.path, "--release", "--apply", "--json"]) ?? [:]
+                    if let why = self.problems(d) {
+                        self.note(p.path, "Releasing it did not go through:\n\n" + why)
+                        return
+                    }
+                    let released = d["released"] as? Bool ?? false
+                    let warned = ((d["warnings"] as? [String]) ?? []).map { "\n⚠ " + $0 }.joined()
+                    // the pause as the registry has it now, not as expected
+                    self.refresh {
+                        let now = self.projects.first { $0.path == p.path }
+                        var done = "Released. The project is here as it was; its copy on \(there) "
+                            + "stays as it is."
+                        if !released {
+                            done = "aht did not say it released the project; see the log (Settings)."
+                        } else if let s = now?.syncPaused, now?.mirror != nil {
+                            done = "Released. The project is here as it was. Keep in sync with "
+                                + "\(s.machine ?? there) is paused, so the copy there stays as it is."
+                        }
+                        self.note(p.path, done + warned)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Turn a paused Keep in sync back on: the next sync makes the copy there
+    /// match this Mac again; what it replaces there is set aside there first.
+    /// The note comes once the command has run, from its answer and the row.
+    func resumeSync(_ p: Project, _ to: String) {
+        guard alert("Turn Keep in sync with \(to) back on?",
+                    "The next sync makes the copy of \(p.name) on \(to) the same as the one "
+                    + "here, so the work left there is replaced. aht keeps what it replaces "
+                    + "in a set-aside folder on \(to).",
+                    confirm: "Turn Sync Back On") else { return }
+        note(p.path, nil)
+        busy("turning the sync with \(to) back on…") {
+            let r = shWithStderr(PY, [ahtScript(), "mirror", p.path, "--on", "--to", to])
+            // the pause as the registry has it now, not as expected
+            self.refresh {
+                let now = self.projects.first { $0.path == p.path }
+                self.note(p.path, resumedText(to, ok: r.ok, out: r.out, err: r.err, now: now))
+            }
+        }
+    }
+
     // ---- across agents ----
 
     func refreshBoard() {
@@ -1067,7 +1384,13 @@ final class AppModel: ObservableObject {
                : " The tab keeps its title: to let it take the name too, switch on iTerm2 → "
                  + "Settings → General → Magic → Enable Python API.")
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        field.stringValue = r.pendingTitle ?? r.title ?? r.tab ?? ""
+        // a name with a key in it comes masked ([GitHub token: ghp_…r8]): shown
+        // as a hint, not as the text, so Rename never gives it the masked text
+        let current = r.pendingTitle ?? r.title ?? r.tab ?? ""
+        let masked = current.range(of: #"\[[^\[\]:]*(?:key|token|address|webhook): [^\[\]]*\]"#,
+                                   options: .regularExpression) != nil
+        field.stringValue = masked ? "" : current
+        if masked { field.placeholderString = current }
         a.accessoryView = field
         a.addButton(withTitle: "Rename")
         a.addButton(withTitle: "Cancel")
@@ -1736,7 +2059,9 @@ final class AppModel: ObservableObject {
     func share(_ p: Project) {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "\(p.name) session.html"
-        panel.message = "A page of the latest session, without keys, e-mail addresses or local paths"
+        panel.message = "A page of the latest session: keys aht recognises masked, e-mail and "
+            + "local network addresses and your home folder removed. Look it through before "
+            + "you share it."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         busy("writing the page…") {
             let r = sh(PY, [ahtScript(), "share", p.path, "--format",
@@ -2139,6 +2464,60 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Fetch Backups From…: the machine that keeps the backups holds a folder
+    /// for each computer that copies there; the sheet lists them.
+    func openFetchBackups() {
+        let there = text("offsite_backup", "")
+        guard !there.isEmpty else { return }
+        if offsite?.machine == there {
+            offsite?.loading = true
+            offsite?.error = nil
+            offsite?.result = nil
+        } else {
+            offsite = OffsiteView(machine: there)
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript(), "backup", "--offsite-list", "--json"])
+            let d = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]
+            DispatchQueue.main.async {
+                guard self.offsite?.machine == there else { return }
+                self.offsite?.loading = false
+                guard r.ok, let d = d, !(d["error"] is String) else {
+                    let why = ((d?["error"] as? String) ?? r.err)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.offsite?.error = "aht could not ask \(there)"
+                        + (why.isEmpty ? "; see the log (Settings)." : ": " + why)
+                    return
+                }
+                let folders = offsiteFolders(d)
+                self.offsite?.folders = folders
+                if !folders.contains(where: { $0.id == self.offsite?.pick }) {
+                    self.offsite?.pick = firstPick(folders)
+                }
+            }
+        }
+    }
+
+    /// Adds the backups that are missing here from one computer's folder there;
+    /// a backup here is never replaced.
+    func fetchBackups() {
+        guard let v = offsite, let f = v.folders.first(where: { $0.id == v.pick }) else { return }
+        offsite?.fetching = true
+        offsite?.result = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript(), "backup", "--fetch-offsite", "--from", f.id,
+                                      "--json"])
+            let d = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]
+            DispatchQueue.main.async {
+                guard self.offsite?.id == v.id else { return }
+                self.offsite?.fetching = false
+                // a failed run's JSON counts only when it says what went wrong
+                self.offsite?.result = fetchedText(r.ok || d?["error"] is String ? d : nil, f,
+                                                   said: r.err)
+            }
+        }
+    }
+
     func showGuide(_ topic: String? = nil) {
         showGuideWindow(topic)
     }
@@ -2226,10 +2605,13 @@ final class AppModel: ObservableObject {
     }
 
     func remove(_ m: Machine) {
-        let held = projects.filter { $0.awayRemote == m.name }.map { $0.path }
+        let held = projects.filter { $0.awayRemote == m.name || $0.handing?.machine == m.name }
+            .map { $0.path }
         if !held.isEmpty {
             _ = alert("\(m.name) still holds handed-over projects",
-                      "Take these back first:\n" + held.map { "• " + $0 }.joined(separator: "\n"))
+                      "Take these back first. If \(m.name) is gone for good, select each one "
+                      + "and press Release…: the files here stay as they are.\n\n"
+                      + held.map { "• " + $0 }.joined(separator: "\n"))
             return
         }
         guard alert("Remove \(m.name)?",
@@ -2354,12 +2736,9 @@ final class AppModel: ObservableObject {
             guard let d = ahtJSON(["adopt", "--json"]) else { return }
             let rows = (d["planned"] as? [[String: Any]]) ?? []
             let planned = rows.count
-            // adopt also takes on a project the user told aht to forget: say so
-            let forgot = rows.filter { $0["forgotten"] as? Bool ?? false }.count
-            let whom = planned == 1 ? "it" : forgot == planned ? "all of them"
-                : forgot == 1 ? "one of them" : "\(forgot) of them"
-            let forgotNote = forgot == 0 ? "" : "\n\nYou told aht to forget \(whom): adopting takes "
-                + (forgot == 1 ? "it" : "them") + " on again."
+            // adopt also takes on a project the user told aht to forget: say which
+            let forgot = forgottenNote(rows)
+            let forgotNote = forgot.isEmpty ? "" : "\n\n" + forgot
             let already = d["already"] as? Int ?? 0
             let orphans = d["orphans_claude"] as? Int ?? 0
             DispatchQueue.main.async {
@@ -2548,6 +2927,7 @@ struct MainView: View {
         .sheet(isPresented: $m.showGettingStarted) { GettingStartedSheet() }
         .sheet(item: $m.sessionList) { v in SessionListSheet(v: v) }
         .sheet(isPresented: $m.showUpdate) { UpdateSheet() }
+        .sheet(item: $m.offsite) { _ in FetchBackupsSheet() }
     }
 }
 
@@ -2595,6 +2975,7 @@ struct ProjectsView: View {
                 .width(min: 200, ideal: 280)
                 TableColumn("Where") { p in
                     Text(p.place).foregroundColor(p.away != nil ? .blue
+                                                  : p.handing != nil ? .orange
                                                   : (p.exists ? .primary : .secondary))
                 }
                 .width(min: 100, ideal: 150)
@@ -2627,24 +3008,32 @@ struct DetailView: View {
                 }
                 Text(tilde(p.path)).font(.caption).foregroundColor(.secondary)
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                if let h = p.handing, h.state != "running" { HandingBanner(p: p, h: h) }
+                if let s = p.syncPaused, let to = p.mirror, p.away == nil, p.handing == nil {
+                    SyncPausedBanner(p: p, s: s, to: s.machine ?? to)
+                }
                 HStack(spacing: 10) {
                     if p.away != nil {
                         Button("Take Back…") { m.takeBack(p) }
                             .keyboardShortcut(.defaultAction)
                         Button("Open Session") { m.openSession(p) }
+                        Button("Release…") { m.release(p) }
+                            .help("Stop waiting for it: the files here stay as they are, "
+                                  + "and the copy over there is not touched")
                         HelpButton("Hand a project over")
                     } else if p.exists {
                         Button(m.machine.map { "Hand Over to \($0)…" } ?? "Hand Over…") {
                             m.handOver(p)
                         }
-                        .disabled(m.machine == nil || !m.supported || p.open != nil)
+                        .disabled(m.machine == nil || !m.supported || p.open != nil
+                                  || p.handing != nil)
                         Toggle("Keep in sync" + (p.mirror.map { " with \($0)" } ?? ""),
                                isOn: Binding(get: { p.mirror != nil },
                                              set: { m.keepInSync(p, $0) }))
-                            .disabled(m.machine == nil || !m.supported)
+                            .disabled(m.machine == nil || !m.supported || p.handing != nil)
                         HelpButton("Hand a project over")
                         Button("Continue Session") { m.continueHere(p) }
-                            .disabled(p.sessions == 0)
+                            .disabled(p.sessions == 0 || p.handing != nil)
                         Menu("Switch Agent") {
                             ForEach(m.agentCLIs, id: \.self) { a in
                                 Button("Continue in \(AGENT_LABEL[a] ?? a)…") {
@@ -2653,7 +3042,7 @@ struct DetailView: View {
                             }
                         }
                         .fixedSize()
-                        .disabled(p.sessions == 0 && p.agents.isEmpty)
+                        .disabled(p.sessions == 0 && p.agents.isEmpty || p.handing != nil)
                         HelpButton("Continue in another agent")
                     }
                     Spacer()
@@ -2734,6 +3123,77 @@ struct DetailView: View {
         }
         if !p.exists { return "the folder is gone; its histories are safe" }
         return "\(p.sessions) session(s), \(byteText(NSNumber(value: p.bytes))) of history"
+    }
+}
+
+/// A handover that did not finish (yet): what is known, and the two ways on.
+/// The notices check settles it by itself once the other machine answers.
+struct HandingBanner: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+    let h: Handing
+
+    var body: some View {
+        let silent = h.state == "unreachable"
+        let at = clock(silent ? h.silentSince ?? h.since : h.since)
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(silent ? "Handover to \(h.machine) did not finish"
+                            : "Handover to \(h.machine) unfinished: checking…")
+                    .fontWeight(.semibold)
+                Text(silent
+                     ? "\(h.machine) has not answered" + (at.isEmpty ? "" : " since \(at)")
+                       + ". Release lets the project go on here; what was done on "
+                       + "\(h.machine) stays there."
+                     : (at.isEmpty ? "" : "Started at \(at). ") + "aht asks \(h.machine) "
+                       + "whether the session there started, then finishes the handover or "
+                       + "undoes it.")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button("Check Now") { m.checkHanding(p) }.disabled(!m.supported)
+            Button("Release…") { m.release(p) }     // after an hour of silence, the way on
+                .keyboardShortcut(h.release ? .defaultAction : nil)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+        .disabled(m.working != nil)
+    }
+}
+
+/// Keep in sync that waits for the user: Release paused it so the copy left
+/// on the other machine is not overwritten. Turning it back on is the way on.
+struct SyncPausedBanner: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+    let s: SyncPause
+    let to: String
+
+    var why: String {
+        let at = clock(s.at)
+        let copy: String = s.reason == "released"
+            ? "You released the project" + (at.isEmpty ? "" : " at \(at)") + ", so the copy"
+            : "The copy"
+        return copy + " on \(to) stays as it is. Turn sync back on to make it match this Mac again."
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "pause.circle.fill").foregroundColor(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Keep in sync with \(to) is paused").fontWeight(.semibold)
+                Text(why)
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button("Turn Sync Back On…") { m.resumeSync(p, to) }.disabled(!m.supported)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+        .disabled(m.working != nil)
     }
 }
 
@@ -3811,7 +4271,7 @@ struct SessionListSheet: View {
                 Button("Continue") {
                     m.resumeSession(v.project.path, agent: s.agent, session: s.session)
                 }
-                .disabled(v.project.away != nil)
+                .disabled(v.project.away != nil || v.project.handing != nil)
                 .help("Continue this session in a new terminal window")
             }
         }
@@ -3835,6 +4295,10 @@ struct SessionListSheet: View {
             if let host = v.project.away {
                 Text("This project is handed over to \(host): take it back before you "
                      + "continue a session here.")
+                    .font(.callout).foregroundColor(.orange)
+            } else if let h = v.project.handing {
+                Text("The handover to \(h.machine) is unfinished: check it, or release the "
+                     + "project, before you continue a session here.")
                     .font(.callout).foregroundColor(.orange)
             }
             Divider()
@@ -4561,6 +5025,92 @@ struct UpdateSheet: View {
     }
 }
 
+/// Fetch Backups From…: each computer's folder of backups on the machine that
+/// keeps them. Fetching adds what is missing here and replaces nothing.
+struct FetchBackupsSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    func row(_ f: OffsiteFolder, picked: Bool) -> some View {
+        Button(action: { m.offsite?.pick = f.id }) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: picked ? "largecircle.fill.circle" : "circle")
+                    .foregroundColor(picked ? .accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(f.name).fontWeight(.medium)
+                        if f.mine {
+                            Text("this Mac").font(.caption2)
+                                .padding(.horizontal, 4)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                        }
+                    }
+                    Text(f.detail).font(.caption).foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 5).padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(picked ? Color.accentColor.opacity(0.22) : Color.clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    var body: some View {
+        let v = m.offsite ?? OffsiteView(machine: "")
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Fetch backups from \(v.machine)", "Backups")
+            Text("\(v.machine) keeps the backups of each computer that copies them there, in a "
+                 + "folder of its own. Pick one: aht adds the backups that are missing here and "
+                 + "never replaces one you have.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            Group {
+                if v.loading {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Asking \(v.machine) which backups it keeps…").foregroundColor(.secondary)
+                    }
+                } else if let e = v.error {
+                    Text(e).foregroundColor(.orange).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if v.folders.isEmpty {
+                    Text("\(v.machine) keeps no backups yet.").foregroundColor(.secondary)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(v.folders) { f in row(f, picked: v.pick == f.id) }
+                        }
+                        .padding(.trailing, 12)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            if v.fetching {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Fetching…").foregroundColor(.secondary)
+                }
+            } else if let r = v.result {
+                Text(r).font(.callout).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            HStack {
+                Button("Look Again") { m.openFetchBackups() }
+                    .disabled(v.loading || v.fetching)
+                Spacer()
+                Button("Close") { m.offsite = nil }.keyboardShortcut(.cancelAction)
+                Button("Fetch") { m.fetchBackups() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(v.pick == nil || v.loading || v.fetching || v.error != nil)
+            }
+        }
+        .padding(20).frame(width: 620, height: 460)
+    }
+}
+
 // ---- the welcome window: setting aht up the first time -----------------------
 
 struct RootChoice: Identifiable {
@@ -4590,6 +5140,14 @@ func projectChoices(_ d: [String: Any]) -> [ProjectChoice] {
     }
 }
 
+/// Whether the welcome's login switch is an answer to note (`aht autostart`,
+/// as in aht's window): it changes how things are now, or the person moved
+/// it. A first setup starts it on with nothing set up yet, so turning it off
+/// there changes nothing on disk but is still a no to keep.
+func loginAnswered(_ login: Bool, was: Bool, start: Bool) -> Bool {
+    return login != was || login != start
+}
+
 /// What the welcome window asks, and the setting up itself (`aht setup`).
 final class WelcomeModel: ObservableObject {
     enum Page { case hello, quick, folders, projects, rules, extras, updates, working, done }
@@ -4604,6 +5162,7 @@ final class WelcomeModel: ObservableObject {
     @Published var backups = true
     @Published var notifications = true
     @Published var login = true
+    var loginStart = true                       // … as the switch stood when the window opened
     var asked = false                           // login: answered or set up before, so kept
     var answered = false                        // … answered (a switch, `aht autostart`)
     @Published var updateCheck = false
@@ -4687,7 +5246,7 @@ final class WelcomeModel: ObservableObject {
             + ["--moves", moves, "--copies", copies, "--badges", on(badges),
                "--backups", on(backups), "--notifications", on(notifications),
                "--update-check", on(updateCheck)]
-        let login = self.login
+        let login = self.login, loginStart = self.loginStart
         DispatchQueue.global(qos: .userInitiated).async {
             if self.install, let res = BUNDLE_RES {
                 DispatchQueue.main.async { self.working = "installing the watcher, the hooks and the aht command…" }
@@ -4714,9 +5273,8 @@ final class WelcomeModel: ObservableObject {
                 }
                 self.adopted = ((d["adopted"] as? [String]) ?? []).count
                 self.finished = true
-                // the answer is noted only when this changes it, as in aht's window
                 let was = FileManager.default.fileExists(atPath: TRAY_PLIST)
-                app.setLoginItem(login, note: login != was)
+                app.setLoginItem(login, note: loginAnswered(login, was: was, start: loginStart))
                 UserDefaults.standard.set(true, forKey: "welcomeShown")
                 UserDefaults.standard.set(true, forKey: "gettingStartedShown")
                 app.refresh { self.page = .done }
@@ -5416,19 +5974,31 @@ struct SettingsView: View {
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 GroupBox(label: HStack(spacing: 6) { Text("Backups on another machine"); HelpButton("Backups") }) {
-                    HStack {
-                        Picker("Keep a copy of the history backups on", selection: Binding(
-                            get: { m.text("offsite_backup", "") },
-                            set: { m.set("offsite_backup", $0) })) {
-                            Text("no other machine").tag("")
-                            ForEach(m.machines) { Text($0.name).tag($0.name) }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Picker("Keep a copy of the history backups on", selection: Binding(
+                                get: { m.text("offsite_backup", "") },
+                                set: { m.set("offsite_backup", $0) })) {
+                                Text("no other machine").tag("")
+                                ForEach(m.machines) { Text($0.name).tag($0.name) }
+                            }
+                            .frame(maxWidth: 460)
+                            Spacer()
+                            Button("Copy Now") { m.copyBackupsNow() }
+                                .disabled(m.text("offsite_backup", "").isEmpty)
+                            Button("Fetch Backups From…") { m.openFetchBackups() }
+                                .disabled(m.text("offsite_backup", "").isEmpty || !m.canReach
+                                          || m.working != nil)
                         }
-                        .frame(maxWidth: 460)
-                        Spacer()
-                        Button("Copy Now") { m.copyBackupsNow() }
-                            .disabled(m.text("offsite_backup", "").isEmpty)
+                        Text("After each daily backup, aht adds the new ones to a folder of this "
+                             + "Mac's own there. A backup there goes only after aht removed it "
+                             + "here, and at least 3 per project stay. Fetch Backups From… brings "
+                             + "back the backups any of your computers left there: it adds what "
+                             + "is missing here and replaces nothing.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .padding(6)
+                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 GroupBox(label: HStack(spacing: 6) { Text("Folder badges"); HelpButton("Folder badges") }) {
                     HStack(spacing: 16) {
@@ -6474,6 +7044,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         w.answered = (model.status["autostart"] as? [String: Any])?["answered"] as? Bool ?? false
         w.asked = !w.install && (w.answered || (model.status["setup_done"] as? Bool ?? true))
         w.login = !w.asked || model.loginItem
+        w.loginStart = w.login
         w.close = { [weak self] in self?.welcomeWindow?.close() }
         welcome = w
         welcomeDeclining = declining
@@ -6665,7 +7236,8 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     }
 
     /// A click on a notice: to the session's tab when it is here, else to the
-    /// Sessions tab (another machine) or the project (the usage limit).
+    /// Sessions tab (another machine) or the project (the usage limit, a
+    /// handover that was cut off).
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
                                 withCompletionHandler done: @escaping () -> Void) {
         let info = r.notification.request.content.userInfo
@@ -6684,7 +7256,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
                 }
             } else if kind == "update" {
                 self.showUpdateFromMenu()
-            } else if kind == "limit", let p = info["project"] as? String {
+            } else if kind == "limit" || kind == "handover", let p = info["project"] as? String {
                 self.openWindow()
                 self.model.tab = .projects
                 self.model.selection = p
@@ -6777,6 +7349,9 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         if !away.isEmpty {
             let hosts = Set(away.compactMap { $0.away }).sorted()
             add(disabled: "\(away.count) handed over to " + hosts.joined(separator: ", "))
+        }
+        for p in model.projects where p.handing != nil && p.handing?.state != "running" {
+            add(disabled: "⚠ \(p.name): the handover to \(p.handing?.machine ?? "") is unfinished")
         }
         if let v = model.newVersion {
             add("aht \(v) is out — What's New…", #selector(showUpdateFromMenu))
@@ -6963,7 +7538,223 @@ if CommandLine.arguments.contains("--selftest") {
     let picks = projectChoices(["projects": [["path": "/x/old", "forgotten": true], ["path": "/x/new"]]])
     let marksOK = rows.map { $0.link } == [true, false] && picks.map { $0.chosen } == [false, true]
     print("TIDY LINKS AND FORGOTTEN PROJECTS \(marksOK ? "OK" : "FAIL")")
-    exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK ? 0 : 1)
+    // the adopt question names up to three forgotten folders, then how many more
+    let gone = { (n: Int) in (0..<n).map { ["real": "/x/p\($0)", "forgotten": true] as [String: Any] } }
+    let notes = [forgottenNote([["real": "/x/new"]]), forgottenNote(gone(1)), forgottenNote(gone(2)),
+                 forgottenNote(gone(5) + [["real": "/x/new"]])]
+    let namesOK = notes[0].isEmpty
+        && notes[1] == "You told aht to forget /x/p0: adopting takes it on again."
+        && notes[2].hasPrefix("You told aht to forget /x/p0 and /x/p1: adopting takes them")
+        && notes[3].hasPrefix("You told aht to forget /x/p0, /x/p1, /x/p2 and 2 more:")
+    print("FORGOTTEN FOLDERS NAMED \(namesOK ? "OK" : "FAIL \(notes)")")
+    // an unfinished handover (`projects --json`'s `handing`): the banner's
+    // state, and Release's question from `reclaim --release --json`
+    let iso = { (t: Date) -> String in
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return f.string(from: t)
+    }
+    let t = Date().timeIntervalSince1970
+    let rec: [String: Any] = ["attempt": "20261026-010000-ab12", "step": "starting",
+                              "remote": "box", "host": "box.local",
+                              "since": iso(Date(timeIntervalSince1970: t - 4000)),
+                              "error": "ssh: connect timed out", "checked_at": t,
+                              "unreachable_since": t - 3700, "state": "unreachable", "release": true]
+    let late = Project(["real_path": "/x/api", "exists": true, "handing": rec])
+    let young = Project(["real_path": "/x/api", "exists": true, "handing": rec.merging(
+        ["state": "checking", "unreachable_since": NSNull(), "release": false]) { $1 }])
+    let plain = Project(["real_path": "/x/api", "exists": true, "handing": NSNull()])
+    let lose = { (files: Any, history: Any?) -> [String: Any] in
+        ["released": false, "remote": "box", "would_lose": ["files": files, "since": rec["since"]!]
+            .merging(history.map { ["history": $0] } ?? [:]) { $1 }]
+    }
+    let ask = releaseText(lose(3, 0), "box", away: false)
+    let none = releaseText(lose(0, 0), "box", away: true)
+    let unknown = releaseText(lose(NSNull(), NSNull()), "box", away: false)
+    // the conversation went on there: something stays, even with no file changed
+    let talked = releaseText(lose(0, 4), "box", away: false)
+    let both = releaseText(lose(["src/a.py"], true), "box", away: false, sync: true)
+    let older = releaseText(lose(0, nil), "box", away: false)     // a core without `history`
+    let releaseOK = ask.contains("\n\n3 files stay there.") && !ask.contains("conversation")
+        && !talked.contains("Nothing changed") && talked.contains("\n\nThe conversation stays there.")
+        && both.contains("1 file and the conversation stay there:\n• src/a.py")
+        && both.contains("Release pauses Keep in sync with box, so the copy there stays as it is")
+        && !ask.contains("Keep in sync") && !older.contains("Nothing changed")
+        && !unknown.contains("stay there") && !unknown.contains("stays there")
+    // Keep in sync paused by Release (`projects --json`'s `mirror_paused`)
+    let paused = Project(["real_path": "/x/api", "exists": true, "mirror": "box",
+                          "mirror_paused": ["reason": "released", "at": rec["since"]!, "remote": "box"]])
+    let syncing = Project(["real_path": "/x/api", "exists": true, "mirror": "box",
+                           "mirror_synced_at": t, "mirror_status": "ok", "mirror_paused": NSNull()])
+    let pauseOK = paused.syncPaused?.reason == "released" && paused.syncPaused?.machine == "box"
+        && paused.syncPaused?.at != nil && paused.sync == "paused"
+        && syncing.syncPaused == nil && syncing.sync == "just now"
+    print("RELEASE TEXTS AND PAUSED SYNC \(releaseOK && pauseOK ? "OK" : "FAIL — \(ask) / \(talked) / \(both) / \(older)")")
+    // Turn Sync Back On: the note is what `mirror --on` answered and the row
+    // after it says, not what was expected
+    let backOn = [resumedText("box", ok: true, out: "mirroring on: /x/api", err: "", now: syncing),
+                  resumedText("box", ok: true, out: "", err: "", now: paused),
+                  resumedText("box", ok: false, out: "", err: "no machine called box\n", now: paused),
+                  resumedText("box", ok: false, out: " ", err: "", now: nil)]
+    let backOnOK = backOn[0] == "Kept in sync with box again; the next copy runs in the background."
+        && backOn[1] == "The sync with box did not come back on; see the log (Settings)."
+        && backOn[2] == "The sync was not turned back on:\n\nno machine called box"
+        && backOn[3].hasSuffix("aht gave no answer — see the log (Settings).")
+    print("TURN SYNC BACK ON \(backOnOK ? "OK" : "FAIL — \(backOn)")")
+    let gave = handingNote("api", late.handing!, after: plain, checked: [])
+    let told = handingNote("api", late.handing!, after: late,
+                           checked: ["Handover of api to box finished: the session there runs"])
+    let handingOK = late.handing?.machine == "box" && late.handing?.state == "unreachable"
+        && late.handing?.release == true && late.handing?.silentSince != nil
+        && young.handing?.state == "checking" && young.handing?.release == false
+        && plain.handing == nil && late.place == "handing over to box"
+        && ask.hasPrefix("The work done on box since ") && ask.contains("3 files stay there")
+        && !ask.contains("Take Back") && none.hasPrefix("Nothing changed on box since ")
+        && none.contains("Take Back") && !unknown.contains("stay there")
+        && gave.contains("did not finish") && told.hasPrefix("Handover of api to box finished")
+    print("UNFINISHED HANDOVER \(handingOK ? "OK" : "FAIL — \(ask) / \(none) / \(gave)")")
+    // the fetch sheet (`backup --offsite-list --json`): each computer's folder,
+    // another computer's newest picked first
+    let listed = offsiteFolders(["remote": "box", "folders": [
+        ["id": "a1b2c3d4e5f6", "folder": "a1b2c3d4e5f6", "name": "studio", "system": "Darwin",
+         "updated": iso(Date()), "projects": 4, "files": 12, "bytes": 3_000_000, "mine": true,
+         "legacy": false],
+        ["id": "0f9e8d7c6b5a", "folder": "0f9e8d7c6b5a", "name": "old-mac", "system": "Darwin",
+         "updated": iso(Date().addingTimeInterval(-86400)), "projects": 9, "files": 40,
+         "bytes": 90_000_000, "mine": false, "legacy": false],
+        ["id": NSNull(), "folder": "laptop", "name": "laptop", "system": NSNull(),
+         "updated": NSNull(), "projects": 1, "files": 2, "bytes": 1000, "mine": false,
+         "legacy": true]]])
+    let fetched = fetchedText(["machine": "box", "from": ["id": "0f9e8d7c6b5a", "name": "old-mac"],
+                               "files": 5, "bytes": 2048, "pulled": true,
+                               "renamed": ["p1/20261020-0900.zip", "p1/20261020-0900.meta.json"]],
+                              listed[1], said: "")
+    let offsiteOK = listed.map { $0.id } == ["a1b2c3d4e5f6", "0f9e8d7c6b5a", "laptop"]
+        && firstPick(listed) == "0f9e8d7c6b5a" && listed[0].detail.hasPrefix("macOS · updated")
+        && listed[2].detail.hasPrefix("from an older aht · 1 project · 2 backups")
+        && fetched.hasPrefix("Fetched 5 backup(s)") && fetched.contains("; 1 differed")
+        && fetchedText(nil, listed[1], said: "box did not answer\n")
+            == "Nothing was fetched: box did not answer"
+    print("BACKUPS FROM ANOTHER MACHINE \(offsiteOK ? "OK" : "FAIL")")
+    // the core's own output (its samples in tests/fixtures/phase1, or fresh
+    // ones: build_app.sh --test passes the folder in AHT_FIXTURES) through
+    // the same parsers, value for value
+    var samplesOK = true
+    if let dir = ProcessInfo.processInfo.environment["AHT_FIXTURES"], !dir.isEmpty {
+        func sample(_ n: String) -> [String: Any] {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir).appendingPathComponent(n))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] ?? [:]
+        }
+        var miss: [String] = []
+        for n in ["projects_handing.json", "projects_handing_release.json"] {
+            let d = sample(n)
+            let g = d["handing"] as? [String: Any] ?? [:]
+            let h = Project(d).handing
+            if h?.machine != g["remote"] as? String || h?.state != g["state"] as? String
+                || h?.release != g["release"] as? Bool
+                || (h?.silentSince == nil) != (g["unreachable_since"] is NSNull) {
+                miss.append(n)
+            }
+        }
+        let dry = sample("reclaim_release_dry.json")
+        let there = dry["remote"] as? String ?? "?"
+        let lost = (dry["would_lose"] as? [String: Any]) ?? [:]
+        let asked = releaseText(dry, there, away: false)
+        let n = tally(lost["files"]), talk = tally(lost["history"])
+        let lostOK: Bool
+        if n == 0 && talk == 0 {
+            lostOK = asked.hasPrefix("Nothing changed on \(there)")
+        } else {
+            // `files` is a count, a list or null; `history` may be missing (an older core)
+            lostOK = (n != nil || lost["files"] is NSNull) && !asked.hasPrefix("Nothing changed")
+                && ((n ?? 0) == 0 || asked.contains(n == 1 ? "\n\n1 file" : "\n\n\(n!) files"))
+                && ((talk ?? 0) == 0 || asked.contains("the conversation stay")
+                    || asked.contains("The conversation stays"))
+        }
+        if !lostOK || (dry["released"] as? Bool) != false { miss.append("reclaim_release_dry.json") }
+        if (sample("reclaim_release_apply.json")["released"] as? Bool) != true {
+            miss.append("reclaim_release_apply.json")
+        }
+        // a project whose Keep in sync Release paused, when the core recorded one
+        let held = sample("projects_mirror_paused.json")
+        if !held.isEmpty {
+            let p = Project(held)
+            let g = held["mirror_paused"] as? [String: Any] ?? [:]
+            if p.syncPaused == nil || p.syncPaused?.reason != g["reason"] as? String
+                || p.syncPaused?.at == nil || p.sync != "paused" {
+                miss.append("projects_mirror_paused.json")
+            }
+        }
+        let list = sample("backup_offsite_list.json")
+        let rows = list["folders"] as? [[String: Any]] ?? []
+        let parsed = offsiteFolders(list)
+        let ids = rows.map { ($0["id"] as? String) ?? ($0["folder"] as? String) ?? "" }
+        if rows.isEmpty || parsed.map({ $0.id }) != ids
+            || parsed.map({ $0.legacy }) != rows.map({ $0["legacy"] as? Bool ?? false })
+            || parsed.map({ $0.mine }) != rows.map({ $0["mine"] as? Bool ?? false })
+            || parsed.map({ $0.files }) != rows.map({ $0["files"] as? Int ?? -1 })
+            || Set(ids).count != ids.count {
+            miss.append("backup_offsite_list.json")
+        }
+        let got = sample("backup_fetch_offsite.json")
+        if let f = parsed.first, let n = got["files"] as? Int {
+            let said = fetchedText(got, f, said: "")
+            if !(n == 0 ? said.hasPrefix("Nothing to fetch") : said.hasPrefix("Fetched \(n) backup(s)")) {
+                miss.append("backup_fetch_offsite.json")
+            }
+        } else {
+            miss.append("backup_fetch_offsite.json")
+        }
+        let ho = sample("status_handover.json")["handover"] as? [String: Any] ?? [:]
+        if !(ho["can_reach"] is Bool) || !(ho["supported"] is Bool) { miss.append("status_handover.json") }
+        let told = sample("notices_handover.json")["notices"] as? [[String: Any]] ?? []
+        if told.isEmpty || told.contains(where: {
+            ($0["info"] as? [String: Any])?["kind"] as? String != "handover"
+                || ($0["info"] as? [String: Any])?["project"] as? String == nil
+        }) {
+            miss.append("notices_handover.json")
+        }
+        samplesOK = miss.isEmpty
+        print("CORE SAMPLES \(samplesOK ? "OK" : "FAIL \(miss)") — \(dir)")
+    } else {
+        print("CORE SAMPLES not checked (AHT_FIXTURES names no folder)")
+    }
+    // the welcome's login switch: a first setup's "off" is an answer too, and
+    // the core then keeps it (answered, and Getting started's step optional)
+    var loginOK = loginAnswered(false, was: false, start: true)
+        && loginAnswered(true, was: false, start: true)
+        && !loginAnswered(false, was: false, start: false)
+        && !loginAnswered(true, was: true, start: true)
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("aht-selftest-\(getpid())").path
+    try? FileManager.default.createDirectory(atPath: tmp + "/LaunchAgents",
+                                             withIntermediateDirectories: true)
+    func inTmp(_ args: [String]) -> [String: Any] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: PY)
+        p.arguments = [core] + args
+        var env = ProcessInfo.processInfo.environment
+        env.merge(["HOME": tmp, "AHT_HOME": tmp + "/.aht", "AHT_LAUNCH_AGENTS": tmp + "/LaunchAgents",
+                   "AHT_NO_NOTIFY": "1", "AHT_NO_ICONS": "1", "AHT_NO_BACKUP": "1",
+                   "AHT_NO_MIRROR": "1"]) { $1 }
+        p.environment = env
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return [:] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+    }
+    let said = inTmp(["autostart", "off", "--json"])
+    let step = ((inTmp(["getting-started", "--json"])["steps"] as? [[String: Any]]) ?? [])
+        .first { $0["id"] as? String == "login" }
+    loginOK = loginOK && said["answered"] as? Bool == true && step?["optional"] as? Bool == true
+    try? FileManager.default.removeItem(atPath: tmp)
+    print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
+    exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
+         && releaseOK && pauseOK && backOnOK && offsiteOK && samplesOK && loginOK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -7040,7 +7831,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
 
 // snapshot: the window's tabs (and its dialogs) as PNG files, to look at a
 // layout without clicking through it (needs a login session; nothing changes)
-//   --snapshot DIR [--select-first] [--query WORDS] [--corner-only | --welcome-only]
+//   --snapshot DIR [--select-first] [--query WORDS]
+//              [--corner-only | --welcome-only | --handover-only]
 /// --dark renders in the dark appearance; the window's own background is
 /// drawn under every snapshot, so the PNG is opaque (a transparent one is
 /// unreadable on a page of the other colour)
@@ -7131,6 +7923,73 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
     snapshot(WelcomeView(w: welcome).environmentObject(model), dir + "/welcome-quick-login-off.png",
              NSSize(width: 640, height: 580))
     if args.contains("--welcome-only") { exit(0) }
+    // an unfinished handover (its banner: Check Now, Release…), a project on
+    // another machine (Release… next to Take Back) and Fetch Backups From…,
+    // from made-up rows in the shape of the core's JSON
+    let demo = AppModel()
+    (demo.status, demo.config, demo.loaded) = (model.status, model.config, true)
+    let stamp = { (ago: Double) -> String in
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return f.string(from: Date().addingTimeInterval(-ago))
+    }
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+    let handing = { (ago: Double, silent: Bool) -> [String: Any] in
+        ["attempt": "20261026-141000-ab12", "step": "starting", "remote": "box", "host": "box",
+         "since": stamp(ago), "state": silent ? "unreachable" : "checking", "release": silent,
+         "unreachable_since": silent ? Date().timeIntervalSince1970 - ago + 60 : NSNull() as Any]
+    }
+    let demoRows: [(String, [String: Any])] = [
+        ("api", ["handing": handing(4000, true)]), ("site", ["handing": handing(40, false)]),
+        ("shop", ["away": "box", "away_remote": "box", "away_since": stamp(7200)]),
+        ("blog", ["mirror": "box", "mirror_synced_at": Date().timeIntervalSince1970 - 9000,
+                  "mirror_status": "ok",
+                  "mirror_paused": ["reason": "released", "at": stamp(1800), "remote": "box"]])]
+    demo.projects = demoRows.map { name, extra in
+        Project(["real_path": home + "/code/" + name, "exists": true, "sessions": 6,
+                 "bytes": 4_200_000, "agents": ["claude"]].merging(extra) { $1 })
+    }
+    demo.status["handover"] = ((demo.status["handover"] as? [String: Any]) ?? [:])
+        .merging(["default_remote": "box"]) { $1 }
+    for (p, name) in zip(demo.projects, ["handing", "handing-checking", "away", "sync-paused"]) {
+        demo.selection = p.path
+        snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                 dir + "/detail-\(name).png", NSSize(width: 900, height: 176))
+    }
+    demo.offsite = OffsiteView(machine: "box", loading: false, folders: offsiteFolders(["folders": [
+        ["id": "a1b2c3d4e5f6", "name": "studio", "system": "Darwin", "updated": stamp(5400),
+         "projects": 14, "files": 131, "bytes": 412_000_000, "mine": true, "legacy": false],
+        ["id": "0f9e8d7c6b5a", "name": "old-mac", "system": "Darwin", "updated": stamp(9 * 86400),
+         "projects": 22, "files": 208, "bytes": 960_000_000, "mine": false, "legacy": false],
+        ["id": NSNull(), "folder": "laptop", "name": "laptop", "system": NSNull(),
+         "updated": stamp(40 * 86400), "projects": 3, "files": 12, "bytes": 18_000_000,
+         "mine": false, "legacy": true]]]))
+    demo.offsite?.pick = firstPick(demo.offsite?.folders ?? [])
+    snapshot(FetchBackupsSheet().environmentObject(demo), dir + "/sheet-fetch-backups.png",
+             NSSize(width: 620, height: 460))
+    if let f = demo.offsite?.folders.first(where: { $0.id == demo.offsite?.pick }) {
+        demo.offsite?.result = fetchedText(["machine": "box", "files": 208, "bytes": 960_000_000,
+                                            "pulled": true, "renamed": []], f, said: "")
+        snapshot(FetchBackupsSheet().environmentObject(demo), dir + "/sheet-fetch-backups-done.png",
+                 NSSize(width: 620, height: 460))
+    }
+    if args.contains("--handover-only") {
+        // … and the same from the core's own answers: the Projects tab, and
+        // the fetch sheet when a machine keeps the backups
+        model.tab = .projects
+        snapshot(MainView().environmentObject(model), dir + "/projects.png", NSSize(width: 900, height: 620))
+        model.openFetchBackups()
+        let listEnd = Date().addingTimeInterval(60)
+        while model.offsite?.loading == true && Date() < listEnd {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        }
+        if model.offsite != nil {
+            snapshot(FetchBackupsSheet().environmentObject(model), dir + "/sheet-fetch-backups-live.png",
+                     NSSize(width: 620, height: 460))
+        }
+        exit(0)
+    }
     model.refreshBoard()                        // the Sessions tab shows real rows
     let boardEnd = Date().addingTimeInterval(60)
     while model.boardAt == nil && Date() < boardEnd {

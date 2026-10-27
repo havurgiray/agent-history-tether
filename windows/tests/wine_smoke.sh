@@ -6,13 +6,14 @@
 # overrides, so it never touches real agent data:
 #   tag -> move+reconcile (claude+gemini dir renames, codex cwd rewrite) ->
 #   hook -> badges -> backup/restore -> copies -> tray selftest
+# It works in /tmp/aht-smoke (AHT_SMOKE_DIR in place of /tmp).
 set -e
 
 EXE="$1"
 [ -n "$EXE" ] || { echo "usage: wine_smoke.sh /path/to/aht.exe"; exit 2; }
 export WINEDEBUG=-all
 
-T=/tmp/aht-smoke
+T="${AHT_SMOKE_DIR:-/tmp}/aht-smoke"
 rm -rf "$T"
 mkdir -p "$T/home/.aht" "$T/roots/projA/src" \
          "$T/tools/claude" "$T/tools/gemini" "$T/tools/codex/2026/08/29" \
@@ -24,7 +25,7 @@ if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
                                            # 8.3 name, and the core realpaths
 else
   RUN="wine"
-  WT='Z:\tmp\aht-smoke'                    # wine maps / to Z:
+  WT="Z:$(printf '%s' "$T" | tr '/' '\\')"   # wine maps / to Z:
 fi
 WTJ=$(printf '%s' "$WT" | sed 's/\\/\\\\/g')   # backslashes doubled for JSON
 
@@ -117,12 +118,20 @@ W config --set move_policy=apply --no-reload > /dev/null
 W config --json | grep -q '"move_policy": "apply"' || fail "config set/get"
 
 echo "== folder badges (desktop.ini + composited ico) =="
-# the badges' icon cache goes to the sandbox too, not to this user's own
+# as an older aht left it: the badge under its fixed name, which goes; the
+# badge file is named after its picture.  The badges' icon cache goes to the
+# sandbox too, not to this user's own
+mkdir -p "$T/roots/projC/.aht"
+printf 'old picture' > "$T/roots/projC/.aht/aht-badge.ico"
+printf '[.ShellClassInfo]\r\nIconResource=.aht\\aht-badge.ico,0\r\n' > "$T/roots/projC/desktop.ini"
 env AHT_NO_ICONS= LOCALAPPDATA="$WT\\localappdata" $RUN "$EXE" icons --refresh > /dev/null ||
   fail "icons --refresh crashed"
-[ -f "$T/roots/projC/.aht/aht-badge.ico" ] || fail "badge ico not written"
+ICO=$(cd "$T/roots/projC/.aht" && ls aht-badge-*.ico 2>/dev/null)
+[ -n "$ICO" ] && [ "$(printf '%s\n' "$ICO" | wc -l)" -eq 1 ] || fail "badge ico not written (or more than one: $ICO)"
+[ ! -e "$T/roots/projC/.aht/aht-badge.ico" ] || fail "the badge under the old fixed name stayed"
 [ -f "$T/roots/projC/desktop.ini" ] || fail "desktop.ini not written"
-grep -q 'aht-badge.ico' "$T/roots/projC/desktop.ini" || fail "IconResource not set"
+grep -q "IconResource=.aht.$ICO,0" "$T/roots/projC/desktop.ini" || fail "IconResource does not point at $ICO"
+grep -q 'aht-badge.ico' "$T/roots/projC/desktop.ini" && fail "desktop.ini still names the old badge"
 
 echo "== backup + restore across backends =="
 W backup --json > "$T/bk.json"

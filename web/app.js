@@ -37,6 +37,8 @@ const parent = (p) => { const s = (p || "").replace(/[\\/]+$/, ""); const i = Ma
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const AGENTS = { claude: "Claude Code", kimi: "Kimi Code", codex: "Codex", gemini: "Gemini CLI",
   cursor: "Cursor", opencode: "OpenCode", copilot: "Copilot" };
+// a computer's system as the core names it (Python's platform.system())
+const SYSTEMS = { Darwin: "macOS", Linux: "Linux", Windows: "Windows" };
 
 function tilde(p) {
   const home = S.status.home || "";
@@ -47,6 +49,12 @@ function when(t) {
   if (!t) return "—";
   const d = typeof t === "number" ? new Date(t * 1000) : new Date(t);
   return isNaN(d) ? String(t) : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+/** A time of day for today, else date and time. */
+function clock(t) {
+  const d = typeof t === "number" ? new Date(t * 1000) : new Date(t);
+  if (isNaN(d)) return String(t || "");
+  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString(undefined, { timeStyle: "short" }) : when(t);
 }
 function ago(t) {
   if (!t) return "";
@@ -340,7 +348,13 @@ const S = { tab: "projects", status: {}, config: {}, projects: [], selection: nu
   board: null, boardAt: null, query: "", hits: null, notes: {}, loaded: false };
 const ON_WINDOWS = () => (S.status.platform || "").startsWith("win");
 const CAN_HAND_OVER = () => !!(S.status.handover || {}).supported;
+// asking other machines (ssh alone); an older core says only "supported"
+const CAN_REACH = () => { const ho = S.status.handover || {}; return "can_reach" in ho ? !!ho.can_reach : !!ho.supported; };
 const flag = (k, d = true) => (k in S.config ? !!S.config[k] : d);
+/** Keep in sync, paused (`mirror_paused`: {reason, at, remote}): Release
+ * pauses it, so no sync replaces the copy left on that machine until the
+ * user turns it back on.  null while it runs. */
+const syncPaused = (p) => (p.mirror && p.mirror_paused ? p.mirror_paused : null);
 
 async function refresh() {
   const [st, cfg, pj] = await Promise.all([J("status", "--json"), J("config", "--json"), J("projects", "--json")]);
@@ -409,12 +423,14 @@ function draw() {
 // ---- Projects -------------------------------------------------------------------
 
 function projState(p) {
+  if (p.handing) return ["handover unfinished", "waiting"];
   if (p.away) return [`handed over to ${p.away}`, "working"];
   if (!p.exists) return ["folder gone", "waiting"];
   if (p.open === "waiting") return ["waiting for you", "waiting"];
   if (p.open === "working") return ["working", "working"];
   if (p.open === "idle") return ["open", ""];
   if (p.limit) return ["usage limit", "waiting"];
+  if (syncPaused(p)) return ["sync paused", ""];
   return ["", ""];
 }
 
@@ -429,7 +445,7 @@ function drawProjects(m) {
     const [state, cls] = projState(p);
     tbody.append(h("tr", { class: p.real_path === S.selection ? "picked" : "",
       onclick: () => { S.selection = p.real_path; draw(); },
-      ondblclick: () => { S.selection = p.real_path; if (p.exists && !p.away) continueHere(p); } },
+      ondblclick: () => { S.selection = p.real_path; if (p.exists && !p.away && !p.handing) continueHere(p); } },
       h("td", {}, h("strong", { text: base(p.real_path) }), " ", h("span", { class: "dim small", text: tilde(parent(p.real_path)) })),
       h("td", {}, state ? h("span", { class: "badge " + cls, text: state }) : ""),
       h("td", { class: "dim", text: ago(p.last_activity) }),
@@ -450,25 +466,31 @@ function detail() {
   const p = S.projects.find((x) => x.real_path === S.selection);
   const d = h("div", { class: "detail stack" });
   if (!p) { d.append(h("p", { class: "dim", text: "Select a project to continue a session, see what changed, or look back." })); return d; }
-  const st = p.away ? `handed over to ${p.away}${p.away_since ? ", " + ago(p.away_since) : ""}`
+  const st = p.handing ? `handover to ${handing(p).to} unfinished`
+    : p.away ? `handed over to ${p.away}${p.away_since ? ", " + ago(p.away_since) : ""}`
     : !p.exists ? "the folder is gone; its histories are safe"
     : `${plural(p.sessions || 0, "session")}, ${bytes(p.bytes)} of history`;
   d.append(h("div", { class: "row" }, h("strong", { text: base(p.real_path) }), h("span", { class: "dim", text: st })),
     h("div", { class: "dim small mono", text: tilde(p.real_path) }));
+  if (p.handing) d.append(handingBanner(p));
+  else if (!p.away && p.exists && syncPaused(p)) d.append(pausedBanner(p));
   const row = h("div", { class: "row" });
   const handover = CAN_HAND_OVER() && (S.status.handover || {}).default_remote;
   if (p.away) {
     if (CAN_HAND_OVER()) row.append(h("button", { class: "primary", text: "Take Back…", onclick: () => takeBack(p) }));
   } else if (p.exists) {
+    // while a handover is unfinished, nobody knows yet where the work goes on
+    const held = !!p.handing;
     if (CAN_HAND_OVER()) {
-      row.append(h("button", { text: handover ? `Hand Over to ${handover}…` : "Hand Over…", disabled: !handover || !!p.open,
+      row.append(h("button", { text: handover ? `Hand Over to ${handover}…` : "Hand Over…", disabled: !handover || !!p.open || held,
         onclick: () => handOver(p) }));
-      row.append(h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!p.mirror, disabled: !handover,
-        onchange: (e) => keepInSync(p, e.target.checked) }), "Keep in sync" + (p.mirror ? ` with ${p.mirror}` : "")));
+      row.append(h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!p.mirror, disabled: !handover || held,
+        onchange: (e) => keepInSync(p, e.target.checked) }), "Keep in sync" + (p.mirror ? ` with ${p.mirror}` : "")
+        + (syncPaused(p) ? " (paused)" : "")));
     }
-    row.append(h("button", { text: "Continue Session", disabled: !(p.sessions > 0), onclick: () => continueHere(p) }));
+    row.append(h("button", { text: "Continue Session", disabled: !(p.sessions > 0) || held, onclick: () => continueHere(p) }));
     row.append(menu("Switch Agent", ["claude", "kimi", "codex"].filter((a) => (S.status.agent_clis || {})[a])
-      .map((a) => [`Continue in ${AGENTS[a]}…`, () => switchAgent(p, a)]), { disabled: !(p.sessions > 0 || (p.agents || []).length) }));
+      .map((a) => [`Continue in ${AGENTS[a]}…`, () => switchAgent(p, a)]), { disabled: !(p.sessions > 0 || (p.agents || []).length) || held }));
     row.append(helpBtn("Continue in another agent"));
   }
   row.append(h("span", { class: "grow" }));
@@ -486,12 +508,13 @@ function detail() {
       "-",
       ["Second Opinion…", () => openOpinion(p)],
       CAN_HAND_OVER() ? ["Night Shift…", () => openNightShift(p), !handover] : null,
+      p.away && CAN_HAND_OVER() ? [`Release from ${p.away_remote || p.away}…`, () => release(p)] : null,
       "-",
       [ON_WINDOWS() ? "Show in Explorer" : "Show in Files", () => post("/api/reveal", { path: p.real_path })],
     ], { right: true }), helpBtn("The window at a glance"));
   }
   d.append(row);
-  if (p.open && !p.away && CAN_HAND_OVER()) {
+  if (p.open && !p.away && !p.handing && CAN_HAND_OVER()) {
     d.append(h("p", { class: "warn small", text: p.open === "waiting"
       ? "An agent session in this project is waiting for you. Answer it in its terminal; the project cannot be handed over until it has finished and is closed."
       : "An agent session is open in this project. It can be handed over once it has finished and is closed." }));
@@ -550,6 +573,7 @@ async function openSessionList(p) {
   const s = sheet(`Sessions: ${base(p.real_path)}`, "A project's sessions", 860);
   s.body.append(h("p", { class: "dim", text: "Every session in this folder, the latest work first. A branch (/branch in Claude Code) sits under the session it came from, with the time it branched. Continue opens a session in a new terminal window." }));
   if (p.away) s.body.append(h("p", { class: "warn", text: `This project is handed over to ${p.away}: take it back before you continue a session here.` }));
+  else if (p.handing) s.body.append(h("p", { class: "warn", text: `The handover to ${handing(p).to} is unfinished: check it, or release the project, before you continue a session here.` }));
   const filter = h("input", { type: "search", placeholder: "Filter by title", style: "margin-bottom:6px" });
   const box = h("div", { class: "sessions" });
   const drawList = () => {
@@ -569,7 +593,7 @@ async function openSessionList(p) {
           h("div", { class: "dim small", text: bits.filter(Boolean).join(" · ") })),
         h("span", { class: "dim mono", text: it.id.slice(0, 8), title: "Session id: " + it.id }),
         it.open ? h("span", { class: "dim small", text: "open in its terminal" })
-          : h("button", { text: "Continue", disabled: !!p.away,
+          : h("button", { text: "Continue", disabled: !!p.away || !!p.handing,
             onclick: () => resume([p.real_path, "--session", it.id, "--agent", it.agent]) })));
     }
     if (!items.length) box.append(h("p", { class: "dim", text: "No sessions in this folder yet." }));
@@ -604,7 +628,7 @@ async function openStatement(p) {
 }
 async function share(p) {
   const name = base(p.real_path);
-  const ans = await ask("Share the latest session", `aht writes a page of ${name}'s latest session, without keys, e-mail addresses or local paths, into the project folder (${name} session.html), and shows it.`, ["Cancel", "Write the Page"]);
+  const ans = await ask("Share the latest session", `aht writes a page of ${name}'s latest session into the project folder (${name} session.html) and shows it. Keys and passwords aht recognises are masked; e-mail addresses, local network addresses and your home folder's path are removed. Look it through before you share it.`, ["Cancel", "Write the Page"]);
   if (!ans) return;
   const sep = ON_WINDOWS() ? "\\" : "/";
   const out = p.real_path + sep + `${name} session.html`;
@@ -834,8 +858,10 @@ async function handOver(p) {
   for (const w of plan.warnings || []) body += "\n\n⚠ " + w;
   body += "\n\nThe session is resumed there and this folder is marked as away until you take it back.";
   if (!(await confirmIt(`Hand “${base(p.real_path)}” over to ${remote}?`, body, "Hand Over"))) return;
+  S.moving = p.real_path;             // its own record of it is no unfinished handover
   const d = await busy(`handing ${base(p.real_path)} over…`, () =>
-    job(["handover", p.real_path, "--apply", "--json", "--to", remote], "handing over", true).then((a) => a.json || {}));
+    job(["handover", p.real_path, "--apply", "--json", "--to", remote], "handing over", true).then((a) => a.json || {}))
+    .finally(() => { S.moving = null; });
   const s = d.sent || {};
   note(p, problems(d) ? "The handover did not go through:\n\n" + problems(d)
     : `Handed over to ${remote}: ${s.files || 0} file(s) sent, ${bytes(s.wire_bytes)} over the network.`);
@@ -868,6 +894,110 @@ async function keepInSync(p, on) {
   const remote = (S.status.handover || {}).default_remote;
   note(p, on ? `Kept in sync with ${remote}; the first copy runs in the background.` : null);
   await run(["mirror", p.real_path].concat(on ? ["--on", "--to", remote] : ["--off"]));
+  refresh();
+}
+/** Keep in sync paused by a Release: a note with a way to turn it back on. */
+function pausedBanner(p) {
+  const x = syncPaused(p), to = p.mirror;
+  return h("div", { class: "callout row" },
+    h("div", { class: "grow" }, h("strong", { text: `Keep in sync with ${to} is paused` }),
+      h("div", { class: "small", text: x.reason === "released"
+        ? `You released this project${x.at ? " at " + clock(x.at) : ""}, so the copy on ${to} stays as it is. Turning the sync back on makes that copy the same as this one again.`
+        : `The copy on ${to} stays as it is until you turn the sync back on.` })),
+    h("button", { class: "small", text: "Turn Sync Back On…", onclick: () => resumeSync(p) }),
+    helpBtn("Hand a project over"));
+}
+async function resumeSync(p) {
+  const x = syncPaused(p) || {}, to = p.mirror, name = base(p.real_path);
+  if (!(await confirmIt(`Keep “${name}” in sync with ${to} again?`, `The next sync makes the copy on ${to} the same as this one`
+    + (x.reason === "released" ? ", so the work left there when you released it is replaced. " : ". ")
+    + "What a sync replaces there is set aside first, not deleted.", "Turn It On"))) return;
+  const r = await busy(`turning the sync with ${to} back on…`, () => run(["mirror", p.real_path, "--on", "--to", to]));
+  note(p, r.ok ? `Kept in sync with ${to} again; the next copy runs in the background.`
+    : "The sync was not turned back on:\n\n" + ((r.out + r.err).trim() || "aht gave no answer."));
+  refresh();
+}
+
+// A handover that did not finish (`handing`: the link dropped, or a machine
+// slept): the core finishes it or undoes it once the other machine answers
+// (at its notices check, or at once with Check Now); Release lets the
+// project go on here without it.  `state`: "running" (it runs right now),
+// "checking" or "unreachable"; `release`: an hour went by without an answer.
+function handing(p) {
+  const g = p.handing && typeof p.handing === "object" ? p.handing : {};
+  return { to: g.remote || g.host || "the other machine", state: g.state || "checking", error: g.error || "",
+    silent: g.unreachable_since, release: !!g.release };
+}
+const sentence = (t) => { t = String(t || "").trim(); return t ? t[0].toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? " " : ". ") : ""; };
+function handingBanner(p) {
+  const g = handing(p);
+  if (S.moving === p.real_path) return null;          // this window is handing it over right now
+  if (g.state === "running") {
+    return h("div", { class: "callout row" }, h("div", { class: "grow" }, h("strong", { text: `Handover to ${g.to} under way` }),
+      h("div", { class: "small", text: "This note goes when it is done." })));
+  }
+  const gone = g.state === "unreachable";
+  return h("div", { class: "callout row" },
+    h("div", { class: "grow" },
+      h("strong", { text: gone ? `Handover to ${g.to} did not finish` : `Handover to ${g.to} unfinished: checking…` }),
+      h("div", { class: "small", text: gone
+        ? `${g.to} has not answered${g.silent ? " since " + clock(g.silent) : ""}. ` + (g.release
+          ? `Release lets the project go on here; what was done on ${g.to} stays there.` : "aht asks again every minute.")
+        : `${sentence(g.error)}aht asks ${g.to} within a few minutes whether the session there started, then finishes the handover or undoes it.` })),
+    h("button", { class: "small", text: "Check Now", onclick: () => checkHanding(p) }),
+    h("button", { class: g.release ? "small primary" : "small", text: "Release…", onclick: () => release(p) }),
+    helpBtn("Hand a project over"));
+}
+/** Check Now: Take Back's dry run, which first settles an unfinished
+ * handover with the other machine. */
+async function checkHanding(p) {
+  const { to } = handing(p), name = base(p.real_path);
+  note(p, null);
+  const d = await busy(`asking ${to}…`, () => job(["reclaim", p.real_path, "--json"], `asking ${to}`).then((a) => a.json || {}));
+  await refresh();
+  const q = S.projects.find((x) => x.real_path === p.real_path) || {};
+  if ((d.checked || []).length) return note(p, d.checked.join("\n"));
+  if (q.handing) {
+    const g = handing(q);
+    return note(p, g.state === "running" ? `The handover to ${to} is under way right now.`
+      : `${to} did not answer${g.error ? ` (${g.error})` : ""}. aht asks again every minute.`);
+  }
+  note(p, q.away ? `The handover of ${name} to ${to} finished.` : `The handover of ${name} to ${to} did not finish. The project stays here.`);
+}
+/** Release: the project counts as here again, as it is; the copy on the
+ * other machine is left as it is (`aht reclaim --release`). */
+async function release(p) {
+  let to = p.handing ? handing(p).to : p.away_remote || p.away || "the other machine";
+  const since = (p.handing || {}).since || p.away_since;
+  const name = base(p.real_path);
+  note(p, null);
+  const a = await busy(`checking ${name}…`, () => run(["reclaim", p.real_path, "--release", "--json"]));
+  const plan = a.json || {};
+  if (problems(plan) || !a.json) return note(p, "Cannot be released now:\n\n" + (problems(plan) || (a.out + a.err).trim() || "aht gave no answer."));
+  const lose = plan.would_lose || {}, from = lose.since || since;
+  if (plan.remote) to = plan.remote;
+  // what stays there: the files changed there and the conversation held
+  // there (its history); each a count, or null when that machine did not
+  // answer
+  const count = (x) => (Array.isArray(x) ? x.length : x === true ? 1 : x === false ? 0 : x);
+  const n = count(lose.files), conv = count(lose.history);
+  const at = from ? ` since ${clock(from)}` : "";
+  const stays = [n ? plural(n, "file") : null, conv ? "the conversation" : null].filter(Boolean).join(" and ");
+  // Keep in sync with that machine pauses (`pauses_sync`: its name), so no
+  // sync replaces the copy there
+  const pauses = plan.pauses_sync;
+  let body = `${name} counts as here again, with its files here as they are. The copy on ${to} is not touched.\n\n`;
+  body += n === 0 && conv === 0 ? `Nothing changed on ${to}${at}, so nothing stays behind there.`
+    : `The work done on ${to}${at} stays on ${to}${stays ? ": " + stays : ""}. It does not come here.`;
+  if (Array.isArray(lose.files) && n) body += "\n" + lose.files.slice(0, 6).map((x) => "• " + x).join("\n") + (n > 6 ? `\n… and ${n - 6} more` : "");
+  if (pauses) body += `\n\nKeep in sync with ${pauses} will be paused, so the copy there stays as it is. You can turn it back on later.`;
+  if (!(await confirmIt(`Release “${name}” from ${to}?`, body, "Release"))) return;
+  const r = await busy(`releasing ${name}…`, () => run(["reclaim", p.real_path, "--release", "--apply", "--json"]));
+  const d = r.json || {};
+  // the pause as the core recorded it, not as the dry run expected
+  note(p, !d.released ? "Not released:\n\n" + (problems(d) || (r.out + r.err).trim() || "aht gave no answer.")
+    : `Released: ${name} is here again. ` + (d.pauses_sync ? `Keep in sync with ${d.pauses_sync} is paused, so the copy there stays as it is.`
+      : `The copy on ${to} stays as it is.`));
   refresh();
 }
 
@@ -1056,7 +1186,10 @@ function drawMachines(m) {
       } }),
       h("button", { class: "small", text: "Remove…", onclick: async () => {
         if (!(await confirmIt(`Remove ${name}?`, "aht forgets this machine. Nothing on it is deleted.", "Remove"))) return;
-        await run(["remote", "remove", name]); refresh();
+        // a machine that still holds a project stays: aht says how to release it
+        const r = await run(["remote", "remove", name]);
+        if (!r.ok) await tell(`${name} is not removed`, (r.err + r.out).trim() || "aht gave no answer.");
+        refresh();
       } })));
     m.append(box);
   }
@@ -1137,6 +1270,22 @@ function drawSettings(m) {
     tok("Second opinion: one task, two agents, compared", "second_opinion", "both agents work"),
     CAN_HAND_OVER() ? tok("Night shift: hand a project over with a task, on a timer", "night_shift", "the agent works while you are away") : null,
     h("div", { class: "dim small", text: "Each of these makes an agent read or work, which counts against your plan or API bill. aht's own work — watching, search, backups, reports, loose ends — never uses tokens." })));
+  // Windows gets it with aht's own file copy, later
+  if (CAN_HAND_OVER() && !ON_WINDOWS()) {
+    const off = S.config.offsite_backup || "";
+    const names = Object.keys((st.handover || {}).remotes || {}).sort();
+    if (off && !names.includes(off)) names.push(off);
+    m.append(group("Backups on another machine", "Backups",
+      h("div", { class: "row" }, "Keep a copy of the history backups on",
+        h("select", { onchange: (e) => setConfig("offsite_backup", e.target.value) },
+          [["", "no other machine"]].concat(names.map((n) => [n, n])).map(([v, l]) => h("option", { value: v, text: l, selected: off === v }))),
+        h("span", { class: "grow" }),
+        h("button", { text: "Copy Now", disabled: !off, onclick: copyBackupsNow }),
+        h("button", { text: "Fetch Backups From…", disabled: !off || !CAN_REACH(), onclick: () => fetchBackups(off) })),
+      h("div", { class: "dim small", text: names.length
+        ? "After each daily backup, aht adds the new ones to a folder of this computer's own there. A backup there goes only after aht removed it here, and at least 3 per project stay. Fetch Backups From… brings back the backups any of your computers left there: it adds what is missing here and replaces nothing."
+        : "Add one of your other machines in the Machines tab first." })));
+  }
   m.append(group("Folder badges", "Folder badges", h("div", { class: "row" }, check("Badge folders", "icons_enabled"), check("Agent symbols", "icons_agent"), check("Git “+”", "icons_git"),
     h("span", { class: "grow" }), h("button", { text: "Refresh All", onclick: () => busy("refreshing the badges…", () => run(["icons", "--refresh"])) }),
     h("button", { text: "Clear All…", onclick: async () => {
@@ -1183,6 +1332,56 @@ function drawSettings(m) {
       h("button", { text: "Open Log", onclick: () => post("/api/reveal", { path: st.log && st.log.path }) }),
       h("button", { text: "Open Data Folder", onclick: () => post("/api/reveal", { path: st.aht_home }) })),
     h("div", { class: "dim small", text: "aht keeps every AI coding agent's per-project history connected to its folder. History is never deleted or overwritten. Data: " + tilde(st.aht_home || "") })));
+}
+async function copyBackupsNow() {
+  const a = await busy("copying the backups…", () => job(["backup", "--offsite", "--json"], "copying the backups"));
+  const d = a.json || {};
+  if (!a.ok) return tell("The backups were not copied", (a.err + a.out).trim() || "aht gave no answer.");
+  toast((d.files ? `Copied ${plural(d.files, "backup")} (${bytes(d.bytes)}) to ${d.machine || "the other machine"}.` : `${d.machine || "The other machine"} has every backup already.`)
+    + (d.removed ? ` ${plural(d.removed, "older backup")} there ${d.removed === 1 ? "was" : "were"} removed, as ${d.removed === 1 ? "it was" : "they were"} here.` : "")
+    // an older aht's folder there that holds backups this computer lacks: left as it is
+    + ((d.legacy || []).length ? ` An older aht's folder there (${d.legacy.join(", ")}) was left as it is; Fetch Backups From… can bring its backups here.` : ""),
+    (d.legacy || []).length ? 9000 : 4000);
+}
+/** Fetch Backups From…: every computer's folder of backups on that machine;
+ * a fetch adds what is missing here and replaces nothing. */
+async function fetchBackups(machine) {
+  const s = sheet(`Backups on ${machine}`, "Backups", 760);
+  const box = h("div", {}, h("p", { class: "dim" }, h("span", { class: "spin" }), `Asking ${machine}…`));
+  s.body.append(h("p", { class: "dim", text: `Each computer that copies its backups to ${machine} has a folder of its own there. Fetch adds the backups that are missing here; nothing here is replaced.` }), box);
+  s.foot.append(h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+  const a = await run(["backup", "--offsite-list", "--json"]);
+  const d = a.json || {};
+  if (!$("#sheet").contains(box)) return;            // closed meanwhile
+  clear(box);
+  if (!Array.isArray(d.folders)) {
+    return box.append(h("p", { class: "warn", text: problems(d) || (a.err + a.out).trim() || `${machine} did not answer.` }));
+  }
+  if (!d.folders.length) box.append(h("p", { class: "dim", text: `There are no backups on ${machine} yet.` }));
+  for (const f of d.folders) {
+    const who = f.name || f.id;
+    const facts = [SYSTEMS[f.system] || f.system, f.updated ? "updated " + ago(f.updated) : null, plural(f.projects || 0, "project"),
+      `${plural(f.files || 0, "backup")}, ${bytes(f.bytes)}`];
+    box.append(h("div", { class: "row", style: "padding:6px 0;border-bottom:1px solid var(--line)" },
+      h("div", { class: "grow" }, h("div", { class: "row" }, h("strong", { text: who }),
+        f.mine ? h("span", { class: "badge ok", text: "this computer" }) : null,
+        f.legacy ? h("span", { class: "badge", text: "older aht", title: "Copied there by an earlier version of aht" }) : null),
+      h("div", { class: "dim small", text: facts.filter(Boolean).join(" · ") })),
+      h("button", { class: "small", text: "Fetch", disabled: !f.files, onclick: () => fetchFrom(machine, f) })));
+  }
+}
+async function fetchFrom(machine, f) {
+  const who = f.name || f.id;
+  const a = await busy(`fetching ${who}'s backups…`, () => job(["backup", "--fetch-offsite", "--from=" + (f.id || f.folder || f.name), "--json"], "fetching the backups"));
+  const d = a.json || {};
+  if (!a.ok) return tell("The backups were not fetched", (a.err + a.out).trim() || "aht gave no answer.");
+  // a backup is a .zip with its .meta.json: each counts once
+  const renamed = Array.isArray(d.renamed) ? d.renamed.filter((x) => /\.zip$/i.test(x)).length : d.renamed || 0;
+  tell(d.files ? "Backups fetched" : "Nothing to fetch", (d.files
+    ? `${plural(d.files, "backup")} (${bytes(d.bytes)}) came from ${who}'s folder on ${machine}.`
+    : `Every backup in ${who}'s folder on ${machine} is here already.`)
+    + (renamed ? ` ${plural(renamed, "backup")} had the name of a different one here, so ${renamed === 1 ? "it was" : "they were"} kept under a new name.` : "")
+    + (d.files ? " Search finds the sessions in them, and Restore brings one back." : ""));
 }
 async function adopt() {
   const d = await busy("looking for projects…", () => J("adopt", "--json"));
@@ -1270,6 +1469,7 @@ async function showWelcome(again) {
       Object.assign(W, { moves: pol.moves || "ask", copies: pol.copies || "ask",
         badges: sw.badges !== false, backups: sw.backups !== false, notifications: sw.notifications !== false,
         update: !!sw.update_check, login: W.asked ? !!auto.on : true });
+      W.loginFirst = W.login;         // where the switch started: a change from it is an answer
       if (W.roots.some((r) => r.chosen && !(d.roots || []).find((x) => x.path === r.path && x.chosen))) return load(false);
     } else {
       for (const r of d.roots || []) { const x = W.roots.find((y) => y.path === r.path); if (x) x.projects = r.projects; }
@@ -1312,11 +1512,14 @@ async function showWelcome(again) {
       "--moves", W.moves, "--copies", W.copies, "--badges", on(W.badges), "--backups", on(W.backups),
       "--notifications", on(W.notifications), "--update-check", on(W.update)]);
     if (!r.ok) { W.failed = r.out + r.err; paint(); return; }
-    // the tray at login only when it changes: `autostart on|off` also notes
-    // the answer, which a page left as it was is not
+    // the tray at login when the switch differs from it, or from where the
+    // switch started: `autostart on|off` also notes the answer, so a first
+    // "no" (the switch turned off while the tray is off anyway) counts; a
+    // page left as it was is no answer
     if (loginWorks()) {
       const now = await J("autostart", "--json");
-      if (W.login !== ("on" in now ? !!now.on : !!(S.status.autostart || {}).on)) await run(["autostart", W.login ? "on" : "off"]);
+      const isOn = "on" in now ? !!now.on : !!(S.status.autostart || {}).on;
+      if (W.login !== isOn || W.login !== W.loginFirst) await run(["autostart", W.login ? "on" : "off"]);
     }
     W.adopted = ((r.json || {}).adopted || []).length;
     await refresh();

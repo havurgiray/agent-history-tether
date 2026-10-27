@@ -236,7 +236,9 @@ Hand a project to another machine of yours — say an always-on box at home —
 keep working on it there over ssh or from your phone, and take it back later.
 The files, the agent's history and the session itself move; nothing is
 installed on the other machine but what it needs anyway (python3, rsync 3,
-tmux or byobu, the agent CLI).  macOS and Linux, Claude Code sessions for now.
+tmux or byobu, the agent CLI).  macOS and Linux, Claude Code sessions for now;
+aht cannot ask a Windows PC yet (`aht remote add` and `aht remote check` stop
+after one harmless `echo` there, and make nothing on it).
 
 ```sh
 aht remote discover                      # machines of your network that qualify
@@ -277,7 +279,8 @@ session is open in it, and a transfer shows its progress.
   itself only sends the last changes.  Transfers are compressed (`rsync -z`).
 - **What travels**: the folder, the history store, the `/rewind` checkpoints
   and, with `--include <path>`, files and folders outside the project
-  (remembered per project).  **What stays**: `node_modules`, `.venv`,
+  (remembered per project; Take Back brings them back, also after a
+  handover that was cut off).  **What stays**: `node_modules`, `.venv`,
   `__pycache__` and the like (rebuilt per machine), Finder's icon files,
   temporary files, running processes.
 - **What the session knew travels in readable form too.**  A summary is
@@ -289,8 +292,36 @@ session is open in it, and a transfer shows its progress.
 - **The way back is three-way.**  Changes made there arrive; what changed
   only here stays; what changed on *both* sides is kept in both versions
   (`--prefer there` takes the other machine's instead).  Whatever a transfer
-  replaces or removes is set aside in `~/.aht/handover/<id>/replaced/` first.
-  A transcript only comes back if it *continues* the one that left.
+  replaces or removes is set aside first: here in
+  `~/.aht/handover/<id>/replaced/`, there in `~/.aht/remote/replaced/`
+  (Claude's checkpoints and plans too); the newest 5 of those folders and
+  every one younger than 30 days are kept.  A transcript only comes back if
+  it *continues* the one that left.  A name whose case changed there
+  (`readme.md` → `README.md`) comes back also to a disk that ignores case,
+  as a Mac's usually does, with the old one set aside; two names that
+  differ only in case are both kept, one under the conflict name; and empty
+  folders made there (a packed git repo's `refs`) come back too.
+- **A handover cut off halfway** (the link drops, this computer sleeps):
+  aht notes the attempt before anything travels, and at its next check asks
+  the other machine what happened — *Handover of api to box finished: the
+  session there runs (the link had dropped at 01:02)*, or *The handover of
+  api to box did not finish. The project stays here; nothing runs there*.
+  It counts as finished when a session runs there, the copy there changed,
+  the conversation went on there, or this attempt's session started there
+  and has ended since; *did not finish* only when nothing happened there.
+  Take Back refuses a record of what left that belongs to another attempt.
+- **Release** — `aht reclaim <folder> --release` (dry run first, then
+  `--apply`) lets a project count as here again when the other machine is
+  gone or does not answer: the files here stay as they are, the copy there
+  is left alone, and the work done there does not come here.  The dry run
+  names what stays there (*What stays there: 3 files and the
+  conversation*).  aht offers it after an hour without an answer, and
+  `aht remote remove` names it for the projects a machine still holds.
+  When the project is kept in sync with that machine, Release pauses Keep
+  in sync, so no sync replaces the copy left there.  It stays paused until
+  you turn it on again (`aht mirror <folder> --on --to box`, or *Turn Sync
+  Back On…*); a later Hand Over to that machine also ends the pause (it
+  sets the released copy aside there first), as does a Take Back from it.
 - **Which session goes on.**  The one you worked in last, picked the way
   `claude --continue` picks it (scripted `claude -p` runs and `/loop`
   sessions do not count) — in both directions.  If that is not the session
@@ -307,7 +338,9 @@ session is open in it, and a transfer shows its progress.
   through network changes and sleep.  aht tests the path once per machine
   (`aht remote check` tests again) and uses ssh when it is blocked.
 - The folder shows a blue → badge while it is away, and a session started in
-  it meanwhile is warned.  With `handover_remote_control` (default on) the
+  it meanwhile is warned, also while a handover of it is unfinished; after a
+  Release the next session is told once that the work done there did not
+  come here.  With `handover_remote_control` (default on) the
   session there is reachable from the Claude app, including permission
   prompts.
 
@@ -321,8 +354,10 @@ behave the same.
   looks through every session of every agent and project, including
   sessions that were deleted since and live on only in a history backup; a
   hit offers to resume it, or to restore it first.  The index
-  (`~/.aht/search.db`) keeps itself up to date and holds no keys: whatever
-  looks like one is masked before it is stored.
+  (`~/.aht/search.db`) keeps itself up to date.  What aht recognises as a
+  key, a token or a password (see *Secrets check*) is masked whole before
+  it is stored: in messages, in the commands, file paths and web addresses
+  of tool calls, and in session titles.
 - **Session board** — `aht board` (the *Sessions* tab) shows every open
   agent session on this Mac and on each machine set up for handover:
   working, waiting for you (and for what), or idle.  The menu bar counts
@@ -344,12 +379,75 @@ behave the same.
 - **Project journal** — `aht journal <folder>` builds a dated diary from all
   agents' sessions: what was asked, which files changed, how each day ended.
   `--write` keeps it as `.aht/journal/journal.md`.
-- **Secrets check** — `aht secrets [folder]` lists what looks like a key, a
-  token or a password in the agents' histories, masked, with where and when
-  it appeared.  A handover says how many travel with the project.  aht never
-  changes the histories themselves, and it masks such values in everything
-  it writes: the search index, journals, and handover and switch summaries
-  (those folders also carry a `.gitignore`).
+- **Secrets check** — `aht secrets [folder]` lists what aht recognises as a
+  key, a token or a password in the agents' histories, masked, with where
+  and when it appeared.  A handover says how many travel with the project.
+  aht never changes the histories themselves.  What it recognises:
+  - keys of a known kind: Anthropic, OpenAI, Groq, GitHub, GitLab, AWS
+    access keys, Google API keys and OAuth tokens, Slack, Stripe live keys,
+    SendGrid, Hugging Face, npm, PyPI, age, Vault, DigitalOcean, Shopify,
+    Docker Hub, Atlassian and Tailscale keys, JSON web tokens, the secret
+    part of a Slack webhook address and the token in a Telegram bot
+    address;
+  - private keys (PEM, also encrypted, PGP and PuTTY `.ppk`), also inside
+    JSON or in a Read tool's numbered output, as their header, their lines
+    of key and their END line (a guide or code that only names the BEGIN
+    and END lines is left alone), and private keys in base64 (a
+    kubeconfig's `client-key-data`, a Kubernetes `tls.key`);
+  - `Bearer` tokens, `Basic` credentials, and what follows
+    `Authorization:` with any other scheme or none (16 characters or
+    more);
+  - the value given to a name that holds a password, a secret, a token or
+    a key (`DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY=`, `client_secret`,
+    `export GITHUB_TOKEN=`, `x-api-key:`, `RAILS_MASTER_KEY=`, `*_PAT=`,
+    and camelCase names such as `dbPassword`, `accessToken` and
+    `SecretAccessKey`), in a `.env` file, YAML or JSON, on any line of a
+    tool's output and in JSON inside JSON, when the value looks generated;
+    a value in quotes is masked to its closing quote.  Not after a name
+    whose last part says it holds something else (`TOKEN_URL`,
+    `password_hash`, `token_type`, `max_tokens`, `accessTokenUrl`,
+    `token_sha256`);
+  - a password on a command line (`--password X`, `--token X`,
+    `--with-token X`, `--api-key X`, `mysql -pX`, `docker login -p X`,
+    `sshpass -p X`, `redis-cli -a X`, `curl -u user:X`), in a cookie whose
+    name holds sess, sid, token or auth, and in XML
+    (`<password>X</password>`, `key="…Password" value="X"`);
+  - the password in a web or database address, whatever the host
+    (`postgres://app:…@db:5432`, also with an `@` in the password, and
+    Go's `user:…@tcp(host:3306)/db`); the rest of the address stays
+    readable.
+
+  It leaves alone placeholders and references to a secret store
+  (`${DB_PASSWORD}`, `<token>`, `changeme`, `op://…`, `vault:…`), code and
+  format strings (`tokenizer.encode(text)`, `password: Optional[str]`, a
+  cut `{name`), names (`MAX_RETRIES`, `spring.datasource.password`), paths
+  and web addresses (`/etc/ssl/private/…`, `config/service-account.json`),
+  ARNs, fingerprints and hashes, a port or an image's tag, test names
+  (`test_auth.py::test_token`, `--- PASS:`) and words.  Masking is best
+  effort and cannot recognise every secret: a value with no name or form
+  it knows stays in clear, and so can a value under 8 characters after a
+  name, one after a camelCase name other than those it knows (`dbPass`,
+  `tokenValue`), one in quotes with a space in it, or one that does not
+  look random enough (small letters only, or short with only two kinds of
+  character, such as a short hex string).  PRIVACY.md lists the rules and
+  the known limits.  So keep secrets out of agent chats.
+
+  Wherever aht copies text out of a history, it masks what it recognises
+  whole (a key of any length, up to 64 KB), and it masks before it shortens
+  a text, so a cut never leaves part of one: the search index, journals,
+  handover and switch summaries (those folders also carry a `.gitignore`),
+  notices and what a session waits for, shared session pages (also the
+  tools they list), Tidy Up's preview, What Changed, the notes for informed
+  sessions, loose ends and second opinions, `aht limits`, and session
+  titles and names, tab titles and names waiting for a session's next
+  prompt wherever aht lists them (the session board, also what other
+  machines receive, loose ends, a handover and Take Back, What Changed,
+  `aht undo --list`, `aht checkup`, `aht sessions`, reports,
+  `aht tab-names` and its sync plan, saved workspaces).  On this computer
+  only, names and tab titles stay as they are where aht needs them so: the
+  session corner, the iTerm2 tab titles aht sets, its files about tabs in
+  `~/.aht/run` (`tab-names.json`, `iterm-tabs.json`), the tab titles of
+  saved workspaces and `aht.log`.
 
 - **Notices** — `aht notices` (run every 30 seconds by a LaunchAgent) tells
   you when a session, here or on another machine, starts waiting for you or
@@ -367,8 +465,13 @@ behave the same.
 - **Report and AI-use statement** — `aht report --since week --by
   project|agent|area` (areas: `report_areas` in the config); `--project …
   --statement` drafts a disclosure of AI use for a paper or a course.
-- **Share** — `aht share <folder> --format html`: a session as a page without
-  keys, e-mail addresses or local paths.
+- **Share** — `aht share <folder> --format html`: a session as a page with
+  keys masked (what aht recognises; see *Secrets check*), and without
+  e-mail addresses, local network addresses (private and link-local IPv4
+  and IPv6 ones, Tailscale's too), your home folder's path or your user and
+  computer names.  Paths outside your home folder (an external disk,
+  `/opt/…`) stay, and masking is best effort, so the page says under its
+  title to look it through before you share it.
 - **Tidy up** — `aht tidy`: gone folders and histories without a folder,
   with suggestions; `--relink <id> --to <folder> --apply`, or
   `--remove-history=<name> --apply` to move such a history to the Trash
@@ -379,11 +482,20 @@ behave the same.
   written exactly as there; a link there (to a folder elsewhere) is listed
   but never removed.
 - **Backups elsewhere** — `offsite_backup = <machine>` copies the history
-  backups there after each daily pass; `aht backup --fetch-offsite` brings
-  them back on a new Mac.
+  backups there after each daily pass, into a folder of this computer's own
+  named by a random id.  Copying only adds: a backup there goes only after
+  this computer pruned it, and at least 3 per project stay.  The copies
+  made before a rewrite go there too, and aht never removes those there.
+  `aht backup --offsite-list` lists every computer's folder there;
+  `aht backup --fetch-offsite [--from ID|NAME]` brings backups (and those
+  copies) back, on a new computer too, adding what is missing and never
+  overwriting.
 - **Taking a key out** — `aht secrets --redact <fingerprint> --apply`
   replaces one found secret in every history file (copies kept first; not
-  while a session is open there).
+  while a session is open there).  A private key goes as its header, its
+  lines of key and its END line, and nothing around it; it is listed once
+  even when the history holds it twice (the Read tool's numbered copy and
+  the file's text), and a new scan then no longer finds it.
 - **Finder and a shortcut** — right-click a project folder for aht's
   Quick Actions; ⌃⌥⌘A (`hotkey`) opens the search from anywhere.
 
@@ -466,7 +578,7 @@ features that make an agent read or work:
 | Night shift (`night_shift`) | the agent on the other machine works on the task | off, and only the shifts you plan |
 | Switch agent | the new agent reads a summary | only when you ask |
 | Hand over with a task | the resumed session starts on the task | only when you give a task |
-| Handover note | one sentence in a new Claude session while its project is away or just came back | part of handover |
+| Handover note | one sentence in a new Claude session while its project is away, half handed over, or just came back or was released | part of handover |
 
 Everything else — watching, relinking, badges, backups, search, the
 session board, notices, loose ends, reports, journals, the secrets check,
@@ -554,29 +666,60 @@ a stable machine interface (it's what the trays use).
 ## Tests
 
 ```sh
-tests/run_tests.sh        # multi-backend core + Linux layer + Windows badge cache (any OS, fake stores)
+tests/run_tests.sh        # multi-backend core + the masker + Linux layer + Windows badge cache and entry point (any OS, fake stores)
 windows/build.sh          # builds the exes, then runs the smoke suites under wine
 macos/build_app.sh --test # builds aht.app, then runs the tray's headless selftest
 windows/tests/vm_check.sh USER@HOST [-i KEY] [--installer]   # a real Windows machine over ssh
-linux/tests/vm_check.sh HOST                     # a real Linux machine over ssh
+linux/tests/vm_check.sh HOST [--out DIR] [--no-suites] [--keep]   # a real Linux machine over ssh
 ```
+
+`tests/redact_test.py` checks the masker: every kind of key it knows, at
+its usual length and longer, in the places keys stand, masked whole; the
+shapes a name=value misses (names on later lines, camelCase, quotes,
+flags, cookies, XML, keys in base64, Go's addresses), as text and as a
+history's raw line, with 39 ordinary lines of the same shapes beside them;
+90 ordinary lines of code and prose and 71 lines the masker once read as
+keys (among them a guide and code that name a private key's BEGIN and END
+lines), all left as they are; and in histories, that
+`aht secrets` lists each find once and `--redact --apply` takes out only
+the find.  Its keys are made up at run time, in pieces.  With
+`AHT_BEFORE=<an older aht.py>` it also compares what both versions find in
+this repository and in Python's standard library (every difference must
+match a rule that says why), and how long they take: it fails when masking
+takes more than 1.5 times as long.  (Measured on a Mac: on a 50 MB history
+this version takes about 1.4 times as long as 0.13.0, on prose less.)
+
+`windows/build.sh` and the Windows CI job run three smoke scripts against
+the exes (`windows/tests/wine_smoke.sh`, `wine_watch_smoke.sh`,
+`features_smoke.sh`); each works in a folder under `/tmp`, or under
+`AHT_SMOKE_DIR` when it is set.  `features_smoke.sh` also checks that
+`aht.exe _core --id` names the checkout's own `aht.py` and that `aht.exe
+_agent` answers a probe.  `windows/tests/aht_main_test.py` checks where
+aht.exe's entry point sends each command.
 
 `windows/tests/vm_check.sh` copies the checkout to a Windows machine
 (OpenSSH Server with key login, Python 3.12 and Git for Windows there,
-someone logged in at the desktop), builds both exes, runs the smoke suites
-and the badge-cache suite natively, then drives the desktop (leave the
-machine alone for about four minutes): the tray and its menu, aht's window
-(and that its API refuses calls without the window's key), setup, the folder
-picker (a real click on *Add Folder…* in the window, on a server about 110 s
-old; the chooser must come up in front, and the folder chosen in it, Music,
+someone logged in at the desktop; the copy leaves out the DEVNOTES files),
+builds both exes, runs the smoke suites natively and the badge-cache and
+entry-point suites (`winbadge_test.py`, `aht_main_test.py`) from source,
+then drives the desktop (leave the machine alone for about four minutes):
+the tray and its menu, aht's window (and that its API refuses calls without
+the window's key), setup, the folder picker (a real click on *Add Folder…*
+in the window, on a server about 110 s old; the chooser must come up in
+front, be aht's own `aht.exe _pick-folder` with no PowerShell under it or
+the server, and the folder chosen in it, Music,
 must show in the welcome's list; **Cancel** in the chooser must ask nothing
 more and leave the page usable; a path put into the chooser's *Folder:*
 field must show in the welcome's list too), Continue's console (checked by
 the folder it runs in, and closed afterwards), notices and a click on one,
 Show in Explorer and start at login.  It keeps the display awake while it
-runs, and before the notice checks it closes any notice still on screen; one
-that stays up is reported as a failed check.  It brings back a report with
-screenshots and uses a throwaway aht home.  The machine's own aht tray and
+runs, and before the tray's menu and before the notice checks it closes
+any notice still on screen; one that stays up is reported as a failed
+check.  The notice-click check waits up to 30 s for the notice and clicks
+on its text, only when the notice itself is what lies under that point.  Its PowerShell runs in a console
+that never shows (`conhost.exe --headless`), so no empty console window
+sits in front.  It brings back a report with screenshots and uses a
+throwaway aht home.  The machine's own aht tray and
 watcher, if they run, stop for the desktop check and start again after it,
 and the login entry is put back as it was.  `--installer` also builds aht's
 installer there (installing Inno Setup 6 when it is missing) and runs it for
@@ -589,9 +732,16 @@ tray box unchecked, over a tray entry an earlier `aht install` left, checks
 that only the watcher starts at sign-in, and removes aht again (an aht
 installed there before is gone afterwards). After each first install it also
 checks that aht recorded the tray box's answer, and at the end it puts
-`~/.aht/run/autostart.json` back as it was.
+`~/.aht/run/autostart.json` back as it was.  Its copy, `~\aht-check` on
+that machine, stays there after the run, since `--no-build` reuses the
+exes built in it; the script's header gives the command that removes it.
 
-`linux/tests/vm_check.sh` does the same for a Linux machine: it runs the
+`linux/tests/vm_check.sh` does the same for a Linux machine: like the
+Windows check, its copy leaves out the DEVNOTES files.  It works in a new
+folder of its own there, made by `mktemp -d /tmp/aht-sbx-check.XXXXXX`
+(outside the home folder, so the desktop's file indexer never sees it),
+and removes that folder at the end, also when a run stops early (`--keep`
+leaves it there for a look and prints its path).  It runs the
 suites there, then the desktop on an invisible screen of its own (the
 tray, aht's window server, setup, the folder picker and its **Cancel**,
 which must ask nothing more and leave no chooser, Continue's terminal,
@@ -617,7 +767,8 @@ bus), so nothing it started is left running.
 
 The suites fake every agent's store via `AHT_ROOT_*` env overrides, so they
 never touch real agent data; the handover tests use a folder that stands in
-for the other machine (they need rsync 3 and are skipped without it).  GitHub Actions runs the core suites (Linux and
+for the other machine, and a stand-in `ssh` (`tests/fake_ssh.py`) that can
+also answer like a Windows PC (they need rsync 3 and are skipped without it).  GitHub Actions runs the core suites (Linux and
 macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
 smoke-tests the Windows exes, the badge cache and the installer (x64 and ARM64) natively on every push; tagging `vX.Y.Z` builds
 the release artifacts (Windows installers and zips for x64 and ARM64, the universal

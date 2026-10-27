@@ -4,7 +4,9 @@
 A "window" is a JSON file under $HOME/.faketmux; starting one also starts an
 idle process and leaves the per-process record an agent CLI would write, so
 aht sees an open session.  Nothing is ever deleted: a window that ended is
-marked as ended, and its process is stopped."""
+marked as ended, and its process is stopped.  Every call is noted in
+$HOME/.faketmux/calls.log, with the server (-L) it named and the folder its
+socket would be in (TMUX_TMPDIR)."""
 import json, os, subprocess, sys
 from pathlib import Path
 
@@ -31,6 +33,12 @@ def end(target):
 
 def main(argv):
     WINDOWS.mkdir(parents=True, exist_ok=True)
+    socket = None
+    if argv[:1] == ["-L"]:          # a server of its own, as a sandbox asks for
+        socket, argv = argv[1], argv[2:]
+    with open(WINDOWS / "calls.log", "a") as fh:
+        fh.write(json.dumps({"socket": socket, "tmpdir": os.environ.get("TMUX_TMPDIR"),
+                             "argv": argv}) + "\n")
     cmd, rest = (argv[0], argv[1:]) if argv else ("", [])
     opts = {}
     i = 0
@@ -48,7 +56,8 @@ def main(argv):
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              start_new_session=True)
         window(opts["-s"]).write_text(json.dumps(
-            {"pid": p.pid, "alive": True, "path": opts.get("-c"), "command": line}))
+            {"pid": p.pid, "alive": True, "path": opts.get("-c"), "command": line,
+             "socket": socket}))
         rec = HOME / ".claude" / "sessions"
         rec.mkdir(parents=True, exist_ok=True)
         (rec / f"{p.pid}.json").write_text(json.dumps(

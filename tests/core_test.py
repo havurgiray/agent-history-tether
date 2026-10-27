@@ -13,6 +13,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CLI = str(HERE.parent / "aht.py")
 PY = os.environ.get("AHT_PY", sys.executable or "python3")
+# by its full path: the stand-in tools of a far "machine" run it with that
+# machine's own PATH, where a bare name such as python3.13 is not found
+PY = shutil.which(PY) or PY
 
 FAILS = []
 def ck(cond, msg):
@@ -670,6 +673,751 @@ def read_text_or_none(p):
     except OSError:
         return None
 
+# the JSON the front-ends read: the suite's own output must keep every key of
+# the samples in tests/fixtures/phase1 (the front-ends are built against them)
+FIXTURES = HERE / "fixtures" / "phase1"
+OPAQUE = {"remotes"}         # maps keyed by the user's own names
+def same_shape(real, sample, where="") -> list:
+    """Keys of `sample` missing from `real`, recursively."""
+    if isinstance(sample, dict):
+        if not isinstance(real, dict):
+            return [where or "."]
+        miss = []
+        for k, v in sample.items():
+            if k not in real:
+                miss.append(f"{where}.{k}")
+            elif v is not None and real[k] is not None and k not in OPAQUE:
+                miss += same_shape(real[k], v, f"{where}.{k}")
+        return miss
+    if isinstance(sample, list) and sample and isinstance(real, list) and real:
+        return same_shape(real[0], sample[0], where + "[0]")
+    return []
+def fixture_ok(real, name: str) -> list:
+    if os.environ.get("AHT_FIXTURE_DUMP"):          # to make new samples from
+        Path(os.environ["AHT_FIXTURE_DUMP"]).mkdir(parents=True, exist_ok=True)
+        (Path(os.environ["AHT_FIXTURE_DUMP"]) / name).write_text(json.dumps(real, indent=2))
+    try:
+        sample = json.loads((FIXTURES / name).read_text())
+    except (OSError, ValueError) as e:
+        return [f"{name}: {e}"]
+    return [f"{name}{m}" for m in same_shape(real, sample)]
+
+def phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row):
+    """Nothing lost on today's paths: an unfinished handover is finished or
+    undone, Release, offsite backups that only add, set-asides, the far
+    copy by hash, a sandbox on a real machine, a Windows far end."""
+    import shlex
+    regf = sb / ".aht" / "registry.json"
+    nlog = sb / "notices-phase1.log"
+    nev = dict(henv, AHT_NOTIFY_LOG=str(nlog), AHT_NO_SEARCH_INDEX="1",
+               AHT_ITERM_TABS=str(sb / "no-tabs.json"))
+    (sb / "no-tabs.json").write_text("{}")
+    def nrun(*a, **extra):
+        return run(*a, extra_env=dict(nev, **extra))
+    def entry(path):
+        reg = json.loads(regf.read_text())
+        return next((u, e) for u, e in reg["projects"].items() if e["real_path"] == path)
+    def set_handing(uid, h):
+        reg = json.loads(regf.read_text())
+        reg["projects"][uid].pop("away", None)
+        reg["projects"][uid]["handing"] = h
+        regf.write_text(json.dumps(reg))
+    def told():
+        return [json.loads(l) for l in nlog.read_text().splitlines()] if nlog.is_file() else []
+    fixture_misses = []
+    hrun("config", "--set", "remotes=" + json.dumps({"box": {"root": str(box)}}))
+    st = J(hrun("status", "--json"))
+    fixture_misses += fixture_ok({"handover": st.get("handover")}, "status_handover.json")
+    ck(st.get("handover", {}).get("can_reach") == st.get("handover", {}).get("supported") is True,
+       "status: can_reach, still the same as supported")
+
+    projD = os.path.realpath(str(roots / "Dropped Link"))
+    os.makedirs(projD)
+    Path(projD, "f.txt").write_text("f\n")
+    hrun("tag", projD, "--apply")
+    uidD = entry(projD)[0]
+    mf = sb / ".aht" / "handover" / uidD / "manifest.json"
+
+    # the probe: what the far end speaks; test mode runs the core itself, no sh
+    rem = core.Remote("box", {"root": str(box)})
+    real_sh = core.Remote.sh
+    def no_sh(*a, **k):
+        raise AssertionError("sh was used")
+    core.Remote.sh = no_sh
+    try:
+        info = rem.connect(projD)
+        ro = sb / "read-only"
+        (Path(str(box) + str(ro))).mkdir(parents=True)
+        os.chmod(str(box) + str(ro), 0o555)
+        ro_info = rem.connect(str(ro / "sub"))
+        os.chmod(str(box) + str(ro), 0o755)
+    finally:
+        core.Remote.sh = real_sh
+    cid = hashlib.sha256(Path(CLI).read_bytes()).hexdigest()[:12]
+    ck(info.get("protocol") == 2 and {"probe", "offsite-list", "offsite-prune",
+                                      "offsite-adopt"} <= set(info.get("ops") or [])
+       and info.get("core_id") == cid and info.get("machine_id") is None
+       and info.get("free_bytes", 0) > 0 and info.get("path_writable") is True
+       and (ro_info.get("path_writable") is False or os.getuid() == 0),
+       "probe: protocol 2 and its ops, the core's id, no machine id made there, free "
+       "space and a write that was tried; test mode runs no sh")
+
+    # the link drops after each step: the handover ends finished or not
+    # finished, never with a lost record
+    for op in ("prepare", "manifest"):
+        d = J(nrun("handover", projD, "--apply", "--no-start", "--json", AHT_TEST_DROP=op))
+        e = entry(projD)[1]
+        ck(not d.get("applied") and "dropped" in (d.get("error") or "")
+           and any("did not finish" in w for w in d.get("warnings", []))
+           and not e.get("handing") and not e.get("away") and not mf.exists(),
+           f"the link drops after “{op}”: the handover did not finish, the project stays "
+           f"here ({d.get('error')})")
+    d = J(nrun("handover", projD, "--apply", "--json", AHT_TEST_DROP="start"))
+    e = entry(projD)[1]
+    row = project_row(projD)
+    fixture_misses += fixture_ok(row, "projects_handing.json")
+    ck(not d.get("applied") and (e.get("handing") or {}).get("step") == "starting"
+       and not e.get("away") and (row.get("handing") or {}).get("state") == "checking"
+       and json.loads(mf.read_text()).get("attempt") == e["handing"]["attempt"],
+       f"the link drops after “start”: not known yet, the record stays ({row.get('handing')})")
+    d = J(nrun("notices", "--json"))
+    e = entry(projD)[1]
+    fixture_misses += fixture_ok(d, "notices_handover.json")
+    ck(e.get("away") and not e.get("handing") and e["away"].get("attempt")
+       == json.loads(mf.read_text()).get("attempt") and e["away"].get("v") == 2
+       and any("finished: the session there runs" in n["message"]
+               for n in d.get("notices", []))
+       and any("finished" in n["message"] for n in told()),
+       f"…the next check finds the session there: it is handed over ({d.get('notices')})")
+    J(hrun("reclaim", projD, "--apply", "--stop", "--json"))
+
+    # cut off without a word (this machine slept): a young record waits, and
+    # so does one whose project a transfer holds; then it is undone
+    h = {"v": 2, "attempt": "20260101-000000-abcd", "remote": "box", "host": "box",
+         "path": projD, "since": core._now(), "driven_by": "here", "agent": "claude",
+         "session": None, "window": "aht-x", "mux": "tmux", "step": "sending",
+         "at": time.time()}
+    set_handing(uidD, h)
+    nrun("notices")
+    young = entry(projD)[1].get("handing")
+    meanwhile = hook(projD)
+    set_handing(uidD, dict(h, at=time.time() - 300))
+    with core.ProjectLock(uidD):
+        nrun("notices")
+        held = entry(projD)[1].get("handing")
+        busy = (project_row(projD).get("handing") or {}).get("state")
+    d = J(nrun("notices", "--json"))
+    e = entry(projD)[1]
+    ck(young and held and busy == "running" and not e.get("handing") and not e.get("away")
+       and "did not finish" in meanwhile and "WARNING" in meanwhile
+       and any(n["message"] == "The handover of Dropped Link to box did not finish. The "
+               "project stays here; nothing runs there" for n in d.get("notices", [])),
+       f"cut off: waits while young or busy, then did not finish ({d.get('notices')})")
+
+    # recorded, and the copy there was worked on: it counts as handed over
+    J(hrun("handover", projD, "--apply", "--no-start", "--json"))
+    away = entry(projD)[1]["away"]
+    set_handing(uidD, dict(away, step="recorded", at=time.time() - 300, error="gone"))
+    time.sleep(1.1)
+    Path(str(box) + projD, "f.txt").write_text("worked on there\n")
+    d = J(nrun("notices", "--json"))
+    e = entry(projD)[1]
+    ck(e.get("away") and any("the copy there was worked on" in n["message"]
+                             for n in d.get("notices", [])),
+       f"…a copy worked on there counts as handed over ({d.get('notices')})")
+
+    # Take Back refuses a record of what left from another attempt
+    m = json.loads(mf.read_text())
+    mf.write_text(json.dumps(dict(m, attempt="19990101-000000-dead")))
+    d = J(hrun("reclaim", projD, "--apply", "--json"))
+    ck(not d.get("applied") and "another handover attempt" in (d.get("error") or "")
+       and entry(projD)[1].get("away") and Path(projD, "f.txt").read_text() == "f\n",
+       f"an attempt that does not match is refused ({d.get('error')})")
+    mf.write_text(json.dumps(m))
+
+    # Release: the work there stays there; a dry run says so first
+    Path(str(box) + projD, "g.txt").write_text("new there\n")
+    d = J(hrun("reclaim", projD, "--release", "--json"))
+    fixture_misses += fixture_ok(d, "reclaim_release_dry.json")
+    ck(d.get("released") is False and d.get("would_lose") == {"files": 2, "history": 0,
+                                                              "since": away["since"]}
+       and d.get("pauses_sync") is None and entry(projD)[1].get("away"),
+       f"Release, dry run: what stays there ({d.get('would_lose')})")
+    r = hrun("remote", "remove", "box")
+    ck(r.returncode == 3 and f"aht reclaim {shlex.quote(projD)} --release" in r.stderr,
+       "a machine that holds a project points to Release")
+    d = J(hrun("reclaim", projD, "--release", "--apply", "--json"))
+    fixture_misses += fixture_ok(d, "reclaim_release_apply.json")
+    e = entry(projD)[1]
+    ck(d.get("released") is True and not e.get("away")
+       and (e.get("returned") or {}).get("released") is True
+       and Path(projD, "f.txt").read_text() == "f\n"
+       and Path(str(box) + projD, "g.txt").is_file() and not mf.exists(),
+       "Release: the files here stay as they are, the copy there is left alone")
+    note = hook(projD)
+    ck("released" in note and "did not come here" in note and hook(projD).strip() == "",
+       "the next session here is told once that it was released")
+
+    # cut off at the start: the conversation that went on there, or a session
+    # that started there and has ended since, counts as handed over; only
+    # when nothing at all happened there does the project stay here
+    projW = os.path.realpath(str(roots / "Went On"))
+    os.makedirs(projW)
+    Path(projW, "w.txt").write_text("w\n")
+    wstore = tools / "claude" / enc(projW)
+    wstore.mkdir()
+    (wstore / "w1.jsonl").write_text(json.dumps(
+        {"type": "user", "cwd": projW, "message": {"content": "start the work"}}) + "\n")
+    hrun("tag", projW, "--apply")
+    uidW = entry(projW)[0]
+    mfW = sb / ".aht" / "handover" / uidW / "manifest.json"
+    farW = bhome / ".claude" / "projects" / enc(str(box) + projW) / "w1.jsonl"
+    def went_on(line):
+        with open(farW, "a") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"content": line}}) + "\n")
+    def cut_off():
+        """Handed over without a session there; then the record says the
+        link dropped at the start."""
+        J(hrun("handover", projW, "--apply", "--no-start", "--json"))
+        set_handing(uidW, dict(entry(projW)[1]["away"], step="starting",
+                               at=time.time() - 300, error="gone"))
+    cut_off()
+    went_on("the work went on there")
+    d = J(nrun("notices", "--json"))
+    e = entry(projW)[1]
+    ck(e.get("away") and not e.get("handing") and mfW.is_file()
+       and any("finished: the conversation went on there" in n["message"]
+               for n in d.get("notices", [])),
+       f"cut off, and only the conversation went on there: it is handed over "
+       f"({d.get('notices')})")
+    d = J(hrun("reclaim", projW, "--apply", "--json"))
+    ck(d.get("applied") and "went on there" in (wstore / "w1.jsonl").read_text(),
+       f"…and Take Back brings that conversation here ({d.get('error') or d.get('blockers')})")
+    J(nrun("handover", projW, "--apply", "--json", AHT_TEST_DROP="start"))
+    h = entry(projW)[1].get("handing") or {}
+    subprocess.run([str(stubs / "tmux"), "kill-session", "-t", "=" + str(h.get("window"))],
+                   env=dict(env, HOME=str(bhome)), capture_output=True)
+    for _ in range(100):                        # the session there ends
+        if not core.running_sessions(home=bhome / ".claude"):
+            break
+        time.sleep(0.1)
+    d = J(nrun("notices", "--json"))
+    e = entry(projW)[1]
+    ck(h.get("step") == "starting" and e.get("away") and not e.get("handing")
+       and any("finished: the session there started, and has ended since" in n["message"]
+               for n in d.get("notices", [])),
+       f"…a session that started there and has ended: handed over ({d.get('notices')})")
+    J(hrun("reclaim", projW, "--apply", "--json"))
+    cut_off()
+    d = J(nrun("notices", "--json"))
+    e = entry(projW)[1]
+    ck(not e.get("away") and not e.get("handing") and not mfW.exists()
+       and any(n["message"] == "The handover of Went On to box did not finish. The project "
+               "stays here; nothing runs there" for n in d.get("notices", [])),
+       f"…and when nothing at all happened there, it did not finish ({d.get('notices')})")
+
+    # what --include carries travels with the record: a handover finished
+    # after the link dropped brings it back at Take Back too
+    xhome = Path(os.path.realpath(sb)) / "xhome"    # only what is in HOME can travel
+    extra = xhome / "notes"
+    extra.mkdir(parents=True)
+    (extra / "n.txt").write_text("n1\n")
+    J(nrun("handover", projW, "--apply", "--include", str(extra), "--json",
+           AHT_TEST_DROP="start", HOME=str(xhome)))
+    h = entry(projW)[1].get("handing") or {}
+    J(nrun("notices", "--json"))
+    e = entry(projW)[1]
+    Path(str(box) + str(extra), "n.txt").write_text("n2, written there\n")
+    d = J(nrun("reclaim", projW, "--apply", "--stop", "--json", HOME=str(xhome)))
+    ck(h.get("extras") == [str(extra)] and e.get("extras") == [str(extra)]
+       and "extras" not in (e.get("away") or {}) and d.get("applied")
+       and (extra / "n.txt").read_text() == "n2, written there\n",
+       f"--include, and the link drops at the start: Take Back brings the folder back "
+       f"({h.get('extras')}, {e.get('extras')}, {d.get('error') or d.get('blockers')})")
+
+    # Release while Keep in sync is on: what stays there is named (files and
+    # the conversation), and the sync pauses, so the next one does not send
+    # this copy over the work left there
+    hrun("mirror", projW, "--on", "--to", "box")
+    J(hrun("handover", projW, "--apply", "--no-start", "--json"))
+    since = entry(projW)[1]["away"]["since"]
+    Path(str(box) + projW, "w.txt").write_text("changed there\n")
+    went_on("and on")
+    (bhome / ".claude" / "file-history" / "w1").mkdir(parents=True, exist_ok=True)
+    (bhome / ".claude" / "file-history" / "w1" / "w@v1").write_text("w\n")
+    d = J(hrun("reclaim", projW, "--release", "--json"))
+    r = hrun("reclaim", projW, "--release")
+    ck(d.get("would_lose") == {"files": 1, "history": 2, "since": since}
+       and d.get("pauses_sync") == "box"
+       and "What stays there: 1 file and the conversation." in r.stdout
+       and "Keep in sync with box will be paused, so the copy there stays as it is."
+       in r.stdout and "is paused" not in r.stdout,
+       f"Release, dry run: the file and the conversation that stay there, and the sync "
+       f"that will pause ({d.get('would_lose')}, {d.get('pauses_sync')})")
+    d = J(hrun("reclaim", projW, "--release", "--apply", "--json"))
+    row = project_row(projW)
+    fixture_misses += fixture_ok(row, "projects_mirror_paused.json")
+    J(hrun("mirror", "--run", "--due", "--json"))
+    ck(d.get("released") and d.get("pauses_sync") == "box" and row.get("mirror") == "box"
+       and (row.get("mirror_paused") or {}).get("reason") == "released"
+       and row["mirror_paused"].get("remote") == "box" and row["mirror_paused"].get("at")
+       and Path(str(box) + projW, "w.txt").read_text() == "changed there\n",
+       f"Release pauses Keep in sync with that machine: the next sync leaves the copy "
+       f"there as it is ({row.get('mirror_paused')})")
+    hrun("mirror", projW, "--on", "--to", "box")
+    J(hrun("mirror", "--run", "--due", "--json"))
+    ck(project_row(projW).get("mirror_paused") is None
+       and Path(str(box) + projW, "w.txt").read_text() == "w\n",
+       "…until it is turned on again")
+    # …or until a handover to that machine sends this copy over the one the
+    # release left there (set aside there first): the pause ends with it, so
+    # once the project is back the sync goes on
+    J(hrun("handover", projW, "--apply", "--no-start", "--json"))
+    Path(str(box) + projW, "w.txt").write_text("changed there again\n")
+    J(hrun("reclaim", projW, "--release", "--apply", "--json"))
+    paused_again = project_row(projW).get("mirror_paused")
+    plan = J(hrun("handover", projW, "--no-start", "--json"))
+    d = J(hrun("handover", projW, "--apply", "--no-start", "--json"))
+    row = project_row(projW)
+    ck(paused_again and plan.get("ends_pause") == "box"
+       and any("the copy that Release left on box is replaced" in w
+               for w in plan.get("warnings", []))
+       and d.get("applied") and d.get("ends_pause") == "box" and row.get("away_remote") == "box"
+       and row.get("mirror") == "box" and row.get("mirror_paused") is None
+       and Path(str(box) + projW, "w.txt").read_text() == "w\n",
+       f"a handover to the machine Release paused the sync with ends the pause, and its "
+       f"dry run says the copy left there is replaced ({plan.get('warnings')}, "
+       f"{d.get('ends_pause')}, {row.get('mirror_paused')})")
+    J(hrun("reclaim", projW, "--apply", "--json"))
+    Path(projW, "w.txt").write_text("w, back here\n")
+    J(hrun("mirror", projW, "--run", "--json"))
+    ck(project_row(projW).get("mirror_paused") is None
+       and Path(str(box) + projW, "w.txt").read_text() == "w, back here\n",
+       "…and after Take Back the sync sends this copy there again")
+    # a sync run that read the registry before a Release paused it looks
+    # again when it sends: the copy there stays as it is
+    far = Path(str(box) + projW, "w.txt")
+    probe = ("import sys, json; sys.path.insert(0, sys.argv[1]); import aht\n"
+             "uid, e = aht._entry_for(aht.load_registry(), sys.argv[2])\n"
+             "open(sys.argv[3], 'w').write('left there\\n')\n"
+             "aht._update_entry(uid, mirror=dict(e['mirror'], paused={\n"
+             "    'reason': 'released', 'at': aht._now(), 'remote': 'box'}))\n"
+             "print(json.dumps(aht.mirror_project(uid, e)))\n")
+    r = subprocess.run([PY, "-c", probe, str(HERE.parent), projW, str(far)],
+                       env=dict(env, **henv), capture_output=True, text=True)
+    try:
+        got = json.loads(r.stdout)
+    except ValueError:
+        got = {"error": r.stdout[-300:] + r.stderr[-300:]}
+    ck(got.get("status") == "paused" and far.read_text() == "left there\n"
+       and project_row(projW).get("mirror_paused"),
+       f"Keep in sync: a run that began before a Release does not send over the copy "
+       f"left there ({got})")
+    hrun("mirror", projW, "--on", "--to", "box")    # on again: the pause ends
+    far.write_text("w, back here\n")
+    hrun("mirror", projW, "--off")
+
+    # files there that the Claude store keeps beside the transcripts travel
+    # with a set-aside too: /rewind's file-history and the plans
+    projF = os.path.realpath(str(roots / "Planned"))
+    os.makedirs(projF)
+    Path(projF, "p.txt").write_text("p\n")
+    fstore = tools / "claude" / enc(projF)
+    fstore.mkdir()
+    (fstore / "fh1.jsonl").write_text(json.dumps(
+        {"type": "user", "cwd": projF, "slug": "the-plan",
+         "message": {"content": "plan it"}}) + "\n")
+    (tools / "file-history" / "fh1").mkdir(parents=True, exist_ok=True)
+    (tools / "file-history" / "fh1" / "p@v1").write_text("v1\n")
+    (tools / "plans").mkdir(exist_ok=True)
+    (tools / "plans" / "the-plan.md").write_text("plan 1\n")
+    hrun("tag", projF, "--apply")
+    J(hrun("handover", projF, "--apply", "--no-start", "--json"))
+    J(hrun("reclaim", projF, "--apply", "--json"))
+    (tools / "file-history" / "fh1" / "p@v1").write_text("v1, again\n")
+    (tools / "plans" / "the-plan.md").write_text("plan 2\n")
+    time.sleep(1.1)
+    J(hrun("handover", projF, "--apply", "--no-start", "--json"))
+    uidF = entry(projF)[0]
+    kept = sorted(str(p.relative_to(bhome / ".aht" / "remote" / "replaced" / uidF))
+                  for p in (bhome / ".aht" / "remote" / "replaced" / uidF).rglob("*")
+                  if p.is_file())
+    ck(any(k.endswith("file-history/fh1/p@v1") for k in kept)
+       and any(k.endswith("plans/the-plan.md") for k in kept)
+       and (bhome / ".claude" / "plans" / "the-plan.md").read_text() == "plan 2\n",
+       f"file-history and plans: what a handover replaces there is set aside ({kept})")
+    J(hrun("reclaim", projF, "--apply", "--json"))
+
+    # a name whose case changed there (readme.md → README.md) comes back: the
+    # file stays in the working copy, the old one is set aside
+    projC = os.path.realpath(str(roots / "Case Change"))
+    os.makedirs(projC)
+    Path(projC, "readme.md").write_text("r1\n")
+    hrun("tag", projC, "--apply")
+    J(hrun("handover", projC, "--apply", "--no-start", "--json"))
+    os.rename(str(box) + projC + "/readme.md", str(box) + projC + "/tmp-name")
+    os.rename(str(box) + projC + "/tmp-name", str(box) + projC + "/README.md")
+    d = J(hrun("reclaim", projC, "--apply", "--json"))
+    names = sorted(os.listdir(projC))
+    aside = Path(d.get("set_aside") or "/nonexistent")
+    ck(d.get("applied") and "README.md" in names and "readme.md" not in names
+       and Path(projC, "README.md").read_text() == "r1\n"
+       and (aside / "project" / "readme.md").read_text() == "r1\n",
+       f"a case rename made there comes back; the old name is set aside ({names})")
+
+    # a repository made there and packed (git gc leaves refs/heads empty)
+    # comes back as a repository: folders travel back too
+    if shutil.which("git"):
+        projR = os.path.realpath(str(roots / "Repo Made There"))
+        os.makedirs(projR)
+        Path(projR, "r.txt").write_text("r\n")
+        hrun("tag", projR, "--apply")
+        J(hrun("handover", projR, "--apply", "--no-start", "--json"))
+        rr = str(box) + projR
+        g = ["git", "-c", "user.name=aht test", "-c", "user.email=test@example.invalid",
+             "-C", rr]
+        for c in (["init", "-q"], ["add", "r.txt"], ["commit", "-q", "-m", "first"],
+                  ["gc", "-q"]):
+            subprocess.run(g + c, capture_output=True)
+        d = J(hrun("reclaim", projR, "--apply", "--json"))
+        lg = subprocess.run(["git", "-C", projR, "log", "--oneline"], capture_output=True,
+                            text=True)
+        ck(d.get("applied") and lg.returncode == 0 and "first" in lg.stdout
+           and Path(projR, ".git", "refs", "heads").is_dir(),
+           f"a packed repository made there is a repository here too ({lg.stderr.strip()})")
+
+    # set-asides there: the same rule (newest 5, everything under 30 days)
+    far_aside = bhome / ".aht" / "remote" / "replaced" / "test-aside"
+    for days in (40, 41, 42, 43, 44, 45, 1):
+        (far_aside / time.strftime("%Y%m%d-%H%M%S",
+                                   time.localtime(time.time() - days * 86400))).mkdir(parents=True)
+    pr = rem.agent("prune", dir=str(far_aside), keep=5)
+    ck(pr.get("pruned") == 2 and len(list(far_aside.iterdir())) == 5,
+       f"set-asides there: the same rule ({pr})")
+    shutil.rmtree(far_aside)
+
+    # ---- offsite backups: a folder per computer, copying only adds ------------ #
+    oev = dict(henv, AHT_MACHINE_NAME="testmac")
+    def orun(*a, **extra):
+        return run(*a, extra_env=dict(oev, **extra))
+    hrun("config", "--set", "offsite_backup=box")
+    up = sb / ".aht" / "backups" / "p1"
+    up.mkdir(parents=True)
+    zs = [f"2026010{i}-000000.zip" for i in range(1, 6)]
+    for z in zs:
+        (up / z).write_bytes(b"zip " + z.encode())
+        (up / z.replace(".zip", ".meta.json")).write_text("{}")
+    d = J(orun("backup", "--offsite", "--json"))
+    fixture_misses += fixture_ok(d, "backup_offsite.json")
+    mid = json.loads((sb / ".aht" / "machine.json").read_text())["id"]
+    fold = bhome / ".aht" / "offsite" / mid
+    there = fold / "backups" / "p1"
+    zips = lambda p: sorted(x.name for x in p.glob("*.zip"))
+    ck(d.get("folder") == mid and zips(there) == zs
+       and json.loads((fold / "machine.json").read_text()).get("name") == "testmac",
+       f"offsite: into a folder named by this computer's id, with machine.json ({d})")
+    # copying only adds: a backup there of the same name but another size
+    # stays as it is (and is named in "differs")
+    (there / zs[0]).write_bytes(b"theirs, another size")
+    d = J(orun("backup", "--offsite", "--json"))
+    ck((there / zs[0]).read_bytes() == b"theirs, another size"
+       and d.get("differs") == ["p1/" + zs[0]] and d.get("files") == 0,
+       f"offsite: copying only adds; a backup there of another size stays as it is "
+       f"({d.get('differs')})")
+    (there / zs[0]).write_bytes(b"zip " + zs[0].encode())
+    shutil.rmtree(up)
+    d = J(orun("backup", "--offsite", "--json"))
+    ck(d.get("removed") == 0 and zips(there) == zs,
+       "offsite: no backups here (wiped, or a new computer) removes nothing there")
+    up.mkdir()
+    (up / zs[-1]).write_bytes(b"zip " + zs[-1].encode())
+    d = J(orun("backup", "--offsite", "--json"))
+    ck(d.get("removed") == 2 and zips(there) == zs[2:]
+       and not (there / zs[0].replace(".zip", ".meta.json")).exists(),
+       f"offsite: pruned here, removed there too, but the newest 3 stay ({zips(there)})")
+
+    # a second computer of the same name gets a folder of its own
+    h2 = sb / "second" / ".aht"
+    (h2 / "backups" / "p2").mkdir(parents=True)
+    (h2 / "backups" / "p2" / "20260201-000000.zip").write_bytes(b"the other one")
+    (h2 / "config.json").write_text(json.dumps({"remotes": {"box": {"root": str(box)}},
+                                                "offsite_backup": "box"}))
+    orun("backup", "--offsite", "--json", AHT_HOME=str(h2))
+    mid2 = json.loads((h2 / "machine.json").read_text())["id"]
+    d = J(orun("backup", "--offsite-list", "--json"))
+    fixture_misses += fixture_ok(d, "backup_offsite_list.json")
+    rows = {f["id"]: f for f in d.get("folders", [])}
+    ck(mid2 != mid and (bhome / ".aht" / "offsite" / mid2 / "backups" / "p2"
+                        / "20260201-000000.zip").is_file()
+       and zips(there) == zs[2:] and rows.get(mid, {}).get("mine") is True
+       and rows.get(mid2, {}).get("mine") is False
+       and rows.get(mid2, {}).get("name") == "testmac",
+       f"offsite: a second computer of the same name has a folder of its own ({sorted(rows)})")
+    r = orun("backup", "--fetch-offsite", "--from", "testmac")
+    ck(r.returncode == 1 and "choose one by its id" in r.stderr,
+       f"fetch --from a name two computers share asks for the id ({r.stderr.strip()})")
+    d = J(orun("backup", "--fetch-offsite", "--from", mid2, "--json"))
+    fixture_misses += fixture_ok(d, "backup_fetch_offsite.json")
+    ck((sb / ".aht" / "backups" / "p2" / "20260201-000000.zip").read_bytes()
+       == b"the other one" and d.get("from", {}).get("id") == mid2,
+       "fetch --from an id brings that computer's backups here")
+    shutil.rmtree(sb / ".aht" / "backups" / "p2")
+
+    # an older aht's folder of this name: taken over only when every backup
+    # in it is here too (another computer of this name may have made it)
+    legacy = bhome / ".aht" / "offsite" / "testmac" / "backups" / "p1"
+    legacy.mkdir(parents=True)
+    (legacy / "20251201-000000.zip").write_bytes(b"older aht")
+    d = J(orun("backup", "--offsite", "--json"))
+    lst = J(orun("backup", "--offsite-list", "--json")).get("folders", [])
+    ck(d.get("legacy") == ["testmac"] and (legacy / "20251201-000000.zip").is_file()
+       and any(f["legacy"] and f["name"] == "testmac" and f["id"] is None for f in lst),
+       "offsite: an older aht's folder with a backup this computer lacks is left alone")
+    # two computers named testmac keep a folder by id, and the older aht's
+    # folder is named testmac too: --from with a folder's name picks that one
+    d = J(orun("backup", "--fetch-offsite", "--from=testmac", "--json"))
+    ck(d.get("from") == {"id": None, "name": "testmac"}
+       and (up / "20251201-000000.zip").read_bytes() == b"older aht",
+       f"fetch --from an older aht's folder, named like computers with an id ({d})")
+    (up / "20251201-000000.zip").write_bytes(b"older aht")
+    d = J(orun("backup", "--offsite", "--json"))
+    ck(d.get("adopted") == 1 and not (bhome / ".aht" / "offsite" / "testmac").exists()
+       and (there / "20251201-000000.zip").read_bytes() == b"older aht",
+       "…and taken over once every backup in it is here too")
+
+    # fetching adds what is missing and never overwrites
+    (up / zs[-1]).write_bytes(b"changed here, another size")
+    d = J(orun("backup", "--fetch-offsite", "--json"))
+    ck((up / zs[-1]).read_bytes() == b"changed here, another size"
+       and (up / zs[2]).is_file()
+       and (up / zs[-1].replace(".zip", "-from-testmac.zip")).read_bytes()
+       == b"zip " + zs[-1].encode(),
+       f"fetch: adds what is missing, never overwrites; theirs comes under its own name "
+       f"({d.get('renamed')})")
+
+    # the copies made before a rewrite (backups/<id>/rewrites) go there too:
+    # only added, never removed there, and fetched back where they are missing
+    rw = Path("rewrites") / "claude-20260102-000000" / "-x-proj"
+    (up / rw).mkdir(parents=True)
+    (up / rw / "s1.jsonl").write_text('{"cwd": "/x/proj"}\n')
+    J(orun("backup", "--offsite", "--json"))
+    sent_rw = (there / rw / "s1.jsonl").is_file()
+    shutil.rmtree(up / "rewrites")
+    J(orun("backup", "--offsite", "--json"))
+    kept_rw = (there / rw / "s1.jsonl").is_file()
+    J(orun("backup", "--fetch-offsite", "--json"))
+    ck(sent_rw and kept_rw and (up / rw / "s1.jsonl").read_text() == '{"cwd": "/x/proj"}\n',
+       f"offsite: the copies made before a rewrite go there, stay there when they are "
+       f"deleted here, and come back with a fetch ({sent_rw}, {kept_rw})")
+    # an older aht's folder: one with nothing left in it goes and is not
+    # named; one with only such copies is taken over once they are here too
+    old_home = bhome / ".aht" / "offsite" / "testmac"
+    (old_home / "backups" / "p1").mkdir(parents=True)
+    d1 = J(orun("backup", "--offsite", "--json"))
+    gone = not old_home.exists()
+    old_rw = old_home / "backups" / "p1" / "rewrites" / "claude-20251101-000000"
+    old_rw.mkdir(parents=True)
+    (old_rw / "a.jsonl").write_text("older aht\n")
+    d2 = J(orun("backup", "--offsite", "--json"))
+    (up / "rewrites" / "claude-20251101-000000").mkdir(parents=True)
+    (up / "rewrites" / "claude-20251101-000000" / "a.jsonl").write_text("older aht\n")
+    d3 = J(orun("backup", "--offsite", "--json"))
+    ck(d1.get("legacy") == [] and gone and d2.get("legacy") == ["testmac"]
+       and d3.get("adopted") == 1 and d3.get("legacy") == [] and not old_home.exists()
+       and (there / "rewrites" / "claude-20251101-000000" / "a.jsonl").is_file(),
+       f"offsite: an older aht's folder with nothing left goes unnamed; one with only "
+       f"rewrites' copies is taken over once they are here too ({d1.get('legacy')}, "
+       f"{d2.get('legacy')}, {d3.get('adopted')}, {d3.get('legacy')})")
+    hrun("config", "--unset", "offsite_backup")
+    shutil.rmtree(up)
+
+    # ---- a real machine, with ssh: a sandbox there, and a Windows PC --------- #
+    # short names: the history folder there is named after the project's
+    # path inside the sandbox, as long as the test machine's (see above)
+    far = Path(os.path.realpath(sb)) / "f"
+    farbin = far / "bin"
+    farbin.mkdir(parents=True)
+    os.symlink(core.find_rsync()["path"], farbin / "rsync")
+    machine = far / "127.0.0.1"
+    realhome = machine / "home"
+    (realhome / ".claude" / "projects").mkdir(parents=True)
+    (realhome / ".claude" / "settings.json").write_text("{}")
+    (realhome / ".profile").write_text("# the machine's own\n")
+    (machine / "path").write_text(f"{farbin}:/usr/bin:/bin:/usr/sbin:/sbin")
+    (machine / "env").write_text(f"AHT_ITERM_TABS={sb / 'no-tabs.json'}\n")
+    sbx = far / "s"
+    (sbx / "bin").mkdir(parents=True)
+    for n in ("tmux", "claude"):
+        shutil.copy(stubs / n, sbx / "bin" / n)
+    sshbin = sb / "sshbin"
+    sshbin.mkdir()
+    (sshbin / "ssh").write_text(f'#!/bin/sh\nexec "{PY}" "{HERE / "fake_ssh.py"}" "$@"\n')
+    (sshbin / "ssh").chmod(0o755)
+    def snapshot(root):
+        return sorted((str(p.relative_to(root)), p.is_dir(),
+                       None if p.is_dir() else p.stat().st_mtime) for p in root.rglob("*"))
+    before = snapshot(realhome)
+    sev = dict(nev, PATH=str(sshbin) + os.pathsep + env["PATH"], FAKE_SSH_DIR=str(far))
+    sev.pop("AHT_REMOTE_PATH", None)
+    def srun(*a, **extra):
+        return run(*a, extra_env=dict(sev, **extra))
+    remotes = {"box": {"root": str(box)},
+               "sbx": {"ssh": "far@127.0.0.1", "sandbox": str(sbx)}}
+    hrun("config", "--set", "remotes=" + json.dumps(remotes))
+
+    cid = hashlib.sha256(Path(CLI).read_bytes()).hexdigest()[:12]
+    d = J(srun("remote", "check", "sbx", "--json"))
+    m0 = (d.get("machines") or [{}])[0]
+    rdir = sbx / "home" / ".aht" / "remote"
+    ck(not m0.get("error") and m0.get("system") in ("Darwin", "Linux"),
+       f"sandbox: remote check reaches it ({m0.get('error') or m0.get('system')})")
+    cfg = json.loads((sb / ".aht" / "config.json").read_text())
+    ck(cfg["remotes"]["sbx"].get("system") == m0.get("system")
+       and sorted(p.name for p in rdir.glob("aht*.py")) == [f"aht-{cid}.py"],
+       "…its system is remembered, and the copy of aht there is named by its checksum")
+    srun("board", "--json")
+    f1 = [(p.name, p.stat().st_mtime) for p in rdir.glob("aht*.py")]
+    srun("board", "--json")
+    f2 = [(p.name, p.stat().st_mtime) for p in rdir.glob("aht*.py")]
+    ck(f1 == f2 == [(f"aht-{cid}.py", f1[0][1])],
+       "two board runs: one copy there, not sent again")
+    for i, age in ((1, 400), (2, 300), (3, 200)):
+        old = rdir / f"aht-00000000000{i}.py"
+        old.write_text("# another version\n")
+        os.utime(old, (time.time() - age, time.time() - age))
+    (rdir / "aht.py").write_text("# the copy older versions used\n")
+    (rdir / f"aht-{cid}.py").unlink()
+    srun("board", "--json")
+    ck(sorted(p.name for p in rdir.glob("aht*.py"))
+       == sorted([f"aht-{cid}.py", "aht-000000000002.py", "aht-000000000003.py"]),
+       "a fourth version there prunes the oldest; the old aht.py is gone")
+
+    projZ = os.path.realpath(str(roots / "Sandboxed"))
+    os.makedirs(projZ)
+    Path(projZ, "z.txt").write_text("z\n")
+    zstore = tools / "claude" / enc(projZ)
+    zstore.mkdir()
+    (zstore / "z1.jsonl").write_text(json.dumps(
+        {"type": "user", "cwd": projZ, "message": {"content": "hello"}}) + "\n")
+    hrun("tag", projZ, "--apply")
+    d = J(srun("handover", projZ, "--to", "sbx", "--apply", "--json", AHT_TEST_DROP="start"))
+    e = entry(projZ)[1]
+    ck(not d.get("applied") and (e.get("handing") or {}).get("step") == "starting",
+       f"sandbox: the link drops after “start” ({d.get('error')})")
+    d = J(srun("notices", "--json"))
+    e = entry(projZ)[1]
+    rz = str(sbx) + projZ
+    ck(e.get("away") and not e.get("handing")
+       and any("finished" in n["message"] for n in d.get("notices", []))
+       and Path(rz, "z.txt").is_file()
+       and (sbx / "home" / ".claude" / "projects" / enc(rz) / "z1.jsonl").is_file(),
+       f"sandbox: finished at the next check; the project and its history are inside "
+       f"the sandbox ({d.get('notices')})")
+    calls = [json.loads(l) for l in (sbx / "home" / ".faketmux" / "calls.log")
+             .read_text().splitlines()] \
+        if (sbx / "home" / ".faketmux" / "calls.log").is_file() else []
+    ck(calls and all(c["socket"] == "aht-sbx" for c in calls),
+       f"sandbox: every tmux call there named a server of its own ({len(calls)})")
+    rsbx = core.Remote("sbx", remotes["sbx"])
+    rsbx._route = ("far@127.0.0.1", None)         # as it resolves: no ssh asked
+    att = core.attach_command(rsbx, "tmux", "aht-x")
+    ck(calls and all(c.get("tmpdir") == str(sbx / "tmux") for c in calls)
+       and (sbx / "tmux").is_dir()
+       and att[:5] == ["ssh", "-t", "far@127.0.0.1", "env",
+                       "TMUX_TMPDIR=" + shlex.quote(str(sbx / "tmux"))],
+       f"sandbox: that tmux server's socket is inside it too, and Open finds it there "
+       f"({sorted({str(c.get('tmpdir')) for c in calls})}, {att[:5]})")
+    d = J(srun("reclaim", projZ, "--apply", "--stop", "--json"))
+    ck(d.get("applied"), f"sandbox: taken back ({d.get('error') or d.get('blockers')})")
+    hrun("config", "--set", "offsite_backup=sbx")
+    d = J(srun("backup", "--offsite", "--json"))
+    ck((sbx / "home" / ".aht" / "offsite" / mid / "machine.json").is_file(),
+       f"sandbox: backups go into the sandbox ({d.get('folder') or d})")
+    hrun("config", "--unset", "offsite_backup")
+    # a test machine added with its sandbox: aht's copy there is inside it
+    # from the first connect on
+    was_default = json.loads((sb / ".aht" / "config.json").read_text()).get("default_remote")
+    r = srun("remote", "add", "sbx2", "far@127.0.0.1", "--sandbox", str(far / "s2"))
+    cfg = json.loads((sb / ".aht" / "config.json").read_text())
+    ck(r.returncode == 0 and (cfg["remotes"].get("sbx2") or {}).get("sandbox") == str(far / "s2")
+       and [p.name for p in (far / "s2" / "home" / ".aht" / "remote").glob("aht*.py")]
+       == [f"aht-{cid}.py"],
+       f"remote add --sandbox: aht's copy there is inside the sandbox from the first "
+       f"connect on ({r.stderr.strip() or cfg['remotes'].get('sbx2')})")
+    if was_default is None:
+        hrun("config", "--unset", "default_remote")
+    ck(snapshot(realhome) == before,
+       "sandbox: NOTHING was written outside it there — that machine's own home is "
+       "as it was")
+
+    # a machine whose ssh answers like Windows: stopped before any sh script
+    pc = far / "127.0.0.2"
+    (pc / "home").mkdir(parents=True)
+    (pc / "windows").write_text("")
+    r = srun("remote", "add", "pc", "me@127.0.0.2")
+    def pc_log():
+        return [json.loads(l) for l in (pc / "commands.log").read_text().splitlines()] \
+            if (pc / "commands.log").is_file() else []
+    cfg = json.loads((sb / ".aht" / "config.json").read_text())
+    ck(r.returncode == 1 and core.WINDOWS_FAR in r.stderr
+       and pc_log() == ["echo aht-os %OS% $env:OS"] and os.listdir(pc / "home") == []
+       and "pc" not in cfg["remotes"],
+       f"remote add: a Windows PC stops it before any sh script, nothing made there "
+       f"({r.stderr.strip()}, {pc_log()}, {os.listdir(pc / 'home')})")
+    # …and one whose ssh starts PowerShell (OpenSSH on Windows can be set up so)
+    ps = far / "127.0.0.3"
+    (ps / "home").mkdir(parents=True)
+    (ps / "windows").write_text("powershell\n")
+    r = srun("remote", "add", "pc2", "me@127.0.0.3")
+    ps_log = [json.loads(l) for l in (ps / "commands.log").read_text().splitlines()] \
+        if (ps / "commands.log").is_file() else []
+    cfg = json.loads((sb / ".aht" / "config.json").read_text())
+    ck(r.returncode == 1 and core.WINDOWS_FAR in r.stderr
+       and ps_log == ["echo aht-os %OS% $env:OS"] and os.listdir(ps / "home") == []
+       and "pc2" not in cfg["remotes"],
+       f"remote add: a PC that answers in PowerShell stops it too, nothing made there "
+       f"({r.stderr.strip()}, {ps_log}, {os.listdir(ps / 'home')})")
+    hrun("config", "--set", "remotes=" + json.dumps(dict(remotes, pc={"ssh": "me@127.0.0.2"})))
+    d = J(srun("remote", "check", "pc", "--json"))
+    srun("board", "--json")
+    cfg = json.loads((sb / ".aht" / "config.json").read_text())
+    ck(core.WINDOWS_FAR in ((d.get("machines") or [{}])[0].get("error") or "")
+       and cfg["remotes"]["pc"].get("system") == "Windows"
+       and pc_log() == ["echo aht-os %OS% $env:OS"] * 2 and os.listdir(pc / "home") == [],
+       f"remote check: one set up before asks first and remembers; nothing more is sent "
+       f"({pc_log()})")
+
+    # a machine that does not answer: after an hour Release is offered, once
+    h = dict(h, remote="gone", host="gone", at=time.time() - 4000, error="no answer",
+             unreachable_since=time.time() - 3700, checked_at=time.time() - 100)
+    hrun("config", "--set", "remotes=" + json.dumps(
+        {"box": {"root": str(box)}, "gone": {"ssh": "me@127.0.0.9"}}))
+    set_handing(uidD, h)
+    d1 = J(srun("notices", "--json"))
+    fixture_misses += fixture_ok(project_row(projD), "projects_handing_release.json")
+    row = project_row(projD).get("handing") or {}
+    reg = json.loads(regf.read_text())
+    reg["projects"][uidD]["handing"]["checked_at"] = time.time() - 100
+    regf.write_text(json.dumps(reg))
+    d2 = J(srun("notices", "--json"))
+    ck(any("has not answered since" in n["message"] for n in d1.get("notices", []))
+       and not d2.get("notices") and row.get("state") == "unreachable"
+       and row.get("release") is True,
+       f"no answer for an hour: Release is offered once ({row}, {d2.get('notices')})")
+    d = J(hrun("reclaim", projD, "--release", "--apply", "--json"))
+    ck(d.get("released") and not entry(projD)[1].get("handing"),
+       "…and Release drops the unfinished record")
+    hrun("config", "--set", "remotes=" + json.dumps({"box": {"root": str(box)}}))
+    ck(not fixture_misses, f"the JSON keeps every key of the samples the front-ends "
+                           f"use ({fixture_misses})")
+    for w in (sbx / "home" / ".faketmux").glob("*.json"):
+        rec = json.loads(w.read_text())
+        if rec.get("alive"):
+            try:
+                os.kill(int(rec["pid"]), 15)
+            except OSError:
+                pass
+
 def handover_suite():
     box = Path(os.path.realpath(sb)) / "box"    # a folder standing in for the machine
     bhome = box / "home"
@@ -1160,6 +1908,8 @@ def handover_suite():
     rows = J(hrun("projects", "--json"))["projects"]
     ck(not [r for r in rows if r["mirror"]], "mirror --all --off: none any more")
 
+    phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row)
+
     for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
         rec = json.loads(w.read_text())
         if rec.get("alive"):
@@ -1178,6 +1928,201 @@ elif handover_name(sb) > 255:
           f"(for example TMPDIR=/tmp).")
 else:
     handover_suite()
+
+print("\n[16b] nothing lost on the way: the plumbing under handover (any system)")
+ck(all(core._is_abs(p) for p in ("/x", "C:\\x", "C:/x", "\\\\server\\x", "c:\\"))
+   and not any(core._is_abs(p) for p in ("x", "./x", "C:x", "", None)),
+   "absolute paths of all three systems are told apart")
+ck(core._inside("C:\\Users\\Me\\x\\a.py", "c:/users/me/x")
+   and not core._inside("C:\\Users\\Me\\xy", "C:\\Users\\Me\\x")
+   and core._inside("/a/b", "/a") and not core._inside("/A/b", "/a"),
+   "inside a folder: either separator and any case on a drive, exact elsewhere")
+
+# manifests: "/" keys, every folder (an empty one too), the executable bit
+mt = sb / "manifest-tree"
+(mt / ".git" / "refs" / "heads").mkdir(parents=True)
+(mt / "bin").mkdir()
+(mt / "bin" / "run.sh").write_text("#!/bin/sh\n")
+os.chmod(mt / "bin" / "run.sh", 0o755)
+(mt / "a.txt").write_text("a")
+(mt / unicodedata.normalize("NFC", "é.txt")).write_text("one")
+(mt / unicodedata.normalize("NFD", "é.txt")).write_text("two")
+# a disk that keeps both Unicode forms apart (Linux) holds two names here
+both = len([n for n in os.listdir(mt)
+            if unicodedata.normalize("NFC", n) == unicodedata.normalize("NFC", "é.txt")]) == 2
+m = core.tree_manifest(str(mt), [])
+ck(".git/refs/heads" in m["dirs"] and "bin/run.sh" in m["files"]
+   and m["modes"].get("bin/run.sh") == 0o755 and "a.txt" not in m["modes"]
+   and (list(m["twins"]) == [unicodedata.normalize("NFC", "é.txt")] if both
+        else m["twins"] == {}),
+   f"manifest: folders (empty ones too), executable marks, twin names ({m['dirs']}, "
+   f"{m['modes']}, {m['twins']})")
+
+# set-asides: the newest 5, and everything younger than 30 days (faked times)
+def aside_names(base):
+    return sorted(p.name for p in base.iterdir())
+def stamp(days):
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - days * 86400))
+sa = sb / "aside-a"
+for days in (31, 32, 33, 34, 35, 36, 37, 1, 2):
+    (sa / stamp(days) / "project").mkdir(parents=True)
+    (sa / stamp(days) / "project" / "x.txt").write_text(str(days))
+n = core.prune_set_asides(sa)
+ck(n == 4 and aside_names(sa) == sorted(stamp(d) for d in (1, 2, 31, 32, 33)),
+   f"set-asides: the newest 5 stay ({aside_names(sa)})")
+sb2 = sb / "aside-b"
+for days in (40, 41, 42) + tuple(range(1, 9)):
+    (sb2 / stamp(days)).mkdir(parents=True)
+core.prune_set_asides(sb2)
+ck(aside_names(sb2) == sorted(stamp(d) for d in range(1, 9)),
+   "set-asides: everything younger than 30 days stays, however many")
+
+# one prune for a project's .aht/handover: a handover's summary no longer
+# deletes a switch's, and the other way round
+rh = sb / "relays" / ".aht" / "handover"
+rh.mkdir(parents=True)
+for i in range(10):
+    (rh / f"202601{10 + i}-1200-to-box.md").write_text("handover")
+    (rh / f"202601{10 + i}-1300-to-codex.md").write_text("switch")
+(rh / "relay-20250101-000000-aaaa.json").write_text("{}")         # open: it stays
+for x in (".json", ".md", ".closed"):
+    (rh / f"relay-20250102-000000-bbbb{x}").write_text("{}")      # closed and old
+core.prune_relays(rh)
+left = sorted(p.name for p in rh.iterdir())
+ck(len([n for n in left if n.endswith(".md") and "-to-" in n]) == 12
+   and any(n.endswith("-to-box.md") for n in left)
+   and any(n.endswith("-to-codex.md") for n in left)
+   and "relay-20250101-000000-aaaa.json" in left
+   and not any("bbbb" in n for n in left),
+   f"prune_relays: open relays stay, the newest 12 closed ones of either kind ({len(left)})")
+
+# a take-back on a disk that ignores case: two names of one case group never
+# land on one file; the one that would is kept next to it (any system:
+# AHT_CASELESS makes a Linux disk act so)
+class CaseRem:
+    def __init__(self, files):
+        self.files = files
+    def spec(self, p):
+        return p
+    def rsync(self, src, dst, files_from=(), backup_dir=None, **kw):
+        for n in files_from:
+            t = Path(dst) / n
+            if backup_dir and t.exists():
+                core._set_aside(t, Path(backup_dir), n)
+            t.parent.mkdir(parents=True, exist_ok=True)
+            t.write_bytes(self.files[n])
+        return {"ok": True}
+ct = sb / "case-tree"
+ct.mkdir()
+(ct / "Notes.txt").write_text("ours\n")
+os.environ["AHT_CASELESS"] = "1"
+try:
+    done = core._pull_tree(CaseRem({"notes.txt": b"theirs\n", "Two.md": b"2\n",
+                                    "two.md": b"two\n"}),
+                           {"take": [], "new": ["notes.txt", "Two.md", "two.md"],
+                            "delete": [], "conflict": [], "kept": []},
+                           "/far", str(ct), {}, sb / "case-aside" / "x", "box", False, [],
+                           False, here_keys={"Notes.txt": [5, 0]})
+finally:
+    del os.environ["AHT_CASELESS"]
+day = time.strftime("%Y-%m-%d")
+got = sorted(os.listdir(ct))
+ck((ct / "Notes.txt").read_text() == "ours\n"
+   and (ct / f"notes (from box {day}).txt").read_text() == "theirs\n"
+   and (ct / "Two.md").read_text() == "2\n"
+   and (ct / f"two (from box {day}).md").read_text() == "two\n"
+   and sorted(c["file"] for c in done["conflicts"]) == ["notes.txt", "two.md"],
+   f"case groups: a clash is kept next to the file that stays ({got})")
+
+# how aht runs itself in the background (the mirror, the offsite copy, the
+# night shift): in the Windows exes, aht.exe, also from the tray's own exe
+exes = sb / "exes"
+exes.mkdir()
+(exes / "aht-tray.exe").write_text("")
+was = (getattr(sys, "frozen", None), sys.executable)
+try:
+    sys.frozen, sys.executable = True, str(exes / "aht-tray.exe")
+    lone = core._aht_argv()
+    (exes / "aht.exe").write_text("")
+    tray, cli = core._aht_argv(), None
+    sys.executable = str(exes / "aht.exe")
+    cli = core._aht_argv()
+finally:
+    if was[0] is None:
+        del sys.frozen
+    else:
+        sys.frozen = was[0]
+    sys.executable = was[1]
+here_argv = core._aht_argv()
+ck(lone == [str(exes / "aht-tray.exe")] and tray == [str(exes / "aht.exe")]
+   and cli == [str(exes / "aht.exe")] and here_argv[1:] == [str(Path(CLI).resolve())],
+   f"aht runs itself: aht.exe from the tray's exe, this file from a checkout "
+   f"({lone}, {tray}, {cli}, {here_argv})")
+
+# this install's id: made once, kept out of the config; the core's own id
+ie = iso_env("machine-id")
+r1 = iso_run(ie, "_core", "--id").stdout.strip()
+ck(r1 == hashlib.sha256(Path(CLI).read_bytes()).hexdigest()[:12],
+   f"_core --id: the core's checksum names its copy elsewhere ({r1})")
+mprobe = "import aht; print(aht.machine_id(), aht.machine_id(create=True), aht.machine_id(create=True))"
+out = subprocess.run([PY, "-c", mprobe], env=dict(ie, PYTHONPATH=str(HERE.parent)),
+                     capture_output=True, text=True).stdout.split()
+mj = json.loads((Path(ie["AHT_HOME"]) / "machine.json").read_text())
+ctext = read_text_or_none(Path(ie["AHT_HOME"]) / "config.json") or ""
+ck(out[:1] == ["None"] and len(out) == 3 and out[1] == out[2] == mj["id"]
+   and len(mj["id"]) == 12 and {"id", "name", "created"} <= set(mj) and mj["id"] not in ctext,
+   f"machine id: made only when asked, then always the same, not in the config ({out})")
+
+# Keep in sync sends what the registry says when it sends, not what it said
+# when the run began: a project released meanwhile (its sync paused) or
+# handed over meanwhile is not sent (stand-ins for the machine and the
+# sending, so any system)
+re_ = iso_env("mirror-race")
+race = """
+import json, os, sys
+import aht
+S = sys.argv[1]
+aht.save_config(dict(aht.load_config(), remotes={"box": {"root": os.path.join(S, "box")}}))
+reg, uids = aht.load_registry(), {}
+for n in ("A-first", "X-released", "Y-handed"):
+    p = os.path.realpath(os.path.join(S, n))
+    os.makedirs(p, exist_ok=True)
+    uids[n] = aht.new_uuid()
+    aht._register(reg, uids[n], p)
+    reg["projects"][uids[n]]["mirror"] = {"enabled": True, "remote": "box"}
+aht.save_registry(reg)
+sent = []
+def connect(self, path=None):
+    self.info = {"sessions": [], "processes": [], "path_writable": True}
+    return self.info
+def push(rem, uid, entry, **kw):
+    sent.append(os.path.basename(entry["real_path"]))
+    if uid == uids["A-first"]:          # while A is sent, X is released, Y handed over
+        with aht.Lock():
+            r = aht.load_registry()
+            r["projects"][uids["X-released"]]["mirror"]["paused"] = {
+                "reason": "released", "at": aht._now(), "remote": "box"}
+            r["projects"][uids["Y-handed"]]["away"] = {"remote": "box", "since": aht._now()}
+            aht.save_registry(r)
+    return {"project": {}, "history": {}, "extras": []}
+aht.Remote.connect = connect
+aht.push_project = push
+rows = aht.mirror_pass()
+x = aht.load_registry()["projects"][uids["X-released"]]["mirror"]
+print(json.dumps({"sent": sent, "rows": {os.path.basename(r["project"]): r["status"]
+                                         for r in rows},
+                  "paused": bool(x.get("paused")), "tried": "tried_at" in x}))
+"""
+r = subprocess.run([PY, "-c", race, str(Path(re_["HOME"]).parent)],
+                   env=dict(re_, PYTHONPATH=str(HERE.parent)), capture_output=True, text=True)
+try:
+    got = json.loads(r.stdout)
+except ValueError:
+    got = {"error": r.stdout[-300:] + r.stderr[-300:]}
+ck(got.get("sent") == ["A-first"]
+   and got.get("rows") == {"A-first": "synced", "X-released": "paused", "Y-handed": "skipped"}
+   and got.get("paused") is True and got.get("tried") is False,
+   f"Keep in sync: a project released or handed over during a run is not sent ({got})")
 
 print("\n[17] across agents: search, secrets, journal, rules, switch, board")
 from datetime import datetime, timezone
@@ -1273,7 +2218,7 @@ junk = projX + "/app.py"
     cline(type="assistant", timestamp=iso(T + 99), message={"role": "assistant", "content": [
         {"type": "text", "text": "use settings.api_key = config.api_key_value and "
                                  "password=${DB_PASSWORD}, secret: round-robin-2023, "
-                                 "passwd = Xk29!aa8Qz3"}]}))
+                                 "passwd = Xk29!" + "aa8Qz3"}]}))
 d = JS("secrets", projX, "--json")
 found = sorted(f["masked"] for f in d.get("finds", []) if f["session"] == "c2")
 ck(found == ["Xk29…z3"], f"secrets: code, placeholders and words are not reported ({found})")
@@ -1425,6 +2370,15 @@ ck([g["title"] for g in got] == ["Across waits for you", "Across is done"]
    f"notices: waiting for you, then done — once each ({[g['title'] for g in got]})")
 run("notices", extra_env=nenv)
 ck(len(nlog.read_text().splitlines()) == 2, "notices: nothing new, nothing said")
+# what a session waits for can quote a command with a key in it: masked where
+# it is read, before it goes to another machine or the phone
+say("busy"); run("notices", extra_env=nenv)
+say("waiting", f"approve Bash: curl -H 'x-api-key: {KEY}' https://api.example.com")
+run("notices", extra_env=nenv)
+last = json.loads(nlog.read_text().splitlines()[-1])
+ck(KEY not in nlog.read_text() and last["title"] == "Across waits for you"
+   and last["message"].startswith("approve Bash: curl") and "sk-a…" in last["message"],
+   f"notices: what a session waits for is masked ({last['message']})")
 worker.kill(); worker.wait()
 wrec.unlink()
 
@@ -1492,16 +2446,28 @@ d = JS("report", "--project", projX, "--statement", "--json")
 ck("Claude Code" in d.get("statement", "") and "Kimi Code" in d.get("statement", ""),
    "report --statement: a draft naming the agents used")
 
-# share a session: no key, no e-mail address, no home folder
+# share a session: no key, no e-mail address, no home folder, no local
+# network address (IPv4, link-local, and IPv6 unique local and link-local)
 home = str(Path.home())
+lan = ["192.168.1.20", "169.254.10.20", "fd7a:115c:a1e0::5a1:2b3c", "fd12:3456:789a:1::1",
+       "fe80::1c2b:3a4d:5e6f:7081%en0"]
 (cstore / "c3.jsonl").write_text(cline(type="user", timestamp=iso(T + 500), message={
     "role": "user", "content": f"mail me at someone@example.org, file {home}/notes.txt, "
-                               f"key {KEY}"}))
+                               f"key {KEY}, on {', '.join(lan)}; std::fd12 and fdab3c1: stay"}))
 d = JS("share", projX, "--session", "c3", "--format", "html", "--json")
 page = d.get("text", "")
 ck(d.get("turns") == 1 and KEY not in page and "someone@example.org" not in page
    and home not in page and "~/notes.txt" in page and "<!doctype html>" in page,
    "share: a clean page — no key, no e-mail address, no home folder")
+import html as _html
+md = JS("share", projX, "--session", "c3", "--json").get("text", "")
+ck(not [a for a in lan for p in (page, md) if a.split("%")[0] in p]
+   and md.count("[address]") == len(lan) and "std::fd12 and fdab3c1: stay" in md,
+   f"share: no local network address, IPv6 ones too; text like one stays ({md[-300:]!r})")
+ck(_html.escape(core.SHARE_NOTE) in page and core.SHARE_NOTE in md
+   and "Keys and passwords aht recognises are masked" in md
+   and "Look it through before you share it." in md and "local paths are removed" not in md,
+   "share: the page says what aht takes out of it, and to look it through")
 
 # taking a found key out of the histories
 fp = next(f["fingerprint"] for f in JS("secrets", projX, "--json")["finds"]
@@ -1521,6 +2487,358 @@ ck(d.get("applied") and KEY not in (cstore / "c1.jsonl").read_text()
    and all(json.loads(l) for l in (cstore / "c1.jsonl").read_text().splitlines())
    and kept and KEY in kept[0].read_text(),
    "secrets --redact: gone from the history, which stays valid; the original is kept")
+
+# a long key leaves nothing of itself behind.  For every kind of key aht
+# knows, one of full length and one twice as long, alone and where keys
+# stand (a header, an assignment, JSON, a web address): no 12 characters of
+# it in a row are left, and a known kind of key is named as such.  The keys
+# are made up here, in pieces
+import random, string
+_rk = random.Random(26)
+AN = string.ascii_letters + string.digits
+def rk(n, al=AN):
+    return "".join(_rk.choice(al) for _ in range(n))
+def long_keys(x):
+    """(kind, the text that holds the key, the part that must not be left) of
+    every kind of key redact() knows, `x` times its usual length."""
+    body = [rk(64, AN + "+/") for _ in range(25 * x)] + [rk(20, AN + "+/") + "=="]
+    pem = ("-----BEGIN RSA PRIV" + "ATE KEY-----\n" + "\n".join(body)
+           + "\n-----END RSA PRIV" + "ATE KEY-----")
+    pw = rk(24 * x, AN + "!~")
+    keys = [("Anthropic API key", "sk-" + "ant-" + "api03-" + rk(93 * x, AN + "_-") + "AA"),
+            ("OpenAI API key", "sk-" + "proj-" + rk(156 * x, AN + "_-")),
+            ("Groq API key", "gs" + "k_" + rk(52 * x)),
+            ("GitHub token", "gh" + "p_" + rk(36 * x)),
+            ("GitHub token", "github_" + "pat_" + rk(22 * x) + "_" + rk(59 * x)),
+            ("AWS access key", "AK" + "IA" + rk(16 * x, string.ascii_uppercase + string.digits)),
+            ("Google API key", "AI" + "za" + rk(35 * x, AN + "_-")),
+            ("Slack token", "xo" + "xb-" + rk(12, string.digits) + "-"
+             + rk(13, string.digits) + "-" + rk(24 * x)),
+            ("Stripe key", "sk_" + "live_" + rk(99 * x)),
+            ("Hugging Face token", "hf" + "_" + rk(34 * x)),
+            ("npm token", "npm" + "_" + rk(36 * x)),
+            ("Tailscale key", "tsk" + "ey-auth-" + rk(12 * x) + "CNTRL-" + rk(33 * x)),
+            ("JSON web token", "ey" + "JhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.ey" + "J"
+             + rk(200 * x, AN + "_-") + "." + rk(342 * x, AN + "_-")),
+            ("password or token", rk(40 * x))]
+    return [(k, v, v) for k, v in keys] + [
+        ("private key", pem, "\n".join(body)),
+        ("password in a web address", f"postgres://deploy:{pw}@db.corp.lan:5432/app", pw)]
+PLACES = [("alone", "use {} for the deploy"),
+          ("after x-api-key", "curl -H 'x-api-key: {}' https://api.example.com/v1"),
+          ("after api_key=", "api_key={}"),
+          ("after api_key=, more after it", "api_key={}&v2 was set"),
+          ("after a bearer", 'curl -H "Authorization: Bearer {}" https://api.example.com'),
+          ("inside JSON", None),
+          ("in a web address", "https://api.example.com/v1/items?api_key={}&page=2"),
+          ("in a web address's path", "https://hooks.example.com/services/{}/run")]
+def kept_runs(text, secret):
+    """The runs of 12 characters of `secret` that are still in `text`."""
+    return sorted({p[i:i + 12] for p in secret.split("\n") for i in range(len(p) - 11)
+                   if p[i:i + 12] in text})
+GENERIC = ("password or token", "password in a web address")
+bad = []
+for x in (1, 2):
+    for kind, key, secret in long_keys(x):
+        for where, form in PLACES:
+            if where.startswith("in a web address") and kind in (
+                    "private key", "password in a web address"):
+                continue                    # not something a web address holds
+            if kind == "password or token" and where in ("alone", "in a web address's path"):
+                continue                    # nothing there says a random word is a key
+            text = form.format(key) if form else json.dumps({"env": {"API_KEY": key}})
+            out = core.redact(text)
+            left = kept_runs(out, secret)
+            named = [kind] if kind not in GENERIC else GENERIC
+            if left or not any(f"[{k}: " in out for k in named):
+                bad.append(f"{kind}, {x}x as long, {where}: {left[:2]} in {out[:120]!r}")
+ck(not bad, f"redact: nothing of a long key is left, and a known kind of key is named "
+            f"({len(bad)}: {bad[:3]})")
+
+# …and nothing of one is left anywhere aht writes what it read: the search
+# index, a summary, a notice, the journal and a shared page
+projL = os.path.realpath(str(roots / "Long Keys"))
+os.makedirs(projL)
+lstore = tools / "claude" / enc(projL)
+lstore.mkdir()
+lkeys = long_keys(2)
+def across_400(kind, key):
+    """A command in which `key` runs across character 400, where the text of
+    a tool call is cut."""
+    head = "deploy api_key=" if kind == "password or token" else "deploy --with "
+    pad = max(1, 401 - len(key) - len(f"echo  && {head}"))
+    return f"echo {'z' * pad} && {head}{key} --now"
+lmsgs = [cline(type="ai-title", cwd=projL, aiTitle=f"zebra deploy with {lkeys[0][1]}")]
+for i, (kind, key, _s) in enumerate(lkeys):
+    lmsgs.append(cline(type="user", cwd=projL, timestamp=iso(T + 600 + i), message={
+        "role": "user", "content": f"zebra {i}: curl -H 'Authorization: Bearer {key}' "
+                                   "https://api.example.com"}))
+    lmsgs.append(cline(type="assistant", cwd=projL, timestamp=iso(T + 601 + i), message={
+        "role": "assistant", "content": [
+            {"type": "text", "text": f"The zebra call works with api_key={key} now."},
+            {"type": "tool_use", "name": "TodoWrite", "input": {"todos": [
+                {"content": f"rotate {key}", "status": "pending"}]}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": across_400(kind, key)}}]}))
+# the last answer asks a question right after a fenced private key
+lpem = next(k for kind, k, _s in lkeys if kind == "private key")
+lmsgs.append(cline(type="user", cwd=projL, timestamp=iso(T + 700), message={
+    "role": "user", "content": "zebra: make me a deploy key"}))
+lmsgs.append(cline(type="assistant", cwd=projL, timestamp=iso(T + 701), message={
+    "role": "assistant", "content": [{"type": "text", "text": "I made a deploy key:\n\n```\n"
+                                      + lpem + "\n```\nShall I put it on the server?"}]}))
+(lstore / "L1.jsonl").write_text("".join(lmsgs))
+# a second session, named with a key in its own title (/rename)
+(lstore / "L2.jsonl").write_text(
+    cline(type="user", cwd=projL, timestamp=iso(T + 500), message={
+        "role": "user", "content": "zebra notes"})
+    + json.dumps({"type": "custom-title", "customTitle": f"zebra notes {lkeys[3][1]}",
+                  "sessionId": "L2"}) + "\n")
+os.utime(lstore / "L2.jsonl", (T + 500, T + 500))      # L1 stays the latest session
+run("tag", projL, "--apply")
+JS("search", "zebra", "--json")
+db = sqlite3.connect(str(sb / ".aht" / "search.db"))
+written = {"the search index": "\n".join(
+    [t for (t,) in db.execute("select text from msgs")]
+    + [t for (t,) in db.execute("select title from sessions")])}
+ltools = db.execute("select count(*) from msgs where text like 'Bash: echo z%'").fetchone()[0]
+db.close()
+written["a summary"] = "\n".join(core._brief_sections(
+    core.session_digest(lstore / "L1.jsonl", projL)))
+written["the journal"] = JS("journal", projL, "--json").get("markdown", "")
+written["a shared page"] = JS("share", projL, "--session", "L1", "--format", "html",
+                              "--json").get("text", "")
+written["a shared page with the tools"] = JS("share", projL, "--session", "L1", "--tools",
+                                             "--json").get("text", "")
+lw = subprocess.Popen(["sleep", "600"], cwd="/")
+lw2 = subprocess.Popen(["sleep", "600"], cwd="/")
+lrec, lrec2 = rec / f"{lw.pid}.json", rec / f"{lw2.pid}.json"
+lrec2.write_text(json.dumps({"pid": lw2.pid, "cwd": projL, "sessionId": "L2",
+                             "status": "idle"}))
+waits = "approve Bash: " + " && ".join(f"curl -H 'x-api-key: {k}'" for _k, k, _s in lkeys)
+for status in ("busy", "waiting"):
+    lrec.write_text(json.dumps({"pid": lw.pid, "cwd": projL, "sessionId": "L1",
+                                "status": status, "name": f"zebra {lkeys[5][1]}",
+                                **({"waitingFor": waits} if status == "waiting" else {})}))
+    run("notices", extra_env=nenv)
+written["a notice"] = json.loads(nlog.read_text().splitlines()[-1])["message"]
+left = [f"{kind} in {where}" for where, text in written.items()
+        for kind, _k, secret in lkeys if kept_runs(text, secret)]
+unmasked = [where for where, text in written.items()
+            if not any(f"[{kind}: " in text for kind, _k, _s in lkeys)]
+ck(not left and not unmasked and written["a notice"].startswith("approve Bash")
+   and ltools == len(lkeys),
+   f"nothing of a long key is left in the search index (a tool's command cut at 400 "
+   f"characters too), a summary, a notice, the journal or a shared page ({left[:4]}; "
+   f"no key masked in: {unmasked}; {ltools} tool rows)")
+
+# …nor where a session's title, name or last question is shown: the board,
+# loose ends, a handover, the sessions list, What Changed, checkpoints, the
+# checkup and a restart's plan, the tab names and a saved workspace
+# (stand-in iTerm2 tabs, whose titles carry the sessions' names)
+ltabs = sb / "long-keys-tabs.json"
+ltabs.write_text(json.dumps({
+    "/dev/ttysZ1": {"title": "Zebra", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 1},
+    "/dev/ttysZ2": {"title": "", "override": False, "pane": 1, "panes": 1, "window": 1, "tab": 2}}))
+lenv = {"AHT_ITERM_TABS": str(ltabs), "AHT_CLAUDE_VERSION": "9.9.9",
+        "AHT_TTYS": json.dumps({str(lw.pid): "/dev/ttysZ1", str(lw2.pid): "/dev/ttysZ2"}),
+        "AHT_TTY_PROCS": json.dumps({"/dev/ttysZ1": [[lw.pid, "claude --resume L1"]],
+                                     "/dev/ttysZ2": [[lw2.pid, "claude"]]}),
+        "AHT_CWDS": "{}"}
+def mine(rows):
+    return [r for r in rows if os.path.realpath(r.get("project") or "/") == projL]
+shown = {}
+# a saved workspace keeps each tab's title as it is (a restore gives it
+# back), so it is saved while the tabs hold no key
+wsh = sb / "long-keys-ws" / ".aht"
+JS("workspace", "--save", "--json", extra_env=dict(lenv, AHT_HOME=str(wsh)))
+shown["a saved workspace"] = [json.loads(f.read_text())
+                              for f in (wsh / "workspaces").glob("*.json")]
+# then the tabs carry the sessions' names: L2's tab the name it was renamed
+# to (aht gives a tab that name), L1's the name asked for in aht's Rename…
+# (the session takes it at its next prompt, the tab at once)
+ltn = json.loads(ltabs.read_text())
+ltn["/dev/ttysZ2"].update(title=f"zebra notes {lkeys[3][1]}", override=True)
+ltabs.write_text(json.dumps(ltn))
+lnext = f"next {lkeys[5][1]}"                    # an AWS access key: the name fits in 80
+lren = JS("tab-names", "--rename", "L1", "--to", lnext, "--json", extra_env=lenv)
+ck(lren.get("tab") == "" and json.loads(ltabs.read_text())["/dev/ttysZ1"]["title"] == lnext,
+   f"the tabs hold the sessions' names with a key in each ({lren.get('tab')!r})")
+b = JS("board", "--local", "--json", extra_env=lenv)
+shown["the board"] = mine(b.get("machines", [{}])[0].get("sessions", []))
+le = mine(JS("loose-ends", "--json").get("loose_ends", []))
+shown["loose ends"] = le
+lq = [i for r in le for i in r.get("items", []) if i["kind"] == "question"]
+shown["the sessions list"] = mine(JS("sessions", "--json").get("sessions", []))
+shown["a project's sessions"] = JS("sessions", projL, "--json").get("sessions", [])
+shown["What Changed"] = JS("changes", projL, "--session", "L1", "--json")
+JS("checkpoint", projL, "--session", "L1", "--json")
+shown["checkpoints"] = JS("undo", projL, "--list", "--json").get("checkpoints", [])
+shown["the checkup"] = mine(JS("checkup", "--json", extra_env=lenv).get("sessions", []))
+shown["a restart's plan"] = JS("checkup", "--restart", str(lw.pid), "--json", extra_env=lenv)
+shown["the tab names"] = mine(JS("tab-names", "--json", extra_env=lenv).get("sessions", []))
+shown["the tab names to sync"] = mine(JS("tab-names", "--sync-all", "--json",
+                                         extra_env=lenv).get("plan", []))
+# the board shows a tab's title and a waiting name masked, as the name: a
+# tab named after its session reads as that name (the Mac shows no "tab:"
+# line for it)
+lb = {r.get("session"): r for r in shown["the board"]}
+ck("[AWS access key: " in str(lb.get("L1", {}).get("tab"))
+   and "[AWS access key: " in str(lb.get("L1", {}).get("pending_title"))
+   and "[GitHub token: " in str(lb.get("L2", {}).get("tab"))
+   and lb.get("L2", {}).get("tab") == lb.get("L2", {}).get("title"),
+   f"board: a tab's title and a waiting name are masked "
+   f"({[(r.get('title'), r.get('tab'), r.get('pending_title')) for r in lb.values()]})")
+run("tab-names", "--rename", "L1", "--to", "", extra_env=lenv)
+remotes = JS("remote", "list", "--json").get("remotes") or {}
+if "box" in remotes and (sb / "stubs" / "claude").exists():
+    shown["a handover"] = JS("handover", projL, "--to", "box", "--json", extra_env={
+        "AHT_REMOTE_PATH": str(sb / "stubs"), "AHT_CLAUDE": str(sb / "stubs" / "claude"),
+        "AHT_NO_MIRROR": "1"})
+else:
+    print("  SKIP a handover's title: no stand-in machine (the handover test did not run)")
+lw.kill(); lw.wait(); lw2.kill(); lw2.wait()
+lrec.unlink(); lrec2.unlink()
+shown = {k: json.dumps(v, ensure_ascii=False) for k, v in shown.items()}
+left = [f"{kind} in {where}" for where, text in shown.items()
+        for kind, _k, secret in lkeys if kept_runs(text, secret)]
+unmasked = [where for where, text in shown.items()
+            if not any(f"[{kind}: " in text for kind, _k, _s in lkeys)]
+ck(not left and not unmasked and lq and "[private key: " in lq[0]["text"],
+   f"nothing of a long key is left in a title, a session's name or a question shown "
+   f"anywhere ({left[:4]}; no key masked in: {unmasked}; question: {lq})")
+
+# a search index an older aht built can hold parts of keys: it is built anew
+# once.  AHT_OLD_CORE names an older aht.py to build it with; without one,
+# an index of this version is made to look like one from before
+oe = iso_env("old-index")
+ost = Path(oe["AHT_ROOT_CLAUDE"]) / enc(projL)
+ost.mkdir(parents=True)
+# a GitHub token of the usual length: cut by one character, it was too short
+# for its own pattern
+okind = "GitHub token"
+okey = osecret = "gh" + "p_" + rk(36)
+(ost / "o1.jsonl").write_text(cline(type="assistant", cwd=projL, timestamp=iso(T), message={
+    "role": "assistant", "content": [
+        {"type": "text", "text": "The okapi deploy runs."},
+        {"type": "tool_use", "name": "Bash", "input": {"command": across_400(okind, okey)}}]}))
+def oindex():
+    db = sqlite3.connect(str(Path(oe["AHT_HOME"]) / "search.db"))
+    try:
+        return (db.execute("pragma user_version").fetchone()[0],
+                "\n".join(t for (t,) in db.execute("select text from msgs")))
+    finally:
+        db.close()
+def oleak():
+    """An index of before: what an older aht stored for that command."""
+    db = sqlite3.connect(str(Path(oe["AHT_HOME"]) / "search.db"))
+    db.execute("pragma user_version = 0")
+    db.execute("insert into msgs values (?,?,?,?,?,?,?)",
+               ("Bash: " + across_400(okind, okey)[:400], "tool", "claude", "o1", projL, T,
+                str(ost / "o1.jsonl")))
+    db.commit()
+    db.close()
+old_core = os.environ.get("AHT_OLD_CORE")
+if old_core:
+    subprocess.run([PY, old_core, "search", "--update", "--quiet"], env=oe, capture_output=True)
+else:
+    iso_run(oe, "search", "--update", "--quiet")
+    oleak()
+before = oindex()
+d = json.loads(iso_run(oe, "search", "--update", "--json").stdout or "{}")
+after = oindex()
+again = json.loads(iso_run(oe, "search", "--update", "--json").stdout or "{}")
+hits = json.loads(iso_run(oe, "search", "okapi", "--json", "--no-update").stdout or "{}")
+ck(kept_runs(before[1], osecret) and (d.get("index") or {}).get("rebuilt") is True
+   and not kept_runs(after[1], osecret) and after[0] == core.SEARCH_FORMAT
+   and "[GitHub token: " in after[1] and (again.get("index") or {}).get("rebuilt") is False
+   and [r["session"] for r in hits.get("results", [])] == ["o1"],
+   f"search: an index {'built by ' + old_core if old_core else 'of an older format'} is "
+   f"built anew once, and the parts of a key in it are gone ({before[0]} -> {after[0]}, "
+   f"{d.get('index')}, {again.get('index')})")
+# a rebuild cut short: the index stays marked old, so the next run starts over
+oleak()
+cut = ("import aht\n"
+       "def stop(*a, **k):\n"
+       "    raise SystemExit(7)\n"
+       "aht._note_session = stop\n"
+       "aht.update_search_index()\n")
+r = subprocess.run([PY, "-c", cut], env=dict(oe, PYTHONPATH=str(HERE.parent)),
+                   capture_output=True, text=True)
+mid = oindex()
+d = json.loads(iso_run(oe, "search", "--update", "--json").stdout or "{}")
+end = oindex()
+ck(r.returncode == 7 and mid[0] == 0 and not kept_runs(mid[1], osecret)
+   and (d.get("index") or {}).get("rebuilt") is True and end[0] == core.SEARCH_FORMAT
+   and not kept_runs(end[1], osecret) and "[GitHub token: " in end[1],
+   f"search: a rebuild cut short is done again by the next run ({r.returncode}, "
+   f"{mid[0]}, {end[0]}, {d.get('index')})")
+# the rebuild takes the old file away: that needs no room, and nothing of
+# the old rows stays.  Where it cannot (Windows, while a search reads it;
+# here the file refuses to go) its tables are dropped and vacuum clears the
+# file.  Either way the index counts as updated at once, so the watcher and
+# the hook start no other update while it builds
+rebuild = ("import json, os, pathlib, sys, aht\n"
+           "old = open(str(aht.search_db()), 'rb')\n"
+           "real, asked = pathlib.Path.unlink, []\n"
+           "def unlink(self, *a, **k):\n"
+           "    asked.append(self.name)\n"
+           "    if self.name == 'search.db' and sys.argv[1] == 'busy':\n"
+           "        raise PermissionError(13, 'in use', str(self))\n"
+           "    return real(self, *a, **k)\n"
+           "pathlib.Path.unlink = unlink\n"
+           "ages, listed = [], aht.list_sessions\n"
+           "def spy(*a, **k):\n"
+           "    ages.append(aht._search_age())\n"
+           "    return listed(*a, **k)\n"
+           "aht.list_sessions = spy\n"
+           "st = aht.update_search_index()\n"
+           "print(json.dumps({'rebuilt': st['rebuilt'], 'age': ages[0] if ages else None,\n"
+           "                  'asked': [n for n in asked if n.startswith('search.db')],\n"
+           "                  'gone': os.fstat(old.fileno()).st_nlink == 0}))\n")
+odb = Path(oe["AHT_HOME"]) / "search.db"
+for how in ("free", "busy"):
+    oleak()
+    was = kept_runs(odb.read_bytes().decode("latin-1"), osecret)
+    r = subprocess.run([PY, "-c", rebuild, how], env=dict(oe, PYTHONPATH=str(HERE.parent)),
+                       capture_output=True, text=True)
+    try:
+        got = json.loads(r.stdout)
+    except ValueError:
+        got = {"unparsed": r.stdout[-300:] + r.stderr[-300:]}
+    now = oindex()
+    hits = json.loads(iso_run(oe, "search", "okapi", "--json", "--no-update").stdout or "{}")
+    ck(was and got.get("rebuilt") is True
+       and got.get("age") is not None and 0 <= got["age"] < 600
+       and got.get("asked") ==["search.db-journal", "search.db-wal", "search.db-shm",
+                                "search.db"]
+       and got.get("gone") is (how == "free")
+       and not kept_runs(odb.read_bytes().decode("latin-1"), osecret)
+       and now[0] == core.SEARCH_FORMAT
+       and [x["session"] for x in hits.get("results", [])] == ["o1"],
+       "search: the rebuild " + ("takes the old file away" if how == "free" else
+                                 "drops and vacuums a file that cannot go")
+       + f", nothing of the old rows is left, and it counts as updated at once ({got})")
+# …and while an update holds the index, the watcher and the hook start no
+# other one (it would only wait for the lock)
+spawn = ("import fcntl, json, aht\n"
+         "seen = []\n"
+         "aht.subprocess.Popen = lambda argv, **kw: seen.append(argv[-3:])\n"
+         "aht.aht_home().mkdir(parents=True, exist_ok=True)\n"
+         "with open(str(aht.search_db()) + '.lock', 'w') as held:\n"
+         "    fcntl.flock(held, fcntl.LOCK_EX)\n"
+         "    aht._spawn_search_update()\n"
+         "    busy = list(seen)\n"
+         "aht._spawn_search_update()\n"
+         "print(json.dumps({'busy': busy, 'free': seen}))\n")
+se = iso_env("spawn-index")
+r = subprocess.run([PY, "-c", spawn], env=dict(se, PYTHONPATH=str(HERE.parent)),
+                   capture_output=True, text=True)
+try:
+    got = json.loads(r.stdout)
+except ValueError:
+    got = {"unparsed": r.stdout[-300:] + r.stderr[-300:]}
+ck(got.get("busy") == [] and got.get("free") == [["search", "--update", "--quiet"]],
+   f"search: no other update is started while one runs, one is when none runs ({got})")
 
 print("\n[19] before and after a session: informed, usage limit, undo, loose ends, "
       "second opinion")
@@ -1870,6 +3188,31 @@ ck(d.get("tab") == "panes" and tab_now() == "Viva",
 r = run("tab-names", "--rename", "t9", "--to", "Off", extra_env=dict(T, AHT_ITERM_API_OFF="1"))
 ck("Enable Python API" in r.stdout, f"rename: says how to let the tab take names ({r.stdout!r})")
 run("tab-names", "--rename", "t9", "--to", "")
+
+# a key in a tab's title: the session takes the title as it is, and at its
+# next prompt the name still counts as the tab's (a name read from a history
+# is masked where it is shown, not where it is compared), so the tab keeps it
+live3 = sb / "iterm-live3.json"
+tkey = "gh" + "p_" + "Kd8" * 12                         # made up, in pieces
+live3.write_text(json.dumps({"/dev/ttysT4": {"title": f"Deploy {tkey}", "override": True,
+                                             "panes": 1, "id": "9"}}))
+n_ = fake_claude("t10")
+L3 = {"AHT_ITERM_LIVE": str(live3)}
+first = tab_hook("SessionStart", "t10", "/dev/ttysT4", n_.pid, **L3)
+with open(tstore / "t10.jsonl", "a") as fh:
+    fh.write(title_line(f"Deploy {tkey}", "t10"))
+nxt = tab_hook("UserPromptSubmit", "t10", "/dev/ttysT4", n_.pid, **L3)
+T4 = {"AHT_ITERM_TABS": str(live3), "AHT_TTYS": json.dumps({str(n_.pid): "/dev/ttysT4"})}
+row = next((r for r in JS("tab-names", "--json", extra_env=T4).get("sessions", [])
+            if r["session"] == "t10"), {})
+ck(first == f"Deploy {tkey}" and nxt is None
+   and json.loads(live3.read_text())["/dev/ttysT4"]["title"] == f"Deploy {tkey}"
+   and row.get("origin") == "tab" and "[GitHub token: " in str(row.get("name"))
+   and tkey not in str(row.get("name")),
+   f"tab names: a key in a tab's title is compared as it is and shown masked; the tab "
+   f"keeps its title ({first!r}, {nxt!r}, {row.get('name')!r}, {row.get('origin')})")
+n_.kill(); n_.wait()
+(rec / f"{n_.pid}.json").unlink()
 
 # aht speaks iTerm2's Python API itself: a WebSocket on a Unix socket, protobuf in it
 import socket as _so, threading as _th
@@ -2579,7 +3922,8 @@ arow = next((a for a in aplan if a["real"] == fresh), {})
 atext = iso_run(ne, "adopt").stdout
 ck(arow.get("forgotten") is True and all(a.get("forgotten") is False for a in aplan if a is not arow)
    and "(you told aht to forget it)" in atext
-   and core.forgotten_note([arow]) == "You told aht to forget it: adopting takes it on again."
+   and core.forgotten_note([arow])
+   == f"You told aht to forget {core.tilde_path(fresh)}: adopting takes it on again."
    and core.forgotten_note([{"forgotten": True}, {"forgotten": False}, {"forgotten": True}])
    == "You told aht to forget 2 of them: adopting takes them on again."
    and core.forgotten_note([{"forgotten": False}]) == "",
@@ -3015,6 +4359,20 @@ ck('"link": _is_link(' in core_src and '"forgotten": bool(' in core_src
    and 'o["link"]' in swift and '$0["forgotten"]' in swift
    and "p.forgotten" in ui and "a.forgotten" in ui,
    "the window and the Mac app read \"link\" and \"forgotten\" by the names the core sends")
+# …and Release's: "mirror_paused" on projects' rows, "pauses_sync" and
+# would_lose's "history" on reclaim --release, "ends_pause" on handover
+ck('"mirror_paused": (e.get("mirror")' in core_src and 'pauses_sync=synced(' in core_src
+   and 'would_lose={"files": None, "history": None' in core_src
+   and 'return {"files": files, "history": history}' in core_src
+   and 'out["ends_pause"] = rem.name' in core_src
+   and "p.mirror_paused" in ui and "plan.pauses_sync" in ui and "d.pauses_sync" in ui
+   and "lose.history" in ui
+   and 'd["mirror_paused"]' in swift and 'plan["pauses_sync"]' in swift
+   and 'lose["history"]' in swift,
+   "the window and the Mac app read Release's paused sync and what stays there by the "
+   "names the core sends")
+ck(_re.search(r'\bSYSTEMS\s*=\s*\{[^}]*\bDarwin:\s*"macOS"', ui) and "SYSTEMS[f.system]" in ui,
+   "the window says macOS where the core says Darwin")
 # Getting started on Windows and Linux, and the tray at login on Linux
 gs = JS("getting-started", "--json", extra_env={"AHT_STEPS": "linux", "AHT_AUTOSTART_DIR": str(sb / "autostart")})
 ck([x["id"] for x in gs.get("steps", [])][:1] in (["login"], ["notify_send"])
@@ -3170,7 +4528,9 @@ run("config", "--unset", "terminal_app")
 import ast
 missing = set()
 for src in ("windows/src/winlayer.py", "windows/src/aht_tray.py", "windows/src/winbadge.py",
-            "windows/src/aht_main.py", "linux/tray.py", "linux/watcher.py", "aht_web.py"):
+            "windows/src/aht_main.py", "windows/src/make_icons.py", "linux/tray.py",
+            "linux/watcher.py", "linux/install.py", "linux/uninstall.py", "install.py",
+            "aht_web.py", "tests/fake_kimi.py"):
     tree = ast.parse((HERE.parent / src).read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)

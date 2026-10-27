@@ -1,0 +1,30 @@
+{
+  "uuid": "82ac847452ac4a00b12b2c96041b2771",
+  "real_path": "/Users/me/code/api",
+  "exists": true,
+  "stores": [
+    "claude"
+  ],
+  "updated_at": "2026-10-26T17:40:02",
+  "is_git": true,
+  "away": null,
+  "away_remote": null,
+  "away_since": null,
+  "mirror": "box",
+  "mirror_synced_at": 1793028100.4,
+  "mirror_status": "ok",
+  "mirror_paused": {
+    "reason": "released",
+    "at": "2026-10-26T17:40:02",
+    "remote": "box"
+  },
+  "handing": null,
+  "agents": [
+    "claude"
+  ],
+  "open": null,
+  "limit": null,
+  "sessions": 3,
+  "bytes": 81234,
+  "last_activity": "2026-10-26T17:10:02"
+}

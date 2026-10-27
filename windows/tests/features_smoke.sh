@@ -1,17 +1,21 @@
 #!/bin/sh
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
 # journal, report, share, secrets, rules, loose ends, undo, tidy, limits,
-# sessions, workspace.  Runs natively on Windows from Git Bash with
+# sessions, workspace; and the hidden ones another aht uses: `_core --id`
+# (the core inside the exe is this checkout's aht.py, byte for byte) and
+# `_agent`.  Runs natively on Windows from Git Bash with
 # AHT_SMOKE_NATIVE=1 (CI), under wine otherwise, or with AHT_SMOKE_POSIX=1
 # against any `aht` command on macOS or Linux (to check the script itself).
-# Every store is a throwaway fake; real agent data is never touched.
+# Every store is a throwaway fake; real agent data is never touched.  It
+# works in /tmp/aht-features-smoke (AHT_SMOKE_DIR in place of /tmp).
 set -e
 
 EXE="$1"
 [ -n "$EXE" ] || { echo "usage: features_smoke.sh /path/to/aht.exe"; exit 2; }
 export WINEDEBUG=-all
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 
-T=/tmp/aht-features-smoke
+T="${AHT_SMOKE_DIR:-/tmp}/aht-features-smoke"
 rm -rf "$T"
 mkdir -p "$T/home/.aht" "$T/roots/paper" "$T/tools/claude" "$T/tools/nope" "$T/trash"
 if [ -n "${AHT_SMOKE_POSIX:-}" ]; then
@@ -19,7 +23,7 @@ if [ -n "${AHT_SMOKE_POSIX:-}" ]; then
 elif [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
   RUN=""; WT="$(cygpath -w -l "$T")"; SEP='\'
 else
-  RUN="wine"; WT='Z:\tmp\aht-features-smoke'; SEP='\'
+  RUN="wine"; WT="Z:$(printf '%s' "$T" | tr '/' '\\')"; SEP='\'
 fi
 J() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }           # a path as JSON text
 P() {                                                     # a path under the sandbox
@@ -37,6 +41,14 @@ for b in GEMINI CURSOR OPENCODE CODEX COPILOT KIMI KIMI_CODE; do
 done
 export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1 AHT_NO_SEARCH_INDEX=""
 export AHT_TRASH="$(P trash)"
+
+echo "== the core inside: _core --id, _agent =="
+# the first 12 hex digits of the sha256 of this checkout's aht.py, as built
+sum256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
+WANT=$(sum256 "$REPO/aht.py" | cut -c1-12)
+GOT=$(W _core --id)
+[ "$GOT" = "$WANT" ] || fail "_core --id is '$GOT', this checkout's aht.py is $WANT"
+has "$(printf '%s' '{"op": "probe"}' | W _agent)" '^@@AHT@@\{.*"ok": true' "_agent did not answer the probe"
 
 PAPER="$(P roots/paper)"
 echo "x = 1" > "$T/roots/paper/a.py"

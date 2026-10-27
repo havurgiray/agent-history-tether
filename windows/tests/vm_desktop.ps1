@@ -51,6 +51,13 @@ public static class W {
   public static IntPtr RootAt(int x, int y) {   // the top-level window at a point of the screen
     var p = new POINT(); p.X = x; p.Y = y; return GetAncestor(WindowFromPoint(p), 2);
   }
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  public static bool Inside(IntPtr h, int x, int y) {   // the point lies within the window
+    RECT r; return GetWindowRect(h, out r) && x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom;
+  }
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  public static uint Pid(IntPtr h) { uint p; GetWindowThreadProcessId(h, out p); return p; }
   public static IntPtr[] Shown(string cls) {   // the top-level windows of a class that are on screen
     var l = new System.Collections.Generic.List<IntPtr>(); var h = IntPtr.Zero; int c;
     while ((h = FindWindowEx(IntPtr.Zero, h, cls, null)) != IntPtr.Zero)
@@ -212,6 +219,16 @@ function ClearToasts { # dismiss the notices on screen: how many stay
   }
   return @(Toasts).Count
 }
+function ToastWith($text) { # the notice on screen that shows $text: its window and the smallest
+  # element that shows the text (the text itself, not the notice around it), or $null
+  foreach ($h in [W]::Shown("Windows.UI.Core.CoreWindow")) {
+    try { $all = $UIA::FromHandle($h).FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) } catch { continue }
+    $e = @($all | Where-Object { $_.Current.Name -like "*$text*" -and -not $_.Current.BoundingRectangle.IsEmpty } |
+           Sort-Object { $_.Current.BoundingRectangle.Width * $_.Current.BoundingRectangle.Height }) | Select-Object -First 1
+    if ($e) { return [pscustomobject]@{ Window = $h; Element = $e } }
+  }
+  return $null
+}
 
 # ---- the machine's own tray and watcher stop until the end: the tray and
 # the watcher run once per sign-in, so the check's would give way to them ----
@@ -252,6 +269,10 @@ $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $Started = Get-Date
 $runBefore = (Get-ItemProperty $RunKey -ErrorAction SilentlyContinue)."aht-watcher"
 
+# a notice still up from before (Windows keeps one on screen while nobody
+# uses the machine) holds the front: the tray's menu would not get the keys
+[W]::Wake(); $null = ClearToasts
+
 # ---- 1. the tray starts and stays up ----
 $tray = Start-Process "$Dist\aht-tray.exe" -PassThru
 Start-Sleep 6
@@ -263,6 +284,7 @@ Result "tray starts" ($alive -and -not $crash) ("pid " + $tray.Id + $(if ($crash
 $ahtOld = @(Windows "aht" | ForEach-Object { $_.Current.NativeWindowHandle })
 $before = $ahtOld.Count
 $h = [W]::FindWindow("aht_tray_wnd", "aht-tray")
+$null = ClearToasts                        # one that came up meanwhile, too
 [W]::Raise($h)                             # else the menu may show without the keyboard
 [W]::PostMessage($h, 0x8001, [IntPtr]::Zero, [IntPtr]0x202) | Out-Null   # a click on the icon
 Start-Sleep 2
@@ -360,6 +382,20 @@ if (-not $win) { $why = "the window from step 2 is not there" } else {
 $inFront = $chooser -and [W]::GetForegroundWindow() -eq [IntPtr]$chooser.Current.NativeWindowHandle
 Result "the folder picker comes up in front after a click in the window" ([bool]$inFront) $(if ($why) { $why } else { "server $age s old; in front: $front" }) (Shot "04-folder-picker")
 
+# the chooser is aht's own: `aht.exe _pick-folder`, a child of the server, and
+# no PowerShell under the server or the chooser (it once compiled C# through
+# PowerShell each time, which antivirus tools flag)
+$how = ""; $own = $false
+if ($chooser) {
+  $cp = Get-CimInstance Win32_Process -Filter "ProcessId=$($chooser.Current.ProcessId)"
+  $ps = @(Get-CimInstance Win32_Process -Filter "name='powershell.exe' or name='pwsh.exe'" |
+          Where-Object { $_.ParentProcessId -eq $st.pid -or $_.ParentProcessId -eq $cp.ProcessId })
+  $own = $cp.Name -eq "aht.exe" -and "$($cp.CommandLine)" -match '\s_pick-folder(\s|$)' -and
+         $cp.ParentProcessId -eq $st.pid -and $ps.Count -eq 0
+  $how = "$($cp.Name) ($($cp.CommandLine)), parent $($cp.ParentProcessId), server $($st.pid), PowerShell under them: $($ps.Count)"
+} else { $how = "no folder chooser" }
+Result "the folder picker is aht.exe _pick-folder, without PowerShell" $own $how $null
+
 function AsShown($path) {      # a path as the page shows it
   if ($path.StartsWith("$env:USERPROFILE\", [StringComparison]::OrdinalIgnoreCase)) { return "~" + $path.Substring($env:USERPROFILE.Length) }
   return $path
@@ -401,6 +437,19 @@ function Press($d, $id) {      # a real click on the chooser's OK (1) or Cancel 
   if (-not $b) { return "no button $id in the chooser" }
   return ClickOn $dh $b $b.Current.Name
 }
+function Settled($eh) {        # the chooser's Folder: field once it stops changing (up to 10 s):
+  # while its tree fills, the chooser writes the selected item into the field,
+  # over text set there too early
+  $last = $null; $same = 0
+  for ($i = 0; $i -lt 20 -and $same -lt 3; $i++) {
+    $b = New-Object System.Text.StringBuilder 1024
+    [W]::ReadText($eh, 0x000D, [IntPtr]1024, $b) | Out-Null              # WM_GETTEXT
+    if ($b.ToString() -eq $last) { $same++ } else { $same = 0; $last = $b.ToString() }
+    Start-Sleep -Milliseconds 500
+  }
+  return $last
+}
+# (never name a function here Type: PowerShell's `type` alias, Get-Content, wins)
 function Listed($text) {       # the page shows $text, within 15 s
   if ([W]::GetForegroundWindow() -ne $hw) { [W]::Raise($hw); Start-Sleep 2 }   # the page shows itself to UIA in front
   for ($i = 0; $i -lt 15; $i++) { if (Like ($UIA::FromHandle($hw)) $text) { return $true }; Start-Sleep 1 }
@@ -471,6 +520,7 @@ if ($c -is [string]) { $why = $c } else {
          elseif ([W]::GetForegroundWindow() -ne $dh) { "the chooser was not in front (" + [W]::Front($false) + " was): nothing put in" } else { "" }
   if (-not $why) {
     $eh = [IntPtr]$field.Current.NativeWindowHandle
+    $null = Settled $eh
     $got = New-Object System.Text.StringBuilder 1024
     [W]::SendText($eh, 0x000C, [IntPtr]::Zero, $paste) | Out-Null          # WM_SETTEXT
     [W]::ReadText($eh, 0x000D, [IntPtr]1024, $got) | Out-Null              # WM_GETTEXT
@@ -493,6 +543,26 @@ if ($why -and $c) { [W]::PostMessage([IntPtr]$c.Current.NativeWindowHandle, 0x01
 $said = if ($pick.Wait(15000)) { $pick.Result.Content.ReadAsStringAsync().Result | ConvertFrom-Json } else { $null }
 $picked = if ($said) { $said.path } else { "" }
 Result "folder picker answers with the folder" (-not $why -and $picked -and $said.chooser -eq $true) $(if ($why) { $why } else { "picked: $picked" }) $shot
+
+# a path that is no folder, put into its Folder: field (once the field has
+# settled), then OK: the answer says not_folder, and no folder
+$pick = Send "/api/pick-folder" @{ prompt = "aht check: a path that is no folder" }
+$c = NewChooser
+$why = if (-not $c) { "no folder chooser came up" } else { "" }
+if (-not $why) {
+  $field = Control $c $UIA::ClassNameProperty "Edit"
+  if (-not $field) { $why = "no Folder: field in the chooser" }
+  else {
+    $eh = [IntPtr]$field.Current.NativeWindowHandle
+    $null = Settled $eh
+    $nope = "$Box\no such folder"
+    [W]::SendText($eh, 0x000C, [IntPtr]::Zero, $nope) | Out-Null          # WM_SETTEXT
+    $why = Press $c 1
+  }
+  if ($why) { [W]::PostMessage([IntPtr]$c.Current.NativeWindowHandle, 0x0111, [IntPtr]2, [IntPtr]::Zero) | Out-Null }
+}
+$said = if ($pick.Wait(15000)) { $pick.Result.Content.ReadAsStringAsync().Result | ConvertFrom-Json } else { $null }
+Result "a path that is no folder: the picker says so" (-not $why -and $said -and $said.not_folder -and -not $said.path) $(if ($why) { $why } elseif ($said) { $said | ConvertTo-Json -Compress } else { "no answer" }) (Shot "04e-not-a-folder")
 
 # ---- 5. Continue: a console in the project folder ----
 # the console starts in the folder, which is not on its command line: the
@@ -524,14 +594,31 @@ Result "notices reach the tray (see the two screenshots)" $n1 "the test notice i
 Result "a second notice in a row" $null "check the screenshot" (Shot "06b-second-notice")
 
 # ---- 7. a click on a notice opens a window ----
+# step 6's notices go first; then a real click on the text of the new one
+# once it is on screen (the tray shows notices one after another, so that
+# takes a while), only while nothing covers that point.  UI Automation's
+# FromPoint sees through a notice (it names the desktop behind it), so the
+# window at the point decides: the notice's own, with the point inside it
+$null = ClearToasts
 $before = (Windows "aht").Count
-[System.IO.File]::AppendAllText($q, '{"title": "aht check", "message": "a click here opens aht", "info": {}, "at": 0}' + "`n")
-Start-Sleep 5
-$b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-ClickAt ([int]($b.Width * 0.85)) ([int]($b.Height * 0.872))
+$text = "a click here opens aht"
+[System.IO.File]::AppendAllText($q, '{"title": "aht check", "message": "' + $text + '", "info": {}, "at": 0}' + "`n")
+$t = $null
+for ($i = 0; $i -lt 30 -and -not $t; $i++) { Start-Sleep 1; $t = ToastWith $text }
+$why = ""
+if (-not $t) { $why = "the notice did not come up within 30 s" } else {
+  Start-Sleep 1                            # it slides in: where it stays
+  $r = $t.Element.Current.BoundingRectangle
+  $x = [int]($r.X + $r.Width / 2); $y = [int]($r.Y + $r.Height / 2)
+  $tw = [IntPtr]$t.Window
+  if ([W]::RootAt($x, $y) -ne $tw) { $why = "another window was over the notice: no click" }
+  elseif (-not [W]::Inside($tw, $x, $y)) { $why = "the notice's text is not inside its window: no click" }
+  elseif ([W]::Pid($tw) -ne $t.Element.Current.ProcessId) { $why = "the text is not the notice's own: no click" }
+  else { ClickAt $x $y }
+}
 $more = $false
-for ($i = 0; $i -lt 15 -and -not $more; $i++) { Start-Sleep 1; $more = (Windows "aht").Count -gt $before }
-Result "a click on a notice opens aht" $more ("aht windows: $before before" + $(if ($stay) { "; an older notice stayed up" })) (Shot "07-notice-click")
+for ($i = 0; $i -lt 15 -and -not $more -and -not $why; $i++) { Start-Sleep 1; $more = (Windows "aht").Count -gt $before }
+Result "a click on a notice opens aht" $more $(if ($why) { $why } else { "aht windows: $before before" + $(if ($stay) { "; an older notice stayed up" }) }) (Shot "07-notice-click")
 
 # ---- 8. Show in Explorer ----
 $r = Api "/api/reveal" @{ path = $Proj }

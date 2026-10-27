@@ -66,9 +66,11 @@ jobs:
           sh windows/tests/wine_smoke.sh "$PWD/windows/dist/aht/aht.exe"
           sh windows/tests/wine_watch_smoke.sh "$PWD/windows/dist/aht/aht.exe"
           sh windows/tests/features_smoke.sh "$PWD/windows/dist/aht/aht.exe"
-      - name: the badge cache, and a drawn badge replaced on the next refresh
+      - name: the badge cache, a drawn badge replaced on the next refresh, and the entry point
         shell: bash
-        run: python windows/tests/winbadge_test.py
+        run: |
+          python windows/tests/winbadge_test.py
+          python windows/tests/aht_main_test.py
       - name: the installer, installed and removed
         shell: pwsh
         run: |

@@ -1,0 +1,39 @@
+{
+  "uuid": "82ac847452ac4a00b12b2c96041b2771",
+  "real_path": "/Users/me/code/api",
+  "exists": true,
+  "stores": [
+    "claude"
+  ],
+  "updated_at": "2026-10-26T17:15:13",
+  "is_git": true,
+  "away": null,
+  "away_remote": null,
+  "away_since": null,
+  "mirror": null,
+  "mirror_synced_at": null,
+  "mirror_status": null,
+  "mirror_paused": null,
+  "handing": {
+    "attempt": "20261026-171515-7441",
+    "step": "sending",
+    "remote": "box",
+    "holder": "box",
+    "host": "box",
+    "driven_by": "here",
+    "since": "2026-10-26T17:15:15",
+    "error": "cannot reach box (me@box): Connection timed out",
+    "checked_at": 1793034990.2,
+    "unreachable_since": 1793031300.5,
+    "state": "unreachable",
+    "release": true
+  },
+  "agents": [
+    "claude"
+  ],
+  "open": null,
+  "limit": null,
+  "sessions": 3,
+  "bytes": 81234,
+  "last_activity": "2026-10-26T17:10:02"
+}

@@ -164,13 +164,16 @@ CONFIG_DEFAULTS = {
     "watcher_owner":    "agent",     # agent (LaunchAgent/systemd/RunKey) | none
     "backup_enabled":   True,
     "backup_interval_hours": 24.0,
-    "backup_keep":      10,
+    "backup_keep":      10,          # per project; the copies on the other machine
+                                     #   follow it, keeping at least 3
     "backup_dir":       None,        # None -> <aht_home>/backups
     "linux_emblem_method": "auto",   # auto | gio | kde | both | none
     "linux_agent_emblem": "emblem-favorite",
     "linux_git_emblem":   "aht-git",     # aht's own "+", drawn like the agent emblems
     # handover: run a project on another machine of yours (see `aht remote`)
-    "remotes":          None,        # {name: {"ssh": "user@host"}}
+    "remotes":          None,        # {name: {"ssh": "user@host", "system": "Linux"}}
+                                     #   (tests on a real machine: "sandbox": a
+                                     #   folder there that holds everything)
     "default_remote":   None,
     "mirror_interval_minutes": 30,   # background sync of mirrored projects
     "handover_excludes": [],         # extra names that never travel
@@ -1201,7 +1204,7 @@ def save_registry(reg: dict) -> None:
         os.fsync(fh.fileno())
     os.replace(tmp, p)
 
-REGISTRY_KEEP = ("mirror", "away", "returned", "extras")   # handover's records
+REGISTRY_KEEP = ("mirror", "away", "handing", "returned", "extras")   # handover's records
 
 def _register(reg: dict, uid: str, real_path: str, stores=None) -> None:
     prev = reg["projects"].get(uid) or {}
@@ -2556,12 +2559,20 @@ def apply_adoption(planned: list) -> list:
 
 def forgotten_note(planned: list) -> str:
     """For the trays' adopt question: which of the `adopt --json` planned
-    folders the user told aht to forget ("" when none)."""
-    n, k = len(planned), sum(1 for a in planned if a.get("forgotten"))
+    folders the user told aht to forget, up to three by name, then "and N
+    more" ("" when none)."""
+    forgot = [a for a in planned if a.get("forgotten")]
+    n, k = len(planned), len(forgot)
     if not k:
         return ""
-    whom = ("it" if n == 1 else "all of them" if k == n
-            else "one of them" if k == 1 else f"{k} of them")
+    names = [tilde_path(str(a.get("real") or a.get("path") or "")) for a in forgot]
+    if all(names):
+        shown = names[:3]
+        whom = (", ".join(shown[:-1]) + " and " + shown[-1] if len(shown) > 1 else shown[0]) \
+            if k <= 3 else ", ".join(shown) + f" and {k - 3} more"
+    else:                               # rows without a folder: counted
+        whom = ("it" if n == 1 else "all of them" if k == n
+                else "one of them" if k == 1 else f"{k} of them")
     return f"You told aht to forget {whom}: adopting takes {'it' if k == 1 else 'them'} on again."
 
 def cmd_adopt(args):
@@ -3341,6 +3352,11 @@ def cmd_projects(args):
                if (e.get("mirror") or {}).get("enabled") else None,
                "mirror_synced_at": (e.get("mirror") or {}).get("synced_at"),
                "mirror_status": (e.get("mirror") or {}).get("status"),
+               # Keep in sync that sends nothing until it is turned on again:
+               # {reason: "released", at, remote}
+               "mirror_paused": (e.get("mirror") or {}).get("paused")
+               if (e.get("mirror") or {}).get("enabled") else None,
+               "handing": handing_row(e.get("handing"), uid),
                "agents": agents_of(e.get("stores") or {})}
         mine = [s["status"] for s in live
                 if _inside(os.path.realpath(s["cwd"]), os.path.realpath(e["real_path"]))]
@@ -3363,7 +3379,9 @@ def cmd_projects(args):
         for r in out:
             flag = " " if r["exists"] else "!"
             print(f" {flag} {r['real_path']}"
-                  + (f"   → handed over to {r['away']}" if r["away"] else ""))
+                  + (f"   → handed over to {r['away']}" if r["away"] else "")
+                  + (f"   (handover to {r['handing']['remote']} unfinished)"
+                     if r["handing"] else ""))
             print(f"     [{', '.join(r['stores']) or 'no stores yet'}]  "
                   f"{r['sessions']} session(s), {r['bytes']/1024:.0f} KiB, "
                   f"last {r['last_activity'] or '—'}")
@@ -3631,9 +3649,10 @@ def cmd_doctor(args):
     return 0
 
 def cmd_backup(args):
-    if args.offsite or args.fetch_offsite:
+    if args.offsite or args.fetch_offsite or args.offsite_list:
         try:
-            st = offsite_backup(pull=args.fetch_offsite)
+            st = offsite_list() if args.offsite_list else \
+                offsite_fetch(args.offsite_from) if args.fetch_offsite else offsite_push()
         except HandoverError as e:
             if not args.quiet:
                 print(str(e), file=sys.stderr)
@@ -3641,9 +3660,27 @@ def cmd_backup(args):
             return 1
         if args.json:
             print(json.dumps(st, indent=2))
-        elif not args.quiet:
-            print(f"{'fetched from' if st['pulled'] else 'copied to'} {st['machine']}: "
-                  f"{st['files']} file(s), {_human(st['bytes'])}")
+        elif args.quiet:
+            pass
+        elif args.offsite_list:
+            print(f"backups kept on {st['remote']}:" if st["folders"]
+                  else f"{st['remote']} keeps no backups yet")
+            for f in st["folders"]:
+                print(f"   {f['name']:<20} {f['id'] or 'older aht':<14} "
+                      f"{f['projects']} project(s), {f['files']} backup(s), "
+                      f"{_human(f['bytes'])}, last {_clock(f['updated'])}"
+                      + ("   (this computer)" if f["mine"] else ""))
+        elif st["pulled"]:
+            print(f"fetched from {st['machine']} ({st['from']['name']}): "
+                  f"{st['files']} backup(s), {_human(st['bytes'])}")
+            for k in st["renamed"]:
+                print(f"   kept next to ours (another size): {k}")
+        else:
+            print(f"copied to {st['machine']}: {st['files']} backup(s), {_human(st['bytes'])}"
+                  + (f"; {st['removed']} older one(s) removed there" if st["removed"] else ""))
+            if st["legacy"]:
+                print("   left alone there (an older aht's, not all of them are here): "
+                      + ", ".join(st["legacy"]))
         return 0
     if args.list:
         reg = load_registry()
@@ -4184,8 +4221,22 @@ SCRATCH_MAX_BYTES = 100 * 1024 * 1024
 class HandoverError(Exception):
     pass
 
-def handover_supported() -> bool:
+class LinkError(HandoverError):
+    """The link dropped or the other machine went quiet: whether the last
+    step happened there is not known."""
+
+def can_send_projects() -> bool:
+    """Projects can move between this machine and another: handover, take
+    back, keep in sync, the night shift and the offsite copy."""
     return os.name != "nt" and not getattr(sys, "frozen", False)
+
+def can_reach_machines() -> bool:
+    """Other machines can be asked: their sessions, notices, search and
+    backups.  For now the same as can_send_projects(); in the end only an ssh
+    client is needed."""
+    return can_send_projects()
+
+handover_supported = can_send_projects      # the old name, for untouched callers
 
 def handover_skip() -> list:
     extra = cfg_get("handover_excludes") or []
@@ -4197,8 +4248,19 @@ def _skip_name(name: str, skip) -> bool:
 def _nfc(s: str) -> str:
     return unicodedata.normalize("NFC", s)
 
+_DRIVE = re.compile(r"[A-Za-z]:(?:[\\/]|$)")
+
+def _is_abs(p) -> bool:
+    """An absolute path on any of the three systems: /x, C:\\x, C:/x, \\\\server\\x."""
+    p = str(p or "")
+    return p.startswith(("/", "\\\\")) or bool(_DRIVE.match(p))
+
 def _inside(path: str, root: str) -> bool:
-    path, root = _nfc(str(path)).rstrip("/"), _nfc(str(root)).rstrip("/")
+    path, root = _nfc(str(path)), _nfc(str(root))
+    if _DRIVE.match(root) or root.startswith("\\\\"):
+        # a Windows path: either separator, and a drive's names ignore case
+        path, root = path.replace("\\", "/").casefold(), root.replace("\\", "/").casefold()
+    path, root = path.rstrip("/"), root.rstrip("/")
     return path == root or path.startswith(root + "/")
 
 def handover_dir(uid: str) -> Path:
@@ -4216,6 +4278,77 @@ def _human(n) -> str:
         if n < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
         n /= 1024
+
+# ---- this install, and the copy of it that runs on the other machine ------- #
+
+AGENT_PROTOCOL = 2      # what the far end speaks; its probe also names its ops
+
+def _core_text() -> bytes:
+    """The core's own bytes: what runs on the other machine.  In the Windows
+    exe it travels as core/aht.py next to the program."""
+    if getattr(sys, "frozen", False):
+        p = Path(getattr(sys, "_MEIPASS", "") or ".") / "core" / "aht.py"
+    else:
+        p = Path(__file__).resolve()
+    try:
+        return p.read_bytes()
+    except OSError:
+        raise HandoverError("this build of aht lacks its own core (core/aht.py)")
+
+_CORE_ID = []
+
+def core_id() -> str:
+    """The first 12 hex digits of the core's sha256: the far copy's name."""
+    if not _CORE_ID:
+        _CORE_ID.append(hashlib.sha256(_core_text()).hexdigest()[:12])
+    return _CORE_ID[0]
+
+def machine_path() -> Path:
+    return aht_home() / "machine.json"
+
+def machine_id(create: bool = False):
+    """This install's own id: 12 random hex digits in ~/.aht/machine.json, not
+    in config.json, so a copied config cannot clone it.  Only made when
+    `create`: a copy of aht that another machine runs here never makes one."""
+    try:
+        d = json.loads(machine_path().read_text())
+        if re.fullmatch(r"[0-9a-f]{12}", str(d.get("id") or "")):
+            return d["id"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not create:
+        return None
+    d = {"id": os.urandom(6).hex(), "name": _here(), "created": _now()}
+    p = machine_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p, "x") as fh:            # two at once: the first one wins
+            json.dump(d, fh, indent=1)
+        return d["id"]
+    except FileExistsError:
+        mid = machine_id()
+        if mid:
+            return mid
+    _write_json(p, d)                       # there, but unreadable
+    return d["id"]
+
+def _sandbox_env(home: str) -> dict:
+    """The variables aht runs with on a test machine or in a sandbox: a home of
+    its own with aht's state and Claude's store in it, no badges, notices,
+    backups or syncs, and a tmux server of its own."""
+    return {"HOME": home, "AHT_HOME": home + "/.aht",
+            "AHT_ROOT_CLAUDE": home + "/.claude/projects",
+            "AHT_NO_ICONS": "1", "AHT_NO_NOTIFY": "1", "AHT_NO_BACKUP": "1",
+            "AHT_NO_MIRROR": "1", "AHT_TMUX_SOCKET": "aht-sbx"}
+
+def _tmux_socket() -> list:
+    s = os.environ.get("AHT_TMUX_SOCKET")
+    return ["-L", s] if s else []
+
+def _test_drop(step: str, where: str) -> None:
+    """Tests: AHT_TEST_DROP=<step> cuts the link right after that step."""
+    if os.environ.get("AHT_TEST_DROP") == step:
+        raise LinkError(f"the link to {where} dropped after “{step}” (test)")
 
 # ---- what is running in a folder ------------------------------------------ #
 
@@ -4289,11 +4422,15 @@ def running_sessions(inside: str = None, home: Path = None) -> list:
         cwd = str(rec.get("cwd") or "")
         if inside and not _inside(os.path.realpath(cwd), inside):
             continue
+        wait, name = rec.get("waitingFor"), rec.get("name")
         out.append({"pid": pid, "cwd": cwd, "session": rec.get("sessionId"),
                     "status": str(rec.get("status") or "unknown"),
-                    "waiting_for": rec.get("waitingFor"),
+                    # it may quote a command with a key in it, and it goes
+                    # on to other machines and the phone; so may a name
+                    "waiting_for": redact(wait) if isinstance(wait, str) else None,
                     "since": _when(rec.get("statusUpdatedAt")),
-                    "kind": rec.get("kind"), "name": rec.get("name")})
+                    "kind": rec.get("kind"),
+                    "name": redact(name) if isinstance(name, str) else name})
     return out
 
 def processes_inside(path: str) -> list:
@@ -4368,11 +4505,23 @@ def _activity_blockers(act: dict, where: str) -> list:
 
 # ---- manifests -------------------------------------------------------------- #
 
+def _rel_key(p: str, root: str) -> tuple:
+    """(key, name on disk) of `p` below `root`: the key always uses "/" and
+    NFC, so a Mac's decomposed names and Windows' separators compare equal
+    to Linux's."""
+    rel = os.path.relpath(p, root)
+    if os.sep != "/":
+        rel = rel.replace(os.sep, "/")
+    return _nfc(rel), rel
+
 def tree_manifest(root: str, skip=None) -> dict:
-    """{files: {rel: [size, mtime] | ["l", target]}, raw: {rel: name on disk}}
-    — `rel` is NFC so a Mac's decomposed names compare equal to Linux's."""
+    """{files: {key: [size, mtime] | ["l", target]}, raw: {key: name on disk},
+    dirs: [key], modes: {key: mode}, twins: {key: [names]}} — `dirs` lists
+    every folder, so an empty one (a git repo's refs/heads) is made again;
+    `modes` the files with an executable bit (not on Windows); `twins` the
+    names that are one key in two Unicode forms."""
     skip = list(handover_skip() if skip is None else skip)
-    files, raw = {}, {}
+    files, raw, dirs, modes, twins = {}, {}, [], {}, {}
     root = str(root)
     for dp, dns, fns in os.walk(root):
         keep = []
@@ -4383,6 +4532,7 @@ def tree_manifest(root: str, skip=None) -> dict:
                 fns.append(d)               # a linked folder travels as a link
             else:
                 keep.append(d)
+                dirs.append(_rel_key(os.path.join(dp, d), root)[0])
         dns[:] = keep
         for n in fns:
             if _skip_name(n, skip):
@@ -4401,12 +4551,16 @@ def tree_manifest(root: str, skip=None) -> dict:
                 val = [st.st_size, int(st.st_mtime)]
             else:
                 continue
-            rel = os.path.relpath(p, root)
-            key = _nfc(rel)
+            key, rel = _rel_key(p, root)
+            if key in files:
+                twins.setdefault(key, [raw.get(key) or key]).append(rel)
             files[key] = val
             if key != rel:
                 raw[key] = rel
-    return {"files": files, "raw": raw}
+            if os.name != "nt" and val[0] != "l" and st.st_mode & 0o111:
+                modes[key] = stat.S_IMODE(st.st_mode)
+    return {"files": files, "raw": raw, "dirs": sorted(dirs), "modes": modes,
+            "twins": twins}
 
 def file_sha256(path, limit: int = None) -> str:
     h = hashlib.sha256()
@@ -4487,10 +4641,16 @@ def _ssh_opts() -> list:
         os.chmod(run, 0o700)
     except OSError:
         pass
-    return ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
-            "-o", "ControlMaster=auto", "-o", f"ControlPath={run}/ssh-%C",
-            "-o", "ControlPersist=60"]
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+    # Windows' ssh stops with "getsockname failed: Not a socket" when any of
+    # the Control options is set.  And a socket's path holds 104 bytes on a
+    # Mac: with %C's 40 hex digits and the 17 characters ssh adds while it
+    # makes one, a long aht folder would stop every connection
+    if os.name == "nt" or len(str(run).encode("utf-8")) + 62 > 103:
+        return opts
+    return opts + ["-o", "ControlMaster=auto", "-o", f"ControlPath={run}/ssh-%C",
+                   "-o", "ControlPersist=60"]
 
 def _tailscale_exe():
     return os.environ.get("AHT_TAILSCALE") or find_tool("tailscale") or next(
@@ -4506,7 +4666,7 @@ def tailscale_address(host: str):
         return None
     try:
         r = subprocess.run([ts, "status", "--json"], capture_output=True, text=True,
-                           timeout=15, cwd="/")
+                           timeout=15, cwd="/", **_NO_WINDOW)
         peers = (json.loads(r.stdout).get("Peer") or {}).values()
     except Exception:
         return None
@@ -4539,16 +4699,35 @@ _STAT_RE = {
 def _num(s: str) -> int:
     return int(re.sub(r"[^\d]", "", s) or 0)
 
+# a program aht starts on Windows gets no console window of its own (an ssh
+# run from the tray would flash one)
+_NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
+
+WINDOWS_FAR = ("aht cannot ask a Windows machine yet. On the PC, use Bring Here, "
+               "Pick Up or Leave a Note.")
+
+def _decoded(r):
+    """A finished run's output as text: bytes travel, UTF-8 is read here (a
+    Windows console's code page would garble names)."""
+    return subprocess.CompletedProcess(r.args, r.returncode,
+                                       (r.stdout or b"").decode("utf-8", "replace"),
+                                       (r.stderr or b"").decode("utf-8", "replace"))
+
 # ---- a remote machine ------------------------------------------------------- #
 
 class Remote:
     """One of the user's other machines.  `ssh` is the usual user@host; `root`
-    (tests) makes a local directory stand in for the machine instead."""
+    (tests) makes a local directory stand in for the machine instead.  With
+    `sandbox` (tests on a real machine) everything there happens inside that
+    folder: its own home, aht, Claude store and tmux server, and the projects
+    under it."""
 
     def __init__(self, name: str, spec: dict):
         self.name = name
         self.target = str(spec.get("ssh") or "")
         self.root = str(spec.get("root") or "").rstrip("/")
+        self.sandbox = str(spec.get("sandbox") or "").rstrip("/") if self.target else ""
+        self.system = spec.get("system")
         self.claude = spec.get("claude")
         self.info = {}
         self.on_percent = None          # called with rsync's percentage
@@ -4563,7 +4742,7 @@ class Remote:
             user, at, host = self.target.rpartition("@")
             try:
                 g = subprocess.run(["ssh", "-G", host], capture_output=True, text=True,
-                                   timeout=10, cwd="/").stdout
+                                   timeout=10, cwd="/", **_NO_WINDOW).stdout
                 real = next((l.split(None, 1)[1] for l in g.splitlines()
                              if l.startswith("hostname ")), host)
             except Exception:
@@ -4589,67 +4768,121 @@ class Remote:
         return bool(self.root) and not self.target
 
     def path(self, p: str) -> str:
-        return self.root + p if self.local else p
+        base = self.root if self.local else self.sandbox
+        return base + p if base else p
 
     def spec(self, remote_abs: str) -> str:
         return remote_abs if self.local else f"{self.dest}:{remote_abs}"
 
     def _env(self) -> dict:
-        home = self.root + "/home"
         e = {k: v for k, v in os.environ.items()
-             if not k.startswith("AHT_") or k == "AHT_CLAUDE"}
-        e.update(HOME=home, AHT_HOME=home + "/.aht",
-                 AHT_ROOT_CLAUDE=home + "/.claude/projects",
-                 AHT_NO_ICONS="1", AHT_NO_NOTIFY="1", AHT_NO_BACKUP="1",
-                 AHT_NO_MIRROR="1")
+             if not k.startswith("AHT_") or k in ("AHT_CLAUDE", "AHT_ITERM_TABS")}
+        e.update(_sandbox_env(self.root + "/home"))
+        if os.name == "nt":
+            e["USERPROFILE"] = e["HOME"]        # Windows' Path.home()
         if os.environ.get("AHT_REMOTE_PATH"):
             e["PATH"] = os.environ["AHT_REMOTE_PATH"] + os.pathsep + e.get("PATH", "")
         if os.environ.get("AHT_REMOTE_CLAUDE"):     # tests: another version there
             e["AHT_CLAUDE"] = os.environ["AHT_REMOTE_CLAUDE"]
         return e
 
-    def sh(self, script: str, stdin: str = None, timeout: float = 120):
-        kw = {"input": stdin, "capture_output": True, "text": True,
-              "timeout": timeout, "cwd": "/"}
+    def _sandboxed(self, script: str) -> str:
+        """`script` with the sandbox's variables set first, and its bin folder
+        (stand-in agents) first on PATH.  Its tmux server's socket is inside
+        it too (TMUX_TMPDIR), not in that machine's /tmp."""
+        env = dict(_sandbox_env(self.sandbox + "/home"), TMUX_TMPDIR=self.sandbox + "/tmux")
+        return ("export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+                + f" PATH={shlex.quote(self.sandbox + '/bin')}:\"$PATH\" && "
+                + 'mkdir -p "$HOME" "$TMUX_TMPDIR" && ' + script)
+
+    def sh(self, script: str, stdin=None, timeout: float = 120, raw: bool = False):
+        """Run a sh script there.  `raw`: as it is, without the sandbox."""
+        if self.system == "Windows" and not raw:
+            raise HandoverError(WINDOWS_FAR)
+        if isinstance(stdin, str):
+            stdin = stdin.encode("utf-8")
+        kw = {"input": stdin, "capture_output": True, "timeout": timeout, "cwd": "/",
+              **_NO_WINDOW}
         try:
             if self.local:
                 Path(self.root + "/home").mkdir(parents=True, exist_ok=True)
-                return subprocess.run(["/bin/sh", "-c", script], env=self._env(), **kw)
-            r = subprocess.run(["ssh"] + self.ssh_opts() + [self.dest, script], **kw)
+                r = subprocess.run(["/bin/sh", "-c", script], env=self._env(), **kw)
+            else:
+                if self.sandbox and not raw:
+                    script = self._sandboxed(script)
+                r = subprocess.run(["ssh"] + self.ssh_opts() + [self.dest, script], **kw)
         except subprocess.TimeoutExpired:
-            raise HandoverError(f"{self.name} did not answer within {timeout:.0f} s")
+            raise LinkError(f"{self.name} did not answer within {timeout:.0f} s")
+        r = _decoded(r)
         if r.returncode == 255:
-            raise HandoverError(f"cannot reach {self.name} ({self.target}): "
-                                + ((r.stderr or "").strip().splitlines() or ["no answer"])[-1])
+            raise LinkError(f"cannot reach {self.name} ({self.target}): "
+                            + ((r.stderr or "").strip().splitlines() or ["no answer"])[-1])
         return r
 
+    def check_shell(self) -> None:
+        """Before the first sh script to a machine: which shell answers there.
+        `echo aht-os %OS% $env:OS` is harmless in sh, cmd.exe and PowerShell,
+        and the two Windows shells name Windows_NT in it.  A Windows answer
+        stops here, so nothing is made on a PC (cmd.exe would make folders
+        named -p and $HOME)."""
+        if self.local:
+            return
+        r = self.sh("echo aht-os %OS% $env:OS", timeout=60, raw=True)
+        if "Windows_NT" in (r.stdout or ""):
+            self.system = "Windows"
+            raise HandoverError(WINDOWS_FAR)
+
     def push_agent(self) -> None:
-        """The other side runs this very file, so both ends always agree."""
-        r = self.sh('mkdir -p "$HOME/.aht/remote" && chmod 700 "$HOME/.aht/remote" && '
-                    'cat > "$HOME/.aht/remote/aht.py.new" && '
-                    'mv "$HOME/.aht/remote/aht.py.new" "$HOME/.aht/remote/aht.py"',
-                    stdin=Path(__file__).resolve().read_text(encoding="utf-8"))
+        """The other side runs this very file, so both ends always agree.  It
+        is named after its checksum and written under a name of its own
+        first; the newest 3 stay, and the aht.py older versions used goes."""
+        if self.local:
+            return                          # a test machine runs the core itself
+        cid, tmp = core_id(), f".aht-new-{os.urandom(4).hex()}"
+        r = self.sh('d="$HOME/.aht/remote" && mkdir -p "$d" && chmod 700 "$d" && '
+                    f'cat > "$d/{tmp}" && mv -f "$d/{tmp}" "$d/aht-{cid}.py" && '
+                    'rm -f "$d/aht.py" "$d/aht.py.new" && cd "$d" && '
+                    'ls -t aht-*.py | tail -n +4 | while read -r f; do rm -f "$f"; done',
+                    stdin=_core_text())
         if r.returncode != 0:
             raise HandoverError(f"could not prepare {self.name}: "
                                 + (r.stderr or "").strip()[-200:])
 
+    def _run_local(self, data: bytes, timeout: float):
+        """A test machine: the core itself with that machine's home, no sh."""
+        Path(self.root + "/home").mkdir(parents=True, exist_ok=True)
+        try:
+            return _decoded(subprocess.run(_aht_argv() + ["_agent"], input=data,
+                                           capture_output=True, timeout=timeout,
+                                           cwd="/", env=self._env(), **_NO_WINDOW))
+        except subprocess.TimeoutExpired:
+            raise LinkError(f"{self.name} did not answer within {timeout:.0f} s")
+
     def agent(self, op: str, timeout: float = 120, **req) -> dict:
+        """One operation there.  The copy of aht there is asked first; when it
+        is not there yet ("can't open file"), it is sent and asked again."""
         req["op"] = op
-        py = shlex.quote(sys.executable) if self.local else "python3"
-        r = self.sh(f'exec {py} "$HOME/.aht/remote/aht.py" _agent',
-                    stdin=json.dumps(req), timeout=timeout)
+        data = json.dumps(req).encode("utf-8")
+        if self.local:
+            r = self._run_local(data, timeout)
+        else:
+            line = f'exec python3 "$HOME/.aht/remote/aht-{core_id()}.py" _agent'
+            r = self.sh(line, stdin=data, timeout=timeout)
+            if r.returncode == 2 and "can't open file" in (r.stderr or ""):
+                self.push_agent()
+                r = self.sh(line, stdin=data, timeout=timeout)
         i = (r.stdout or "").rfind(AGENT_MARK)
         if i < 0:
             raise HandoverError(f"{self.name} gave no usable answer to “{op}”: "
                                 + ((r.stderr or r.stdout or "").strip()[-300:]
                                    or "python3 missing?"))
         res = json.loads(r.stdout[i + len(AGENT_MARK):])
+        _test_drop(op, self.name)
         if not res.get("ok"):
             raise HandoverError(f"{self.name}: {res.get('error') or op + ' failed'}")
         return res
 
     def connect(self, path: str = None) -> dict:
-        self.push_agent()
         self.info = self.agent("probe", path=self.path(path) if path else None,
                                claude=self.claude)
         return self.info
@@ -4657,9 +4890,10 @@ class Remote:
     def rsync(self, src: str, dst: str, *, delete: bool = False,
               backup_dir: str = None, skip=(), files_from: list = None,
               dry: bool = False, update: bool = False, include: list = None,
-              progress: bool = False) -> dict:
+              progress: bool = False, add_only: bool = False) -> dict:
         """One rsync run between this machine and the remote.  Paths ending in
-        a slash are directories whose CONTENT is synced."""
+        a slash are directories whose CONTENT is synced.  `add_only`: a file
+        that is there already is never written."""
         rs = find_rsync()
         if not rs:
             raise HandoverError("no usable rsync on this machine (version 3 or "
@@ -4687,6 +4921,8 @@ class Remote:
             cmd.append("-n")
         if update:
             cmd.append("--update")
+        if add_only:
+            cmd.append("--ignore-existing")
         if delete:
             cmd.append("--delete")
         if backup_dir:
@@ -4795,8 +5031,8 @@ def _tmux(*args, timeout: float = 15):
     if not exe:
         return None
     try:
-        return subprocess.run([exe, *args], capture_output=True, text=True,
-                              timeout=timeout, cwd="/")
+        return subprocess.run([exe, *_tmux_socket(), *args], capture_output=True,
+                              text=True, timeout=timeout, cwd="/")
     except Exception:
         return None
 
@@ -4809,6 +5045,27 @@ def _tmux_screen(name: str, lines: int = 14) -> list:
     if not r or r.returncode != 0:
         return []
     return [l.rstrip() for l in r.stdout.splitlines() if l.strip()][-lines:]
+
+def _quiet_value(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+def _can_write(folder: str) -> bool:
+    """Whether a file can be made in `folder`: tried, not asked, because macOS
+    privacy rules can make os.access say yes and the write fail."""
+    p = os.path.join(folder, f".aht-write-test-{os.getpid()}-{os.urandom(3).hex()}")
+    try:
+        with open(p, "x"):
+            pass
+    except OSError:
+        return False
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+    return True
 
 def _agent_probe(req: dict) -> dict:
     path = req.get("path")
@@ -4827,14 +5084,17 @@ def _agent_probe(req: dict) -> dict:
             "tailscale_if": os.path.exists("/sys/class/net/tailscale0"),
             "logged_in": (claude_home() / ".credentials.json").is_file()
             if not IS_MAC else None,     # macOS keeps the login in the keychain
-            "sessions_open": len(running_sessions())}
+            "sessions_open": len(running_sessions()),
+            "protocol": AGENT_PROTOCOL, "ops": sorted(AGENT_OPS),
+            "core_id": _quiet_value(core_id),
+            "machine_id": machine_id(create=False)}
     if path:
         anc = Path(path)
         while not anc.exists() and anc != anc.parent:
             anc = anc.parent
         info["path_exists"] = os.path.isdir(path)
         info["path_base"] = str(anc)
-        info["path_writable"] = os.access(str(anc), os.W_OK | os.X_OK)
+        info["path_writable"] = _can_write(str(anc))
         try:
             info["path_open_to_others"] = bool(os.stat(path).st_mode & 0o077) \
                 if os.path.isdir(path) else None
@@ -4842,8 +5102,7 @@ def _agent_probe(req: dict) -> dict:
             info["path_open_to_others"] = None
         info["path_real"] = os.path.realpath(path)
         try:
-            v = os.statvfs(str(anc))
-            info["free_bytes"] = v.f_bavail * v.f_frsize
+            info["free_bytes"] = shutil.disk_usage(str(anc)).free
         except OSError:
             pass
         info.update(activity_in(info["path_real"]) if info["path_exists"]
@@ -4854,7 +5113,7 @@ def _agent_manifest(req: dict) -> dict:
     out = {}
     for name, spec in (req.get("trees") or {}).items():
         out[name] = tree_manifest(spec["path"], spec.get("skip") or []) \
-            if os.path.isdir(spec["path"]) else {"files": {}, "raw": {}}
+            if os.path.isdir(spec["path"]) else tree_manifest(os.devnull, [])
     return {"ok": True, "trees": out}
 
 def _agent_hash(req: dict) -> dict:
@@ -4978,7 +5237,8 @@ def _agent_install_claude(req: dict) -> dict:
 
 def _agent_start(req: dict) -> dict:
     path, name = req["path"], req["name"]
-    mux = shutil.which("byobu") or shutil.which("tmux")
+    # a tmux server of its own (a sandbox) is plain tmux: byobu picks its own
+    mux = (None if _tmux_socket() else shutil.which("byobu")) or shutil.which("tmux")
     if not shutil.which("tmux"):
         return {"ok": False, "error": "tmux is not installed (byobu needs it too)"}
     if running_sessions(inside=path):
@@ -5005,7 +5265,8 @@ def _agent_start(req: dict) -> dict:
             "\"$st\"; sleep 60"
             % (shlex.quote(path), " ".join(shlex.quote(a) for a in argv)))
     (run / "command.txt").write_text(line + "\n")
-    new = ["new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", path, line]
+    new = _tmux_socket() + ["new-session", "-d", "-s", name, "-x", "200", "-y", "50",
+                            "-c", path, line]
     r = subprocess.run([mux] + new, capture_output=True, text=True, timeout=60)
     if r.returncode != 0 and os.path.basename(mux) == "byobu":
         mux = shutil.which("tmux")
@@ -5013,6 +5274,15 @@ def _agent_start(req: dict) -> dict:
     if r.returncode != 0:
         return {"ok": False, "error": "could not start the terminal session: "
                 + (r.stderr or r.stdout).strip()[-200:]}
+    # the trace of this attempt's start, for resolve_handing: the session
+    # may end before anyone asks whether it started
+    for old in run.glob("attempt-*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    if re.fullmatch(r"[0-9A-Za-z-]{1,40}", str(req.get("attempt") or "")):
+        (run / f"attempt-{req['attempt']}").write_text(_now() + "\n")
     started, attention, screen = False, None, []
     end = time.time() + float(req.get("wait") or 12)
     while time.time() < end:
@@ -5076,14 +5346,40 @@ def _agent_peek(req: dict) -> dict:
     return {"ok": True, "window": bool(name) and _tmux_has(name),
             "screen": _tmux_screen(name) if name else [], **act}
 
-def _agent_prune(req: dict) -> dict:
-    """Drop what earlier syncs set aside, beyond the newest few."""
-    base, keep, n = Path(req["dir"]), int(req.get("keep") or 5), 0
-    if base.is_dir():
-        for d in sorted(p for p in base.iterdir() if p.is_dir())[:-keep]:
-            shutil.rmtree(d, ignore_errors=True)
+ASIDE_KEEP, ASIDE_DAYS = 5, 30      # set-aside folders: the newest 5, and every
+                                    # one younger than 30 days
+
+def _stamp_time(name: str, path=None):
+    """When a folder named by _stamp() was made; else its mtime."""
+    m = re.match(r"(\d{8}-\d{6})", name)
+    if m:
+        try:
+            return time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))
+        except ValueError:
+            pass
+    try:
+        return os.stat(path).st_mtime if path else None
+    except OSError:
+        return None
+
+def prune_set_asides(base, keep: int = ASIDE_KEEP, days: float = ASIDE_DAYS) -> int:
+    """Drop what earlier transfers set aside in `base`, keeping the newest
+    `keep` folders and every one younger than `days` days."""
+    base = Path(base)
+    if not base.is_dir():
+        return 0
+    rows = sorted((_stamp_time(d.name, d) or 0, d.name) for d in base.iterdir() if d.is_dir())
+    old, n = time.time() - days * 86400, 0
+    for t, name in rows[:-keep] if keep > 0 else rows:
+        if t < old:
+            shutil.rmtree(base / name, ignore_errors=True)
             n += 1
-    return {"ok": True, "pruned": n}
+    return n
+
+def _agent_prune(req: dict) -> dict:
+    """Drop what earlier syncs set aside: see prune_set_asides."""
+    return {"ok": True, "pruned": prune_set_asides(req["dir"],
+                                                   int(req.get("keep") or ASIDE_KEEP))}
 
 AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "hash": _agent_hash, "prepare": _agent_prepare,
@@ -5092,7 +5388,20 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "close": _agent_close, "written-by": _agent_written_by,
              "board": lambda req: _agent_board(req),
              "udp-echo": _agent_udp_echo,
-             "prune": _agent_prune}
+             "prune": _agent_prune,
+             "offsite-list": lambda req: _agent_offsite_list(req),
+             "offsite-prune": lambda req: _agent_offsite_prune(req),
+             "offsite-adopt": lambda req: _agent_offsite_adopt(req)}
+
+def cmd_core(args):
+    """`aht _core --id`: the id of the core this build carries (the name of
+    its copy on other machines)."""
+    try:
+        print(core_id())
+    except HandoverError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    return 0
 
 def cmd_agent(args):
     try:
@@ -5194,7 +5503,7 @@ def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dic
                         if inp.get("status"):
                             tasks[str(inp["taskId"])]["status"] = inp["status"]
                     fp = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
-                    if not (isinstance(fp, str) and fp.startswith("/")):
+                    if not (isinstance(fp, str) and _is_abs(fp)):
                         continue
                     if _inside(fp, project):
                         if b.get("name") in ("Write", "Edit", "NotebookEdit"):
@@ -5210,7 +5519,36 @@ def session_digest(jsonl, project: str, turns: int = 8, tail: int = None) -> dic
     d["outside"] = d["outside"][-15:]
     d["todos"] = [x for x in d["todos"] + list(tasks.values()) if isinstance(x, dict)
                   and x.get("status") not in ("completed", "deleted")]
+    d["title"] = redact(str(d["title"])) if d["title"] else None     # it is shown and sent
     return d
+
+RELAYS_KEEP = 12        # closed relays kept in a project's .aht/handover
+
+def prune_relays(d) -> int:
+    """One prune for a project's .aht/handover, whatever wrote there last:
+    every open relay stays, and the newest RELAYS_KEEP closed ones.  A summary
+    from before relays (`*-to-*.md`, a handover's or a switch's) counts as a
+    closed one."""
+    d = Path(d)
+    closed = []                     # (name to sort by, files that make it up)
+    try:
+        for f in d.glob("relay-*.json"):
+            rid = f.name[len("relay-"):-len(".json")]
+            if (d / f"relay-{rid}.closed").is_file():
+                closed.append((rid, [d / f"relay-{rid}{x}"
+                                     for x in (".json", ".md", ".closed", ".told")]))
+        closed += [(f.name, [f]) for f in d.glob("*-to-*.md")]
+    except OSError:
+        return 0
+    n = 0
+    for _name, files in sorted(closed)[:-RELAYS_KEEP]:
+        for f in files:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        n += 1
+    return n
 
 def scratch_dir(real: str, sid: str):
     """Where the agent CLI keeps a session's own scratch files."""
@@ -5237,7 +5575,7 @@ def write_brief(real: str, sid, dig: dict, here: str, there: str,
          f"- From **{here}** ({mine}) to **{there}** ({theirs}), {when}",
          f"- Folder: `{real}` (the same path on both machines)"]
     if sid:
-        L.append(f"- Session: {dig.get('title') or 'untitled'} — `{sid}`"
+        L.append(f"- Session: {redact(dig.get('title') or 'untitled')} — `{sid}`"
                  + (f", Claude Code {dig['version']}" if dig.get("version") else ""))
         L.append(f"- Continue it with: `claude --resume {sid}`")
     if task:
@@ -5259,8 +5597,7 @@ def write_brief(real: str, sid, dig: dict, here: str, there: str,
         L += ["", "## Carried along besides the project", ""]
         L += [f"- `{p}`" for p in carried]
     (out / name).write_text("\n".join(L) + "\n", encoding="utf-8")
-    for old in sorted(out.glob("*-to-*.md"))[:-5]:
-        old.unlink()
+    prune_relays(out)
     note = [f"[aht] This session was handed over from “{here}” ({mine}) to "
             f"“{there}” ({theirs}) on {when}. The project folder and this "
             f"conversation's history came along; the folder's path is unchanged.",
@@ -5435,7 +5772,11 @@ def mosh_usable(rem: Remote, test: bool = False) -> bool:
     return bool(spec.get("udp"))
 
 def attach_command(rem: Remote, mux: str, name: str) -> list:
-    inner = [mux or "tmux", "attach", "-t", name]
+    # a test machine or a sandbox has a tmux server of its own
+    sock = ["-L", _sandbox_env("")["AHT_TMUX_SOCKET"]] if rem.local or rem.sandbox else []
+    inner = [mux or "tmux", *sock, "attach", "-t", name]
+    if rem.sandbox:                     # whose socket is inside the sandbox
+        inner = ["env", "TMUX_TMPDIR=" + shlex.quote(rem.sandbox + "/tmux")] + inner
     if rem.local:
         return inner
     if mosh_usable(rem):
@@ -5549,7 +5890,7 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
     if not dry:
         rem.agent("prepare", dirs=[rpath, f"{rclaude}/projects", f"{rclaude}/file-history",
                                    f"{rclaude}/plans", os.path.dirname(aside)],
-                  their_home=str(Path.home()))
+                  their_home=rem.path(str(Path.home())))
     res["project"] = rem.rsync(real + "/", rem.spec(rpath + "/"), delete=True,
                                backup_dir=aside + "/project", skip=handover_skip(),
                                dry=dry, progress=progress)
@@ -5570,7 +5911,7 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
         for src, sub, inc in side:
             if inc:
                 r = rem.rsync(str(src) + "/", rem.spec(f"{rclaude}/{sub}/"),
-                              include=inc, dry=dry)
+                              include=inc, backup_dir=f"{aside}/{sub}", dry=dry)
                 res["history"]["bytes"] = res["history"].get("bytes", 0) + r.get("bytes", 0)
     for p in _extras(entry):
         isdir = os.path.isdir(p)
@@ -5583,7 +5924,7 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
         res["extras"].append({"path": p, **r})
     if not dry:
         try:
-            rem.agent("prune", dir=os.path.dirname(aside), keep=5)
+            rem.agent("prune", dir=os.path.dirname(aside), keep=ASIDE_KEEP)
         except HandoverError:
             pass
     return res
@@ -5592,7 +5933,7 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
 
 def mirror_due(entry: dict, now: float = None) -> bool:
     m = entry.get("mirror") or {}
-    if not m.get("enabled") or entry.get("away"):
+    if not m.get("enabled") or m.get("paused") or entry.get("away") or entry.get("handing"):
         return False
     try:
         every = float(cfg_get("mirror_interval_minutes", 30)) * 60
@@ -5601,18 +5942,68 @@ def mirror_due(entry: dict, now: float = None) -> bool:
     last = max(float(m.get("synced_at") or 0), float(m.get("tried_at") or 0))
     return (now or time.time()) - last >= every
 
+def _update_mirror(uid: str, **fields) -> None:
+    """Set fields of a project's Keep in sync record as the registry has it
+    now: a Release may have paused it meanwhile."""
+    with Lock():
+        reg = load_registry()
+        e = reg["projects"].get(uid)
+        if e is None:
+            return
+        e["mirror"] = dict(e.get("mirror") or {}, **fields)
+        save_registry(reg)
+
+def _paused_with(entry: dict, remote: str):
+    """The pause Release put on Keep in sync with `remote`, if there is one."""
+    m = (entry or {}).get("mirror") or {}
+    p = m.get("paused")
+    return p if p and remote and (p.get("remote") or m.get("remote")) == remote else None
+
+def _end_pause(uid: str, remote: str) -> bool:
+    """A handover to the machine Release paused Keep in sync with (or a Take
+    Back from it) has finished: it sent this copy over the one the release
+    left there, and what it replaced is set aside there, so the pause has
+    done its job and the sync goes on once the project is here."""
+    with Lock():
+        reg = load_registry()
+        e = reg["projects"].get(uid)
+        if not _paused_with(e, remote):
+            return False
+        e["mirror"] = {k: v for k, v in e["mirror"].items() if k != "paused"}
+        save_registry(reg)
+    log(f"MIRROR pause with {remote} ends: {e['real_path']} went there again")
+    return True
+
+MIRROR_PAUSED = "paused since the project was released; turn Keep in sync on again to send it"
+
+def _mirror_check(entry: dict, real: str) -> None:
+    if entry.get("away"):
+        raise HandoverError("handed over: the other machine holds the live copy")
+    if entry.get("handing"):
+        raise HandoverError("a handover of it has not finished")
+    if not os.path.isdir(real):
+        raise HandoverError("the folder is missing")
+
 def mirror_project(uid: str, entry: dict, progress: bool = False) -> dict:
     real = os.path.realpath(entry["real_path"])
-    m = dict(entry.get("mirror") or {})
-    row = {"project": real, "remote": m.get("remote")}
-    m["tried_at"] = time.time()
+    m = {"tried_at": time.time()}
+    row = {"project": real, "remote": (entry.get("mirror") or {}).get("remote")}
     try:
-        if entry.get("away"):
-            raise HandoverError("handed over: the other machine holds the live copy")
-        if not os.path.isdir(real):
-            raise HandoverError("the folder is missing")
+        _mirror_check(entry, real)
         with ProjectLock(uid):
-            rem = get_remote(m.get("remote"))
+            # the entry as the registry has it now, not as the pass read it
+            # at its start: a handover, or a Release that paused this sync,
+            # may have come in between (neither can while this lock is held)
+            entry = load_registry().get("projects", {}).get(uid) or {}
+            mm = entry.get("mirror") or {}
+            if mm.get("paused"):
+                return dict(row, status="paused", reason=MIRROR_PAUSED)
+            if not mm.get("enabled"):
+                return dict(row, status="skipped", reason="Keep in sync is off for it now")
+            real = os.path.realpath(entry["real_path"])
+            row.update(project=real, remote=mm.get("remote"))
+            _mirror_check(entry, real)
+            rem = get_remote(mm.get("remote"))
             rem.connect(real)
             row["remote"] = rem.name
             if rem.info.get("sessions") or rem.info.get("processes"):
@@ -5631,7 +6022,7 @@ def mirror_project(uid: str, entry: dict, progress: bool = False) -> dict:
         m["status"] = str(e)
         row.update(status="skipped", reason=str(e))
         warn(f"MIRROR {real}: {e}")
-    _update_entry(uid, mirror=m)
+    _update_mirror(uid, **m)
     return row
 
 def mirror_pass(only_due: bool = False, only: str = None, progress: bool = False) -> list:
@@ -5645,6 +6036,10 @@ def mirror_pass(only_due: bool = False, only: str = None, progress: bool = False
             continue
         if only_due and not mirror_due(e):
             continue
+        if e["mirror"].get("paused"):       # Release paused it: nothing goes there
+            rows.append({"project": e["real_path"], "remote": e["mirror"].get("remote"),
+                         "status": "paused", "reason": MIRROR_PAUSED})
+            continue
         rows.append(mirror_project(uid, e, progress=progress))
     return rows
 
@@ -5652,16 +6047,12 @@ def _spawn_mirror() -> None:
     """From the watcher and the hook: sync what is due, detached, one run at
     a time."""
     try:
-        if os.environ.get("AHT_NO_MIRROR") or not handover_supported():
+        if os.environ.get("AHT_NO_MIRROR") or not can_send_projects():
             return
         reg = load_registry()
         if not any(mirror_due(e) for e in reg.get("projects", {}).values()):
             return
-        subprocess.Popen([sys.executable or "python3", str(Path(__file__).resolve()),
-                          "mirror", "--run", "--due", "--quiet"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, close_fds=True,
-                         start_new_session=True, cwd="/")
+        _spawn_aht(["mirror", "--run", "--due", "--quiet"])
     except Exception:
         pass
 
@@ -5684,7 +6075,8 @@ def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
             and os.path.realpath(e["real_path"]) != home]
     for uid, e in projects.items():
         real, m = e["real_path"], e.get("mirror") or {}
-        if not os.path.isdir(real) or e.get("away") or os.path.realpath(real) == home:
+        if not os.path.isdir(real) or e.get("away") or e.get("handing") \
+                or os.path.realpath(real) == home:
             continue
         if on and any(t != real and _inside(real, t) for t in tops):
             continue            # inside another project: that one's copy carries it
@@ -5713,6 +6105,7 @@ def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
                 continue
             m = dict(e.get("mirror") or {})
             m["enabled"] = on
+            m.pop("paused", None)
             if rem:
                 m["remote"] = rem.name
             e["mirror"] = m
@@ -5769,6 +6162,7 @@ def cmd_mirror(args):
                 entry = reg["projects"][uid]
             m = dict(entry.get("mirror") or {})
             m["enabled"] = bool(args.on)
+            m.pop("paused", None)           # on again (or off): Release's pause ends
             if rem:
                 m["remote"] = rem.name
             entry["mirror"] = m
@@ -5819,7 +6213,8 @@ def cmd_mirror(args):
                 if r.get("synced_at") else "never"
             print(f"   {r['project']}  → {r.get('remote')}   last sync {at}"
                   + ("" if r.get("status") in (None, "ok") else f"   ({r['status']})")
-                  + ("   [handed over]" if r["away"] else ""))
+                  + ("   [handed over]" if r["away"] else "")
+                  + ("   [paused: it was released]" if r.get("paused") else ""))
     return 0
 
 # ---- handover ----------------------------------------------------------------- #
@@ -5839,6 +6234,156 @@ def _emit(args, out: dict, lines: list) -> int:
     if out.get("error"):
         print(f"  ✗ {out['error']}")
     return code
+
+HANDING_GRACE = 180         # s: a younger unfinished handover may still be under way
+HANDING_RELEASE_AFTER = 3600    # s without an answer, then Release is offered
+HANDING_ONLY = ("step", "at", "error", "checked_at", "unreachable_since", "told_release",
+                "extras")
+
+def _clock(v) -> str:
+    """A time as people read it: "14:10" today, else "2026-10-25 14:10"."""
+    t = _when(v)
+    if not t:
+        return str(v or "?")
+    if time.strftime("%Y-%m-%d", time.localtime(t)) == time.strftime("%Y-%m-%d"):
+        return time.strftime("%H:%M", time.localtime(t))
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+def _retire_manifest(hd: Path) -> None:
+    """The record of what left, kept under its time once it is no longer the
+    base of a way back (the newest few stay)."""
+    try:
+        if (hd / "manifest.json").is_file():
+            (hd / "manifest.json").replace(hd / f"manifest-{_stamp()}-{os.urandom(2).hex()}.json")
+        for old in sorted(hd.glob("manifest-*.json"))[:-5]:
+            old.unlink()
+    except OSError:
+        pass
+
+def _unfinished_text(h: dict, real: str) -> str:
+    return (f"a handover of this project to {h.get('remote')} has not finished; aht "
+            "asks that machine again within a few minutes — or release it to work "
+            f"on it here:  aht reclaim {shlex.quote(real)} --release")
+
+def handing_row(h: dict, uid: str = None):
+    """`projects --json` "handing": the record and where it stands — "running"
+    (the handover runs now), "checking" (aht asks the other machine at its
+    next check), "unreachable" (it did not answer); `release`: Release is
+    offered (no answer for an hour)."""
+    if not h:
+        return None
+    row = {k: h.get(k) for k in ("attempt", "step", "remote", "holder", "host", "driven_by",
+                                 "since", "error", "checked_at", "unreachable_since")}
+    busy = False
+    if uid:
+        try:
+            with ProjectLock(uid):
+                pass
+        except HandoverError:
+            busy = True
+    row["state"] = ("running" if busy else
+                    "unreachable" if h.get("unreachable_since") else "checking")
+    row["release"] = bool(h.get("unreachable_since")) and \
+        time.time() - float(h["unreachable_since"]) >= HANDING_RELEASE_AFTER
+    return row
+
+def resolve_handing(uid: str, force: bool = False) -> list:
+    """Finish or undo a handover that was cut off (the link dropped, this
+    machine slept, aht was stopped).  The other machine says what happened:
+    a session runs in the copy there, the copy or its conversation changed
+    since the record of what left, or this attempt's session started there
+    (and has ended since) → it is handed over; only when nothing at all
+    happened there does the project stay here.  When that machine does not
+    answer, the record stays, and after an hour Release is offered.
+    Skipped while a transfer of the project runs; unless `force`, also for
+    3 minutes after a step of an attempt that may still be under way, and
+    for a minute after a machine did not answer.  -> the notices to show."""
+    e = load_registry().get("projects", {}).get(uid) or {}
+    h = e.get("handing")
+    if not h or not can_send_projects():
+        return []
+    now = time.time()
+    if not force:
+        if not h.get("error") and now - float(h.get("at") or 0) < HANDING_GRACE:
+            return []
+        if h.get("unreachable_since") and now - float(h.get("checked_at") or 0) < 55:
+            return []
+    real = e["real_path"]
+    name, there = os.path.basename(real) or real, h.get("remote") or "the other machine"
+    hd = handover_dir(uid)
+    try:
+        lock = ProjectLock(uid).__enter__()
+    except HandoverError:
+        return []                           # a transfer of it runs right now
+    try:
+        try:
+            base = json.loads((hd / "manifest.json").read_text())
+        except Exception:
+            base = {}
+        if base.get("attempt") != h.get("attempt"):
+            base = {}                       # no record of what left in this attempt
+        try:
+            rem = get_remote(h.get("remote"))
+            info = rem.connect(real)
+            runs = bool(info.get("sessions"))
+            changed = talked = started = False
+            if base and not runs:
+                trees = {"project": {"path": rem.path(real), "skip": handover_skip()},
+                         "history": {"path": f"{info['claude_home']}/projects/"
+                                             f"{_key_claude(rem.path(real))}", "skip": []}}
+                if h.get("window") and info.get("home"):
+                    trees["run"] = {"path": f"{info['home']}/.aht/remote/run/{h['window']}",
+                                    "skip": []}
+                now_there = rem.agent("manifest", timeout=900, trees=trees)["trees"]
+                was = base.get("there") or {}
+                changed = now_there["project"]["files"] != was.get("project")
+                talked = now_there["history"]["files"] != (was.get("history") or {})
+                started = f"attempt-{h.get('attempt')}" in \
+                    ((now_there.get("run") or {}).get("files") or {})
+        except HandoverError as err:
+            h2 = dict(h, checked_at=now, error=str(err),
+                      unreachable_since=h.get("unreachable_since") or now)
+            notes = []
+            if now - h2["unreachable_since"] >= HANDING_RELEASE_AFTER and not h.get("told_release"):
+                h2["told_release"] = True
+                notes.append({"kind": "handover", "title": f"{name}: handover unfinished",
+                              "message": f"{there} has not answered since "
+                                         f"{_clock(h2['unreachable_since'])}. To work on "
+                                         f"{name} here, release it in aht; the work on "
+                                         f"{there} stays there.",
+                              "info": {"kind": "handover", "project": real, "remote": there}})
+            _update_entry(uid, handing=h2)
+            return notes
+        dropped = _clock(float(h.get("at") or now))
+        if base and (runs or changed or talked or started):
+            away = {k: v for k, v in h.items() if k not in HANDING_ONLY}
+            _update_entry(uid, away=away, handing=None,
+                          extras=h.get("extras") or e.get("extras"))
+            _end_pause(uid, h.get("remote"))
+            msg = (f"Handover of {name} to {there} finished: "
+                   + ("the session there runs" if runs else
+                      "the copy there was worked on" if changed else
+                      "the conversation went on there" if talked else
+                      "the session there started, and has ended since")
+                   + f" (the link had dropped at {dropped})")
+            title = f"{name} is on {there}"
+            log(f"HANDOVER {real} -> {there}: finished after the link dropped")
+        else:
+            _update_entry(uid, handing=None)
+            _retire_manifest(hd)
+            msg = (f"The handover of {name} to {there} did not finish. The project stays "
+                   "here; " + ("a session runs in the copy there, which aht does not follow"
+                               if runs else "nothing runs there"))
+            title = f"{name} stays here"
+            log(f"HANDOVER {real} -> {there}: did not finish; the project stays here")
+    finally:
+        lock.__exit__(None, None, None)
+    try:
+        apply_badge(real, desired_marks(real, True))
+    except Exception:
+        pass
+    return [{"kind": "handover", "title": title, "message": msg,
+             "info": {"kind": "handover", "project": real, "remote": there}}]
 
 def cmd_handover(args):
     out = {"command": "handover", "applied": False, "blockers": [], "warnings": []}
@@ -5872,12 +6417,19 @@ def cmd_handover(args):
                 _register(reg, uid, real)
                 entry = reg["projects"][uid]
                 save_registry(reg)
+        if (entry or {}).get("handing"):
+            # an earlier attempt was cut off: finish it or undo it first
+            out["warnings"] += [n["message"] for n in resolve_handing(uid, force=True)]
+            entry = _entry_for(load_registry(), real)[1] or entry
         entry = dict(entry or {"real_path": real})
         uid = uid or "untracked"
         if entry.get("away"):
             a = entry["away"]
             out["blockers"].append(f"already handed over to {a.get('remote')} since "
                                    f"{a.get('since')} — take it back first:  aht reclaim")
+            return _emit(args, out, lines)
+        if entry.get("handing"):
+            out["blockers"].append(_unfinished_text(entry["handing"], real))
             return _emit(args, out, lines)
         for p in args.include or []:
             why = _check_extra(p)
@@ -5993,96 +6545,148 @@ def cmd_handover(args):
             if out["outside_not_carried"]:
                 lines.append("   stays here     " + ", ".join(out["outside_not_carried"][:5])
                              + "   (carry with --include <path>)")
+            if _paused_with(entry, rem.name):
+                # Release left work there; this handover replaces it
+                out["ends_pause"] = rem.name
+                out["warnings"].append(
+                    f"the copy that Release left on {rem.name} is replaced by this one "
+                    f"(aht sets it aside there first); Keep in sync with {rem.name} "
+                    "goes on again once the project is back here")
             lines.append("(dry run — pass --apply to do it)")
             return _emit(args, out, lines)
 
-        # (4) do it
+        # (4) do it.  The attempt is recorded before anything travels: should
+        # the link drop or this machine sleep halfway, resolve_handing
+        # finishes it or undoes it at the next check
+        attempt = f"{_stamp()}-{os.urandom(2).hex()}"
+        away = {"v": 2, "attempt": attempt, "remote": rem.name,
+                "holder": info.get("host") or rem.name, "holder_id": info.get("machine_id"),
+                "host": info.get("host"), "system": info.get("system"),
+                "driven_by": "here", "path": real, "remote_path": rem.path(real),
+                "since": _now(), "agent": "claude", "session": sid,
+                "window": _mux_name(real, uid), "mux": "byobu" if tools.get("byobu") else "tmux",
+                "relay": None, "task": args.task, "claude": here_ver, "transfer": "rsync"}
+        if rem.sandbox:
+            away["mux"] = "tmux"            # a tmux server of its own
         with ProjectLock(uid):
-            try:
-                _snapshot_project(uid, entry)
-            except Exception as e:
-                out["warnings"].append(f"history backup failed: {e}")
-            scratch = False
-            if sid:
-                sdir = scratch_dir(real, sid)
-                keep = Path(real) / ".aht" / "handover" / "scratch"
-                shutil.rmtree(keep, ignore_errors=True)
-                keep.parent.mkdir(parents=True, exist_ok=True)
-                (keep.parent / ".gitignore").write_text("*\n")
-                if sdir and any(sdir.iterdir()) and sum(
-                        f.stat().st_size for f in sdir.rglob("*") if f.is_file()) \
-                        <= SCRATCH_MAX_BYTES:
-                    shutil.copytree(sdir, keep / sid, symlinks=True)
-                    scratch = True
-            brief, note = write_brief(real, sid, dig, _here(), info.get("host") or rem.name,
-                                      info.get("system"), carried, scratch, args.task)
-            out["brief"] = str(brief)
-            say(f"sending the project to {rem.name} …")
-            sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty())
-            out["sent"] = {"files": sent["project"].get("files", 0),
-                           "bytes": sent["project"].get("bytes", 0),
-                           "history_bytes": sent["history"].get("bytes", 0),
-                           "wire_bytes": sent["project"].get("sent", 0)
-                           + sent["history"].get("sent", 0)}
-
-            # what left, as seen on BOTH sides: the base of the way back
-            rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
-            theirs = rem.agent("manifest", timeout=900, trees={
-                "project": {"path": rem.path(real), "skip": handover_skip()},
-                "history": {"path": rstore, "skip": []}})["trees"]
-            ours = {"project": tree_manifest(real),
-                    "history": tree_manifest(str(store), []) if store
-                    else {"files": {}, "raw": {}}}
-            lost = sorted(set(ours["project"]["files"]) - set(theirs["project"]["files"]))
-            if lost:
-                out["warnings"].append(f"{len(lost)} file(s) did not arrive, e.g. {lost[0]}")
-            hashes = {k: [v[0], file_sha256(Path(store) / (ours["history"]["raw"].get(k) or k))]
-                      for k, v in ours["history"]["files"].items()
-                      if k.endswith(".jsonl") and isinstance(v[0], int)} if store else {}
             hd = handover_dir(uid)
-            hd.mkdir(parents=True, exist_ok=True)
-            (hd / "manifest.json").write_text(json.dumps({
-                "uuid": uid, "project": real, "remote": rem.name, "at": _now(),
-                "here": {k: v["files"] for k, v in ours.items()},
-                "there": {k: v["files"] for k, v in theirs.items()},
-                "transcripts": hashes}))
-
-            away = {"remote": rem.name, "host": info.get("host"), "since": _now(),
-                    "path": real, "session": sid, "window": _mux_name(real, uid),
-                    "task": args.task,
-                    "mux": "byobu" if tools.get("byobu") else "tmux",
-                    "claude": here_ver}
-            if install:
-                say(f"installing Claude Code {install} on {rem.name} …")
-                got = rem.agent("install-claude", timeout=1000, version=install)
-                info["claude"] = got["claude"]
-            if not args.no_start:
-                trusted = False
+            _retire_manifest(hd)            # an earlier attempt's: never a base
+            # what --include carries goes with the record: a handover that
+            # resolve_handing finishes brings them back at Take Back too
+            handing = dict(away, step="sending", at=time.time(),
+                           **({"extras": extras} if extras else {}))
+            _update_entry(uid, handing=handing)
+            try:
                 try:
-                    cj = json.loads(_claude_json().read_text())
-                    trusted = bool((cj.get("projects") or {}).get(real, {})
-                                   .get("hasTrustDialogAccepted"))
-                except Exception:
-                    pass
-                if trusted and cfg_get("handover_carry_trust", True):
-                    out["trust"] = rem.agent("trust", path=rem.path(real)).get("trust")
-                say(f"starting the session on {rem.name} …")
-                st = rem.agent("start", timeout=90, path=rem.path(real), session=sid,
-                               name=away["window"], claude=info["claude"], note=note,
-                               args=list(cfg_get("handover_claude_args") or []),
-                               task=args.task,
-                               remote_control=handover_session_name(sid, real, rem.name)
-                               if cfg_get("handover_remote_control", True) else None)
-                away["mux"] = st.get("mux") or away["mux"]
-                out["started"] = st.get("started")
-                out["screen"] = st.get("screen")
-                if st.get("attention"):
-                    out["warnings"].append(f"the session on {rem.name} needs you: "
-                                           f"{st['attention']} — open it to answer")
-            _update_entry(uid, away=away, extras=extras or None)
+                    _snapshot_project(uid, entry)
+                except Exception as e:
+                    out["warnings"].append(f"history backup failed: {e}")
+                scratch = False
+                if sid:
+                    sdir = scratch_dir(real, sid)
+                    keep = Path(real) / ".aht" / "handover" / "scratch"
+                    shutil.rmtree(keep, ignore_errors=True)
+                    keep.parent.mkdir(parents=True, exist_ok=True)
+                    (keep.parent / ".gitignore").write_text("*\n")
+                    if sdir and any(sdir.iterdir()) and sum(
+                            f.stat().st_size for f in sdir.rglob("*") if f.is_file()) \
+                            <= SCRATCH_MAX_BYTES:
+                        shutil.copytree(sdir, keep / sid, symlinks=True)
+                        scratch = True
+                brief, note = write_brief(real, sid, dig, _here(), info.get("host") or rem.name,
+                                          info.get("system"), carried, scratch, args.task)
+                out["brief"] = str(brief)
+                say(f"sending the project to {rem.name} …")
+                sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty())
+                out["sent"] = {"files": sent["project"].get("files", 0),
+                               "bytes": sent["project"].get("bytes", 0),
+                               "history_bytes": sent["history"].get("bytes", 0),
+                               "wire_bytes": sent["project"].get("sent", 0)
+                               + sent["history"].get("sent", 0)}
+
+                # what left, as seen on BOTH sides: the base of the way back
+                rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
+                theirs = rem.agent("manifest", timeout=900, trees={
+                    "project": {"path": rem.path(real), "skip": handover_skip()},
+                    "history": {"path": rstore, "skip": []}})["trees"]
+                ours = {"project": tree_manifest(real),
+                        "history": tree_manifest(str(store), []) if store
+                        else tree_manifest(os.devnull, [])}
+                lost = sorted(set(ours["project"]["files"]) - set(theirs["project"]["files"]))
+                if lost:
+                    out["warnings"].append(f"{len(lost)} file(s) did not arrive, e.g. {lost[0]}")
+                hashes = {k: [v[0], file_sha256(Path(store) / (ours["history"]["raw"].get(k) or k))]
+                          for k, v in ours["history"]["files"].items()
+                          if k.endswith(".jsonl") and isinstance(v[0], int)} if store else {}
+                hd.mkdir(parents=True, exist_ok=True)
+                _write_json(hd / "manifest.json", {
+                    "v": 2, "attempt": attempt,
+                    "uuid": uid, "project": real, "remote": rem.name, "at": _now(),
+                    "here": {k: v["files"] for k, v in ours.items()},
+                    "there": {k: v["files"] for k, v in theirs.items()},
+                    "dirs": {"here": {k: v.get("dirs") or [] for k, v in ours.items()},
+                             "there": {k: v.get("dirs") or [] for k, v in theirs.items()}},
+                    "modes": {k: v.get("modes") or {} for k, v in ours.items()},
+                    "transcripts": hashes})
+                handing = dict(handing, step="recorded", at=time.time())
+                _update_entry(uid, handing=handing)
+
+                if install:
+                    say(f"installing Claude Code {install} on {rem.name} …")
+                    got = rem.agent("install-claude", timeout=1000, version=install)
+                    info["claude"] = got["claude"]
+                if not args.no_start:
+                    trusted = False
+                    try:
+                        cj = json.loads(_claude_json().read_text())
+                        trusted = bool((cj.get("projects") or {}).get(real, {})
+                                       .get("hasTrustDialogAccepted"))
+                    except Exception:
+                        pass
+                    if trusted and cfg_get("handover_carry_trust", True):
+                        out["trust"] = rem.agent("trust", path=rem.path(real)).get("trust")
+                    say(f"starting the session on {rem.name} …")
+                    handing = dict(handing, step="starting", at=time.time())
+                    _update_entry(uid, handing=handing)
+                    st = rem.agent("start", timeout=90, path=rem.path(real), session=sid,
+                                   name=away["window"], attempt=attempt,
+                                   claude=info["claude"], note=note,
+                                   args=list(cfg_get("handover_claude_args") or []),
+                                   task=args.task,
+                                   remote_control=handover_session_name(sid, real, rem.name)
+                                   if cfg_get("handover_remote_control", True) else None)
+                    away["mux"] = st.get("mux") or away["mux"]
+                    out["started"] = st.get("started")
+                    out["screen"] = st.get("screen")
+                    if st.get("attention"):
+                        out["warnings"].append(f"the session on {rem.name} needs you: "
+                                               f"{st['attention']} — open it to answer")
+                # one write: nothing ever sees the one record without the other
+                _update_entry(uid, away=away, handing=None, extras=extras or None)
+            except BaseException as e:
+                if handing["step"] == "starting" and (isinstance(e, LinkError)
+                                                      or not isinstance(e, HandoverError)):
+                    # whether the session there started is not known: the
+                    # record stays for resolve_handing
+                    _update_entry(uid, handing=dict(handing, error=str(e) or type(e).__name__,
+                                                    at=time.time()))
+                    if isinstance(e, HandoverError):
+                        raise HandoverError(
+                            f"{e} — whether the session on {rem.name} started is not known "
+                            "yet; aht asks again within a few minutes and tells you")
+                    raise
+                # nothing runs there: the project stays here
+                _update_entry(uid, handing=None)
+                _retire_manifest(hd)
+                out["warnings"].append(f"The handover of {os.path.basename(real)} to "
+                                       f"{rem.name} did not finish. The project stays "
+                                       "here; nothing runs there")
+                raise
         out["applied"] = True
         out["away"] = away
         out["attach"] = attach_command(rem, away["mux"], away["window"])
+        if _end_pause(uid, rem.name):       # Release's: this copy went over that one
+            out["ends_pause"] = rem.name
         log(f"HANDOVER {real} -> {rem.name} (session {sid}, "
             f"{_human(out['sent']['bytes'] + out['sent']['history_bytes'])})")
         apply_badge(real, desired_marks(real, True))
@@ -6096,6 +6700,9 @@ def cmd_handover(args):
                   f"   summary   {brief}",
                   "   open it   " + " ".join(shlex.quote(a) for a in out["attach"]),
                   "   back      aht reclaim " + shlex.quote(real) + " --apply"]
+        if out.get("ends_pause"):
+            lines.append(f"   Keep in sync with {rem.name} goes on again once you take it back "
+                         "(the copy Release left there is set aside there)")
     except HandoverError as e:
         out["error"] = str(e)
         warn(f"HANDOVER {real}: {e}")
@@ -6111,72 +6718,261 @@ def _conflict_name(rel: str, there: str, day: str) -> str:
     stem, ext = os.path.splitext(tail)
     return os.path.join(head, f"{stem} (from {there} {day}){ext}")
 
+def _free_name(root: str, rel: str) -> str:
+    """`rel`, or "name 2.ext", "name 3.ext" … when a file of that name is there."""
+    stem, ext = os.path.splitext(rel)
+    n, cand = 2, rel
+    while os.path.lexists(os.path.join(root, cand)):
+        cand, n = f"{stem} {n}{ext}", n + 1
+    return cand
+
 def _set_aside(path: Path, aside: Path, rel: str) -> None:
     dst = aside / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     os.replace(path, dst)
 
+def _ignores_case(folder: str) -> bool:
+    """Whether the disk under `folder` takes Readme and README for one name:
+    tried, since a Mac's disk can be either (tests: AHT_CASELESS=1)."""
+    if os.environ.get("AHT_CASELESS"):
+        return True
+    p = Path(folder) / f".aht-case-{os.urandom(3).hex()}"
+    try:
+        with open(p, "x"):
+            pass
+    except OSError:
+        return CASE_BLIND
+    try:
+        return p.with_name(p.name.upper()).exists()
+    finally:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
 def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
-               aside: Path, there: str, inert: bool, skip, progress: bool) -> dict:
-    """Carry out one three-way plan: fetch what changed there, set aside what
-    it replaces, and keep both versions of what changed on both sides."""
+               aside: Path, there: str, inert: bool, skip, progress: bool,
+               here_keys=(), new_dirs=()) -> dict:
+    """Carry out one three-way plan: set aside what was removed there, fetch
+    what changed there (setting aside what it replaces), and keep both
+    versions of what changed on both sides.  Removals go first, so a name
+    whose case changed there (readme.md → README.md) arrives on a disk that
+    ignores case, instead of being set aside right after.  On such a disk,
+    two incoming names that differ only in case, or one that would land on a
+    file here that stays, are kept next to it under the conflict name.
+    `new_dirs`: folders made there (git's empty refs/heads) are made here."""
     done = {"updated": 0, "new": 0, "deleted": 0, "conflicts": [], "kept": len(plan["kept"])}
     name = lambda k: there_raw.get(k) or k
-    fetch = [name(k) for k in plan["take"] + plan["new"]]
-    if fetch:
-        aside.mkdir(parents=True, exist_ok=True)
-        r = rem.rsync(rem.spec(src + "/"), dst + "/", files_from=fetch,
-                      backup_dir=str(aside), skip=skip, progress=progress)
-        if not r["ok"]:
-            raise HandoverError("fetching the changes failed: " + r["error"])
-        done["updated"], done["new"] = len(plan["take"]), len(plan["new"])
+    gone = set(plan["delete"])
     for k in plan["delete"]:
         p = Path(dst) / k
         if p.exists() or p.is_symlink():
             _set_aside(p, aside, k)
             done["deleted"] += 1
-    if plan["conflict"]:
-        inc = aside.parent / (aside.name + "-incoming")
-        inc.mkdir(parents=True, exist_ok=True)
-        r = rem.rsync(rem.spec(src + "/"), str(inc) + "/",
-                      files_from=[name(k) for k in plan["conflict"]], skip=skip)
+    incoming, clash = plan["take"] + plan["new"], []
+    if incoming and _ignores_case(dst):
+        stays = {k.casefold(): k for k in here_keys if k not in gone}
+        seen = {}
+        for k in incoming:
+            f = k.casefold()
+            if stays.get(f, k) != k or seen.get(f, k) != k:
+                clash.append(k)
+            else:
+                seen[f] = k
+    fetch = [k for k in incoming if k not in clash]
+    if fetch:
+        aside.mkdir(parents=True, exist_ok=True)
+        r = rem.rsync(rem.spec(src + "/"), dst + "/", files_from=[name(k) for k in fetch],
+                      backup_dir=str(aside), skip=skip, progress=progress)
         if not r["ok"]:
-            raise HandoverError("fetching the conflicting files failed: " + r["error"])
+            raise HandoverError("fetching the changes failed: " + r["error"])
+        done["updated"] = len([k for k in plan["take"] if k not in clash])
+        done["new"] = len([k for k in plan["new"] if k not in clash])
+    for d in new_dirs:
+        try:
+            (Path(dst) / d).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass                            # a file of that name here: it stays
+    # each group in a folder of its own: two names of one case group would
+    # land on one file there too
+    groups = ([plan["conflict"]] if plan["conflict"] else []) + [[k] for k in clash]
+    if groups:
+        inc = aside.parent / (aside.name + "-incoming")
         day = time.strftime("%Y-%m-%d")
-        for k in plan["conflict"]:
-            got = next((c for c in (inc / k, inc / name(k)) if c.exists()), None)
-            mine = Path(dst) / k
-            if got is None:
-                continue
-            if mine.is_file() and got.is_file() and \
-                    file_sha256(mine) == file_sha256(got):
-                continue                        # changed alike on both sides
-            rel = (k + f".aht-conflict-{there}-{_stamp()}") if inert \
-                else _conflict_name(k, there, day)
-            (Path(dst) / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(got), str(Path(dst) / rel))
-            done["conflicts"].append({"file": k, "their_version": rel})
+        for i, keys in enumerate(groups):
+            box = inc / str(i)
+            box.mkdir(parents=True, exist_ok=True)
+            r = rem.rsync(rem.spec(src + "/"), str(box) + "/",
+                          files_from=[name(k) for k in keys], skip=skip)
+            if not r["ok"]:
+                raise HandoverError("fetching the conflicting files failed: " + r["error"])
+            for k in keys:
+                got = next((c for c in (box / k, box / name(k)) if c.exists()), None)
+                mine = Path(dst) / k
+                if got is None:
+                    continue
+                if mine.is_file() and got.is_file() and \
+                        file_sha256(mine) == file_sha256(got):
+                    continue                    # the same on both sides
+                rel = _free_name(dst, (k + f".aht-conflict-{there}-{_stamp()}") if inert
+                                 else _conflict_name(k, there, day))
+                (Path(dst) / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(got), str(Path(dst) / rel))
+                done["conflicts"].append({"file": k, "their_version": rel,
+                                          **({"case": True} if k in clash else {})})
         shutil.rmtree(inc, ignore_errors=True)
     return done
+
+def _changed_there(uid: str, entry: dict) -> dict:
+    """{files, history}: how many files of a handed-over project, and of its
+    Claude history (with /rewind's file-history and the plans), changed on
+    the other machine since it left; None each when that machine does not
+    answer."""
+    away, real = entry.get("away") or {}, entry["real_path"]
+    store = _store_of(real)
+    sids = _sessions_of(store)
+    plans = [p[1:] for p in _plans_of(store)]
+    try:
+        base = json.loads((handover_dir(uid) / "manifest.json").read_text())
+        if base.get("attempt") != away.get("attempt"):
+            return {"files": None, "history": None}
+        rem = get_remote(away.get("remote"))
+        info = rem.connect()
+        rclaude = info["claude_home"]
+        trees = {"project": {"path": rem.path(real), "skip": handover_skip()},
+                 "history": {"path": f"{rclaude}/projects/{_key_claude(rem.path(real))}",
+                             "skip": []}}
+        # file-history and plans were sent as they are here: what differs
+        # there now was written there
+        trees.update({f"file-history/{s}": {"path": f"{rclaude}/file-history/{s}", "skip": []}
+                      for s in sids})
+        if plans:
+            trees["plans"] = {"path": f"{rclaude}/plans", "skip": []}
+        now = rem.agent("manifest", timeout=300, trees=trees)["trees"]
+    except (HandoverError, OSError, ValueError, KeyError):
+        return {"files": None, "history": None}
+    was = base.get("there") or {}
+    differ = lambda a, b: sum(1 for k in set(a) | set(b) if a.get(k) != b.get(k))
+    files = differ(was.get("project") or {}, now["project"]["files"])
+    history = differ(was.get("history") or {}, now["history"]["files"])
+    for s in sids:
+        mine = claude_home() / "file-history" / s
+        mine = tree_manifest(str(mine), [])["files"] if mine.is_dir() else {}
+        history += sum(1 for k, v in now[f"file-history/{s}"]["files"].items()
+                       if mine.get(k) != v)
+    if plans:
+        mine = tree_manifest(str(claude_home() / "plans"), [])["files"] \
+            if (claude_home() / "plans").is_dir() else {}
+        history += sum(1 for k in plans if k in now["plans"]["files"]
+                       and now["plans"]["files"][k] != mine.get(k))
+    return {"files": files, "history": history}
+
+def _what_stays(lost: dict) -> str:
+    """What Release leaves on the other machine, in words: "3 files and the
+    conversation"; "" when nothing, or when that machine did not say."""
+    what = []
+    if lost.get("files"):
+        what.append(f"{lost['files']} file" + ("s" if lost["files"] != 1 else ""))
+    if lost.get("history"):
+        what.append("the conversation")
+    return " and ".join(what)
+
+def _release(args, out: dict, lines: list, real: str) -> int:
+    """Stop waiting for a project that was handed over, or half handed over:
+    the files here stay as they are, the copy there is left alone, and the
+    work done there does not come here.  For a machine that is gone, or a
+    handover that cannot be finished."""
+    uid, entry = _entry_for(load_registry(), real)
+    rec = (entry or {}).get("away") or (entry or {}).get("handing")
+    if not rec:
+        out["blockers"].append("this project is not handed over")
+        return _emit(args, out, lines)
+    there = rec.get("remote") or rec.get("host") or "the other machine"
+    since = rec.get("since")
+    def synced(e):
+        """The machine Keep in sync sends this project to, when it is the one
+        released: its next sync would send this copy over the work left
+        there, so Release pauses it until the user turns it on again."""
+        m = e.get("mirror") or {}
+        return m.get("remote") if m.get("enabled") and rec.get("remote") \
+            and m.get("remote") == rec.get("remote") else None
+    out.update(remote=there, released=False, pauses_sync=synced(entry),
+               would_lose={"files": None, "history": None, "since": since})
+    when = _clock(since)
+    if not args.apply:
+        if entry.get("away") and can_send_projects():
+            out["would_lose"].update(_changed_there(uid, entry))
+        what = _what_stays(out["would_lose"])
+        lines += [f"would release:  {real}  (on {there} since {when})",
+                  f"   The work done on {there} since {when} stays on {there}. "
+                  "It does not come here." + (f" What stays there: {what}." if what else "")]
+        if out["pauses_sync"]:
+            lines.append(f"   Keep in sync with {out['pauses_sync']} will be paused, so the "
+                         "copy there stays as it is.")
+        lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, out, lines)
+    try:
+        with ProjectLock(uid):
+            # one write: the record goes and the sync pauses together
+            with Lock():
+                reg = load_registry()
+                e = reg["projects"].get(uid)
+                if e is not None:
+                    out["pauses_sync"] = synced(e)
+                    if out["pauses_sync"]:
+                        e["mirror"] = dict(e["mirror"], paused={
+                            "reason": "released", "at": _now(), "remote": out["pauses_sync"]})
+                    e.pop("away", None)
+                    e.pop("handing", None)
+                    e["returned"] = {
+                        "from": rec.get("host") or there, "left": since, "at": _now(),
+                        "released": True, "mode": "away", "session": rec.get("session"),
+                        "handed_over": None, "updated": 0, "new": 0, "deleted": 0,
+                        "conflicts": []}
+                    save_registry(reg)
+            _retire_manifest(handover_dir(uid))
+    except HandoverError as e:
+        out["error"] = str(e)
+        return _emit(args, out, lines)
+    out.update(applied=True, released=True)
+    log(f"RELEASE {real} (on {there} since {since})"
+        + (f"; keep in sync with {out['pauses_sync']} paused" if out["pauses_sync"] else ""))
+    apply_badge(real, desired_marks(real, True))
+    lines.append(f"released:  {real}  — it is yours here again; the copy on {there} "
+                 "stays as it is")
+    if out["pauses_sync"]:
+        lines.append(f"   Keep in sync with {out['pauses_sync']} is paused, so the copy "
+                     "there stays as it is.")
+    return _emit(args, out, lines)
 
 def cmd_reclaim(args):
     out = {"command": "reclaim", "applied": False, "blockers": [], "warnings": []}
     lines = []
+    real = os.path.realpath(args.path)
+    out["project"] = real
+    if args.release:                    # only records here change: any build can
+        return _release(args, out, lines, real)
     if not handover_supported():
         out["blockers"].append("handover needs rsync and ssh; it is not available "
                                "in this build")
         return _emit(args, out, lines)
-    real = os.path.realpath(args.path)
-    out["project"] = real
     talk = not args.json
     prog = Progress(args.status_file, talk)
     say = prog.say
     try:
         reg = load_registry()
         uid, entry = _entry_for(reg, real)
+        if (entry or {}).get("handing"):
+            # cut off on the way there: finished or undone first (this is
+            # also the window's "Check Now")
+            out["checked"] = [n["message"] for n in resolve_handing(uid, force=True)]
+            out["warnings"] += out["checked"]
+            uid, entry = _entry_for(load_registry(), real)
         away = (entry or {}).get("away")
         if not away:
-            out["blockers"].append("this project is not handed over")
+            out["blockers"].append(_unfinished_text(entry["handing"], real)
+                                   if (entry or {}).get("handing")
+                                   else "this project is not handed over")
             return _emit(args, out, lines)
         if os.path.realpath(away.get("path") or real) != real:
             out["blockers"].append(f"the folder was at {away['path']} when it was "
@@ -6187,6 +6983,14 @@ def cmd_reclaim(args):
             base = json.loads((hd / "manifest.json").read_text())
         except Exception as e:
             raise HandoverError(f"the record of what left is unreadable ({e})")
+        if (base.get("attempt") or away.get("attempt")) \
+                and base.get("attempt") != away.get("attempt"):
+            # a list from another attempt would count the wrong files as changed
+            raise HandoverError(
+                "the record of what left belongs to another handover attempt "
+                f"({base.get('attempt') or 'none'}, not {away.get('attempt') or 'none'}), "
+                "so aht cannot tell what changed there. Release the project (aht reclaim "
+                f"{shlex.quote(real)} --release) and bring over what you need by hand")
         rem = get_remote(away.get("remote"))
         rem.on_percent = prog.percent
         out["remote"] = rem.name
@@ -6244,7 +7048,7 @@ def cmd_reclaim(args):
             "history": {"path": rstore, "skip": []}})["trees"]
         ours = {"project": tree_manifest(real),
                 "history": tree_manifest(str(store), []) if Path(store).is_dir()
-                else {"files": {}, "raw": {}}}
+                else tree_manifest(os.devnull, [])}
         plans = {t: three_way(base["here"].get(t) or {}, base["there"].get(t) or {},
                               ours[t]["files"], theirs[t]["files"])
                  for t in ("project", "history")}
@@ -6319,14 +7123,22 @@ def cmd_reclaim(args):
                 out["warnings"].append(f"history backup failed: {e}")
             aside = hd / "replaced" / _stamp()
             say(f"fetching the changes from {rem.name} …")
+            bdirs = base.get("dirs") or {}
+            def made_there(t):                  # folders new there (empty ones too)
+                was = set((bdirs.get("here") or {}).get(t) or []) \
+                    | set((bdirs.get("there") or {}).get(t) or [])
+                return sorted(set(theirs[t].get("dirs") or []) - was
+                              - set(ours[t].get("dirs") or []))
             done = {"project": _pull_tree(rem, pp, rem.path(real), real,
                                           theirs["project"]["raw"], aside / "project",
                                           there, False, handover_skip(),
-                                          talk and sys.stderr.isatty())}
+                                          talk and sys.stderr.isatty(),
+                                          ours["project"]["files"], made_there("project"))}
             Path(store).mkdir(parents=True, exist_ok=True)
             done["history"] = _pull_tree(rem, hp, rstore, str(store),
                                          theirs["history"]["raw"], aside / "history",
-                                         there, True, [], False)
+                                         there, True, [], False,
+                                         ours["history"]["files"], made_there("history"))
             sids = _sessions_of(store)
             for sub, inc in (("file-history", [f"/{s}/***" for s in sids]),
                              ("plans", _plans_of(store))):
@@ -6360,15 +7172,9 @@ def cmd_reclaim(args):
                     "new": pd["new"], "deleted": pd["deleted"],
                     "conflicts": [c["their_version"] for c in pd["conflicts"]]}
             _update_entry(uid, away=None, returned=back)
-            try:
-                (hd / "manifest.json").replace(hd / f"manifest-{_stamp()}.json")
-                for old in sorted(hd.glob("manifest-*.json"))[:-5]:
-                    old.unlink()
-                for old in sorted(p for p in (hd / "replaced").iterdir()
-                                  if p.is_dir())[:-5]:
-                    shutil.rmtree(old, ignore_errors=True)
-            except OSError:
-                pass
+            _end_pause(uid, rem.name)       # the two copies agree again
+            _retire_manifest(hd)
+            prune_set_asides(hd / "replaced")
         out["applied"] = True
         out["session"] = latest
         out["session_title"] = session_title(store, latest)
@@ -6408,7 +7214,7 @@ def discover_machines(notes: list = None) -> list:
     if ts:
         try:
             r = subprocess.run([ts, "status", "--json"], capture_output=True,
-                               text=True, timeout=15, cwd="/")
+                               text=True, timeout=15, cwd="/", **_NO_WINDOW)
             if not (r.stdout or "").strip():
                 raise ValueError(((r.stderr or "").strip().splitlines()
                                   or ["no answer"])[0])
@@ -6460,7 +7266,7 @@ def remote_checks(rem: Remote, info: dict) -> list:
        f"{get} rsync")
     ck("tmux there", tools.get("tmux"), tools.get("byobu") or tools.get("tmux")
        or "missing", f"{get} tmux")
-    there = rem.agent("probe", path=home)
+    there = rem.agent("probe", path=rem.path(home))
     same = info.get("home") == home or bool(there.get("path_exists"))
     ck(f"{home} exists there", same, "projects keep their path" if same else "missing",
        f'sudo mkdir -p {shlex.quote(home)} && sudo chown "$USER" {shlex.quote(home)}')
@@ -6495,8 +7301,20 @@ def remote_checks(rem: Remote, info: dict) -> list:
            needed=False)
     return rows
 
+def _remember_system(name: str, system) -> None:
+    """remotes.<name>.system: what answered there (Darwin, Linux or Windows)."""
+    if not system or (remotes_config().get(name) or {}).get("system") == system:
+        return
+    with Lock():
+        cfg = load_config()
+        rs = dict(cfg.get("remotes") or {})
+        if name in rs:
+            rs[name] = dict(rs[name], system=system)
+            cfg["remotes"] = rs
+            save_config(cfg)
+
 def cmd_remote(args):
-    if not handover_supported():
+    if not can_reach_machines():
         print("handover needs rsync and ssh; it is not available in this build")
         return 2
     act = args.action or "list"
@@ -6521,8 +7339,17 @@ def cmd_remote(args):
         if not (args.name and args.target) or not re.fullmatch(r"[A-Za-z0-9_.-]+", args.name):
             print("usage: aht remote add <name> <user@host>", file=sys.stderr)
             return 2
-        rem = Remote(args.name, {"ssh": args.target})
+        spec = {"ssh": args.target}
+        if args.sandbox:
+            # a test machine: from the first connect on, everything there
+            # stays inside this folder, never in that machine's own ~/.aht
+            if not args.sandbox.startswith("/"):
+                print("--sandbox takes a full path on that machine", file=sys.stderr)
+                return 2
+            spec["sandbox"] = args.sandbox.rstrip("/")
+        rem = Remote(args.name, spec)
         try:
+            rem.check_shell()               # before any sh script goes there
             info = rem.connect()
         except HandoverError as e:
             print(f"✗ {e}", file=sys.stderr)
@@ -6530,7 +7357,7 @@ def cmd_remote(args):
         with Lock():
             cfg = load_config()
             rs = dict(cfg.get("remotes") or {})
-            rs[args.name] = {"ssh": args.target}
+            rs[args.name] = dict(spec, system=info.get("system"))
             cfg["remotes"] = rs
             cfg.setdefault("default_remote", args.name)
             save_config(cfg)
@@ -6546,10 +7373,14 @@ def cmd_remote(args):
                 return 2
             if act == "remove":
                 held = [e["real_path"] for e in load_registry()["projects"].values()
-                        if (e.get("away") or {}).get("remote") == args.name]
+                        if (e.get("away") or e.get("handing") or {}).get("remote")
+                        == args.name]
                 if held:
-                    print(f"{args.name} still holds {len(held)} handed-over project(s); "
-                          "take them back first:\n   " + "\n   ".join(held),
+                    print(f"{args.name} still holds {len(held)} handed-over project(s). "
+                          "Take them back first; or, when that machine is gone, release "
+                          f"them (the work on {args.name} stays there):\n   "
+                          + "\n   ".join(f"aht reclaim {shlex.quote(p)} --release"
+                                         for p in held),
                           file=sys.stderr)
                     return 3
                 rs.pop(args.name)
@@ -6566,14 +7397,22 @@ def cmd_remote(args):
             (args.name == "all" or not cfg_get("default_remote")) else [args.name]
         results, code = [], 0
         for n in names:
+            rem = None
             try:
                 rem = get_remote(n)
+                if not rem.system:
+                    rem.check_shell()       # set up before aht asked: ask once
                 info = rem.connect()
                 rows = remote_checks(rem, info)
                 results.append({"remote": rem.name, "target": rem.target, "checks": rows,
+                                "system": info.get("system"),
                                 "ok": all(c["ok"] for c in rows if c["needed"])})
+                _remember_system(rem.name, info.get("system"))
             except HandoverError as e:
-                results.append({"remote": n, "ok": False, "error": str(e), "checks": []})
+                results.append({"remote": n, "ok": False, "error": str(e), "checks": [],
+                                "system": rem.system if rem else None})
+                if rem is not None and rem.system == "Windows":
+                    _remember_system(rem.name, "Windows")
                 code = 1
         if args.json:
             print(json.dumps({"ok": all(r["ok"] for r in results),
@@ -6732,10 +7571,11 @@ def handover_status() -> dict:
         m = e.get("mirror") or {}
         if m.get("enabled"):
             mirrored.append({"project": e["real_path"], "remote": m.get("remote"),
-                             "synced_at": m.get("synced_at"), "status": m.get("status")})
+                             "synced_at": m.get("synced_at"), "status": m.get("status"),
+                             "paused": m.get("paused")})
     rs = find_rsync() if handover_supported() else {}
     rs_cfg = remotes_config()
-    return {"supported": handover_supported(),
+    return {"supported": handover_supported(), "can_reach": can_reach_machines(),
             "remotes": rs_cfg,
             "default_remote": cfg_get("default_remote") if cfg_get("default_remote")
             in rs_cfg else (sorted(rs_cfg)[0] if rs_cfg else None),
@@ -6749,7 +7589,12 @@ def _hook_notes(cwd: str) -> str:
         uid, entry = _entry_for(reg, cwd)
         if not entry:
             return ""
-        a, b = entry.get("away"), entry.get("returned")
+        a, b, h = entry.get("away"), entry.get("returned"), entry.get("handing")
+        if h and not a:
+            return (f"[aht] WARNING: a handover of this project to “{h.get('host') or h.get('remote')}” "
+                    f"began on {h.get('since')} and did not finish; aht is finding out "
+                    "whether the session there runs. Changes made here now can collide "
+                    "with work there. Tell the user before changing anything.")
         if a:
             notify_user("Project is handed over",
                         f"{os.path.basename(cwd)} runs on {a.get('host')} — "
@@ -6758,6 +7603,11 @@ def _hook_notes(cwd: str) -> str:
                     f"{a.get('since')} and is being worked on there. Changes made here "
                     "now can collide with that work. Tell the user before changing "
                     "anything, and suggest taking the project back first (aht reclaim).")
+        if b and not b.get("told") and b.get("released"):
+            _update_entry(uid, returned=dict(b, told=True))
+            return (f"[aht] This project was handed over to “{b.get('from')}” on "
+                    f"{b.get('left')} and released on {b.get('at')}: the work done "
+                    "there since then did not come here.")
         if b and not b.get("told"):
             msg = (f"[aht] This project is back on “{_here()}”. It ran on "
                    f"“{b.get('from')}” from {b.get('left')} to {b.get('at')}; the "
@@ -6806,10 +7656,13 @@ def _stat(p):
         return None
 
 def _target(inp: dict) -> str:
+    """What a tool call worked on, for the index, shared pages and the
+    journal: masked before it is cut, so a key the cut would split is
+    masked whole."""
     for k in ("file_path", "notebook_path", "path", "command", "pattern", "url", "query"):
         v = inp.get(k)
         if isinstance(v, str) and v.strip():
-            return v.strip()[:400]
+            return _masked(v, 400)
     return ""
 
 def _claude_events(e: dict):
@@ -6817,7 +7670,7 @@ def _claude_events(e: dict):
     if typ in ("ai-title", "custom-title"):
         title = e.get("customTitle") or e.get("aiTitle")
         if title:
-            yield {"t": t, "role": "title", "text": title}
+            yield {"t": t, "role": "title", "text": redact(str(title))}
         return
     m = e.get("message")
     if e.get("isSidechain") or not isinstance(m, dict):
@@ -6967,8 +7820,9 @@ def list_sessions(project: str = None, agents=None) -> list:
                     state = {}
                 if real and os.path.realpath(state.get("cwd") or real) != real:
                     continue
+                title = state.get("title")
                 out.append({"agent": "kimi", "id": sd.name, "project": state.get("cwd"),
-                            "file": str(wire), "title": state.get("title"),
+                            "file": str(wire), "title": redact(str(title)) if title else None,
                             "updated": _when(state.get("updatedAt")) or st.st_mtime})
     b = BY_NAME.get("codex")
     if "codex" in want and b is not None and b.available():
@@ -7022,6 +7876,10 @@ create virtual table if not exists msgs using fts5(text, role unindexed,
     file unindexed, tokenize = "unicode61 remove_diacritics 2");
 """
 SEARCH_TEXT_MAX = 4000
+# an index of an older format is built anew once.  2: tool calls and titles
+# are masked whole (an index from before can hold parts of keys).  3: the
+# masker's rules changed (rows it masked wrongly come back, more kinds go)
+SEARCH_FORMAT = 3
 
 def _open_search_db():
     import sqlite3
@@ -7045,7 +7903,7 @@ def _index_events(db, agent, sid, project, file, events) -> tuple:
             text = f"{ev.get('tool')}: {ev.get('target') or ''}".strip()
         else:
             text = ev.get("text") or ""
-        text = redact(text[:SEARCH_TEXT_MAX])           # the index holds no keys
+        text = _redact_head(text, SEARCH_TEXT_MAX)[:SEARCH_TEXT_MAX]   # the index holds no keys
         if text:
             rows.append((text[:SEARCH_TEXT_MAX], ev["role"], agent, sid, project or "",
                          ev.get("t"), file))
@@ -7065,19 +7923,43 @@ def _note_session(db, agent, sid, project, title, first, last, live, source):
         first = min(x for x in (first, old[1]) if x) if (first or old[1]) else None
         last = max(x for x in (last, old[2]) if x) if (last or old[2]) else None
     db.execute("insert or replace into sessions values (?,?,?,?,?,?,?,?,?)",
-               (key, agent, sid, project or "", title or "", first, last, live, source))
+               (key, agent, sid, project or "", redact(title or ""), first, last, live,
+                source))
 
 def update_search_index(progress=None) -> dict:
     """Bring the index up to date: what live sessions appended since the last
     run, sessions that are new, and sessions that now exist only in history
-    backups.  A session whose file is gone stays searchable."""
+    backups.  A session whose file is gone stays searchable, except across
+    a rebuild: an index of an older format is built anew from the files and
+    backups there are."""
     import zipfile
     lock = open(str(search_db()) + ".lock", "w") if aht_home().is_dir() else None
     if lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
     db = _open_search_db()
-    stats = {"sessions": 0, "files_read": 0, "from_backups": 0}
+    stats = {"sessions": 0, "files_read": 0, "from_backups": 0, "rebuilt": False}
     try:
+        if db.execute("pragma user_version").fetchone()[0] < SEARCH_FORMAT:
+            # marked done only at the end, so a run cut short starts over.
+            # The old file goes: that needs no room, and nothing of the old
+            # rows stays.  Where it cannot go (Windows, while a search reads
+            # it) its tables are dropped and vacuum clears the file
+            db.close()
+            try:
+                for end in ("-journal", "-wal", "-shm", ""):    # the database last
+                    Path(str(search_db()) + end).unlink(missing_ok=True)
+                db = _open_search_db()
+            except OSError:
+                db = _open_search_db()
+                db.executescript("drop table if exists msgs; drop table if exists files; "
+                                 "drop table if exists sessions;" + _SEARCH_SCHEMA)
+                db.execute("vacuum")
+            # updated now: the watcher and the hook start no other update
+            # while this one builds it
+            db.execute("insert or replace into files values (?,?,?,?,?,?)",
+                       ("@updated", 0, time.time(), 0, "", ""))
+            db.commit()
+            stats["rebuilt"] = True
         live = list_sessions()
         live_keys = {f"{s['agent']}:{s['id']}" for s in live}
         known = {r[0]: r[1:] for r in db.execute("select path, size, mtime, pos from files")}
@@ -7166,6 +8048,7 @@ def update_search_index(progress=None) -> dict:
         stats["sessions"] = db.execute("select count(*) from sessions").fetchone()[0]
         db.execute("insert or replace into files values (?,?,?,?,?,?)",
                    ("@updated", 0, time.time(), 0, "", ""))
+        db.execute(f"pragma user_version = {SEARCH_FORMAT}")
         db.commit()
     finally:
         db.close()
@@ -7228,8 +8111,8 @@ def search_history(q: str, project: str = None, agent: str = None,
             r = found[key]
             meta = db.execute("select title, started, updated, live, source from sessions "
                               "where key = ?", (key,)).fetchone() or ("", None, None, 1, "")
-            r.update(title=meta[0] or None, started=meta[1], updated=meta[2],
-                     live=bool(meta[3]), source=meta[4])
+            r.update(title=redact(meta[0]) if meta[0] else None, started=meta[1],
+                     updated=meta[2], live=bool(meta[3]), source=meta[4])
             proj = r["project"]
             if r["live"] and proj and os.path.isdir(proj):
                 r["resume"] = resume_command(r["agent"], r["session"], proj)
@@ -7257,6 +8140,15 @@ def _spawn_search_update() -> None:
     try:
         if os.environ.get("AHT_NO_SEARCH_INDEX") or _search_age() < 600:
             return
+        if aht_home().is_dir():
+            # an update that runs now (a rebuild takes minutes) brings the
+            # index up to date: no other one waits for it
+            with open(str(search_db()) + ".lock", "a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return
+                fcntl.flock(lock, fcntl.LOCK_UN)
         me = [sys.executable] if getattr(sys, "frozen", False) else \
             [sys.executable or "python3", str(Path(__file__).resolve())]
         subprocess.Popen(me + ["search", "--update", "--quiet"],
@@ -7328,69 +8220,428 @@ def cmd_search(args):
 
 # ---- secrets ------------------------------------------------------------------- #
 
+_SPAN = 1 << 16                 # a find runs on for at most 64 KB
+
 def _secret_patterns() -> list:
-    """(kind, needles, pattern, generic).  A pattern only runs around its
-    needles, so gigabytes of history take seconds; a generic one runs on the
-    lower-cased text.  Built from pieces, so this file does not itself look
-    like it holds a key."""
+    """(kind, needles, pattern, generic, at).  A pattern only runs from its
+    needles, so gigabytes of history take seconds: an `at` one starts at its
+    needle, any other near it (160 bytes before to 480 after), and a find
+    runs on from there for up to 64 KB.  A generic one finds its needles in
+    the lower-cased text, keeps its value in a group whose name starts with
+    v and leaves it to _plausible.  Built from pieces, so this file does not
+    itself look like it holds a key."""
     k = lambda *parts: "".join(parts).encode()
     rx = lambda *parts: re.compile(k(*parts))
+    pk = "PRIV" + "ATE KEY"
+    # between the lines of a key: a line break, escaped once or more (JSON
+    # inside JSON), and the line numbers of a Read tool's output; taken
+    # whole and never given back (a lookahead), so a long run costs one pass
+    arrow = r"(?:\xe2\x86\x92|\\+u2192)"
+    sep = r"(?:\s|\\+[nrt]|%s|\d+(?:\t|\\+t|%s))+" % (arrow, arrow)
+    once = lambda g, p: r"(?=(?P<%s>%s))(?P=%s)" % (g, p, g)
+    b64 = r"[A-Za-z0-9+/=]"
+    line = r"(?![A-Z]?[a-z]+(?!%s))%s{12,}" % (b64, b64)        # base64, not a word
+    ppk = r"(?:Encryption|Comment|Public-Lines|Private-Lines|Key-Derivation|Argon2-[A-Za-z]+)"
+    # a value: no space, quote, backslash, < or >; a bracket open, in a pair
+    # or closed with more of the value right after it (code never has that:
+    # f(pw=x) ends there), an & unless a parameter starts there (&page=2).
+    # In quotes, it runs to its closing quote (as many backslashes before
+    # it: JSON inside JSON) over anything but a space, a line break (in JSON
+    # an odd run of backslashes before n, r or t) or the end of a JSON
+    # string (a bare " before , } ] or :), and its closing quote ends a
+    # value (a , ; ) } or a space after it, not more code: "?k="],a:{id:"x"),
+    # nor does one that a + follows ("token="+t)
+    u = r"[^\s\"'\\,;(){}\[\]`<>&]"
+    val = (r"(?:%s|\(%s*\)|\{%s*\}|\[%s*\]|[(\[{]|[)\]}](?=[A-Za-z0-9!@#$%%^*~])"
+           r"|&(?![A-Za-z_][A-Za-z0-9_.\-]*=))" % (u, u, u, u))
+    value = lambda x: (
+        r"(?P<bs{0}>\\+)?(?P<q{0}>[\"'])?(?P<v{0}>(?(q{0})(?!\+)"
+        r"(?:(?!(?<!\\)(?(bs{0})(?P=bs{0}))(?P=q{0}))(?:[^\s\\\"]|\"(?![,}}\]:])|(?<=\\)\""
+        r"|(?:\\\\)+(?!\\)|\\(?:\\\\)*(?![nrt\\])|(?(bs{0})(?!)|\\+))){{8,}}"
+        r"(?=(?<!\\)(?(bs{0})(?P=bs{0}))(?P=q{0})(?:[\s,;:.)\]}}>/\\&|+\"']|\Z)|\Z)"
+        r"|(?=[^\s\"'\\,;`<>]{{8}}){1}+))".format(x, val))
+    op = r"\\*[\"']?\s*(?:=>|:=|=|:(?!:))\s*"                    # not ::
+    # a name with a part that says it holds a secret (DB_PASSWORD,
+    # aws_secret_access_key, x-api-key, GITHUB_TOKEN, PGPASSWORD, RAILS_
+    # MASTER_KEY), not right after a letter, digit, / @ or : (auth-service:
+    # 8080, Auth::attempt) but after an escaped line break; unless its last
+    # part says it holds something else (TOKEN_URL, password_hash).  It
+    # starts at its needle; a prefix before it is looked at behind it
+    at = r"(?:(?<![a-z0-9/@:])|(?<=\\[nrt]))"
+    pre = lambda *ps: "|".join(r"(?<=(?<![a-z0-9/@:])%s)|(?<=\\[nrt]%s)" % (p, p) for p in ps)
+    ends = "(?![a-z0-9])(?:[_.\\-][a-z0-9]{1,40}){0,8}(?![a-z0-9])" + "".join(
+        r"(?<![_.\-](?:%s))" % w for w in (
+            "id", "url|uri|dir|env|var|len|max|min|ttl|arn|md5|num|idx|sha",
+            "host|file|path|name|type|size|hash|used|lens|sha1", "count|limit|field|regex|usage",
+            "length|expiry|header|prefix|budget|digest|number|sha224|sha256|sha384|sha512",
+            "expires|pattern", "endpoint|checksum", "fingerprint"))
+    # …and in camelCase, a hump after a small letter or a digit (dbPassword,
+    # SecretAccessKey, SessionToken), its last hump not one of the same
+    humps = "(?![a-z])(?:[A-Z][a-z0-9]*){0,8}(?![A-Za-z0-9])" + "".join(r"(?<!%s)" % w for w in (
+        "Id", "ID", "Url", "URL", "Uri", "Dir", "Env", "Var", "Len", "Max", "Min", "Ttl", "TTL",
+        "Arn", "Num", "Idx", "Host", "File", "Path", "Name", "Type", "Size", "Hash", "Used",
+        "Lens", "Count", "Limit", "Field", "Regex", "Usage", "Length", "Expiry", "Header",
+        "Prefix", "Budget", "Digest", "Number", "Expires", "Pattern", "Endpoint", "Checksum",
+        "Fingerprint"))
+    word = r"pass(?:word|wd|phrase)?|pwd|secret|token"
+    words = (r"(?:(?i:(?:%s(?:%s|auth|credentials?)|(?=password)(?:%s)password"
+             r"|(?=secret)(?:%s)secret)%s)|(?<=[a-z0-9])(?:Pass(?:word|wd|phrase)|Pwd|Secret|Token"
+             r"|Auth|Credentials?)%s)" % (at, word, pre("pg"), pre("client", "client_", "client-"),
+                                          ends, humps))
+    keys = (r"(?<=[A-Za-z_\-])(?:(?i:(?:%s)key%s)|(?:%s)Key%s)"
+            % (pre(*[p + s for p in ("api", "access", "private", "app", "master", "encryption",
+                                     "signing", "hmac", "jwt", "account", "shared", "secret")
+                     for s in ("", "_", "-")]), ends,
+               "|".join(r"(?<=[a-z0-9]%s)" % p for p in (
+                   "Api", "Access", "Private", "App", "Master", "Encryption", "Signing", "Hmac",
+                   "Jwt", "Account", "Shared", "Secret")), humps))
+    # where no name=value stands: Authorization with any scheme, a flag
+    # and its value (--password X, --with-token X), an XML element or
+    # setting (<password>X</password>, key="…Password" value="X")
+    authz = (r"(?i:authorization\\*[\"']?\s*[:=]\s*\\*[\"']?"
+             r"(?:(?!bearer\s|basic\s)[a-z][\w\-]{0,20}\s+)?(?P<va>[a-z0-9\-._~+/=]{16,}))")
+    flag = lambda w: r"(?<=-)(?i:%s)\s+%s" % (w, value("f"))
+    xml = r"(?<=<)(?i:(?P<t>%s)>(?P<vx>[^<\s\"'\\]{8,})</(?P=t)>)" % word
+    setting = lambda w: r"(?i:(?:%s)\\*\"\s+value=\\*\"(?P<vs>[^\s\"\\]{8,}))" % w
     return [
-        ("Anthropic API key", [k("sk-", "ant-")], rx("sk-", "ant-", r"[A-Za-z0-9_\-]{20,}"), False),
+        ("Anthropic API key", [k("sk-", "ant-")], rx("sk-", "ant-", r"[A-Za-z0-9_\-]{20,}"),
+         False, True),
         ("OpenAI API key", [k("sk-")], rx(r"sk-(?!", "ant-", r")(?:proj-|svcacct-)?",
-                                          r"[A-Za-z0-9_\-]{32,}"), False),
-        ("Groq API key", [k("gs", "k_")], rx(r"\bgs", r"k_[A-Za-z0-9]{40,}"), False),
-        ("GitHub token", [k("gh", "p_"), k("gh", "o_"), k("gh", "u_"), k("gh", "s_"),
-                          k("gh", "r_"), k("github_", "pat_")],
-         rx(r"(?:gh", r"[pousr]_[A-Za-z0-9]{36,}|github_", r"pat_[A-Za-z0-9_]{50,})"), False),
+                                          r"[A-Za-z0-9_\-]{32,}"), False, True),
+        ("Groq API key", [k("gs", "k_")], rx(r"\bgs", r"k_[A-Za-z0-9]{40,}"), False, True),
+        # (a short needle: fewer passes over the text, each a few ms)
+        ("GitHub token", [k("g", "h"), k("github_", "pat_")],
+         rx(r"(?:gh", r"[pousr]_[A-Za-z0-9]{36,}|github_", r"pat_[A-Za-z0-9_]{50,})"),
+         False, True),
+        ("GitLab token", [k("g", "l")],
+         rx(r"\bgl(?:", r"pat|rt|dt|ptt)-[A-Za-z0-9_\-]{20,}"), False, True),
         ("AWS access key", [k("AK", "IA"), k("AS", "IA")],
-         rx(r"\b(?:AK", r"IA|AS", r"IA)[0-9A-Z]{16}\b"), False),
-        ("Google API key", [k("AI", "za")], rx("AI", r"za[0-9A-Za-z_\-]{35}"), False),
-        ("Slack token", [k("xo", "x")], rx("xo", r"x[abprs]-[0-9A-Za-z\-]{10,}"), False),
-        ("Stripe key", [k("_li", "ve_")], rx(r"(?:sk|rk)_", r"live_[0-9A-Za-z]{20,}"), False),
-        ("Hugging Face token", [k("hf", "_")], rx(r"\bhf_", r"[A-Za-z0-9]{30,}"), False),
-        ("npm token", [k("npm", "_")], rx(r"\bnpm_", r"[A-Za-z0-9]{36}\b"), False),
-        ("Tailscale key", [k("tsk", "ey-")], rx("tskey", r"-[A-Za-z0-9\-]{20,}"), False),
-        ("private key", [k("PRIV", "ATE KEY-----")],
-         rx(r"-----BEGIN (?:[A-Z]+ )?PRIV", r"ATE KEY-----"), False),
+         rx(r"\b(?:AK", r"IA|AS", r"IA)[0-9A-Z]{16,}\b"), False, True),
+        ("Google API key", [k("AI", "za")], rx("AI", r"za[0-9A-Za-z_\-]{35,}"), False, True),
+        ("Google OAuth token", [k("ya", "29.")], rx(r"\bya", r"29\.[0-9A-Za-z_\-]{20,}"),
+         False, True),
+        ("Slack token", [k("xo", "x")], rx("xo", r"x[abprs]-[0-9A-Za-z\-]{10,}"), False, True),
+        # a webhook's address names it; only its last part is the secret
+        ("Slack webhook", [k("hooks.sl", "ack.com/services/")],
+         rx(r"hooks\.sl", r"ack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/(?P<v>[A-Za-z0-9]{24})"),
+         False, True),
+        ("Stripe key", [k("sk_li", "ve_"), k("rk_li", "ve_")],
+         rx(r"(?:sk|rk)_", r"live_[0-9A-Za-z]{20,}"), False, True),
+        ("SendGrid key", [k("S", "G.")],
+         rx(r"\bS", r"G\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{40,}"), False, True),
+        ("Hugging Face token", [k("hf", "_")], rx(r"\bhf_", r"[A-Za-z0-9]{30,}"), False, True),
+        ("npm token", [k("npm", "_")], rx(r"\bnpm_", r"[A-Za-z0-9]{36,}\b"), False, True),
+        ("PyPI token", [k("pypi-", "AgEI")], rx(r"\bpypi-", r"AgEI[A-Za-z0-9_\-]{50,}"),
+         False, True),
+        ("age key", [k("AGE-SEC", "RET-KEY-1")], rx(r"AGE-SEC", r"RET-KEY-1[0-9A-Z]{58}"),
+         False, True),
+        ("Vault token", [k("hv", "s.")], rx(r"\bhv", r"s\.[A-Za-z0-9_\-]{24,}"), False, True),
+        ("DigitalOcean token", [k("dop", "_v1_")], rx(r"\bdop", r"_v1_[0-9a-f]{64}"),
+         False, True),
+        ("Shopify token", [k("sh", "p")], rx(r"\bsh", r"p(?:at|ss|ca|pa)_[0-9a-fA-F]{32}"),
+         False, True),
+        ("Docker Hub token", [k("dckr", "_pat_")], rx(r"\bdckr", r"_pat_[A-Za-z0-9_\-]{27,}"),
+         False, True),
+        ("Atlassian token", [k("ATA", "TT3")], rx(r"\bATA", r"TT3[A-Za-z0-9_\-=]{100,}"),
+         False, True),
+        ("Telegram bot token", [k("api.tele", "gram.org/bot")],
+         rx(r"api\.tele", r"gram\.org/bot\d+:(?P<v>[A-Za-z0-9_\-]{35})"), False, True),
+        ("Tailscale key", [k("tsk", "ey-")], rx("tskey", r"-[A-Za-z0-9\-]{20,}"), False, True),
+        # its header, the lines of key below it and its END line, nothing
+        # else (a guide that names BEGIN and END keeps its words); cut off
+        # before its END, as far as its lines go
+        ("private key", [k(pk)],
+         rx(r"-*BEGIN (?P<t>(?:[A-Z0-9]+ ){0,3})", pk, r"(?P<b>(?: BLOCK)?)-----",
+            r"(?:%s[A-Za-z][A-Za-z0-9\-]*: [^\n\"\\]*)*" % once("s1", sep),
+            r"(?:%s%s)*" % (once("s2", sep), line),
+            r"(?:(?:%s%s{1,11})?(?:%s)?-----END (?P=t)" % (once("s3", sep), b64, once("s4", sep)),
+            pk, r"(?P=b)-----)?"), False, False),
+        # a PuTTY key file, to its Private-MAC line (cut off: as far as it goes)
+        ("private key", [k("PuTTY-User-", "Key-File-")],
+         rx(r"PuTTY-User-", r"Key-File-\d+: [^\s\"\\]+(?:",
+            r"(?:%s(?:%s: [^\n\"\\]*|[A-Za-z0-9+/=]{4,}))*?" % (sep, ppk),
+            r"%sPrivate-(?:MAC|Hash): [0-9A-Fa-f]+" % sep,
+            r"|(?:%s(?:%s: [^\n\"\\]*|[A-Za-z0-9+/=]{12,}))*)" % (sep, ppk)), False, True),
+        # a key in base64 (kubeconfig's client-key-data, a secret's tls.key):
+        # _plausible decodes its head
+        ("private key", [k("LS0tLS1CRUdJ", "Ti")],
+         rx(r"(?:(?<![A-Za-z0-9+/])|(?<=\\[nrt]))LS0tLS1CRUdJ", r"Ti[A-Za-z0-9+/]*={0,2}",
+            r"(?:(?:\n|\\+n)[A-Za-z0-9+/]{12,}={0,2})*"), False, True),
+        # header and payload are enough: it runs on to its signature, if any
         ("JSON web token", [k("ey", "J")], rx(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ",
-                                              r"[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), False),
+                                              r"[A-Za-z0-9_\-]{10,}(?:\.[A-Za-z0-9_\-]*)?"),
+         False, True),
+        # any host: a name, one word (a container's), an IPv4 or [IPv6]
+        # address; the password runs to the last @ a host follows
         ("password in a web address", [k(":/", "/")], rx(
-            r"\b[a-z][a-z0-9+.\-]{1,20}://[^\s:/@\"'\\]{1,64}:",
-            r"([^\s:/@\"'\\]{4,128})@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), True),
-        ("password or token", [k("pass", "word"), k("pass", "wd"), k("pw", "d"),
-                               k("sec", "ret"), k("api", "_key"), k("api", "-key"),
-                               k("api", "key"), k("access", "_token"), k("auth", "_token")],
-         rx(r"\b(?:password|passwd|pwd|secret|api[_-]?key|access_token|auth_token)",
-            r"\\?[\"']?\s*[:=]\s*\\?[\"']?([^\s\"'\\,;)}\]`]{8,64})"), True),
+            r"(?i)(?<=[a-z0-9])://[^\s:/@\"'\\]{0,64}:(?P<v>[^\s:/\"'\\<>]{4,})@",
+            r"(?:\[[0-9a-f:.]+\]|[a-z0-9_][a-z0-9_.\-]*)"), True, True),
+        # Go's form of it: user:password@tcp(host:3306)/db
+        ("password in a web address", [k("@tc", "p(")], rx(
+            r"(?i)(?:(?<![^\s\"'=:/\\])|(?<=\\[nrt]))[^\s:@/\"'\\]{1,64}:",
+            r"(?P<v>[^\s\"'\\@]{4,})@(?:tcp|unix|udp)\("), True, False),
+        ("password or token", [k("pa", "ss"), k("pw", "d"), k("sec", "ret"), k("tok", "en"),
+                               k("au", "th"), k("credent", "ial")],
+         rx(words, op, value(""), r"|", authz, r"|", xml, r"|", setting(word), r"|",
+            flag(r"(?<=--)(?:pass(?:word|wd)?|token|secret)|(?<=--with-|--auth-)token"
+                 r"|(?<=--access-)token"), r"|(?<=ssh)(?i:pass\s+-p)\s*", value("p")), True, True),
+        ("password or token", [k("ke", "y")],
+         rx(keys, op, value(""), r"|", setting("key"), r"|", flag(r"(?<=--api-)key")), True, True),
+        ("password or token", [k("pa", "t")],
+         rx(r"(?i:%spat%s)" % (at, ends), op, value("")), True, True),
+        ("password or token", [k("bear", "er")],
+         rx(r"(?i)\bbear", r"er\s+(?P<v>[a-z0-9\-._~+/]{16,}=*)"), True, True),
+        ("password or token", [k("bas", "ic")],
+         rx(r"(?i)\bbas", r"ic\s+(?P<v>(?:[a-z0-9+/]{4}){3,}(?:[a-z0-9+/]{2}==|[a-z0-9+/]{3}=)?)",
+            r"(?![a-z0-9+/=])"), True, True),
+        # a password on a command line: mysql -pX, docker login and twine -p X,
+        # redis-cli -a X, and in curl's -u or --user the part after the colon
+        # (sshpass -p X: with the names above)
+        ("password or token", [k("mys", "ql"), k("maria", "db"), k("docker", " login"),
+                               k("twi", "ne"), k("redis", "-cli")],
+         rx(r"(?i)(?:(?:mysql(?:dump|admin)?|mariadb)\b[^\n|;&]{0,200}?\s(?-i:-p)(?=\S)",
+            r"|(?:docker login|twine)\b[^\n|;&]{0,200}?\s(?:-p\s*|--password(?:=|\s+))",
+            r"|redis-cli\b[^\n|;&]{0,200}?\s-a\s+)", value("")), True, True),
+        ("password or token", [k("cu", "rl")],
+         rx(r"(?i)curl\b[^\n|;&]{0,300}?\s(?:-u\s*|--user(?:=|\s+))\\*[\"']?[^\s:\"'\\]{1,64}:",
+            r"(?P<v>[^\s\"'\\]{4,})"), True, True),
+        # a cookie whose name says it holds a session or a token
+        ("password or token", [k("coo", "kie")],
+         rx(r"(?i)cookie\\*[\"']?\s*:\s*\\*[\"']?",
+            r"(?:[^\s=;\"'\\]{1,64}=[^\s;\"'\\]{0,4096};\s*){0,20}?",
+            r"[^\s=;\"'\\]{0,64}(?:sess|sid|token|auth)[^\s=;\"'\\]{0,64}=(?P<v>[^\s;\"'\\]{8,})"),
+         True, True),
     ]
 
-_PLACEHOLDER = re.compile(r"(?i)(?:x{4,}|\*{3,}|\.{3}|<|>|\$|\{|\(|%|your|example|changeme|"
-                          r"redacted|placeholder|dummy|sample|process\.env|os\.environ|getenv)")
-_CODE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$|^[A-Z][A-Z0-9_]+$"
-                        r"|^[/~.]|^[a-z]+(?:[-_][a-z0-9]+)+$")     # …, a path, joined words
+# a placeholder by its whole shape (${DB_PASSWORD}, $(cat f), %(pw)s,
+# %{DB_PASSWORD}, #{ENV[…]}, $env:X, $__file{…}, <token>, {{ secret }}), or
+# by a part no key has (xxxx, ..., a regular expression's [a-z] or (?:,
+# a %(name)s, <image>, your, example, os.environ)
+_PLACEHOLDER = re.compile(r"(?i)^\$\{?\w+\}?$|^\$[{(]|^%\(?\w*\)?[sdr]$|^%\w+%$|^%\{|^#\{"
+                          r"|^\$env:\w+$|^\$__\w+\{"
+                          r"|^<[^>]*>$|^\{\{.*\}\}$|^\{[\w.]*\}$|^\[.*\]$|x{4,}|\*{3,}|\.{3}|…"
+                          r"|\[\^?(?:a-z|0-9)|\[\^?[A-Za-z0-9]-[A-Za-z0-9]|\(\?[:=!<P]|%\(\w+\)[sdr]"
+                          r"|</?[A-Za-z][\w-]*>"
+                          r"|your|example|changeme|redacted|placeholder|dummy|sample"
+                          r"|process\.env|os\.environ|getenv|env\(|secrets\.")
+# CRAM-MD5, joined words, a port with a path after it (8080/api/v1), a
+# version or an image's tag (1.4.2-alpine3.18), an ARN, a fingerprint or
+# a file's hash (SHA256:…, sha512-…)
+_CODE_NAME = re.compile(r"^[A-Z]+[0-9]*(?:-[A-Z]*[0-9]*)+$|^[a-z]+[0-9]*(?:[-_][a-z0-9]+)+$"
+                        r"|^\d{2,5}(?:/[\w.\-~%]*)*$"
+                        r"|^v?\d+(?:\.\d+)+(?:[-+_.][0-9A-Za-z][0-9A-Za-z.\-]*)?$"
+                        r"|^arn:|^(?:SHA256|SHA1|MD5):|^sha(?:1|256|384|512)-[A-Za-z0-9+/]+=*$")
+# shaped like code: a name (or a number) with calls, indexes and parts
+# after it (tokenizer.encode(text), line[pos:].strip(, TokenElement(id=2),
+# SecretKey::from_slice(&b)?, this.map!.find(node, a+len(b), $req->pw,
+# :not(:empty):before, {elapsed_ms where a format string was cut), or a
+# name alone (Proxy-Authorization).  One way only to read each bracket,
+# so a long value cannot make it backtrack
+_CODE = re.compile(r"^(?:\[\]|[(\[{{&*!?#@\-])*(?:{n}|\d+(?:\.\d+)?)"
+                   r"(?:!?\({g}\)|!?\[[^\[\]]*\]|\?|!?(?:\.|::|->|\+|(?<=[)\]]):)(?:{n}|\d+))*"
+                   r"(?:!?\({g}|!?\[[^\[\]]*|\{{{g})*"            # …left open where it was cut
+                   r"(?:[)\]:=]|(?<=[)\]])!)*$"
+                   .format(n=r"[A-Za-z_$][\w$]*(?:-[A-Za-z_$][\w$]*)*",
+                           g=r"(?:[\w.=*&:+/{}\[\]$!>^-]|\([\w.=*&:+/{}\[\]$!>^-]*\))*"))
+# a name with digits at the end of a word (base64Decode, oauth2_client)
+_IDENT = re.compile(r"^_*(?:[A-Za-z][a-z]*|[A-Z]+)\d+(?:_?[A-Z]?[a-z]+)+$")
+# three words or more, as a password generator joins them
+_PASSPHRASE = re.compile(r"^[A-Za-z]+\d*(?:-[A-Za-z]+\d*){2,}$")
+# pairs of letters common in words and in code (Python's own source has
+# 86% of its pairs among them); what a generator makes has few of them
+_PAIRS = frozenset("ab ac ad ag ai al am an ap ar as at ba be bj bl bu ca ce ch ck cl co ct da"
+                   " de di do du ea ec ed ee ef el em en ep er es et ex fa fi fo fr ge gs ha he"
+                   " hi ho ic id if ig il im in io ir is it ke la le lf li ll lo ls lt lu ma me"
+                   " mo mp na nc nd ne ng ni no ns nt ob oc od of ol om on op or os ot ou ow pa"
+                   " pe pl po pp pr pt ra re rg ri rm rn ro rr rs rt ru ry se sh si so sp ss st"
+                   " su ta te th ti to tr ts tt tu ty ue ul um un up ur us ut va ve wi xc xt yp".split())
+_TRAIL = re.compile(rb"(?:\.{3,}|\xe2\x80\xa6)+$")         # "..." or "…" after a value
+_PEM64 = "LS0tLS1CRUdJ" + "Ti"                            # "-----BEGIN " in base64
 
 def _entropy(s: str) -> float:
     import math
     n = len(s)
     return -sum(c / n * math.log2(c / n) for c in (s.count(x) for x in set(s)))
 
-def _plausible(kind: str, value: str) -> bool:
+def _words(s: str) -> list:
+    return re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])", s)
+
+def _wordy(s: str, need: float) -> bool:
+    """Most pairs of letters in `s` are pairs that words have."""
+    pairs = [w[i:i + 2].lower() for w in _words(s) for i in range(len(w) - 1)]
+    return len(pairs) >= 3 and sum(p in _PAIRS for p in pairs) >= need * len(pairs)
+
+def _a_word(w: str) -> bool:
+    """A word of three letters or more, two thirds of its pairs common."""
+    pairs = [w[i:i + 2].lower() for i in range(len(w) - 1)]
+    return len(w) >= 3 and sum(p in _PAIRS for p in pairs) * 3 >= 2 * len(pairs)
+
+def _code(value: str) -> bool:
+    """Code, not a secret: a name with a call, an index or a part after it,
+    or one name made of words (TokenProvider, _allow_token_discovery)."""
+    if re.search(r"^(?:null|true|false|undefined|this)[^\w$]|[{}()\[\]](?:return|function|else|var"
+                 r"|let|const|if|for|while|this|new|null|true|false|throw|try|catch|switch|case"
+                 r"|break|continue|typeof|void|delete)\b", value):
+        return True                 # minified code: null}fetch(){return
+    if len(value) > 200 or not _CODE.match(value):
+        return False
+    if re.search(r"[(\[.:>]", value.lstrip("[{&*!-")):
+        # a letter seldom turns into a digit, or a small one into a capital
+        flips, could = _flips(value)
+        return (flips * 6 <= could or
+                (_wordy(value, 0.55) and len(re.findall(r"[A-Za-z]\d+[a-z]", value)) <= 1))
+    inner = re.findall(r"[A-Za-z]\d+[A-Za-z]", value)
+    if len(inner) > 1 or not re.search(r"[A-Z_]", value):
+        return False                # digits inside words, or one word: as random
+    if inner and not (_IDENT.match(value) or sum(map(_a_word, _words(value))) >= 2):
+        return False                # NOS98u9Aix: digits between letters, no two words
+    words = _words(value)
+    long = sum(len(w) for w in words if len(w) >= 3)
+    return long >= 6 and long >= 0.8 * sum(map(len, words)) and _wordy(value, 0.6)
+
+def _flips(value: str) -> tuple:
+    """(how often a letter turns into a digit, or a small letter into a
+    capital, within the runs of letters and digits; how often it could)."""
+    runs = re.findall(r"[A-Za-z0-9]+", value)
+    return (sum(a.isdigit() != b.isdigit() or (a.islower() and b.isupper())
+                for r in runs for a, b in zip(r, r[1:])),
+            sum(len(r) - 1 for r in runs))
+
+def _a_name(run: str) -> bool:
+    """A run of letters and digits that reads as a name: short, a number,
+    words, or few turns between letters and digits (k8s, v2, us-east-1)."""
+    if len(run) <= 3 or run.isdigit() or _wordy(run, 0.55):
+        return True
+    flips, could = _flips(run)
+    return len(run) <= 12 and flips * 4 <= could
+
+def _shaped(value: str) -> bool:
+    """A name, not a secret: a constant's (MAX_RETRIES, HMACSHA256; one of
+    capitals and digits only when it reads as words), one named for a
+    secret (isEndOfFileToken), a dotted one or a host's whose every part
+    reads as a name (spring.datasource.password), a dotfile (.env), an
+    Objective-C selector, joined words, a port, a version, an ARN, a hash."""
+    v = value.lstrip("{([")
+    if _CODE_NAME.match(v) or re.match(r"\.[A-Za-z][A-Za-z_\-]*$", v):
+        return True
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", v) and (
+            re.search(r"(?i)(?:pass(?:word|wd|phrase)|secret|token|credentials?|auth|key)$", v)
+            or (re.search(r"(?:Pass(?:word|wd|phrase)|Secret|Token|Credentials?|Auth|Key)"
+                          r"(?![a-z])", v) and len(re.findall(r"[A-Z]", v)) >= 3)):
+        return True                 # isEndOfFileToken, fromTokenIsInRange: a name
+    if re.fullmatch(r"(?:[A-Za-z_]\w*:)+", v):
+        return all(map(_a_name, re.findall(r"[A-Za-z0-9]+", v)))   # initWithToken:error:
+    if re.match(r"[A-Z][A-Z0-9_]+$", v):
+        return "_" in v or _wordy(v, 0.55) or (len(v) <= 12 and not re.search(r"\d", v))
+    if re.match(r"[\w-]+(?:\.[\w-]+)+$", v):
+        return all(map(_a_name, re.findall(r"[A-Za-z0-9]+", v)))
+    return False
+
+# a web address, a reference (scheme:…) or a relative path: a path's
+# characters only, with a / or a scheme in small letters
+_REF = re.compile(r"[a-z][a-z0-9+.\-]*://[\w.\-~%@:+#/?&=]*$|[a-z][a-z0-9+.\-]*:[\w.\-~%@:+#/]*$"
+                  r"|[\w.\-~%@:+#]*/[\w.\-~%@:+#/]*$")
+_ROOT = re.compile(r"/(?:Applications|Library|System|Users|Volumes|app|bin|boot|data|dev|etc"
+                   r"|home|lib|lib64|mnt|nix|opt|private|proc|root|run|sbin|snap|srv|sys|tmp"
+                   r"|usr|var|workspaces?)(?:/|$)")
+
+def _path(value: str) -> bool:
+    """A path: from / (/etc/ssl/private/server.key, /tmp/ssh-Xq3…/agent.42),
+    not a random value that starts with a slash, as one base64 token in 64
+    does: it starts at a folder every system has, or it reads as names;
+    from ~/, ./ or ../; or relative, a web address without a password, a
+    reference (op://vault/item/field, vault:secret/db#password,
+    projects/1/secrets/db/versions/3) whose every run of letters and
+    digits reads as a name (config/<32 random>.json does not)."""
+    if re.match(r"~/|\.\.?/", value):
+        return True
+    if value.startswith("/"):
+        if _ROOT.match(value):
+            return True
+        flips, could = _flips(value)
+        return (flips * 6 <= could or _wordy(value, 0.55) or len(re.findall(
+            r"(?<![^/._\-])(?:[a-z]{3,}|[A-Z][a-z]{2,})(?![^/._\-])", value)) >= 2)
+    return bool(_REF.match(value)) and all(map(_a_name, re.findall(r"[A-Za-z0-9]+", value)))
+
+def _text(value: str) -> bool:
+    """Words, not a key: two letters or more of a language other than
+    English (generated keys are ASCII), a tokenizer's piece of a word
+    (ĠInternational, ▁the), one word of small letters (ansibrightblue)."""
+    return (sum(ord(c) > 127 and c.isalpha() for c in value) >= 2
+            or bool(re.match(r"[ĠĊ▁][^\W\d_]", value))
+            or bool(re.fullmatch(r"[a-z]+", value)))
+
+def _material(value: str) -> bool:
+    """A private key's find holds key material, not only its header: a
+    line of base64 that is not a word, or, in base64 itself, a key."""
+    if value.startswith(_PEM64):
+        import base64
+        head = re.sub(r"[^A-Za-z0-9+/]", "", value)[:96]
+        try:
+            return ("PRIV" + "ATE KEY").encode() in base64.b64decode(head[:len(head) // 4 * 4])
+        except ValueError:
+            return False
+    body = value.lstrip("-").split("-----", 1)[-1] if value.lstrip("-").startswith("BEGIN ") \
+        else re.split(r"[\s\\]", value, 1)[-1]
+    return bool(re.search(r"(?<![A-Za-z0-9+/=])(?![A-Z]?[a-z]+(?![A-Za-z0-9+/=]))"
+                          r"[A-Za-z0-9+/=]{12,}", body))
+
+def _plausible(kind: str, value: str, name: str = "") -> bool:
+    """Whether a find is a secret.  A private key holds key material; a
+    value after a name, or a password in an address, is random: not a
+    placeholder, a name, a path, code or words.  `name` is the text from
+    the character before a name to its value."""
+    if kind == "private key":
+        return _material(value)
     if kind not in ("password or token", "password in a web address"):
         return True
-    if _PLACEHOLDER.search(value) or _CODE_NAME.match(value):
-        return False            # a placeholder, a variable, a constant's name
-    # what people and tools generate is random; words and dates are not
-    if kind == "password or token" and len(value) < 12:
-        classes = sum(bool(re.search(p, value)) for p in
-                      (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
-        return classes >= 3 and len(set(value)) >= 7
+    if "\\u" in value:                    # what JSON escapes (é in café) reads as itself
+        value = re.sub(r"\\+u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), value)
+    if (re.match(r"[^_.\-]?PASS:", name) or re.match(r"[.#][\w-]*:$", name)
+            or re.match(r"(?:Test|Benchmark|Fuzz|Example)\w*/", value)):
+        return False            # a test runner's PASS: line, a CSS selector's :hover
+    if _PLACEHOLDER.search(value):
+        return False
+    if re.search(r"(?i)(?:pass(?:word|wd|phrase)|pwd)\W*$", name) and _PASSPHRASE.match(value):
+        return True             # words joined, after a name that says it is a password
+    if len(set(value)) < 7:
+        return False            # below every bar after this one: cheap to say first
+    if _shaped(value) or _path(value) or _code(value) or _text(value):
+        return False            # a name, a path, a reference, code, words
+    # what people and tools generate is random; words and dates are not.  A
+    # short value is too short for its entropy to say (12 characters reach
+    # 3.5 only when no two are the same), so three kinds of character do
+    if kind == "password or token" and len(value) <= 16:
+        classes = (any(c.islower() for c in value) + any(c.isupper() for c in value)
+                   + any(c.isdigit() for c in value) + any(not c.isalnum() for c in value))
+        if classes >= 3 and len(set(value)) >= 7:
+            return True
+    if kind == "password or token" and re.fullmatch(r"(?=.*\d)(?:(?=.*[a-f])[0-9a-f]{16,}"
+                                                    r"|(?=.*[A-F])[0-9A-F]{16,})", value):
+        return _entropy(value) >= 3.0   # hex: at most 4 bits a character, not 6
     return _entropy(value) >= (3.5 if kind == "password or token" else 2.8)
 
 def _mask(value: str) -> str:
-    if value.startswith("-----BEGIN"):
-        return value.strip("-")                  # the header only: no key material
+    if value.lstrip("-").startswith("BEGIN "):
+        return value.lstrip("-").split("-----")[0]     # the header only: no key material
+    if value.startswith("PuTTY-User-"):
+        return value.split(":")[0]
+    if value.startswith(_PEM64):
+        import base64
+        head = re.sub(r"[^A-Za-z0-9+/]", "", value)[:96]
+        try:
+            text = base64.b64decode(head[:len(head) // 4 * 4]).decode("ascii", "replace")
+        except ValueError:
+            text = ""
+        return text.strip("-").split("-----")[0] + " (in base64)"
     return (value[:4] + "…" + value[-2:]) if len(value) > 10 else value[:2] + "…"
+
+def _fingerprint(value: str) -> str:
+    """What names a find: a private key by its lines alone, so the copy a
+    Read tool shows with line numbers is the same find as the file's."""
+    if value.lstrip("-").startswith(("BEGIN ", "PuTTY-User-", _PEM64)):
+        value = re.sub(r"\d+(?:\t|\\+t|→|\\+u2192)|\\+[nrt]|\\+u2192|→|\s", "", value)
+    return hashlib.sha256(value.encode()).hexdigest()[:16]
 
 def _where_in(line: bytes, agent: str) -> tuple:
     """(when, what kind of message) of the transcript line holding a find."""
@@ -7417,25 +8668,59 @@ def _where_in(line: bytes, agent: str) -> tuple:
     return _when(e.get("timestamp")), "history"
 
 def _scan_bytes(data: bytes, pats: list):
-    """(kind, start, end) of every plausible find in one history file."""
+    """(kind, start, end, value) of every plausible find in one history file.
+    A find inside one found before (a generic one inside a known kind of
+    key, a key inside a longer one) is that one: not found twice, and a
+    needle inside a find, or inside the last match of its own pattern, is
+    not looked at again (so a run of needles costs no more than one)."""
+    import bisect
     lower = None
     seen = set()
-    for kind, needles, rx, generic in pats:
+    starts, ends = [], []           # the known keys found, joined where they overlap
+    def inside(a0, b0):
+        j = bisect.bisect_right(starts, a0) - 1
+        return j >= 0 and b0 <= ends[j]
+    n = len(data)
+    for kind, needles, rx, generic, at in pats:
         if generic and lower is None:
             lower = data.lower()                  # same length: offsets carry over
-        hay = lower if generic else data
+        hay = lower if generic else data          # needles in it, patterns on the text
         for nd in needles:
-            i = hay.find(nd)
+            i, done = hay.find(nd), 0
             while i >= 0:
-                for m in rx.finditer(hay, max(0, i - 160), i + 480):
-                    g = 1 if m.re.groups else 0
-                    span = (m.start(g), m.end(g))
-                    if span in seen:
+                if i < done or inside(i, i + len(nd)):
+                    i = hay.find(nd, i + len(nd))
+                    continue
+                if at:
+                    m = rx.match(data, i, i + _SPAN)
+                    found = [m] if m else ()
+                else:                           # a long one runs on past the window
+                    end = i + 480
+                    found = [rx.match(data, m.start(), m.start() + _SPAN) or m if end < n else m
+                             for m in rx.finditer(data, max(0, i - 160), end)]
+                if found:
+                    done = max([done] + [m.end() for m in found])
+                for m in found:
+                    a0, b0 = next((m.span(g) for g in m.re.groupindex
+                                   if g[0] == "v" and m.start(g) >= 0), m.span())
+                    if generic and data[b0 - 1:b0] in (b".", b"\xa6"):
+                        b0 = a0 + len(_TRAIL.sub(b"", data[a0:b0]))
+                    span = (a0, b0)
+                    if a0 == b0 or span in seen or inside(a0, b0):
                         continue
                     seen.add(span)
-                    value = data[span[0]:span[1]].decode("utf-8", "replace")
-                    if _plausible(kind, value):
-                        yield kind, span[0], span[1], value
+                    value = data[a0:b0].decode("utf-8", "replace")
+                    name = data[max(0, m.start() - 1):a0].decode("utf-8", "replace") \
+                        if generic else ""
+                    if _plausible(kind, value, name):
+                        if not generic:
+                            j = bisect.bisect_left(ends, a0)
+                            k = bisect.bisect_right(starts, b0)
+                            if j < k:
+                                a0, b0 = min(a0, starts[j]), max(b0, ends[k - 1])
+                            starts[j:k], ends[j:k] = [a0], [b0]
+                            a0, b0 = span
+                        yield kind, a0, b0, value
                 i = hay.find(nd, i + len(nd))
 
 _PATS = []
@@ -7448,17 +8733,39 @@ def redact(text: str) -> str:
     if not _PATS:
         _PATS.extend(_secret_patterns())
     data = text.encode("utf-8", "replace")
-    spans = sorted((a0, b0, kind, value) for kind, a0, b0, value in _scan_bytes(data, _PATS))
+    generic = {kind for kind, _n, _rx, g, _at in _PATS if g}
+    # finds that overlap are masked as one, from the first start to the last
+    # end, so no part of a key stays; a known kind of key names it
+    spans = []
+    for a0, b0, kind in sorted((a0, -b0, kind) for kind, a0, b0, _v in _scan_bytes(data, _PATS)):
+        b0 = -b0
+        if spans and a0 < spans[-1][1]:
+            last = spans[-1]
+            last[1] = max(last[1], b0)
+            if last[2] in generic and kind not in generic:
+                last[2] = kind
+        else:
+            spans.append([a0, b0, kind])
     if not spans:
         return text
     out, pos = [], 0
-    for a0, b0, kind, value in spans:
-        if a0 < pos:
-            continue                                # overlaps what is masked already
+    for a0, b0, kind in spans:
+        value = data[a0:b0].decode("utf-8", "replace")
         out += [data[pos:a0], f"[{kind}: {_mask(value)}]".encode()]
         pos = b0
     out.append(data[pos:])
     return b"".join(out).decode("utf-8", "replace")
+
+def _redact_head(text: str, n: int) -> str:
+    """`text` with every key masked, for a caller that keeps only its first
+    `n` characters: masked before the cut, so a key the cut would split is
+    masked whole (only a text over a megabyte is cut first, well past `n`)."""
+    text = text or ""
+    return redact(text if len(text) <= 1 << 20 else text[:n + 4096])
+
+def _masked(text: str, n: int) -> str:
+    """_clip(text, n), every key in it masked first."""
+    return _clip(_redact_head(text, n), n)
 
 def scan_secrets(project: str = None, sessions: list = None) -> list:
     """Everything in the agents' histories that looks like a key, a token or
@@ -7471,7 +8778,7 @@ def scan_secrets(project: str = None, sessions: list = None) -> list:
         except OSError:
             continue
         for kind, a0, b0, value in _scan_bytes(data, pats):
-            digest = hashlib.sha256(value.encode()).hexdigest()[:16]
+            digest = _fingerprint(value)
             key = (s["agent"], s["id"], digest)
             if key in finds:
                 finds[key]["times"] += 1
@@ -7559,14 +8866,15 @@ def build_journal(project: str, days: int = None) -> dict:
                                         "commands": 0, "outcome": ""})
             d["first"], d["last"] = min(d["first"], t), max(d["last"], t)
             if ev["role"] == "user":
-                line = redact(ev["text"].strip().splitlines()[0][:300])[:200]
+                # masked whole before its first line is taken and cut
+                line = (_redact_head(ev["text"].strip(), 200).splitlines() or [""])[0][:200]
                 if line and line not in d["asked"]:
                     d["asked"].append(line)
             elif ev["role"] == "agent":
                 d["outcome"] = ev["text"]
             elif ev["role"] == "tool":
                 tgt = ev.get("target") or ""
-                if ev.get("tool") in _CHANGE_TOOLS and tgt.startswith("/") and _inside(tgt, real):
+                if ev.get("tool") in _CHANGE_TOOLS and _is_abs(tgt) and _inside(tgt, real):
                     rel = os.path.relpath(tgt, real)
                     if rel not in d["changed"]:
                         d["changed"].append(rel)
@@ -7585,7 +8893,7 @@ def build_journal(project: str, days: int = None) -> dict:
             span = (time.strftime("%H:%M", time.localtime(d["first"])) + "–"
                     + time.strftime("%H:%M", time.localtime(d["last"])))
             L += ["", f"### {span} · {AGENT_NAMES.get(d['agent'], d['agent'])} · "
-                      f"{_clip(d.get('title') or d['id'], 90)}"]
+                      f"{_masked(d.get('title') or d['id'], 90)}"]
             if d["asked"]:
                 L += ["", "Asked:"] + [f"- {a}" for a in d["asked"][:12]]
                 if len(d["asked"]) > 12:
@@ -7596,7 +8904,7 @@ def build_journal(project: str, days: int = None) -> dict:
             if d["commands"]:
                 L += ["", f"Ran {d['commands']} command(s)."]
             if d["outcome"]:
-                L += ["", "Where it ended: " + redact(_clip(" ".join(d["outcome"].split()), 400))]
+                L += ["", "Where it ended: " + _masked(" ".join(d["outcome"].split()), 400)]
     if not per_day:
         L += ["", "No agent session of this project could be read."]
     return {"project": real, "days": len(per_day), "markdown": "\n".join(L) + "\n"}
@@ -7797,7 +9105,7 @@ def events_digest(s: dict, project: str, turns: int = 8, tail: int = None) -> di
                 if isinstance(todos, list):
                     d["todos"] = [x for x in todos if isinstance(x, dict)
                                   and x.get("status") not in ("completed", "done")]
-            elif tgt.startswith("/"):
+            elif _is_abs(tgt):
                 if _inside(tgt, project):
                     if ev.get("tool") in _CHANGE_TOOLS:
                         rel = os.path.relpath(tgt, project)
@@ -7816,16 +9124,16 @@ def _brief_sections(dig: dict) -> list:
     is masked: the summary is a new file, and a key must not spread."""
     L = []
     if dig.get("summary"):
-        L += ["", "## Where things stood", "", redact(_clip(dig["summary"], 8000))]
+        L += ["", "## Where things stood", "", _masked(dig["summary"], 8000)]
     if dig.get("exchanges"):
         L += ["", "## The latest exchanges"]
         for x in dig["exchanges"]:
-            L += ["", "**You:** " + redact(_clip(x["you"], 1500))]
+            L += ["", "**You:** " + _masked(x["you"], 1500)]
             if x.get("agent"):
-                L += ["", "**Agent:** " + redact(_clip(x["agent"], 2500))]
+                L += ["", "**Agent:** " + _masked(x["agent"], 2500)]
     if dig.get("todos"):
         L += ["", "## Open to-do items", ""]
-        L += [f"- [ ] {redact(_clip(str(x.get('content') or x.get('subject') or x.get('title') or ''), 200))}"
+        L += [f"- [ ] {_masked(str(x.get('content') or x.get('subject') or x.get('title') or ''), 200)}"
               + ("  *(in progress)*" if x.get("status") == "in_progress" else "")
               for x in dig["todos"]]
     if dig.get("touched"):
@@ -7842,7 +9150,7 @@ def write_switch_brief(real: str, src: dict, dig: dict, target: str) -> Path:
          f"- From **{frm}** to **{AGENT_NAMES.get(target, target)}** on {_here()}, "
          f"{time.strftime('%Y-%m-%d %H:%M')}",
          f"- Folder: `{real}`",
-         f"- Session it continues: {dig.get('title') or 'untitled'} — `{src['id']}`",
+         f"- Session it continues: {redact(dig.get('title') or 'untitled')} — `{src['id']}`",
          f"- To go back to it: `{resume_command(src['agent'], src['id'], real)}`"]
     L += _brief_sections(dig)
     if dig.get("outside"):
@@ -7850,8 +9158,7 @@ def write_switch_brief(real: str, src: dict, dig: dict, target: str) -> Path:
         L += [f"- `{p}`" for p in dig["outside"]]
     name = f"{time.strftime('%Y%m%d-%H%M')}-to-{target}.md"
     (out / name).write_text("\n".join(L) + "\n", encoding="utf-8")
-    for old in sorted(out.glob("*-to-*.md"))[:-8]:
-        old.unlink()
+    prune_relays(out)
     return out / name
 
 def _kimi_session_after(real: str, since: float):
@@ -8047,13 +9354,12 @@ def session_board(remotes: bool = True, names: bool = False) -> list:
     here = {"machine": _here(), "local": True, "reachable": True,
             "sessions": open_sessions_here(names)}
     boards = [here]
-    if remotes and handover_supported():
+    if remotes and can_reach_machines():
         found = []
         def ask(name):
             row = {"machine": name, "local": False, "reachable": False, "sessions": []}
             try:
                 rem = get_remote(name)
-                rem.push_agent()
                 ans = rem.agent("board", timeout=30, names=names)
                 row.update(reachable=True, host=ans.get("host"), sessions=ans["sessions"])
             except HandoverError as e:
@@ -8153,19 +9459,28 @@ def _notify(title: str, message: str, info: dict = None) -> None:
 def check_notices(remotes: bool = None) -> list:
     """Compare the open sessions with the last look and announce what changed:
     a session that now waits for you, and one that finished after working a
-    while.  Other machines are asked only while a project is handed over."""
+    while.  Every check also settles unfinished handovers (`handing`
+    records: resolve_handing asks their machine).  Other machines' sessions
+    are asked only while a project is handed over."""
     try:
         st = json.loads(notices_state().read_text())
     except Exception:
         st = {}
     seen, last_remote = st.get("seen") or {}, float(st.get("remote_at") or 0)
-    away = any(e.get("away") for e in load_registry().get("projects", {}).values())
+    projects = load_registry().get("projects", {})
+    away = any(e.get("away") for e in projects.values())
+    out = []
+    for uid in [u for u, e in projects.items() if e.get("handing")]:
+        try:                                # a handover that was cut off
+            out += resolve_handing(uid)
+        except Exception as e:
+            warn(f"HANDOVER resolving an unfinished one: {e}")
     ask_remote = (remotes if remotes is not None else
                   away and time.time() - last_remote >= 55)
-    boards = session_board(remotes=ask_remote and handover_supported())
+    boards = session_board(remotes=ask_remote and can_reach_machines())
     if ask_remote:
         last_remote = time.time()
-    now, out, fresh = time.time(), [], {}
+    now, fresh = time.time(), {}
     finished_after = float(cfg_get("notify_finished_minutes", 3)) * 60
     for b in boards:
         if not b["reachable"]:
@@ -8525,7 +9840,7 @@ def tidy_history_text(key: str, max_sessions: int = 10, per_session: int = 40) -
             L += ["", f"*… {len(msgs) - per_session} earlier message(s)*"]
         for ev in msgs[-per_session:]:
             who = {"user": "You", "agent": "Agent", "summary": "Summary"}[ev["role"]]
-            L += ["", f"**{who}:** " + _clip(ev["text"], 1500)]
+            L += ["", f"**{who}:** " + _masked(ev["text"], 1500)]
     if len(sessions) > max_sessions:
         L += ["", f"*… and {len(sessions) - max_sessions} older session(s)*"]
     return {"key": key, "path": path, "sessions": len(sessions),
@@ -9001,48 +10316,328 @@ def _tidy_relink(dst: str, as_json: bool) -> int:
     return 0 if e else 1
 
 # ---- history backups on another machine too --------------------------------- #
+#
+# There they go into ~/.aht/offsite/<this install's machine id>/backups, a
+# folder of its own for every computer, also for two of one name.  Copying
+# only adds.  A backup there is removed only when this computer sent it,
+# pruned it here itself, and OFFSITE_FLOOR newer ones of that project stay.
+# The copies made before a rewrite (<project id>/rewrites/…) go too and are
+# never removed there: they are kept until the user deletes them here.
+# Fetching adds what is missing here and never overwrites.
+
+OFFSITE_FLOOR = 3
+_SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 def offsite_remote():
     name = cfg_get("offsite_backup")
     return get_remote(name) if name else None
 
-def offsite_backup(pull: bool = False) -> dict:
-    """Copy the history backups to the machine named in offsite_backup (or,
-    with pull, fetch what is missing here from it).  A second copy that does
-    not burn with this Mac."""
+def offsite_state_path() -> Path:
+    return aht_home() / "offsite.json"
+
+def _offsite_state() -> dict:
+    try:
+        d = json.loads(offsite_state_path().read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _backup_files(root: Path) -> dict:
+    """{"<project id>/<file>": size} of the backups under `root`: each zip
+    and its .meta.json, and every copy made before a rewrite
+    ("<project id>/rewrites/<…>")."""
+    out = {}
+    try:
+        for d in root.iterdir() if root.is_dir() else []:
+            if not d.is_dir() or not _SAFE_NAME.fullmatch(d.name):
+                continue
+            for f in d.iterdir():
+                if f.is_file() and f.name.endswith((".zip", ".meta.json")):
+                    out[f"{d.name}/{f.name}"] = f.stat().st_size
+            rw = d / "rewrites"
+            if rw.is_dir() and not rw.is_symlink():
+                for dp, _dns, fns in os.walk(rw):
+                    for n in fns:
+                        f = Path(dp) / n
+                        if f.is_file() and not f.is_symlink():
+                            out[f.relative_to(root).as_posix()] = f.stat().st_size
+    except OSError:
+        pass
+    return out
+
+def _is_snapshot(rel: str) -> bool:
+    """A backup's zip ("<project id>/<stamp>.zip"), not a rewrite's copy."""
+    return rel.count("/") == 1 and rel.endswith(".zip")
+
+def _offsite_root() -> Path:
+    return aht_home() / "offsite"
+
+def _agent_offsite_list(req: dict) -> dict:
+    """The backup folders here, one per computer that copies its backups to
+    this machine; with `files`, what is in the folders named."""
+    rows, files, root = [], {}, _offsite_root()
+    want = set(req.get("files") or [])
+    for d in sorted(root.iterdir()) if root.is_dir() else []:
+        if not d.is_dir() or not _SAFE_NAME.fullmatch(d.name):
+            continue
+        try:
+            m = json.loads((d / "machine.json").read_text())
+        except Exception:
+            m = None                        # an older aht's folder: named by the computer
+        b = _backup_files(d / "backups")
+        zips = [k for k in b if _is_snapshot(k)]
+        newest = max((_quiet_value(lambda k=k: (d / "backups" / k).stat().st_mtime) or 0
+                       for k in b), default=0)
+        rows.append({"id": d.name if m else None, "folder": d.name,
+                     "name": (m or {}).get("name") or d.name,
+                     "system": (m or {}).get("system"),
+                     "updated": (m or {}).get("updated")
+                     or (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(newest))
+                         if newest else None),
+                     "projects": len({k.split("/")[0] for k in zips}), "files": len(zips),
+                     "bytes": sum(b.values()), "legacy": m is None})
+        if d.name in want:
+            files[d.name] = b
+    return {"ok": True, "folders": rows, "files": files}
+
+def _agent_offsite_adopt(req: dict) -> dict:
+    """Make the folder of the computer `id` (its machine.json says which
+    computer it is).  With `legacy`, an older aht's folder of that computer's
+    name is taken over: its backups and rewrites' copies move in; one already
+    there with the same size is dropped, one of another size stays where it
+    is."""
+    mid = str(req.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{12}", mid):
+        return {"ok": False, "error": "no computer id"}
+    dst = _offsite_root() / mid / "backups"
+    dst.mkdir(parents=True, exist_ok=True)
+    m = req.get("machine") or {}
+    _write_json(dst.parent / "machine.json",
+                {"id": mid, "name": str(m.get("name") or ""), "system": m.get("system"),
+                 "updated": m.get("updated") or _now()})
+    adopted = []
+    old = str(req.get("legacy") or "")
+    src = _offsite_root() / old / "backups"
+    if old and _SAFE_NAME.fullmatch(old) and old != mid \
+            and not (src.parent / "machine.json").exists():
+        for rel, size in sorted(_backup_files(src).items()):
+            here, there = src / rel, dst / rel
+            try:
+                if there.exists():
+                    if there.stat().st_size == size:
+                        here.unlink()
+                    continue
+                there.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(here, there)
+                adopted.append(rel)
+            except OSError:
+                continue
+        for d in sorted(src.parent.rglob("*"), reverse=True) + [src.parent]:
+            try:
+                d.rmdir()                   # empty folders only
+            except OSError:
+                pass
+    return {"ok": True, "adopted": adopted}
+
+def _agent_offsite_prune(req: dict) -> dict:
+    """Remove backups that the computer `id` sent here and has pruned itself;
+    the newest OFFSITE_FLOOR of each project always stay."""
+    mid = str(req.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{12}", mid):
+        return {"ok": False, "error": "no computer id"}
+    base = _offsite_root() / mid / "backups"
+    floor = max(OFFSITE_FLOOR, int(req.get("floor") or 0))
+    removed = []
+    for rel in sorted(set(req.get("files") or [])):
+        proj, _, fname = str(rel).partition("/")
+        if not (_SAFE_NAME.fullmatch(proj) and _SAFE_NAME.fullmatch(fname)
+                and fname.endswith(".zip")):
+            continue
+        zips = sorted(f.name for f in (base / proj).glob("*.zip"))
+        if fname not in zips or len(zips) - zips.index(fname) - 1 < floor:
+            continue
+        for f in (base / proj / fname, base / proj / (fname[:-4] + ".meta.json")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        removed.append(rel)
+    return {"ok": True, "removed": removed}
+
+def _pruned_here(rel: str, mine: dict) -> bool:
+    """A backup this computer pruned itself: newer ones of its project are
+    still here.  None at all is no prune (backups wiped, or a new computer),
+    and then nothing is removed over there."""
+    proj, _, fname = rel.partition("/")
+    return any(k.startswith(proj + "/") and _is_snapshot(k) and k.split("/", 1)[1] > fname
+               for k in mine)
+
+def offsite_push() -> dict:
+    """Copy this computer's history backups to the machine named in
+    offsite_backup: a second copy that does not burn with this one."""
+    rem = _offsite_connect()
+    mid, me = machine_id(create=True), _here()
+    here = backups_root()
+    mine = _backup_files(here)
+    got = rem.agent("offsite-list", files=[mid, me])
+    files = got.get("files") or {}
+    theirs = dict(files.get(mid) or {})
+    old = (files.get(me) or {}) if any(f["legacy"] and f["folder"] == me
+                                       for f in got["folders"]) else None
+    # an older aht's folder of this name is taken over only when it holds
+    # nothing but copies of what is here (backups and rewrites' copies):
+    # another computer of this name may have made it.  One with nothing
+    # left in it is taken over too, and so goes
+    take_over = old is not None and all(mine.get(k) == v for k, v in old.items())
+    adopted = rem.agent("offsite-adopt", id=mid, legacy=me if take_over else None,
+                        machine={"name": me, "system": platform.system(),
+                                 "updated": _now()})["adopted"]
+    st = _offsite_state()
+    sent_all = dict(st.get("sent") or {})
+    sent = dict(sent_all.get(rem.name) or {})
+    for k in adopted:
+        theirs[k] = sent[k] = old[k]
+    there = f"{rem.info['home']}/.aht/offsite/{mid}/backups"
+    missing = sorted(k for k in mine if k not in theirs)
+    res = {"machine": rem.name, "folder": mid, "files": 0, "bytes": 0, "pulled": False,
+           "adopted": len(adopted), "removed": 0,
+           "differs": sorted(k for k in mine if k in theirs and theirs[k] != mine[k]),
+           "legacy": [f["folder"] for f in got["folders"] if f["legacy"]
+                      and (f["files"] or f["bytes"]) and not (take_over and f["folder"] == me)]}
+    if missing:
+        r = rem.rsync(str(here) + "/", rem.spec(there + "/"), files_from=missing,
+                      add_only=True)
+        if not r["ok"]:
+            raise HandoverError("copying the backups failed: " + r["error"])
+        sent.update({k: mine[k] for k in missing})
+        res["files"], res["bytes"] = len([k for k in missing if _is_snapshot(k)]), \
+            sum(mine[k] for k in missing)
+    # only backups go there; a rewrite's copy stays until the user deletes it here
+    pruned = sorted(k for k in sent if _is_snapshot(k) and k not in mine
+                    and _pruned_here(k, mine))
+    if pruned:
+        gone = rem.agent("offsite-prune", id=mid, files=pruned,
+                         floor=OFFSITE_FLOOR)["removed"]
+        for k in gone:
+            sent.pop(k, None)
+            sent.pop(k[:-4] + ".meta.json", None)
+        res["removed"] = len(gone)
+    sent_all[rem.name] = sent
+    st.update(machine=rem.name, at=time.time(), files=res["files"], bytes=res["bytes"],
+              pulled=False, sent=sent_all)
+    _write_json(offsite_state_path(), st)
+    try:
+        (aht_home() / "run" / "offsite.json").unlink()      # where older versions kept it
+    except OSError:
+        pass
+    log(f"OFFSITE copied to {rem.name}: {res['files']} backup(s), {_human(res['bytes'])}"
+        + (f"; {res['removed']} removed there" if res["removed"] else ""))
+    res["at"] = st["at"]
+    return res
+
+def _offsite_folders(rem: Remote) -> list:
+    mid = machine_id()
+    rows = rem.agent("offsite-list")["folders"]
+    for f in rows:
+        f["mine"] = bool(mid) and f["id"] == mid
+    return rows
+
+def _offsite_connect() -> Remote:
     rem = offsite_remote()
     if rem is None:
         raise HandoverError("no machine is set for backups — Settings, or:  "
                             "aht config --set offsite_backup=<machine>")
     rem.connect()
-    there = f"{rem.info['home']}/.aht/offsite/{_here()}/backups"
+    return rem
+
+def offsite_list() -> dict:
+    """The backup folders on the offsite machine: one per computer."""
+    rem = _offsite_connect()
+    return {"remote": rem.name, "folders": _offsite_folders(rem)}
+
+def offsite_fetch(source: str = None) -> dict:
+    """Bring backups here from the offsite machine (on a new computer): from
+    this computer's folder there, or the one named by `source`: an id, then a
+    folder's name (an older aht's folder is named by its computer), then a
+    computer's name.  Adds what is missing; never overwrites.  A backup of
+    the same name but another size arrives as <stamp>-from-<name>.zip."""
+    rem = _offsite_connect()
+    rows = _offsite_folders(rem)
+    if source:
+        # in this order, so an older aht's folder can be picked by its folder
+        # name even when a computer of that name also has a folder by id
+        pick = [f for f in rows if f["id"] == source] or \
+            [f for f in rows if f["folder"] == source] or \
+            [f for f in rows if f["name"] == source]
+        if not pick:
+            raise HandoverError(f"{rem.name} keeps no backups of {source}; it keeps: "
+                                + (", ".join(f"{f['name']} ({f['id'] or 'older aht'})"
+                                             for f in rows) or "none"))
+        if len(pick) > 1:
+            raise HandoverError(f"several computers named {source} keep backups on "
+                                f"{rem.name}; choose one by its id: "
+                                + ", ".join(f["id"] or f["folder"] for f in pick))
+    else:
+        pick = [f for f in rows if f["mine"] and f["files"]] or \
+            [f for f in rows if f["files"]]
+        if not pick:
+            raise HandoverError(f"{rem.name} keeps no backups yet")
+        if len(pick) > 1:
+            raise HandoverError(f"several computers keep backups on {rem.name}: "
+                                + ", ".join(f"{f['name']} ({f['id'] or 'older aht'})"
+                                            for f in pick)
+                                + " — choose one with --from")
+    src, info = pick[0], rem.info
+    folder = src["folder"]
+    theirs = (rem.agent("offsite-list", files=[folder]).get("files") or {}).get(folder) or {}
     here = backups_root()
     here.mkdir(parents=True, exist_ok=True)
-    if pull:
-        r = rem.rsync(rem.spec(there + "/"), str(here) + "/", skip=[".last-run"])
-    else:
-        rem.agent("prepare", dirs=[there])
-        r = rem.rsync(str(here) + "/", rem.spec(there + "/"), delete=True, skip=[".last-run"])
-    if not r["ok"]:
-        raise HandoverError("copying the backups failed: " + r["error"])
-    stamp = {"machine": rem.name, "at": time.time(), "bytes": r.get("bytes", 0),
-             "files": r.get("files", 0), "pulled": pull}
-    (aht_home() / "run").mkdir(parents=True, exist_ok=True)
-    (aht_home() / "run" / "offsite.json").write_text(json.dumps(stamp))
-    log(f"OFFSITE {'fetched from' if pull else 'copied to'} {rem.name}: "
-        f"{r.get('files', 0)} file(s), {_human(r.get('bytes', 0))}")
-    return stamp
+    mine = _backup_files(here)
+    new = sorted(k for k in theirs if k not in mine)
+    other = sorted(k for k in theirs if k in mine and mine[k] != theirs[k])
+    there = f"{info['home']}/.aht/offsite/{folder}/backups"
+    res = {"machine": rem.name, "from": {"id": src["id"], "name": src["name"]},
+           "files": 0, "bytes": 0, "pulled": True, "renamed": []}
+    if new:
+        r = rem.rsync(rem.spec(there + "/"), str(here) + "/", files_from=new, add_only=True)
+        if not r["ok"]:
+            raise HandoverError("fetching the backups failed: " + r["error"])
+    if other:
+        # the same name, another size: both are kept, theirs under its own name
+        inc = aht_home() / "run" / f"offsite-in-{os.urandom(3).hex()}"
+        inc.mkdir(parents=True)
+        try:
+            r = rem.rsync(rem.spec(there + "/"), str(inc) + "/", files_from=other)
+            if not r["ok"]:
+                raise HandoverError("fetching the backups failed: " + r["error"])
+            tag = re.sub(r"[^A-Za-z0-9._-]+", "-", src["name"]).strip("-") or "elsewhere"
+            for k in other:
+                proj, fname = k.split("/", 1)
+                stem, ext = (fname[:-10], ".meta.json") if fname.endswith(".meta.json") \
+                    else os.path.splitext(fname)
+                dest = _free_name(str(here / proj), f"{stem}-from-{tag}{ext}")
+                if (inc / k).is_file():
+                    os.replace(inc / k, here / proj / dest)
+                    res["renamed"].append(f"{proj}/{dest}")
+        finally:
+            shutil.rmtree(inc, ignore_errors=True)
+    res["files"] = len([k for k in new if _is_snapshot(k)]) + \
+        len([k for k in res["renamed"] if _is_snapshot(k)])
+    res["bytes"] = sum(theirs[k] for k in new) + sum(theirs[k] for k in other)
+    st = _offsite_state()
+    st.update(fetched_at=time.time(), fetched_from=res["from"])
+    _write_json(offsite_state_path(), st)
+    log(f"OFFSITE fetched from {rem.name} ({src['name']}): {res['files']} backup(s), "
+        f"{_human(res['bytes'])}")
+    res["at"] = time.time()
+    return res
 
 def _spawn_offsite() -> None:
     try:
         if os.environ.get("AHT_NO_MIRROR") or not cfg_get("offsite_backup") \
-                or not handover_supported():
+                or not can_send_projects():
             return
-        subprocess.Popen([sys.executable or "python3", str(Path(__file__).resolve()),
-                          "backup", "--offsite", "--quiet"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, close_fds=True,
-                         start_new_session=True, cwd="/")
+        _spawn_aht(["backup", "--offsite", "--quiet"])
     except Exception:
         pass
 
@@ -9110,7 +10705,7 @@ def session_changes(project: str, sid: str = None) -> dict:
                                    and not l.startswith("+++")),
                       "removed": sum(1 for l in diff.splitlines() if l.startswith("-")
                                      and not l.startswith("---")),
-                      "diff": redact(diff[:200000])})
+                      "diff": _redact_head(diff, 200000)[:200000]})
     title = session_digest(Path(store) / f"{sid}.jsonl", real, turns=0).get("title")
     order = {"changed": 0, "added": 1, "removed": 2, "no checkpoint kept": 3, "unchanged": 4}
     files.sort(key=lambda f: (not f["inside"], order.get(f["state"], 5), f["name"]))
@@ -9307,18 +10902,29 @@ def cmd_report(args):
 # ---- share a session -------------------------------------------------------- #
 
 def _scrub(text: str) -> str:
-    """No keys, and no local paths or names that say whose Mac this is."""
+    """No keys aht recognises, no e-mail or local network addresses, and no
+    home folder or names that say whose Mac this is."""
     text = redact(text)
     home = str(Path.home())
     text = text.replace(home, "~")
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[e-mail]", text)
-    text = re.sub(r"\b(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01])|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))"
+    text = re.sub(r"\b(?:10|192\.168|169\.254|172\.(?:1[6-9]|2\d|3[01])|"
+                  r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7]))"
                   r"(?:\.\d{1,3}){2,3}\b", "[address]", text)
+    # IPv6: unique local (fd00::/8, Tailscale's among them) and link-local
+    # (fe80::/10, with its zone: %en0); a colon after one is the sentence's
+    text = re.sub(r"\b(?:fd[0-9a-f]{2}|fe[89ab][0-9a-f])(?::[0-9a-f]{0,4}){2,7}(?<![^:]:)"
+                  r"(?:%\w+(?:[.-]\w+)*)?(?!\w)", "[address]", text, flags=re.I)
     user = os.path.basename(home)
     host = _here()
     for word in {user, host} - {"", "home", "user", "root"}:
         text = re.sub(rf"\b{re.escape(word)}\b", "…", text)
     return text
+
+# what a shared page says of itself, under its title
+SHARE_NOTE = ("Keys and passwords aht recognises are masked; e-mail addresses, local network "
+              "addresses and your home folder's path are removed. Look it through before you "
+              "share it.")
 
 def export_session(project: str, sid: str = None, agent: str = None,
                    fmt: str = "md", tools: bool = False) -> dict:
@@ -9337,6 +10943,7 @@ def export_session(project: str, sid: str = None, agent: str = None,
             turns.append((ev["role"], ev.get("t"), _scrub(ev["text"])))
         elif ev["role"] == "tool" and tools:
             turns.append(("tool", ev.get("t"), _scrub(f"{ev.get('tool')}: {ev.get('target')}")))
+    title = _scrub(title) if title else title
     who = {"user": "You", "agent": AGENT_NAMES.get(s["agent"], "Agent"),
            "summary": "Summary of the earlier conversation", "tool": "Tool"}
     name = os.path.basename(real)
@@ -9360,11 +10967,10 @@ def export_session(project: str, sid: str = None, agent: str = None,
                ".user .t{background:#2a2c30}}</style>"
                f"<h1>{H.escape(title or name)}</h1><p class=sub>{H.escape(name)} · "
                f"{H.escape(AGENT_NAMES.get(s['agent'], s['agent']))} · {H.escape(when)}. "
-               "Keys, passwords and local paths are removed.</p>" + "".join(body))
+               f"{H.escape(SHARE_NOTE)}</p>" + "".join(body))
     else:
         L = [f"# {title or name}", "",
-             f"{name} · {AGENT_NAMES.get(s['agent'], s['agent'])} · {when}. "
-             "Keys, passwords and local paths are removed.", ""]
+             f"{name} · {AGENT_NAMES.get(s['agent'], s['agent'])} · {when}. {SHARE_NOTE}", ""]
         for role, t, text in turns:
             L += [f"**{who[role]}**" + (f" · {_when_text(t)}" if t else ""), "", text, ""]
         doc = "\n".join(L)
@@ -9403,7 +11009,7 @@ def redact_in_histories(fingerprint: str, project: str = None, apply: bool = Fal
         except OSError:
             continue
         spans = [(a0, b0) for _k, a0, b0, v in _scan_bytes(data, pats)
-                 if hashlib.sha256(v.encode()).hexdigest()[:16] == fingerprint]
+                 if _fingerprint(v) == fingerprint]
         if spans:
             hits.append((s, spans))
     res = {"fingerprint": fingerprint, "files": len(hits),
@@ -9447,13 +11053,23 @@ def redact_in_histories(fingerprint: str, project: str = None, apply: bool = Fal
 # second_opinion, night_shift.
 # --------------------------------------------------------------------------- #
 
+def _aht_argv() -> list:
+    """How to run aht itself: aht.exe when frozen (also from the tray's own
+    exe), else this file; on Windows from a checkout, through the Windows
+    entry point, which the core needs there (it brings fcntl)."""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+        cli = exe.with_name("aht.exe")
+        return [str(cli) if exe.stem.lower() != "aht" and cli.is_file() else sys.executable]
+    me = Path(__file__).resolve()
+    if os.name == "nt" and (me.parent / "windows" / "src" / "aht_main.py").is_file():
+        return [sys.executable, str(me.parent / "windows" / "src" / "aht_main.py")]
+    return [sys.executable or "python3", str(me)]
+
 def _spawn_aht(args: list):
     """Run `aht <args>` detached; its pid, or None."""
     try:
-        if getattr(sys, "frozen", False):
-            cmd = [sys.executable] + args
-        else:
-            cmd = [sys.executable or "python3", str(Path(__file__).resolve())] + args
+        cmd = _aht_argv() + args
         kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
               "stderr": subprocess.DEVNULL, "close_fds": True, "cwd": "/"}
         if os.name == "nt":
@@ -9485,7 +11101,7 @@ def _session_title(s: dict):
                     title = e.get("aiTitle") or e.get("customTitle") or title
     except OSError:
         pass
-    return title
+    return redact(str(title)) if title else None
 
 # ---- every session starts informed (USES TOKENS: off unless turned on) ------ #
 
@@ -9506,14 +11122,14 @@ def informed_note(cwd: str, current: str = None, limit: int = 1600) -> str:
         title = dig.get("title") or _session_title(s)
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["updated"]))
         L = [f"[aht] The latest earlier session in this folder: {AGENT_NAMES[s['agent']]}, "
-             f"{when}" + (f", “{_clip(title, 80)}”" if title else "") + "."]
-        L.append("- Last request: " + _clip(" ".join(x["you"].split()), 300))
+             f"{when}" + (f", “{_masked(title, 80)}”" if title else "") + "."]
+        L.append("- Last request: " + _masked(" ".join(x["you"].split()), 300))
         if x.get("agent"):
-            L.append("- Where it stopped: " + _clip(" ".join(x["agent"].split()), 500))
+            L.append("- Where it stopped: " + _masked(" ".join(x["agent"].split()), 500))
         todos = [str(t.get("content") or t.get("subject") or t.get("title") or "")
                  for t in dig.get("todos") or []]
         if todos:
-            L.append("- Open to-dos: " + "; ".join(_clip(t, 100) for t in todos[:5]))
+            L.append("- Open to-dos: " + "; ".join(_masked(t, 100) for t in todos[:5]))
         if dig.get("touched"):
             L.append("- Files it changed last: "
                      + ", ".join(list(reversed(dig["touched"]))[:6]))
@@ -9587,6 +11203,7 @@ def limit_stop(jsonl):
             return None                     # the user went on after it
         if (e.get("isApiErrorMessage") or e.get("error")) and _LIMIT_WORDS.search(txt):
             at = _when(e.get("timestamp"))
+            txt = redact(txt)                   # shown and sent: masked before any cut
             r = re.search(r"resets\s+([^\n·]+)", txt)
             return {"at": at, "text": _clip(txt, 200),
                     "resets": r.group(1).strip() if r else None,
@@ -9917,7 +11534,7 @@ def _file_row(name: str, before, now, state: str) -> dict:
                                         text(now).splitlines(True), "before", "now", n=2))
     row["added"] = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
     row["removed"] = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
-    row["diff"] = redact(diff[:200000])
+    row["diff"] = _redact_head(diff, 200000)[:200000]
     return row
 
 def _same_file(a: str, b: str) -> bool:
@@ -10075,7 +11692,9 @@ def _ends_on_question(dig: dict):
     """("question" | "offer", sentence) when the agent's last message ends by
     asking you something or offering a next step; None otherwise."""
     ex = dig.get("exchanges") or []
-    txt = (ex[-1].get("agent") or "").strip() if ex else ""
+    # masked before it is cut into paragraphs and sentences and their dashes
+    # and backticks go: a key, a private key's lines too, is masked whole
+    txt = redact((ex[-1].get("agent") or "").strip()) if ex else ""
     txt = re.split(r"\n\s*\**(?:Sources|References|Links)\**:?\**\s*\n", txt)[0].strip()
     para = re.split(r"\n\s*\n", txt)[-1].strip() if txt else ""
     sents = [x.strip(" *_-#>`") for x in re.split(r"(?<!e\.g\.)(?<!i\.e\.)(?<=[.!?])\s+",
@@ -10086,10 +11705,10 @@ def _ends_on_question(dig: dict):
     n = len(sents)
     for i in reversed(range(max(0, n - 3), n)):
         if sents[i].endswith("?"):
-            return "question", redact(_clip(whole(i), 240))
+            return "question", _masked(whole(i), 240)
     for i in reversed(range(max(0, n - 2), n)):
         if _OFFER.search(sents[i]):
-            return "offer", redact(_clip(whole(i), 240))
+            return "offer", _masked(whole(i), 240)
     return None
 
 def loose_ends(days: int = 30) -> list:
@@ -10125,8 +11744,8 @@ def loose_ends(days: int = 30) -> list:
                               "text": f"{n} file(s) not committed"})
         s = sessions[0]
         dig = events_digest(s, real, turns=1, tail=4 << 20)
-        todos = [redact(_clip(str(t.get("content") or t.get("subject") or t.get("title")
-                                  or ""), 120)) for t in dig.get("todos") or []]
+        todos = [_masked(str(t.get("content") or t.get("subject") or t.get("title")
+                             or ""), 120) for t in dig.get("todos") or []]
         todos = [t for t in todos if t]
         if todos:
             items.append({"kind": "todos", "count": len(todos),
@@ -10236,14 +11855,14 @@ def _opinion_answer(agent: str, out: Path) -> dict:
         try:
             obj = json.loads(raw)
             u = obj.get("usage") or {}
-            return {"answer": redact(_clip(str(obj.get("result") or ""), 6000)),
+            return {"answer": _masked(str(obj.get("result") or ""), 6000),
                     "cost_usd": obj.get("total_cost_usd"),
                     "tokens": sum(int(u.get(k) or 0) for k in (
                         "input_tokens", "output_tokens", "cache_creation_input_tokens",
                         "cache_read_input_tokens"))}
         except Exception:
             pass
-    return {"answer": redact(_clip(raw, 6000))}
+    return {"answer": _masked(raw, 6000)}
 
 def run_second_opinion(rid: str) -> None:
     """Both agents at once, each in its own copy; the state is kept in the
@@ -10279,8 +11898,8 @@ def run_second_opinion(rid: str) -> None:
             ans = _opinion_answer(a, base / f"{a}.out")
             if rc != 0 and not ans.get("answer"):
                 try:
-                    ans["answer"] = redact((base / f"{a}.err").read_text(
-                        errors="replace").strip()[-600:])
+                    err = (base / f"{a}.err").read_text(errors="replace").strip()
+                    ans["answer"] = redact(err[-(1 << 20):])[-600:]
                 except OSError:
                     pass
             meta["state"][a] = dict(ans, state="done" if rc == 0 else "failed", exit=rc,
@@ -10551,7 +12170,7 @@ def night_shift_step(jid: str) -> None:
     if not j:
         return
     name = os.path.basename(j["project"])
-    me = [sys.executable or "python3", str(Path(__file__).resolve())]
+    me = _aht_argv()
     if j["state"] == "starting":
         r = subprocess.run(me + ["handover", j["project"], "--to", j["remote"],
                                  "--task=" + j["task"], "--apply", "--json"],
@@ -10560,6 +12179,15 @@ def night_shift_step(jid: str) -> None:
             d = json.loads(r.stdout)
         except Exception:
             d = {"error": (r.stderr or r.stdout).strip()[-300:]}
+        if not d.get("applied"):
+            # the link dropped while the session started: ask the other
+            # machine whether it runs (a session that started counts)
+            uid, e = _entry_for(load_registry(), os.path.realpath(j["project"]))
+            if (e or {}).get("handing"):
+                resolve_handing(uid, force=True)
+                uid, e = _entry_for(load_registry(), os.path.realpath(j["project"]))
+            if (e or {}).get("away"):
+                d = {"applied": True}
         if d.get("applied"):
             _update_job(jid, state="started", note=f"handed over to {j['remote']}")
             _notify(f"Night shift: {name}", f"working on {j['remote']} until "
@@ -11254,9 +12882,11 @@ def _hook_ancestry():
         pid = ppid
     return tty, cpid
 
-def _current_title(transcript) -> str:
+def _current_title(transcript, masked: bool = True) -> str:
     """The session's own title (what /rename, the Claude app or a hook set),
-    from the end of its transcript; "" when it has none."""
+    from the end of its transcript; "" when it has none.  A key in it is
+    masked, unless it is compared with the names the tabs gave
+    (`masked=False`): those are the names as they are."""
     try:
         fh = open(transcript, "rb")
     except (OSError, TypeError):
@@ -11272,9 +12902,10 @@ def _current_title(transcript) -> str:
             for raw in reversed(lines):
                 if b'"custom-title"' in raw:
                     try:
-                        return str(json.loads(raw).get("customTitle") or "")
+                        title = str(json.loads(raw).get("customTitle") or "")
                     except Exception:
                         continue
+                    return redact(title) if masked else title
             pos = start
     return ""
 
@@ -11313,7 +12944,8 @@ def tab_session_name(data: dict, event: str):
         return None
     state = _load_tab_names()
     entry = state.get(sid) or {}
-    current = _current_title(data.get("transcript_path"))
+    # the name as it is: it is compared with tab titles and set on the tab
+    current = _current_title(data.get("transcript_path"), masked=False)
     tabs_on = bool(IS_MAC or os.environ.get("AHT_ITERM_TABS")) and cfg_get("tab_names", True)
 
     def remember(**now):
@@ -11377,7 +13009,7 @@ def tab_session_name(data: dict, event: str):
     for s in running_sessions():
         if s.get("pid") == cpid or s.get("session") in (None, sid):
             continue
-        t = _current_title(_transcript_of(s["cwd"], s["session"]))
+        t = _current_title(_transcript_of(s["cwd"], s["session"]), masked=False)
         if t:
             taken.add(t.casefold())
     name = base
@@ -11424,9 +13056,9 @@ def handover_session_name(sid, real: str, machine: str) -> str:
         _write_json(tab_names_path(), state)
     return name
 
-def _auto_title(transcript) -> str:
+def _auto_title(transcript, masked: bool = True) -> str:
     """The title Claude Code gave the session itself (it shows when nobody
-    named the session)."""
+    named the session); masked like _current_title."""
     try:
         with open(transcript, "rb") as fh:
             end = fh.seek(0, 2)
@@ -11437,9 +13069,10 @@ def _auto_title(transcript) -> str:
     for raw in reversed(data.split(b"\n")):
         if b'"ai-title"' in raw:
             try:
-                return str(json.loads(raw).get("aiTitle") or "")
+                title = str(json.loads(raw).get("aiTitle") or "")
             except Exception:
                 continue
+            return redact(title) if masked else title
     return ""
 
 def _ttys() -> dict:
@@ -11458,11 +13091,13 @@ def _ttys() -> dict:
         pass
     return out
 
-def session_names(fresh: bool = False) -> list:
+def session_names(fresh: bool = False, masked: bool = True) -> list:
     """The open Claude Code sessions here with their names: the name, where
     it came from ("tab", "aht" = set in aht's window, "yours" = /rename or the
     Claude app, "automatic" = Claude's own title), the tab's title and a
-    name waiting for the session's next prompt."""
+    name waiting for the session's next prompt.  A key in a name, a tab's
+    title or a waiting name is masked, unless the names are compared with
+    tab titles (`masked=False`)."""
     tabs = iterm_tabs(max_age=0 if fresh else 10 ** 9)
     ttys = _ttys()
     state = _load_tab_names()
@@ -11471,16 +13106,19 @@ def session_names(fresh: bool = False) -> list:
     for s in running_sessions():
         sid = s.get("session") or ""
         tr = _transcript_of(s["cwd"], sid) if sid else None
-        custom, entry = _current_title(tr), state.get(sid) or {}
+        custom, entry = _current_title(tr, masked=False), state.get(sid) or {}
         origin = ("aht" if entry.get("pinned") and custom else
                   "tab" if custom and custom in given else
                   "yours" if custom else "automatic")
+        tab = (tabs.get(ttys.get(s["pid"], "")) or {}).get("title") or None
+        pending = (entry.get("pending") or {}).get("name")
+        if masked:
+            custom, tab, pending = redact(custom), redact(tab), redact(pending)
         rec = _session_record(s["pid"])
         rows.append({"pid": s["pid"], "session": sid, "project": s["cwd"],
-                     "tty": ttys.get(s["pid"]),
-                     "tab": (tabs.get(ttys.get(s["pid"], "")) or {}).get("title") or None,
-                     "name": custom or _auto_title(tr) or None, "origin": origin,
-                     "pending": (entry.get("pending") or {}).get("name"),
+                     "tty": ttys.get(s["pid"]), "tab": tab,
+                     "name": custom or _auto_title(tr, masked) or None, "origin": origin,
+                     "pending": pending,
                      "fork": _is_fork(tr), "in_app": bool(rec.get("bridgeSessionId"))})
     return rows
 
@@ -11560,11 +13198,13 @@ def cmd_tab_names(args):
                      else why.get(res.get("tab"), f"its tab kept its title ({res.get('tab')})")))
         return 0
     if args.sync_all:
-        rows = session_names(fresh=True)
-        plan = sync_all_plan(rows)
+        # planned with the names as they are (they are compared with tab
+        # titles), shown with a key in one masked
+        plan = sync_all_plan(session_names(fresh=True, masked=False))
         if args.apply:
             for x in plan:
                 rename_session(x["session"], x["to"], pin=False)
+        plan = [dict(x, **{k: redact(x[k]) for k in ("from", "to") if x[k]}) for x in plan]
         if args.json:
             print(json.dumps({"plan": plan, "applied": bool(args.apply)}, indent=2))
             return 0
@@ -11800,7 +13440,7 @@ def session_checkup() -> list:
                     "status": s.get("status"), "since": s.get("since"),
                     "name": _current_title(tr) or _auto_title(tr) or None,
                     "version": rec.get("version"), "installed": have or None,
-                    "tty": tty, "tab": (tabs.get(tty or "") or {}).get("title") or None,
+                    "tty": tty, "tab": redact((tabs.get(tty or "") or {}).get("title") or None),
                     "in_iterm": bool(tty and tty in tabs), "in_app": bool(rec.get("bridgeSessionId")),
                     "background": not tty, "issues": issues,
                     "can_restart": bool(tty and tty in tabs and s.get("session")
@@ -12937,7 +14577,12 @@ def build_parser():
     s.add_argument("--offsite", action="store_true",
                    help="copy the backups to the machine set as offsite_backup")
     s.add_argument("--fetch-offsite", action="store_true", dest="fetch_offsite",
-                   help="bring backups back from that machine (on a new Mac)")
+                   help="bring backups back from that machine (on a new computer); "
+                        "it adds what is missing and never overwrites")
+    s.add_argument("--from", dest="offsite_from", metavar="ID|NAME",
+                   help="with --fetch-offsite: the computer whose backups to fetch")
+    s.add_argument("--offsite-list", action="store_true", dest="offsite_list",
+                   help="the computers whose backups that machine keeps")
     s.add_argument("--quiet", action="store_true")
     s.add_argument("--project")
     s.add_argument("--uuid")
@@ -12961,6 +14606,7 @@ def build_parser():
     s.add_argument("name", nargs="?")
     s.add_argument("target", nargs="?", help="user@host, as ssh takes it")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--sandbox", metavar="PATH", help=argparse.SUPPRESS)   # test machines
     s.set_defaults(fn=cmd_remote)
 
     s = sub.add_parser("mirror", help="keep a project's copy on the other "
@@ -13015,6 +14661,9 @@ def build_parser():
                         "ours aside (there)")
     s.add_argument("--allow-processes", action="store_true", dest="allow_processes")
     s.add_argument("--ignore-version", action="store_true", dest="ignore_version")
+    s.add_argument("--release", action="store_true",
+                   help="stop waiting for it: the files here stay as they are, the copy "
+                        "there is left alone, and the work done there does not come here")
     s.add_argument("--status-file", dest="status_file", metavar="FILE")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
@@ -13133,7 +14782,8 @@ def build_parser():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_report)
 
-    s = sub.add_parser("share", help="a session as a clean page: no keys, no local paths")
+    s = sub.add_parser("share", help="a session as a page to share: keys aht recognises "
+                                     "masked, addresses and your home folder removed")
     s.add_argument("path")
     s.add_argument("--session")
     s.add_argument("--agent", choices=sorted(AGENT_NAMES))
@@ -13290,6 +14940,10 @@ def build_parser():
 
     s = sub.add_parser("_agent")           # the far end of a handover (stdin: JSON)
     s.set_defaults(fn=cmd_agent)
+
+    s = sub.add_parser("_core")            # the core this build carries
+    s.add_argument("--id", action="store_true", help="its checksum id")
+    s.set_defaults(fn=cmd_core)
 
     return p
 

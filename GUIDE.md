@@ -483,8 +483,10 @@ Some spend tokens only when you ask for them, each time: **Switch Agent**
 (the agent that goes on reads a summary, or a catch-up in its own session:
 one turn), **Hand Back** to Codex, Kimi Code, Antigravity or Mistral Vibe
 (one turn of that agent), **Hand Over** with a task (the session starts
-on it) and **Pick Up** with **Open in** (the agent opened here reads the
-summary from the other machine: one turn). Hand Back to Claude Code runs no
+on it), **Hand Over** or **Bring Here** into Codex, Kimi Code,
+Antigravity or Mistral Vibe (that agent reads the summary as its first
+turn: one turn) and **Pick Up** with **Open in** (the agent opened here
+reads the summary from the other machine: one turn). Hand Back to Claude Code runs no
 turn: the catch-up is in the session when it opens, and Claude reads it
 with your next message. Writing a summary, **Summary Only**, `aht relays`,
 a Pick Up that opens nothing and **Leave a Note** spend nothing (see
@@ -701,6 +703,12 @@ waiting for you.
 > the Sessions tab shows *paper — waiting for you: approve Bash*; the other
 > two are still working. You answer the one that waits.
 
+**Another agent in a handover's window** (see *Another agent on the other
+machine*) shows **working** while its window wrote output in the last 15
+seconds, then **quiet for 6 min**, and **exited** once it ended. aht reads
+only when the window last wrote something, not what it shows, so it cannot
+tell whether a quiet agent is done or waits for your answer.
+
 **A machine that does not answer** (asleep, switched off, offline) keeps
 its place in the list. Its sessions as they were when it last answered
 are shown greyed, under *as of 11:40*, and the machine's line says since
@@ -785,6 +793,11 @@ See *Hand a project over to another machine*.
 - **Claude's usage limit:** when a session stops because the limit is
   reached, a notice says so, with the time it resets (Settings → Safety
   nets → *Tell me when Claude stops at its usage limit*).
+- **Another agent on another machine** (see *Another agent on the other
+  machine*) gives *api on box went quiet — Codex: done, or it waits for
+  you* once its window wrote nothing for a minute after working, or *Codex
+  ended*. A shorter pause says nothing. It follows **Tell me when a
+  session is done** (`notify_finished`).
 - **A handover cut off halfway** gets notices of its own: how it ended,
   and after an hour without an answer from the other machine, that you can
   release the project (see *Hand a project over to another machine*).
@@ -2094,6 +2107,125 @@ bring a project from your Mac and send it back.
   back although a newer Claude Code wrote its history here.
 - `aht send-back C:\Users\me\code\shop --to mac` — name the machine, when
   aht here knows it by another name than the one it came from.
+
+## Another agent on the other machine
+
+Hand Over and Bring Here can go on in **Codex**, **Kimi Code**,
+**Antigravity** (agy) or **Mistral Vibe** instead of Claude Code. The files
+and Claude Code's history travel as always. The other agent starts a new
+session there, and its first turn is to read a summary of where the work
+stood. That turn **uses tokens**: the dialog says so next to the choice.
+When the project comes back, the Claude Code session that left learns what
+the other agent did.
+
+> **Example.** Claude Code is near its usage limit on api, and your Linux
+> box has Codex. **Hand Over to box…**, **Agent there: Codex**. The dialog
+> says *Codex starts on box and reads the summary as its first turn: that
+> uses tokens* and *Codex on box starts in never-ask mode, like the session
+> here*. On box, Codex reads `.aht/handover/relay-….md` and says in two or
+> three lines what it understood. **Sessions** shows *Codex — working* on
+> box, and later *quiet for 6 min*; a notice says *api on box went quiet
+> — Codex: done, or it waits for you*. Back at the Mac, **Take Back…** ends
+> Codex there, brings the files back, and leaves a catch-up for your
+> Claude Code session. Resume it, and its first lines
+> say *While Claude Code was away, Codex worked on box from 14:10 to 16:40
+> (7 exchanges)*, which files changed, and Codex's last words.
+
+- **The summary** is made here, with keys masked, and travels in the
+  project's `.aht/handover/`: where the Claude session stood, its latest
+  exchanges, open to-dos, files changed, and git. The agent's own history
+  stays on the machine where it ran; only Claude Code's travels.
+- **The level** the agent starts in follows the session it continues (see
+  *The permission level follows the work*): Codex's full bypass, Kimi's
+  `--auto`, agy's and Vibe's own flags. The dry run shows the whole start
+  line.
+- **Kimi Code** reads the summary in a run of its own first (`kimi -p`),
+  and its window opens that session; it does that only in never-ask mode.
+  With a task, Kimi works on it in that same run, right after reading the
+  summary, and its window opens once that turn has ended (Hand Over waits
+  for it, up to 10 minutes). In any other
+  mode Kimi opens without reading the summary, and the dialog gives you
+  the first prompt to paste when you open the session there (with the
+  task in it, if you gave one). `aht bring --agent kimi --no-open` runs no
+  such run either: it prints the line that opens Kimi and the first prompt
+  to paste.
+- **Its state** comes from its window, not from the agent: **working**
+  while the window wrote output in the last 15 seconds, **quiet for …**
+  after that, **exited** once it ended. A spinner counts as output. When
+  tmux there does not answer, the state is **tmux did not answer**, never
+  *exited*. aht reads no screen for the state; **Peek** (`aht attach
+  --peek`) shows the last lines of the window, with keys masked, when you
+  ask. Only while a Hand Over starts the agent does aht look at the
+  window's last 14 lines for a few seconds, to see whether it started or
+  asks something; `aht handover --json` gives them, masked, as `screen`.
+- **Staying awake:** the machine there stays awake while the window wrote
+  output in the last 10 minutes (see *Hand a project over to another
+  machine*).
+- **Taking it back** waits while the agent runs there: *Codex still runs
+  in its window on box (working)*. Exit it there, or let aht end it:
+  **Take Back…** in aht's window and in the Mac app asks for that
+  (`aht reclaim --stop`), by the rules below.
+- **What `--stop` can do:** it ends the agent only when its window wrote
+  nothing for 2 minutes **and** the agent's own message is the last thing
+  in its session, so its turn has ended. Then it types the agent's quit
+  keys into its window: Ctrl-C twice for Codex, agy and Vibe, Ctrl-D for
+  Kimi Code, up to three times. The window closes once the agent has
+  exited.
+- **What `--stop` cannot do:**
+  - end an agent that still works or wrote something in the last 2
+    minutes: *Codex on box has been quiet for only 1 min — wait, or end it
+    yourself*;
+  - end one whose turn is open, because your message or a tool call is the
+    last thing in its session: *Codex's last turn is still open on box —
+    wait, or end it yourself*. When aht cannot find the agent's session at
+    all, it says so and does not end it either;
+  - tell whether a quiet agent asked you something: an agent that ended
+    its turn with a question is ended too;
+  - keep what you typed into its prompt and did not send: the quit keys
+    drop it;
+  - end an agent that ignores its keys: *Codex on box did not react to its
+    quit keys (C-c C-c) — end it yourself*. The quit keys are aht's best
+    knowledge of each agent and are not yet confirmed for every version;
+  - tell anything when tmux there does not answer (a timeout, or an error
+    other than "no such window"): *tmux on box did not answer, so aht
+    cannot tell whether Codex still runs in its window — try again in a
+    moment, or end it yourself*.
+
+  `close`, which aht runs when nothing is left in a window, never closes a
+  window whose agent runs, nor one when tmux does not answer: its record
+  (`window.json`) stays until tmux answers again.
+- **On the way back** aht asks box for a catch-up of what happened in the
+  project there since it left, made there from the agents' histories and
+  masked there. It goes into the project's `.aht/handover/` as a hand-back
+  to the Claude Code session that left. When you resume that session,
+  aht's hook gives it the catch-up once, at most 2,000 characters; that
+  costs nothing until you type. **Send Back** from the machine that has the
+  project does the same: it makes the catch-up there and sends it home.
+  When box cannot give one, the note says that the files may differ.
+- **Bring Here into another agent** opens that agent here in a new
+  terminal window with the summary of the session there, in that session's
+  level. Send Back brings the catch-up home. It waits while that agent is
+  still open in the folder, as for an open Claude Code session: *Codex is
+  still open in this project here (pid 4242) — exit it first*.
+  `aht send-back <path> --allow-processes --apply` sends it back anyway;
+  what the agent does after that stays here.
+
+**In the terminal:**
+
+- `aht handover ~/code/api --to box --agent codex` — show what would
+  travel, the start line there and its token line; `--apply` hands it over
+  and starts Codex there. `--agent kimi`, `agy` or `vibe` likewise.
+- `aht handover ~/code/api --agent codex --task "add the tests" --apply` —
+  Codex reads the summary, then works on that task.
+- `aht attach ~/code/api --peek` — print the last screen lines of the
+  session there and its state (*quiet for 6 min*); `--lines 40` shows
+  more, `--json` gives them as JSON. `aht attach ~/code/api` opens it.
+- `aht reclaim ~/code/api --stop` — say whether `--stop` would end the
+  agent there now, and why not; `--apply` ends it, then takes the project
+  back with the catch-up.
+- `aht bring /home/me/code/shop --from box --agent codex --apply` — bring
+  shop here and open Codex on it with the summary.
+- `aht board` — the agent's state on box: *Codex quiet for 6 min*.
 
 ## Across systems and folders
 

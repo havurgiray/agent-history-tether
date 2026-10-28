@@ -1,0 +1,47 @@
+{
+  "uuid": "40400d13c7f3476caf827bdaa9aeab5b",
+  "real_path": "/Users/me/code/api",
+  "exists": true,
+  "stores": [
+    "claude"
+  ],
+  "updated_at": "2026-10-28T10:43:02",
+  "is_git": false,
+  "away": "box",
+  "away_remote": "box",
+  "away_since": "2026-10-28T10:43:07",
+  "away_driven_by": "here",
+  "away_holder": "box",
+  "away_path": "/home/me/code/api",
+  "away_system": "Darwin",
+  "away_agent": "codex",
+  "away_window": "aht-api-40400d",
+  "mirror": null,
+  "mirror_synced_at": null,
+  "mirror_status": null,
+  "mirror_paused": null,
+  "handing": null,
+  "copy_of": null,
+  "relay": {
+    "id": "20261028-104307-b463",
+    "from_agent": "claude",
+    "to_agent": "codex",
+    "since": 1793180587.110781,
+    "open": true,
+    "incoming": null,
+    "kind": "handover",
+    "machine": "box",
+    "remote": "box",
+    "arrived": false,
+    "told": false
+  },
+  "pickup_from": null,
+  "agents": [
+    "claude"
+  ],
+  "open": null,
+  "limit": null,
+  "sessions": 1,
+  "bytes": 728,
+  "last_activity": "2026-10-28T10:43:02"
+}

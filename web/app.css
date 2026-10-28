@@ -222,3 +222,13 @@ details.eol ul.files li { overflow-wrap: anywhere; }
 .opinion-levels:empty { display: none; }
 /* Kimi below never-ask: the first message to paste */
 .first-prompt pre { user-select: all; }
+/* the agent that goes on there (Hand Over) or here (Bring Here), its token
+   line, and the level it starts in */
+.agent-pick strong { min-width: 90px; }
+.agent-pick select { min-width: 220px; }
+.agent-there, .agent-here { border-top: 1px solid var(--line); padding-top: 8px; }
+/* a window aht runs another agent in, on the Sessions board */
+.badge.quiet { color: var(--text); }
+.in-window .hint { font-style: italic; }
+/* Peek: the agent's window there, its last lines */
+pre.peek { max-height: 60vh; white-space: pre; }

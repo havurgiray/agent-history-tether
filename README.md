@@ -103,6 +103,7 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Backups on another machine: copy them there, fetch them back | ✓ | ✓ | ✓ (to and from Mac and Linux machines) |
 | Hand Over and Take Back, keep in sync, night shift | ✓ | ✓ | ✓ (to Mac and Linux machines; nothing is handed over to a PC) |
 | Bring Here and Send Back (the machine that gets the work starts it) | ✓ | ✓ | ✓ (from Mac and Linux machines) |
+| Hand Over or Bring Here into Codex, Kimi Code, Antigravity or Mistral Vibe there (uses tokens: that agent reads a summary), its state on the board, and a catch-up for Claude Code on the way back | ✓ | ✓ | ✓ (Hand Over to Mac and Linux machines; Bring Here into an agent on the PC), not yet tried on Windows |
 | Projects at other paths on each machine; names, line endings, executable marks and git across systems | ✓ | ✓ | ✓ |
 | Stay awake while a handed-over agent works there (a closed lid still sleeps) | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or the GNOME desktop's own inhibitor (`gnome-session-inhibit`) where ssh sessions may not use it) | — |
 | Notices (waiting for you, done, usage limit, new version) | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
@@ -253,7 +254,9 @@ keep working on it there over ssh or from your phone, and take it back later.
 The files, the agent's history and the session itself move; nothing is
 installed on the other machine but what it needs anyway (python3, tmux or
 byobu, the agent CLI); rsync 3 is optional: it makes big changes faster.
-Claude Code sessions for now.  It works between any of macOS, Linux and
+Claude Code resumes its own session there; with `--agent`, Codex, Kimi
+Code, Antigravity or Mistral Vibe starts there instead and reads a summary
+as its first turn (one turn: uses tokens).  It works between any of macOS, Linux and
 Windows: a Mac, a Linux machine or a PC hands projects over to a Mac or
 Linux machine.  The other way round, **Bring Here** runs on the machine
 that gets the work: it fetches a project with Claude Code's history, and
@@ -270,7 +273,8 @@ aht remote paths homebox                 # where projects go there
 aht mirror ~/Desktop/paper --on          # optional: keep its copy there warm
 aht handover ~/Desktop/paper             # dry run: what would travel
 aht handover ~/Desktop/paper --apply     # send it, resume the session there
-aht attach ~/Desktop/paper               # open that session
+aht handover ~/Desktop/paper --agent codex --apply   # or go on in Codex there
+aht attach ~/Desktop/paper               # open that session (--peek: its last lines)
 aht reclaim ~/Desktop/paper --apply      # bring files and history back
 
 # on the machine that gets the work (a PC, say)
@@ -289,6 +293,17 @@ session is open in it, and a transfer shows its progress.
   like, pick one per handover with `--to <name>` (the tray: *Machine*), and
   `aht remote default <name>` sets the one used when none is named.  A
   project remembers where it went, so taking it back needs no name.
+- **Another agent there** (`--agent codex|kimi|agy|vibe`, for Hand Over and
+  Bring Here): Claude Code's history travels as always, the other agent's
+  never does; a new session of it reads the summary aht made here (one
+  turn: uses tokens), in the permission level of the session it continues.
+  Its state comes from its tmux window: *working* while it wrote output
+  in the last 15 s, *quiet for 6 min*, *exited*; a notice says when it
+  *went quiet*.  `reclaim --stop` ends it only after 2 minutes without
+  output and once its own message ends its turn, by its quit keys
+  (Ctrl-C twice; Ctrl-D for Kimi Code).  On the way back, a catch-up of
+  what it did, made and masked there, goes to the Claude Code session that
+  left, which hears it from aht's hook when you resume it.
 - **Bring Here and Send Back** need aht installed on the project's home,
   which keeps the record that the project is away and plans the way back
   (the same three-way plan as Take Back; what it replaces is set aside
@@ -754,6 +769,7 @@ features that make an agent read or work:
 | Hand back to Claude Code | no turn: aht's hook puts the catch-up (at most 2,000 characters) into the session as it opens, and it goes with your next message; without the hook, reading it is the first turn | only when you ask |
 | Pick Up → Open in | the agent opened here reads the summary made on the other machine: one turn; when the work comes back to Claude Code's own session, it gets its catch-up as with Hand back to Claude Code | only when you ask |
 | Hand over with a task | the resumed session starts on the task | only when you give a task |
+| Hand Over or Bring Here into Codex, Kimi Code, Antigravity or Mistral Vibe (`--agent`) | that agent reads the summary as its first turn, there or here: one turn; on the way back Claude Code's own session gets its catch-up as with Hand back to Claude Code | only when you ask |
 | Handover note | one sentence in a new Claude session while its project is away, half handed over, or just came back or was released | part of handover |
 | Hand-off note | one line in a Claude session another agent took the work over from, when you resume it yourself (the catch-up itself only with `informed_sessions`) | part of switch |
 | Pick Up and note line | one line, once, in the next Claude session in the project on the machine the work came to; one line in a Claude session that starts on the machine it left, while it is out | part of Pick Up and Leave a Note |
@@ -969,7 +985,12 @@ Switching agents runs against stand-in agents (`AHT_CLI_<AGENT>`):
 real CLIs do, Claude Code, Antigravity and Mistral Vibe are stubs that only
 note their calls, terminals go to a log (`AHT_TERMINAL_LOG`), and
 `tests/fake_agy.py` and `tests/fake_vibe.py` build stand-in Antigravity and
-Vibe stores, so no test opens a window or spends a token.  GitHub Actions runs the core suites (Linux and
+Vibe stores, so no test opens a window or spends a token.  Another agent
+on the other machine runs against `tests/fake_tmux.py`, which runs that
+agent's window line for real (its output is the window's screen and
+activity, keys sent to it go to a file the stand-in Codex reads), so the
+board, "went quiet", `--stop` and the catch-up are tested without tmux or
+a real agent.  GitHub Actions runs the core suites (Linux and
 macOS, Python 3.9 and 3.12), builds the app bundle, and builds and
 smoke-tests the Windows exes, the badge cache and the installer (x64 and ARM64) natively on every push; tagging `vX.Y.Z` builds
 the release artifacts (Windows installers and zips for x64 and ARM64, the universal

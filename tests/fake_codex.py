@@ -14,15 +14,24 @@ the approval policy and sandbox the command line asked for (Codex's own
 default: on request, in the workspace sandbox), which aht reads for the
 permission level.  Every call is appended to $AHT_FAKE_CODEX_LOG;
 $AHT_FAKE_CODEX_PATCH names the file the patch changes (default
-src/app.py)."""
+src/app.py).
+
+In a window (fake_tmux.py names its keys file in $FAKE_TMUX_KEYS) it then
+stays open the way the real one does: it prints a line every 0.2 s for
+$FAKE_CODEX_WORK seconds (its output: the window works), then waits, and
+ends on its quit keys, Ctrl-C twice.  On another machine of the tests the
+AHT_ variables are not passed on: its store is then Codex's own place in
+that machine's home (~/.codex/sessions), and its log ~/.fake-codex.log."""
 import json, os, sys, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 args = sys.argv[1:]
-with open(os.environ["AHT_FAKE_CODEX_LOG"], "a") as fh:
+with open(os.environ.get("AHT_FAKE_CODEX_LOG")
+          or os.path.join(os.environ["HOME"], ".fake-codex.log"), "a") as fh:
     fh.write(json.dumps({"cwd": os.getcwd(), "args": args}) + "\n")
-root = Path(os.environ["AHT_ROOT_CODEX"])
+root = Path(os.environ.get("AHT_ROOT_CODEX")
+            or os.path.join(os.environ["HOME"], ".codex", "sessions"))
 # Codex's own options come before its subcommand or first prompt
 flags, i = [], 0
 while i < len(args) and args[i].startswith("-") and args[i] != "-":
@@ -98,4 +107,23 @@ else:
                         "cli_version": "0.164.0", "source": "exec"}}
     (day / f"rollout-{time.strftime('%Y-%m-%dT%H-%M-%S')}-{sid}.jsonl").write_text(
         "".join(json.dumps(e) + "\n" for e in [meta] + turn(sid, args[0] if args else "", now)))
-print(sid)
+print(sid, flush=True)
+
+keys = os.environ.get("FAKE_TMUX_KEYS")
+if keys:
+    # its window: it works (prints) for a while, then waits for the user
+    end = time.time() + float(os.environ.get("FAKE_CODEX_WORK") or 0)
+    n = 0
+    while time.time() < end:
+        n += 1
+        print(f"working {n}", flush=True)
+        time.sleep(0.2)
+    print("› waiting for you", flush=True)
+    while True:
+        try:
+            got = Path(keys).read_text().split()
+        except OSError:
+            got = []
+        if got[-2:] == ["C-c", "C-c"]:
+            sys.exit(0)
+        time.sleep(0.2)

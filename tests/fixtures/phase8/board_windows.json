@@ -1,0 +1,60 @@
+{
+  "machines": [
+    {
+      "machine": "mac",
+      "local": true,
+      "reachable": true,
+      "sessions": [],
+      "last_heard": 1793180591.530865,
+      "stale": false,
+      "last_sessions": []
+    },
+    {
+      "machine": "box",
+      "local": false,
+      "reachable": true,
+      "sessions": [
+        {
+          "agent": "codex",
+          "project": "/home/me/code/api",
+          "pid": 73601,
+          "session": null,
+          "name": null,
+          "title": null,
+          "window": "aht-api-40400d",
+          "status": "quiet for 6 min",
+          "raw_status": "quiet",
+          "quiet_for": 401,
+          "not_running": false,
+          "waiting_for": null,
+          "since": 1793180588.177752,
+          "handed_over": true,
+          "here_path": "/Users/me/code/api"
+        }
+      ],
+      "host": "box",
+      "phone_here": false,
+      "last_heard": 1793180592.1490061,
+      "stale": false,
+      "last_sessions": [
+        {
+          "agent": "codex",
+          "project": "/home/me/code/api",
+          "pid": 73601,
+          "session": null,
+          "name": null,
+          "title": null,
+          "window": "aht-api-40400d",
+          "status": "quiet for 6 min",
+          "raw_status": "quiet",
+          "quiet_for": 401,
+          "not_running": false,
+          "waiting_for": null,
+          "since": 1793180588.177752,
+          "handed_over": true,
+          "here_path": "/Users/me/code/api"
+        }
+      ]
+    }
+  ]
+}

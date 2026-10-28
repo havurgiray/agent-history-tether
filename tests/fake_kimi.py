@@ -7,15 +7,21 @@ way the real CLI's stream-json output carries it.  `kimi -S ID -p PROMPT …`
 adds the prompt as a turn of that session instead (unless
 $AHT_FAKE_KIMI_NO_RESUME is set: then it answers without keeping the turn,
 which aht must notice).  Like the real CLI it refuses --auto and --yolo
-together with -p.  Every call is appended to $AHT_FAKE_KIMI_LOG."""
+together with -p.  Every call is appended to $AHT_FAKE_KIMI_LOG.  On
+another machine of the tests the AHT_ variables are not passed on: its
+store is then Kimi Code's own place in that machine's home
+(~/.kimi-code/sessions), its log ~/.fake-kimi.log, and the core the one
+next to this folder."""
 import json, os, sys, time, uuid
 from pathlib import Path
 
-sys.path.insert(0, os.environ["AHT_CORE_DIR"])
+sys.path.insert(0, os.environ.get("AHT_CORE_DIR")
+                or str(Path(__file__).resolve().parent.parent))
 import aht  # noqa: E402  the core's own key function for the store bucket
 
 args = sys.argv[1:]
-with open(os.environ["AHT_FAKE_KIMI_LOG"], "a") as fh:
+with open(os.environ.get("AHT_FAKE_KIMI_LOG")
+          or os.path.join(os.environ["HOME"], ".fake-kimi.log"), "a") as fh:
     fh.write(json.dumps({"cwd": os.getcwd(), "args": args}) + "\n")
 if "-p" in args and any(a in args for a in ("--auto", "--yolo", "-y")):
     # as the real CLI: its print mode never asks and takes no level flag
@@ -24,7 +30,9 @@ if "-p" in args and any(a in args for a in ("--auto", "--yolo", "-y")):
 if "-p" in args:
     prompt = args[args.index("-p") + 1]
     real = os.path.realpath(os.getcwd())
-    bucket = Path(os.environ["AHT_ROOT_KIMI_CODE"]) / aht._key_kimicode(real)
+    bucket = Path(os.environ.get("AHT_ROOT_KIMI_CODE")
+                  or os.path.join(os.environ["HOME"], ".kimi-code", "sessions")) \
+        / aht._key_kimicode(real)
     now = int(time.time() * 1000)
     line = json.dumps({"type": "turn.prompt", "input": [{"type": "text", "text": prompt}],
                        "origin": {"kind": "user"}, "time": now}) + "\n"

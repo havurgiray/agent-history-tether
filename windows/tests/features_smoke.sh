@@ -4,7 +4,7 @@
 # (Summary Only, and the permission level a switch carries) and relays,
 # limits, sessions, workspace, asking other
 # machines over Windows' own ssh (status, remote add, pickup), Bring Here's
-# list and dry run from a test-mode machine; and the hidden ones
+# list and dry run from a test-mode machine (also into Codex); and the hidden ones
 # another aht uses: `_core --id`
 # (the core inside the exe is this checkout's aht.py, byte for byte) and
 # `_agent`.  Runs natively on Windows from Git Bash with
@@ -226,6 +226,19 @@ has "$OUT" '"perm": \{' "the bring dry run names no permission level"
 has "$OUT" 'Claude Code starts in ask mode' "the bring dry run does not say the level the session here starts in"
 printf '%s' "$OUT" | grep -q Traceback && fail "bring crashed: $OUT"
 [ ! -e "$T/landing/shop" ] || fail "the bring dry run made the folder here"
+# into another agent here: a new Codex session reads the summary (a token
+# line says so); the stand-in's name is enough, nothing starts
+export AHT_CLI_CODEX=codex
+OUT=$(W bring "$THERE" --from mac --here "$LAND" --agent codex --json)
+unset AHT_CLI_CODEX
+has "$OUT" '"agent": "codex"' "bring --agent codex does not name the agent"
+has "$OUT" '"blockers": \[\]' "the bring --agent codex dry run is blocked"
+has "$OUT" 'Codex starts here and reads the summary as its first turn: that uses tokens' \
+  "the bring --agent codex dry run has no token line"
+has "$OUT" '"start_line": ".*codex.*You are taking over this project from Claude Code on mac' \
+  "the bring --agent codex dry run has no start line"
+printf '%s' "$OUT" | grep -q Traceback && fail "bring --agent crashed: $OUT"
+[ ! -e "$T/landing/shop" ] || fail "the bring --agent dry run made the folder here"
 rm -f "$T/home/.aht/config.json"
 
 echo "== the line to continue a brought project, as cmd.exe runs it =="

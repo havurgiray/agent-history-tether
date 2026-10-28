@@ -1,0 +1,78 @@
+{
+  "command": "handover",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "agent": "codex",
+  "start_line": "codex --dangerously-bypass-approvals-and-sandbox 'You are taking over this project from Claude Code on mac. Read .aht/handover/relay-20261028-104303-31ca.md first: it records where the work stood, the latest exchanges and the open items. Then tell me in two or three lines what you understood, and wait for my next instruction.'",
+  "tokens": "Codex starts on box and reads the summary as its first turn: that uses tokens",
+  "first_prompt": null,
+  "relay": null,
+  "project": "/Users/me/code/api",
+  "remote": "box",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "here_path": "/Users/me/code/api",
+  "there_path": "/home/me/code/api",
+  "there": {
+    "host": "box",
+    "system": "Darwin",
+    "home": "/home/me",
+    "claude": "/opt/homebrew/bin/claude",
+    "claude_version": "9.9.9",
+    "path_exists": false,
+    "path_writable": true,
+    "free_bytes": 27570180096,
+    "sessions": [],
+    "processes": [],
+    "path": "/home/me/code/api"
+  },
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "names": [],
+  "git": {
+    "is_git": false,
+    "gitattributes": null,
+    "suggest": [],
+    "env": {},
+    "how": null
+  },
+  "transfer": "rsync",
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9"
+  },
+  "session": "4c1b2a3d-1111-4222-8333-444455556666",
+  "sessions": 1,
+  "title": "Parser fix",
+  "perm": {
+    "agent": "codex",
+    "level": "never",
+    "sandbox": false,
+    "flags": [
+      "--dangerously-bypass-approvals-and-sandbox"
+    ],
+    "from": "transcript",
+    "read": "never",
+    "text": "Codex on box starts in never-ask mode, like the session here"
+  },
+  "outside_not_carried": [],
+  "task": null,
+  "plan": {
+    "files": 2,
+    "bytes": 37,
+    "history_bytes": 728,
+    "extras": [],
+    "install_claude": null,
+    "free_bytes": 27570180096
+  },
+  "other_histories": []
+}

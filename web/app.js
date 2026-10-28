@@ -416,15 +416,16 @@ const noName = (c) => !!c && "remote" in c && !c.remote;
  * back only from there (Take Back on the PC), never with Send Back here. */
 const pcHome = (c) => !!c && c.system === "Windows";
 /** A project of this machine's that is on another one: {name, system,
- * there: the holder brought it there (`away.driven_by`), since, take: Take
- * Back can fetch it}.  A PC cannot be reached, so what a PC holds goes back
+ * there: the holder brought it there (`away.driven_by`), since, agent: the
+ * agent working on it there (`away.agent`, in words), take: Take Back can
+ * fetch it}.  A PC cannot be reached, so what a PC holds goes back
  * only with Send Back there, or Release here; so does what a machine this
  * one has no name for brought there (`away_remote` null). */
 function awayOf(p) {
   if (!p.away) return null;
   const r = ((S.status.handover || {}).remotes || {})[p.away_remote] || {};
   const there = p.away_driven_by === "there", system = p.away_system || r.system || null;
-  return { name: p.away_remote || p.away_holder || p.away, system, there, since: p.away_since,
+  return { name: p.away_remote || p.away_holder || p.away, system, there, since: p.away_since, agent: awayAgentLabel(p),
     take: CAN_HAND_OVER() && system !== "Windows" && !(there && !p.away_remote) };
 }
 
@@ -505,7 +506,8 @@ function draw() {
 
 function projState(p) {
   if (p.handing) return ["handover unfinished", "waiting"];
-  if (p.away) return [awayOf(p).there ? `on ${awayOf(p).name}` : `handed over to ${p.away}`, "working"];
+  // the agent working on it there (`away_agent`), when the core names it
+  if (p.away) return [(awayOf(p).there ? `on ${awayOf(p).name}` : `handed over to ${p.away}`) + (awayAgentLabel(p) ? ` (${awayAgentLabel(p)})` : ""), "working"];
   if (!p.exists) return ["folder gone", "waiting"];
   if (p.open === "waiting") return ["waiting for you", "waiting"];
   if (p.open === "working") return ["working", "working"];
@@ -557,7 +559,7 @@ function detail() {
   if (!p) { d.append(h("p", { class: "dim", text: "Select a project to continue a session, see what changed, or look back." })); return d; }
   const aw = awayOf(p);
   const st = p.handing ? `handover to ${handing(p).to} unfinished`
-    : p.away ? `${aw.there ? "on " + aw.name : "handed over to " + p.away}${p.away_since ? ", " + ago(p.away_since) : ""}`
+    : p.away ? `${aw.there ? "on " + aw.name : "handed over to " + p.away}${p.away_since ? ", " + ago(p.away_since) : ""}${awayAgentLabel(p) ? `; ${awayAgentLabel(p)} works on it there` : ""}`
     : !p.exists ? "the folder is gone; its histories are safe"
     : `${plural(p.sessions || 0, "session")}, ${bytes(p.bytes)} of history`;
   d.append(h("div", { class: "row" }, h("strong", { text: base(p.real_path) }), h("span", { class: "dim", text: st })),
@@ -578,6 +580,8 @@ function detail() {
   const handover = CAN_HAND_OVER() && (S.status.handover || {}).default_remote;
   if (p.away) {
     if (aw.take) row.append(h("button", { class: "primary", text: "Take Back…", onclick: () => takeBack(p) }));
+    // the window aht runs the agent in there: its last screen lines
+    if (aw.take && !aw.there && p.away_window) row.append(h("button", { text: "Peek…", onclick: () => peekThere(p) }));
   } else if (p.exists) {
     // while a handover is unfinished, nobody knows yet where the work goes on
     const held = !!p.handing;
@@ -1707,6 +1711,172 @@ async function cancelNight(p, j) {
   openNightShift(p);
 }
 
+// ---- another agent on the other machine ------------------------------------------------
+// Hand Over can start Codex, Kimi Code, Antigravity or Mistral Vibe on the other machine
+// instead of resuming Claude Code's session there (`handover --agent X`), and
+// Bring Here can open one of them here (`bring --agent X`).  That agent reads
+// aht's summary of the work as its first turn, which uses tokens; Claude
+// Code resuming its own session does not.  The dry run for the agent chosen
+// carries the level it starts in (`perm`, phase 7b).
+const OTHER_AGENTS = ["codex", "kimi", "agy", "vibe"];
+/** The agents Hand Over can start on the other machine: Claude Code, and the
+ * others the dry run says are installed there (`agents_there`: a list, or
+ * {agent: its path or null}); a core that does not say: all of them (the
+ * dry run for one that is missing there says so). */
+function agentsThere(plan) {
+  const t = plan && (plan.agents_there || (plan.there && typeof plan.there === "object" ? plan.there.agents : null));
+  const has = Array.isArray(t) ? t : t && typeof t === "object" ? Object.keys(t).filter((a) => t[a]) : null;
+  return ["claude", ...OTHER_AGENTS.filter((a) => !has || has.includes(a))];
+}
+/** …and Bring Here: the agent CLIs installed on this machine. */
+const agentsHere = () => ["claude", ...OTHER_AGENTS.filter((a) => (S.status.agent_clis || {})[a])];
+/** What starting `agent` costs.  `on`: the other machine (Hand Over), or
+ * null (here: Bring Here); `task`: a task given with it; `d`: the dry run
+ * for that agent: its `tokens` (the core's sentence), as given; Kimi below
+ * never-ask opens without reading the summary (`first_prompt`). */
+function agentCost(agent, on, task, d) {
+  const label = AGENTS[agent] || agent, where = on ? `on ${on}` : "here";
+  if (agent !== "claude" && d && typeof d.tokens === "string" && d.tokens.trim()) return sentence(d.tokens).trim();
+  if (agent === "claude") {
+    if (task) return `With a task, Claude Code starts on it at once ${where}: that uses tokens.`;
+    return on ? `Claude Code resumes its own session on ${on}: nothing runs until someone types there, so it uses no tokens.`
+      : "Claude Code's own session opens here: nothing runs until you type, so it uses no tokens.";
+  }
+  if (agent === "kimi" && d && (d.kimi_reads === false || (typeof d.first_prompt === "string" && d.first_prompt.trim()))) {
+    return `Kimi Code opens ${where} without reading the summary: its run that reads it first works only in never-ask mode, so you paste the first message aht shows you${on ? " into its window there" : ""}. That turn uses tokens.`;
+  }
+  return `Starting ${label} ${where} uses tokens: it reads aht's summary of the work as its first turn.`;
+}
+/** Kimi below never-ask, started by Hand Over or Bring Here: the first
+ * message to paste (`first_prompt`), or null. */
+const farFirst = (d) => (d && typeof d.first_prompt === "string" && d.first_prompt.trim() ? d.first_prompt.trim() : null);
+/** What happens there, in one sentence. */
+function agentStarts(agent, on) {
+  const where = on ? `on ${on}` : "here";
+  return agent === "claude" ? (on ? "The session is resumed there" : "Its session opens here in a new terminal")
+    : `${AGENTS[agent] || agent} starts ${where} with aht's summary of the work`;
+}
+/** The "Agent there" (Hand Over) or "Agent here" (Bring Here) choice. */
+function agentPicker(label, agents, chosen, onPick, disabled) {
+  return h("div", { class: "row agent-pick" }, h("strong", { text: label }),
+    h("select", { class: "agent-choice", disabled, onchange: (e) => onPick(e.target.value) },
+      agents.map((a) => h("option", { value: a, selected: a === chosen,
+        text: a === "claude" ? "Claude Code (its own session)" : AGENTS[a] || a }))));
+}
+
+/** A row of the Sessions board for a window aht started for an agent other
+ * than Claude Code on another machine: its status comes from the window's
+ * output, not from the agent's records.  `raw_status` "working" (output in
+ * the last 15 s), "quiet" (none for `quiet_for` seconds: done, or it waits
+ * for you), "exited" (the agent ended; the window closes a minute later);
+ * `not_running`: the agent there ended (its window may be gone).  null for
+ * any other row (Claude Code keeps its own words). */
+function windowStatus(s) {
+  if (!s || !(s.not_running === true || ["working", "quiet", "exited"].includes(s.raw_status))) return null;
+  if (s.raw_status === "exited") return { text: "exited", cls: "", hint: null };
+  if (s.not_running === true) return { text: "not running", cls: "", hint: null };
+  if (s.raw_status === "working") return { text: "working", cls: "working", hint: null };
+  return { text: quietFor(s.quiet_for), cls: "quiet", hint: "done, or it waits for you" };
+}
+/** "quiet for 6 min", from seconds, as the core says it (window_words). */
+function quietFor(sec) {
+  const n = Number(sec);
+  if (sec == null || !isFinite(n) || n < 0) return "quiet";
+  const m = Math.floor(n / 60);
+  return m < 1 ? "quiet for under a minute" : m < 120 ? `quiet for ${m} min` : `quiet for ${Math.floor(m / 60)} h`;
+}
+/** Seconds in words: "40 s", "2 min". */
+const span = (sec) => (sec < 60 ? `${Math.round(sec)} s` : `${Math.floor(sec / 60)} min`);
+
+/** Take Back with --stop ends the agent there only when that is safe.  For
+ * an agent other than Claude Code: when its window has shown no output for
+ * 2 minutes and its last turn has ended.  Otherwise it refuses, with
+ * `not-quiet` (the agent there still prints) or `turn-open` (a turn is not
+ * finished, or aht cannot see whether it is: `seen` false); at --apply also
+ * `no-reaction` (it did not quit on its quit keys).  Read from `stop`
+ * ({stopped, reason, quiet_for, quit_keys, seen}), a bare reason
+ * (`stop_reason`), or the core's own sentence in the blockers or warnings
+ * ("Codex on box has been quiet for only 1 min — wait, or end it yourself
+ * (--stop needs 2 minutes without output)", "Codex's last turn is still open
+ * on box — wait, or end it yourself").  null: no such refusal.  `said`: the
+ * core's sentence, `others`: the other blockers (not the agent's own
+ * processes there, which end with it). */
+const STOP_REASONS = ["not-quiet", "turn-open", "no-reaction"];
+const NOT_QUIET = /quiet for only|still prints/i, TURN_OPEN = /turn is still open|turn is not finished|whether its turn ended/i,
+  NO_REACTION = /did not react to its quit keys/i;
+const STOP_TEXT = { "not-quiet": NOT_QUIET, "turn-open": TURN_OPEN, "no-reaction": NO_REACTION };
+const refusalText = (t) => NOT_QUIET.test(t) || TURN_OPEN.test(t) || NO_REACTION.test(t);
+function stopRefusal(d, p) {
+  if (!d || typeof d !== "object") return null;
+  const objs = [d.stop_refused, d.stop, d.stopped].filter((x) => x && typeof x === "object");
+  const o = objs.find((x) => STOP_REASONS.includes(x.reason)) || {};
+  let reason = o.reason || [d.stop_refused, d.stop_reason, d.reason].find((x) => STOP_REASONS.includes(x)) || null;
+  const blockers = arr(d.blockers).map(String), texts = blockers.concat(arr(d.warnings).map(String));
+  let said = typeof o.text === "string" ? o.text : reason ? texts.find((t) => STOP_TEXT[reason].test(t)) || null : null;
+  if (!reason) {
+    said = texts.find(refusalText) || null;
+    if (!said) return null;
+    reason = STOP_REASONS.find((r) => STOP_TEXT[r].test(said));
+  }
+  const agent = o.agent || d.agent_there || awayAgent(p) || OTHER_AGENTS.find((a) => said && said.includes(AGENTS[a])) || null;
+  const m = said && /quiet for only (\d+)\s*(s|sec|min)/i.exec(said), n = said && /needs (\d+) minutes?/i.exec(said);
+  const quiet = o.quiet_for != null ? Number(o.quiet_for) : d.quiet_for != null ? Number(d.quiet_for)
+    : m ? Number(m[1]) * (/^m/i.test(m[2]) ? 60 : 1) : null;
+  // the agent's own processes there ("codex (4242)"): they end with it, no news
+  const own = (b) => !!agent && /^still running in this folder/i.test(b)
+    && b.slice(b.indexOf(":") + 1).split(",").every((x) => x.trim().toLowerCase().startsWith(agent));
+  return { reason, agent, label: AGENTS[agent] || agent || "The agent", machine: o.machine || d.remote || (p && (p.away_remote || p.away)) || null,
+    quiet, need: Number(o.need || o.quiet_needed || d.quiet_needed) || (n ? Number(n[1]) * 60 : 120), said,
+    seen: o.seen !== false && !(said && /whether its turn ended/i.test(said)), keys: arr(o.quit_keys).map(String),
+    others: blockers.filter((b) => b !== said && !refusalText(b) && !own(b)) };
+}
+/** The refusal in plain words, and what to do. */
+function stopWords(x) {
+  const who = x.label + (x.machine ? ` on ${x.machine}` : "");
+  if (x.reason === "not-quiet") {
+    return { title: `${who} is still printing`,
+      text: `${x.label}'s window ${x.machine ? "there " : ""}showed new output ${x.quiet != null ? span(x.quiet) + " ago" : "a moment ago"}, so it may be in the middle of its work. aht ends it only after ${span(x.need)} without new output.`
+        + `\n\nWhat to do: wait until it has been quiet for ${span(x.need)}, then choose Take Back again. Or open its window, see what it does, and end it yourself.` };
+  }
+  if (x.reason === "no-reaction") {
+    return { title: `${who} did not quit`,
+      text: `aht pressed its quit keys${x.keys.length ? ` (${x.keys.join(" ")})` : ""}, and ${x.label} still runs.`
+        + "\n\nWhat to do: open its window and end it yourself, then choose Take Back again." };
+  }
+  if (!x.seen) {
+    return { title: `aht cannot tell whether ${x.label}'s last turn ended`,
+      text: `aht cannot see ${x.label}'s own last message${x.machine ? ` on ${x.machine}` : ""}, so it cannot tell whether its turn ended, and it does not end an agent in the middle of a turn.`
+        + "\n\nWhat to do: open its window and look. If it is done, end it yourself there, then choose Take Back again." };
+  }
+  return { title: `${x.label}'s last turn is not finished`,
+    text: `${who} has not finished its last turn: it may still be working on it, or wait for an answer. aht does not end an agent in the middle of a turn.`
+      + "\n\nWhat to do: open its window to see what it waits for; answer it, or let it finish. Then choose Take Back again. Or end it yourself there." };
+}
+/** The refusal as a question: Open Its Window (`attach --window`), Try Again. */
+async function stopRefused(p, x, after) {
+  const w = stopWords(x);
+  const extra = x.others.length ? h("p", { class: "warn small stop-others", style: "white-space:pre-wrap", text: "Also in the way:\n\n" + x.others.map((b) => "• " + b).join("\n") }) : null;
+  const pick = await ask(w.title, (after ? "Nothing was taken back. " : "") + w.text, ["Cancel", "Open Its Window", "Try Again"], extra);
+  if (pick === "Try Again") return takeBack(p);
+  if (pick === "Open Its Window") return openWindowThere(p);
+}
+/** Take Back from another agent: what it did there is summed up for Claude
+ * Code's session here (`catchup`: {agent, relay, brief}), which aht's hook
+ * tells it as it opens. */
+function caughtUp(d, remote) {
+  const c = d && d.catchup && typeof d.catchup === "object" ? d.catchup : null;
+  if (!c) return "";
+  return `\nWhat ${AGENTS[c.agent] || c.agent || "the agent"} did on ${remote} is summed up for your Claude Code session${c.brief ? ": " + c.brief : "."}`;
+}
+/** The agent working on a project on another machine (`away_agent`, from
+ * the away record's `agent`), or null when the core does not say. */
+function awayAgent(p) {
+  if (!p) return null;
+  const a = p.away_agent || (p.away && typeof p.away === "object" ? p.away.agent : null);
+  return typeof a === "string" && a ? a : null;
+}
+const awayAgentLabel = (p) => (awayAgent(p) ? AGENTS[awayAgent(p)] || awayAgent(p) : null);
+
 /** Hand Over's dry run blocks over a copy there that was worked on since
  * both copies last agreed, at a sync, a handover or a take back
  * (`copy_changed`: {changed, new, removed, history, files, since}, as a
@@ -1769,17 +1939,75 @@ async function handOver(p, replacing) {
   // …which the core says too, as a warning: once is enough
   for (const w of plan.warnings || []) if (!(replacing && /aside there$/.test(w))) body += "\n\n⚠ " + w;
   for (const t of arr(plan.notes)) body += "\n\n" + sentence(t).trim();
-  body += "\n\nThe session is resumed there and this folder is marked as away until you take it back.";
-  const level = permPart(plan, plan.agent || "claude", { on: remote, agent: plan.agent || "claude", leaving: (a) => `the ${a ? a + " " : ""}session here` });
-  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over", [level, gitattrPart(plan)]))) return;
+  // Agent there: Claude Code resumes its own session (the plan above), or
+  // another agent starts with the summary: its own dry run (`--agent X`),
+  // asked when it is chosen, says what stops it and the level it starts in
+  const source = plan.agent || "claude", agents = agentsThere(plan), dries = { claude: plan };
+  let chosen = "claude";
+  const there = h("div", { class: "stack agent-there" });
+  const paint = () => {
+    const d = dries[chosen], label = AGENTS[chosen] || chosen;
+    const stop = d && chosen !== "claude" ? problems(d) : null;
+    clear(there).append(agents.length > 1 ? agentPicker("Agent there", agents, chosen, pick) : null,
+      !d ? h("div", { class: "dim small" }, h("span", { class: "spin" }), `asking ${remote} about ${label}…`)
+        : stop ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: `Not possible with ${label}:\n\n${stop}` })
+        : [h("div", { class: "small starts", text: `${agentStarts(chosen, remote)} and this folder is marked as away until you take it back.` }),
+          h("div", { class: "dim small tokens", text: agentCost(chosen, remote, false, d) }),
+          chosen === "claude" ? null : arr(d.warnings).filter((w) => !arr(plan.warnings).includes(w)).map((w) => h("p", { class: "warn small", text: "⚠ " + w })),
+          permPart(d, chosen, { on: remote, agent: source, leaving: (a) => `the ${a ? a + " " : ""}session here` })]);
+    // Hand Over waits for the answer about the agent chosen, and what stops it stops Hand Over
+    const go = there.closest(".box") && there.closest(".box").querySelector("button.primary");
+    if (go) go.disabled = !d || !!stop;
+  };
+  const pick = async (a) => {
+    chosen = a;
+    if (!dries[a]) {
+      paint();
+      const d = await dryRun(["handover", p.real_path, "--json", "--to", remote, "--agent", a, ...past]);
+      dries[a] = d;
+      if (chosen !== a || !there.isConnected) return;
+    }
+    paint();
+  };
+  paint();
+  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over", [there, gitattrPart(plan)]))) return;
+  const agent = chosen === "claude" ? [] : ["--agent", chosen], label = AGENTS[chosen] || chosen;
   S.moving = p.real_path;             // its own record of it is no unfinished handover
   const d = await busy(`handing ${name} over…`, () =>
-    job(["handover", p.real_path, "--apply", "--json", "--to", remote, ...past], "handing over", true).then((a) => a.json || {}))
+    job(["handover", p.real_path, "--apply", "--json", "--to", remote, ...past, ...agent], "handing over", true).then((a) => a.json || {}))
     .finally(() => { S.moving = null; });
   const s = d.sent || {};
+  // Kimi below never-ask opened without reading the summary: the first
+  // message to paste into its window there
+  const first = !problems(d) && chosen === "kimi" ? farFirst(d) : null;
   note(p, problems(d) ? "The handover did not go through:\n\n" + problems(d)
-    : `Handed over to ${remote}: ${s.files || 0} file(s) sent, ${bytes(s.wire_bytes)} over the network.`);
+    : `Handed over to ${remote}: ${s.files || 0} file(s) sent, ${bytes(s.wire_bytes)} over the network.`
+      + (agent.length ? ` ${label} started there with aht's summary of the work.` : ""), null,
+    first ? [firstPromptPart(first), h("button", { class: "small", text: "Open Its Window", onclick: () => openWindowThere(p) })] : undefined);
   refresh();
+}
+/** Peek: the last lines the agent's window on the other machine shows
+ * (`attach --peek --json`: {agent, open, status, raw_status, quiet_for,
+ * screen, error}), in a sheet; nothing is typed there. */
+async function peekThere(p) {
+  const remote = p.away_remote || p.away, label = awayAgentLabel(p) || "The agent";
+  const d = await busy(`looking at ${label} on ${remote}…`, () => dryRun(["attach", p.real_path, "--peek", "--json"]));
+  const s = sheet(`${label} on ${remote}`, "Hand a project over", 820);
+  const ws = windowStatus(d), lines = arr(d.screen).map(String);
+  s.body.append(h("div", { class: "row peek-state" }, ws || d.status ? h("span", { class: "badge " + (ws ? ws.cls : ""), text: ws ? ws.text : d.status }) : null,
+    ws && ws.hint ? h("span", { class: "dim small", text: ws.hint }) : null),
+  d.error ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: d.error }) : null,
+  lines.length ? h("pre", { class: "peek", text: lines.join("\n") }) : !d.error ? h("p", { class: "dim", text: "Its window shows nothing yet." }) : null,
+  h("p", { class: "dim small", text: "The last lines its window shows; nothing is typed there. Open Its Window to answer it or end it." }));
+  s.foot.append(h("button", { text: "Look Again", onclick: () => { closeSheet(); peekThere(p); } }),
+    h("button", { text: "Open Its Window", onclick: () => openWindowThere(p) }),
+    h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+}
+/** The window aht runs the agent in on the other machine, in a new terminal. */
+async function openWindowThere(p) {
+  const r = await run(["attach", p.real_path, "--window"]);
+  if (r.ok) return toast("Its window opens in a new terminal.");
+  tell("Its window did not open", ((r.err || "") + (r.out || "")).trim() || "aht gave no answer.");
 }
 /** Take Back, and Bring Them Here (`copy`): the same plan, the same "changed
  * on both: keep both", the same set-aside.  For a copy kept in sync whose
@@ -1795,6 +2023,9 @@ async function takeBack(p, copy) {
   copy = plan.mode ? plan.mode === "copy" : !!copy;
   // Bring Them Here that would remove many files here asks before it does
   if (copy) plan = pastRemovals(plan);
+  // the agent there cannot be ended safely yet (--stop): why, and what to do
+  const refused = copy ? null : stopRefusal(plan, p);
+  if (refused) return stopRefused(p, refused);
   if (problems(plan)) return note(p, (copy ? "The changes cannot be brought here now:\n\n" : "Cannot be taken back now:\n\n") + problems(plan));
   const remote = plan.remote || p.away_remote || p.away || p.mirror;
   const n = (plan.plan || {}).project || {};
@@ -1809,7 +2040,9 @@ async function takeBack(p, copy) {
   }
   // the sync runs after it only when Keep in sync with that machine is on
   if (copy && p.mirror === remote) body += `\n\nThen the sync runs, and the copy on ${remote} is the same as this one again.`;
-  if (plan.would_stop) body += `\n\nThe idle session on ${remote} is ended first.`;
+  const far = awayAgent(p) && awayAgent(p) !== "claude" ? awayAgentLabel(p) : null, q = (plan.stop || plan.window || {}).quiet_for;
+  if (plan.would_stop) body += far ? `\n\n${far} on ${remote} is ended first: it has been ${q != null ? quietFor(q) : "quiet"}, and its last turn has ended.`
+    : `\n\nThe idle session on ${remote} is ended first.`;
   const both = Object.values(plan.conflicts || {}).flat();
   const title = copy ? `Bring the changes on ${remote} here?` : `Take “${name}” back from ${remote}?`;
   // across systems: line endings, names this machine cannot hold, .gitattributes
@@ -1824,10 +2057,13 @@ async function takeBack(p, copy) {
   } else if (!(await confirmIt(title, body, copy ? "Bring Them Here" : "Take Back", across))) return;
   const d = await busy(copy ? `bringing the changes on ${remote} here…` : `taking ${name} back…`, () =>
     job(["reclaim", p.real_path, ...stop, "--apply", "--json", ...extra, ...allow], copy ? "bringing them here" : "taking back", true).then((a) => a.json || {}));
+  // the agent there began to print again, or opened a turn, after the dry run
+  const late = !copy && !d.applied ? stopRefusal(d, p) : null;
+  if (late) { refresh(); return stopRefused(p, late, true); }
   const kept = d.set_aside ? "\nReplaced files are kept in: " + d.set_aside : "";
   note(p, problems(d) ? (copy ? "The changes did not come here:\n\n" : "Taking it back did not go through:\n\n") + problems(d)
     : copy ? `The changes from ${remote} are here.${syncedAfter(d, remote)}${kept}`
-    : "Back on this computer, files and history." + kept);
+    : "Back on this computer, files and history." + kept + caughtUp(d, remote), !problems(d) && !copy ? (d.catchup || {}).brief || null : null);
   refresh();
 }
 async function keepInSync(p, on) {
@@ -2299,7 +2535,7 @@ const sayLines = (d) => [arr(d.notes).map((t) => h("p", { class: "small", text: 
 function awayLine(p, a) {
   const at = a.since ? " since " + clock(a.since) : "";
   return h("div", { class: "row awayrow" },
-    h("span", { class: "grow", text: `On ${a.name}${at}${a.there ? ` (brought there from ${a.name})` : ""}. Send it back from ${a.name}${a.take ? ", or take it back here" : ""}.` }),
+    h("span", { class: "grow", text: `On ${a.name}${at}${a.agent ? `, in ${a.agent}` : ""}${a.there ? ` (brought there from ${a.name})` : ""}. Send it back from ${a.name}${a.take ? ", or take it back here" : ""}.` }),
     h("button", { class: "small", text: "Release…", onclick: () => release(p) }), helpBtn("Hand a project over"));
 }
 
@@ -2381,9 +2617,12 @@ const factsGrid = (rows) => (rows.length ? h("div", { class: "facts" }, rows.map
  * here to use (`--here`: the project's folder itself). */
 async function bringHere(machine, there, o = {}) {
   const name = base(there);
-  const st = { here: o.here || null, idle: false, d: null };
+  // agent: the agent that goes on here (Agent here): Claude Code's own
+  // session, or another agent that starts with the summary (`--agent X`)
+  const st = { here: o.here || null, idle: false, d: null, agent: "claude" };
   const s = sheet(`Bring “${name}” here from ${machine}`, "Hand a project over", 760);
-  const opts = () => [...(st.here ? ["--here", st.here] : []), ...(st.idle ? ["--allow-idle"] : [])];
+  const opts = () => [...(st.here ? ["--here", st.here] : []), ...(st.idle ? ["--allow-idle"] : []),
+    ...(st.agent !== "claude" ? ["--agent", st.agent] : [])];
   const look = async () => {
     st.d = null; paint();
     const d = await dryRun(["bring", there, "--from", machine, ...opts(), "--json"]);
@@ -2405,16 +2644,20 @@ async function bringHere(machine, there, o = {}) {
     await refresh();
     const here = d.here_path || (st.d || {}).here_path || st.here;
     const p = S.projects.find((x) => sameDir(x.real_path, here));
-    const got = d.fetched || {}, line = d.command_line || "";
+    const got = d.fetched || {}, line = d.command_line || "", other = st.agent !== "claude";
+    const label = AGENTS[st.agent] || st.agent;
+    // Kimi below never-ask opened without reading the summary: the first message to paste
+    const first = !failed && st.agent === "kimi" ? farFirst(d) : null;
     const text = failed ? "It did not come here:\n\n" + failed
       : `Brought here from ${machine}${here ? ` into ${here}` : ""}${got.files != null ? `: ${plural(got.files, "file")} (${bytes(got.bytes)})` : ""}. On ${machine} it is marked as being here.\n\n`
-        + (d.opened ? "Its session is open in a new terminal: nothing runs until you type."
+        + (d.opened && other ? `${label} is open in a new terminal${first ? "." : ": it reads aht's summary of the work as its first turn."}`
+          : d.opened ? "Its session is open in a new terminal: nothing runs until you type."
           : line ? `No terminal window opened. Run this in a terminal to go on:\n\n${line}` : "")
         + (d.set_aside ? `\n\nWhat was in that folder before is kept in ${d.set_aside}.` : "")
         + (arr(d.warnings).length ? "\n\n" + d.warnings.map((w) => "⚠ " + w).join("\n") : "");
-    if (!p) return tell(failed ? "Not brought here" : "Brought here", text);
+    if (!p) return tell(failed ? "Not brought here" : "Brought here", text + (first ? "\n\nPaste this into Kimi Code as your first message:\n\n" + first : ""));
     S.tab = "projects"; S.selection = p.real_path; drawTop();
-    note(p, text, d.set_aside || null);
+    note(p, text, d.set_aside || null, first ? [firstPromptPart(first)] : undefined);
   };
   const paint = () => {
     const b = clear(s.body), f = clear(s.foot), d = st.d;
@@ -2427,6 +2670,15 @@ async function bringHere(machine, there, o = {}) {
       [`On ${machine}`, h("span", { class: "mono", text: d.there_path || there })],
       ["Here", h("span", {}, h("span", { class: "mono", text: d.here_path || st.here || "—" }), " ",
         h("button", { class: "small", text: "Another Folder…", onclick: change }))]]));
+    // Agent here: Claude Code's own session (no tokens), or another agent
+    // that starts with the summary (one turn); its own dry run says what
+    // stops it and the level it starts in
+    const agents = agentsHere();
+    if (agents.length > 1 || st.agent !== "claude") {
+      wrap.append(h("div", { class: "stack agent-here" },
+        agentPicker("Agent here", agents.includes(st.agent) ? agents : agents.concat([st.agent]), st.agent, (a) => { st.agent = a; look(); }),
+        h("div", { class: "dim small tokens", text: agentCost(st.agent, null, false, d) })));
+    }
     // an idle session there blocks, unless allowed: if anyone types into it
     // later, Send Back keeps both versions
     const idle = !st.idle && arr(d.blockers).some((x) => /--allow-idle/.test(x));
@@ -2440,9 +2692,15 @@ async function bringHere(machine, there, o = {}) {
       const sess = d.session && typeof d.session === "object" ? d.session : {};
       wrap.append(factsGrid([...planFacts(plan, `on ${machine}`, "here"),
         plan.set_aside ? ["Here", `${plural(plan.set_aside, "file")} in the folder here ${plan.set_aside === 1 ? "is" : "are"} set aside first`] : null,
-        ["Session", sess.id ? `${sess.title ? `“${sess.title}” — ` : ""}opens here in a new terminal; nothing runs until you type` : "none yet"]].filter(Boolean)));
-      // the level its session opens in here, like it ran there
-      if (sess.id) wrap.append(permPart(d, sess.agent || d.agent || "claude", { agent: sess.agent || d.agent || "claude", leaving: (a) => `the ${a ? a + " " : ""}session on ${machine}` }));
+        st.agent !== "claude" ? ["Session", `${AGENTS[st.agent] || st.agent} starts here in a new terminal with aht's summary of the work${sess.title ? ` (“${sess.title}”)` : ""}`]
+          : ["Session", sess.id ? `${sess.title ? `“${sess.title}” — ` : ""}opens here in a new terminal; nothing runs until you type` : "none yet"]].filter(Boolean)));
+      // the level its session opens in here, like it ran there; or the level
+      // the agent chosen starts in
+      const from = sess.agent || (st.agent === "claude" ? d.agent : null) || "claude";
+      if (sess.id || st.agent !== "claude") {
+        wrap.append(permPart(d, st.agent === "claude" ? sess.agent || d.agent || "claude" : st.agent,
+          { agent: from, leaving: (a) => `the ${a ? a + " " : ""}session on ${machine}` }));
+      }
       if (st.idle) wrap.append(h("p", { class: "small", text: `The idle session on ${machine} stays as it is. If anyone types into it later, Send Back keeps both versions.` }));
       wrap.append(h("p", { class: "small", text: `On ${machine} the project is marked as being here; its own copy stays as it is. Send Back returns your work when you are done.` }));
     }
@@ -2489,7 +2747,9 @@ async function sendBack(p) {
     const both = arr(((d.done || {}).project || {}).conflicts).map((x) => (x && typeof x === "object" ? x.their_version || x.file : x));
     const text = failed ? "It was not sent back:\n\n" + failed
       : `Sent back to ${to}: the project is on ${to} again, with the work done here. Whatever it replaced there is set aside on ${to}, not deleted${d.set_aside ? ` (${d.set_aside})` : ""}. This folder stays here as it is.`
-        + (both.length ? `\n\nChanged on both machines, kept twice on ${to}:\n` + both.slice(0, 6).map((x) => "• " + x).join("\n") : "");
+        + (both.length ? `\n\nChanged on both machines, kept twice on ${to}:\n` + both.slice(0, 6).map((x) => "• " + x).join("\n") : "")
+        // another agent worked here: what it did is summed up for Claude Code there
+        + (d.catchup && d.catchup.agent ? `\n\nWhat ${AGENTS[d.catchup.agent] || d.catchup.agent} did here is summed up for the Claude Code session on ${to}.` : "");
     await refresh();
     const q = S.projects.find((x) => sameDir(x.real_path, p.real_path));
     if (q) note(q, text); else tell(failed ? "Not sent back" : "Sent back", text);
@@ -2709,9 +2969,13 @@ function drawSessions(m) {
     if (!old && !rows.length) list.append(h("p", { class: "dim", text: "No agent session open." }));
     if (old && rows.length) list.append(h("div", { class: "dim small", text: b.last_heard ? `as of ${clock(b.last_heard)}` : "as last heard" }));
     for (const s of rows) {
-      const cls = old ? "" : s.raw_status === "waiting" ? "waiting" : s.raw_status === "busy" ? "working" : "";
-      list.append(h("div", { class: "row", style: "padding:5px 0;border-bottom:1px solid var(--line)" },
-        h("strong", { text: base(s.project) }), h("span", { class: "badge " + cls, text: s.status || s.raw_status || "" }),
+      // a window aht runs another agent in there: its status from the
+      // window's output ("working", "quiet for 6 min", "exited")
+      const ws = windowStatus(s);
+      const cls = old ? "" : ws ? ws.cls : s.raw_status === "waiting" ? "waiting" : s.raw_status === "busy" ? "working" : "";
+      list.append(h("div", { class: "row" + (ws ? " in-window" : ""), style: "padding:5px 0;border-bottom:1px solid var(--line)" },
+        h("strong", { text: base(s.project) }), h("span", { class: "badge " + cls, text: ws ? ws.text : s.status || s.raw_status || "" }),
+        ws && ws.hint ? h("span", { class: "dim small hint", text: ws.hint }) : null,
         s.waiting_for ? h("span", { class: "warn small", text: s.waiting_for }) : null,
         h("span", { class: "dim small", text: [AGENTS[s.agent] || s.agent, s.title || s.name, s.since ? ago(s.since) : ""].filter(Boolean).join(" · ") }),
         h("span", { class: "grow" }),

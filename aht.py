@@ -3422,6 +3422,11 @@ def cmd_projects(args):
                or (e.get("away") or {}).get("host"),
                "away_path": (e.get("away") or {}).get("remote_path"),
                "away_system": (e.get("away") or {}).get("system"),
+               # the agent that goes on there (records before phase 8: Claude)
+               # and the window it runs in (a Hand Over's; Bring Here: none)
+               "away_agent": ((e.get("away") or {}).get("agent") or "claude")
+               if e.get("away") else None,
+               "away_window": (e.get("away") or {}).get("window"),
                "mirror": (e.get("mirror") or {}).get("remote")
                if (e.get("mirror") or {}).get("enabled") else None,
                "mirror_synced_at": (e.get("mirror") or {}).get("synced_at"),
@@ -4831,6 +4836,10 @@ def _tmux_socket() -> list:
     s = os.environ.get("AHT_TMUX_SOCKET")
     return ["-L", s] if s else []
 
+# waits a test machine or a sandbox gets from here: the keep-awake helper's
+# look (AHT_AWAKE_EVERY) and the window limits (_secs)
+TEST_TIMES = ("AHT_AWAKE_EVERY", "AHT_AWAKE_QUIET", "AHT_STOP_QUIET", "AHT_WORKING_SECS")
+
 def _test_drop(step: str, where: str) -> None:
     """Tests: AHT_TEST_DROP=<step> cuts the link right after that step."""
     if os.environ.get("AHT_TEST_DROP") == step:
@@ -5686,8 +5695,8 @@ class Remote:
     def _env(self) -> dict:
         e = {k: v for k, v in os.environ.items()
              if not k.startswith("AHT_") or k in ("AHT_CLAUDE", "AHT_ITERM_TABS",
-                                                   "AHT_AWAKE_EVERY", "AHT_SESSION_BUS",
-                                                   "AHT_CASELESS", "AHT_CLAUDE_SANDBOX")}
+                                                   "AHT_SESSION_BUS", "AHT_CASELESS",
+                                                   "AHT_CLAUDE_SANDBOX") + TEST_TIMES}
         e.update(_sandbox_env(self.root + "/home"))
         if os.name == "nt":
             e["USERPROFILE"] = e["HOME"]        # Windows' Path.home()
@@ -5697,6 +5706,8 @@ class Remote:
             e["AHT_CLAUDE"] = os.environ["AHT_REMOTE_CLAUDE"]
         if os.environ.get("AHT_REMOTE_MACHINE_NAME"):   # tests: the name it gives itself
             e["AHT_MACHINE_NAME"] = os.environ["AHT_REMOTE_MACHINE_NAME"]
+        if os.environ.get("AHT_REMOTE_AGENT_PROCS"):    # tests: the agents running there
+            e["AHT_AGENT_PROCS"] = os.environ["AHT_REMOTE_AGENT_PROCS"]
         return e
 
     def _sandboxed(self, script: str) -> str:
@@ -5704,6 +5715,9 @@ class Remote:
         (stand-in agents) first on PATH.  Its tmux server's socket is inside
         it too (TMUX_TMPDIR), not in that machine's /tmp."""
         env = dict(_sandbox_env(self.sandbox + "/home"), TMUX_TMPDIR=self.sandbox + "/tmux")
+        # a check on a real machine may shorten aht's waits there
+        env.update({k: os.environ[k] for k in TEST_TIMES
+                    if re.fullmatch(r"\d+(\.\d+)?", os.environ.get(k) or "")})
         return ("export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
                 + f" PATH={shlex.quote(self.sandbox + '/bin')}:\"$PATH\" && "
                 + 'mkdir -p "$HOME" "$TMUX_TMPDIR" && ' + script)
@@ -7012,6 +7026,222 @@ def _tmux_screen(name: str, lines: int = 14) -> list:
         return []
     return [l.rstrip() for l in r.stdout.splitlines() if l.strip()][-lines:]
 
+# ---- the window a handover opened, and the agent in it ----------------------- #
+#
+# A window aht starts on the machine a project went to has a folder of its
+# own there, ~/.aht/remote/run/<window>/: window.json (which agent, in which
+# folder, since when), `exited` (written by the window's own line when the
+# agent ends: its exit status and the time) and awake.pid (the keep-awake
+# helper).  Claude Code's state comes from its own records.  Another agent's
+# comes from the window: "working" while it wrote output in the last 15 s,
+# "quiet" after that, or "exited".
+
+FAR_AGENTS = ("codex", "kimi", "agy", "vibe")   # agents a window there can run besides Claude
+WORKING_SECS = 15       # s: output this recent means the agent works
+STOP_QUIET = 120        # s: --stop ends another agent only after this long without output
+AWAKE_QUIET = 600       # s: keep-awake holds while the window had output this recently
+WENT_QUIET = 60         # s: quiet this long after working gives "went quiet"
+# the keys that end each agent in its window, tried up to three times; each
+# is still to be confirmed with the real agent (a real turn, with the user's OK)
+QUIT_KEYS = {"codex": ["C-c", "C-c"], "kimi": ["C-d"], "agy": ["C-c", "C-c"],
+             "vibe": ["C-c", "C-c"]}
+
+def _secs(var: str, default: float) -> float:
+    """A time limit, shorter in the tests and the checks on real machines
+    (AHT_WORKING_SECS, AHT_STOP_QUIET, AHT_AWAKE_QUIET; AHT_WENT_QUIET for
+    the notices here)."""
+    try:
+        return float(os.environ.get(var) or default)
+    except ValueError:
+        return default
+
+def run_dir(name: str) -> Path:
+    return aht_home() / "remote" / "run" / name
+
+def _json_or_none(p: Path):
+    """A small JSON record: None when the file is not there, {} when it is
+    there but unreadable."""
+    try:
+        v = json.loads(p.read_text())
+        return v if isinstance(v, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+
+# what tmux says when the window (or its whole server) is not there; any
+# other error, or no answer at all (_tmux's None), tells nothing
+_TMUX_GONE = re.compile(r"can't find (session|window|pane)|no server running|"
+                        r"error connecting to .*\(No such file or directory\)", re.I)
+
+def _tmux_gone(r) -> bool:
+    """Whether tmux's answer `r` (from _tmux) says that what was asked for is
+    not there: no such session or window, or no tmux server."""
+    return r is not None and r.returncode != 0 and bool(_TMUX_GONE.search(r.stderr or ""))
+
+def mux_windows():
+    """{window: when it last wrote output (seconds since 1970)} of every
+    window on this machine's tmux server (a sandbox's own), in one call;
+    False when tmux did not answer (then nobody knows which run)."""
+    r = _tmux("list-sessions", "-F", "#{session_name} #{window_activity}")
+    if r is None or (r.returncode != 0 and not _tmux_gone(r)):
+        return False
+    out = {}
+    for line in (r.stdout.splitlines() if r.returncode == 0 else []):
+        name, _, t = line.strip().partition(" ")
+        if name:
+            try:
+                out[name] = float(t)
+            except ValueError:
+                out[name] = None
+    return out
+
+def mux_activity(name: str):
+    """When the window `name` last wrote output (tmux's #{window_activity});
+    None when there is no such window."""
+    r = _tmux("display", "-p", "-t", f"={name}:", "#{window_activity}")
+    try:
+        return float(r.stdout.strip()) if r and r.returncode == 0 else None
+    except ValueError:
+        return None
+
+def mux_quiet_for(name: str, now: float = None):
+    """Seconds since the window `name` last wrote output; None when there is
+    no such window."""
+    t = mux_activity(name)
+    return None if t is None else max(0.0, (now or time.time()) - t)
+
+def _mux_probe(name: str) -> tuple:
+    """(alive, when it last wrote output) of the window `name`: alive True,
+    False (tmux says there is no such window, or no server), or None when
+    tmux did not answer (a timeout, another error, tmux not found)."""
+    r = _tmux("display", "-p", "-t", f"={name}:", "#{window_activity}")
+    if r is not None and r.returncode == 0:
+        try:
+            return True, float(r.stdout.strip())
+        except ValueError:
+            return True, None
+    return (False if _tmux_gone(r) else None), None
+
+def window_state(name: str, windows=None) -> dict:
+    """What runs in the window `name` aht started here: {name, agent, path,
+    started, session, alive (None: tmux did not answer), exited (the
+    marker, or None), quiet_for (s), raw_status ("working", "quiet",
+    "exited", or "unknown" when tmux did not answer), not_running}.
+    `windows`: mux_windows(), when read already."""
+    rec = _json_or_none(run_dir(name) / "window.json") or {}
+    ex = _json_or_none(run_dir(name) / "exited")
+    if windows is False:
+        alive, act = None, None
+    elif windows is not None:
+        alive, act = name in windows, windows.get(name)
+    else:
+        alive, act = _mux_probe(name)
+    quiet = max(0.0, time.time() - act) if act is not None else None
+    # ended: its line noted the exit, or tmux says the window is gone; when
+    # tmux does not answer, it may still run
+    ended = ex is not None or alive is False
+    raw = "exited" if ended else "unknown" if alive is None else "working" \
+        if quiet is not None and quiet < _secs("AHT_WORKING_SECS", WORKING_SECS) else "quiet"
+    return {"name": name, "agent": rec.get("agent"), "path": rec.get("path"),
+            "started": _number(rec.get("started")), "session": rec.get("session"),
+            "alive": alive, "exited": ex, "quiet_for": None if quiet is None else int(quiet),
+            "raw_status": raw, "not_running": ended}
+
+def pane_pids(name: str) -> list:
+    """The processes of the window `name`: its pane's process and every one
+    below it (the agent, and what it started), so that they are not taken
+    for other programs running in the folder."""
+    r = _tmux("display", "-p", "-t", f"={name}:", "#{pane_pid}")
+    try:
+        root = int(r.stdout.strip()) if r and r.returncode == 0 else None
+    except ValueError:
+        root = None
+    if not root:
+        return []
+    kids = {}
+    try:
+        ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True,
+                            timeout=15, cwd="/").stdout
+        for line in ps.splitlines():
+            w = line.split()
+            if len(w) == 2 and w[0].isdigit() and w[1].isdigit():
+                kids.setdefault(int(w[1]), []).append(int(w[0]))
+    except Exception:
+        pass
+    out, todo = [], [root]
+    while todo and len(out) < 500:
+        p = todo.pop()
+        if p not in out:
+            out.append(p)
+            todo += kids.get(p, [])
+    return out
+
+def window_words(raw: str, quiet) -> str:
+    """A window's state as the board says it: "working", "quiet for 6 min",
+    "exited", "tmux did not answer"."""
+    if raw in ("working", "exited"):
+        return raw
+    if raw == "unknown":
+        return "tmux did not answer"
+    m = int((quiet or 0) // 60)
+    return "quiet for under a minute" if m < 1 else \
+        f"quiet for {m} min" if m < 120 else f"quiet for {m // 60} h"
+
+def window_rows() -> list:
+    """The board's rows for the windows aht started here with an agent other
+    than Claude Code (whose sessions have records of their own): one per
+    window that runs, or ended within the day and was not closed yet."""
+    base = aht_home() / "remote" / "run"
+    if not base.is_dir():
+        return []
+    wins, rows = None, []
+    for f in sorted(base.glob("*/window.json")):
+        name = f.parent.name
+        if not _WINDOW_NAME.fullmatch(name):
+            continue
+        wins = mux_windows() if wins is None else wins
+        st = window_state(name, wins)
+        if st["agent"] not in FAR_AGENTS or not isinstance(st["path"], str):
+            continue
+        if st["not_running"]:
+            t = _when((st["exited"] or {}).get("at")) or (_stat(f).st_mtime if _stat(f) else 0)
+            if time.time() - t > AWAKE_HOURS * 3600:
+                continue
+        rows.append({"agent": st["agent"], "project": st["path"], "pid": None,
+                     "session": st["session"] if isinstance(st["session"], str) else None,
+                     "name": None, "title": None, "window": name,
+                     "status": window_words(st["raw_status"], st["quiet_for"]),
+                     "raw_status": st["raw_status"], "quiet_for": st["quiet_for"],
+                     "not_running": st["not_running"], "waiting_for": None,
+                     "since": st["started"]})
+    return rows
+
+def far_start_argv(agent: str, ask: str, flags: list, kimi_reads: bool = True) -> list:
+    """The command line that starts `agent` in a window on another machine:
+    its program's name (found there), the level's flags, the first prompt.
+    Kimi takes no first prompt in its own window: it reads the summary in a
+    run of its own there first (`kimi_reads`), and `-S <that session>`
+    follows; below never-ask it opens, and you paste the first prompt."""
+    f = [str(x) for x in flags or []]
+    if agent in ("codex", "vibe"):
+        return [agent] + f + [ask]
+    if agent == "agy":
+        return [agent] + f + (["--remote-control"] if cfg_get("handover_remote_control", True)
+                              else []) + ["-i", ask]
+    if agent == "kimi":
+        return [agent] + f
+    raise ValueError(f"no start line for {agent} there")
+
+def _far_ask(frm: str, rel: str, task: str = None) -> str:
+    """The first prompt of an agent that takes the work over on another
+    machine: read the summary first; then the task, when one was given."""
+    if not task:
+        return _ask(frm, rel, False)
+    return (f"You are taking over this project from {frm}. Read {rel} first: it records "
+            f"where the work stood, the latest exchanges and the open items. Then work on "
+            f"this: {' '.join(str(task).split())[:2000]}")
+
 def _quiet_value(fn):
     try:
         return fn()
@@ -7056,7 +7286,9 @@ def _agent_probe(req: dict) -> dict:
             "machine_id": machine_id(create=False),
             "aht_there": _aht_there(),
             "claude_sandbox": claude_can_sandbox(),
-            "keep_awake": _awake_tool()[0]}
+            "keep_awake": _awake_tool()[0],
+            # the other agents a handover can start here (phase 8)
+            "agent_clis": {a: agent_cli(a) for a in FAR_AGENTS}}
     if req.get("test_awake") and info["keep_awake"]:
         # `remote check`: does it work for this account, over ssh?  (polkit
         # may refuse systemd-inhibit to a session that is not at the screen;
@@ -7275,42 +7507,83 @@ def _agent_install_claude(req: dict) -> dict:
     return {"ok": True, "claude": exe, "claude_version": got}
 
 def _agent_start(req: dict) -> dict:
+    """Open the window a handover runs in: Claude Code resuming its session
+    (`claude`, `session`, `args`), or another agent (`agent`) started with
+    `start_argv` (its program's name, found here, then the level's flags and
+    the first prompt).  Kimi reads the summary (`kimi_prompt`) in a run of
+    its own first, and its window opens that session.  window.json says
+    which agent runs there; the window's line writes `exited` when it ends."""
     path, name = req["path"], req["name"]
+    agent = req.get("agent") or "claude"
+    if not _WINDOW_NAME.fullmatch(str(name or "")):
+        return {"ok": False, "error": f"not a window name: {name!r}"}
     # a tmux server of its own (a sandbox) is plain tmux: byobu picks its own
     mux = (None if _tmux_socket() else shutil.which("byobu")) or shutil.which("tmux")
     if not shutil.which("tmux"):
         return {"ok": False, "error": "tmux is not installed (byobu needs it too)"}
+    exe = None
+    if agent != "claude":
+        want = [str(a) for a in req.get("start_argv") or []]
+        if agent not in FAR_AGENTS or not want or want[0] != agent:
+            return {"ok": False, "error": f"aht cannot start {agent!r} there"}
+        exe = agent_cli(agent)
+        if not exe:
+            return {"ok": False, "error": f"{AGENT_NAMES[agent]} is not installed on {_here()}"}
     if running_sessions(inside=path):
         return {"ok": False, "error": "an agent session is already open there"}
     if _tmux_has(name):
         _tmux("kill-session", "-t", "=" + name)
-    run = aht_home() / "remote" / "run" / name
+    run = run_dir(name)
     run.mkdir(parents=True, exist_ok=True)
-    (run / "note.txt").write_text(req.get("note") or "")
-    settings = {"hooks": {"SessionStart": [
-        {"hooks": [{"type": "command", "timeout": 5,
-                    "command": "cat " + shlex.quote(str(run / "note.txt"))}]}]}}
-    if req.get("claude_sandbox"):       # never-ask inside Claude Code's own sandbox
-        settings.update(CLAUDE_SANDBOX)
-    (run / "settings.json").write_text(json.dumps(settings))
-    argv = [req["claude"]]
-    if req.get("session"):
-        argv += ["--resume", req["session"]]
-    argv += ["--settings", str(run / "settings.json")]
-    argv += [str(a) for a in req.get("args") or []]
-    if req.get("remote_control"):
-        argv += ["--remote-control", req["remote_control"]]
-    if req.get("task"):
-        argv += ["--", req["task"]]           # the first prompt: work starts at once
+    for old in ("exited", "window.json"):       # an earlier start's
+        try:
+            (run / old).unlink()
+        except OSError:
+            pass
+    began, session = time.time(), None
+    if agent == "claude":
+        (run / "note.txt").write_text(req.get("note") or "")
+        settings = {"hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "timeout": 5,
+                        "command": "cat " + shlex.quote(str(run / "note.txt"))}]}]}}
+        if req.get("claude_sandbox"):       # never-ask inside Claude Code's own sandbox
+            settings.update(CLAUDE_SANDBOX)
+        (run / "settings.json").write_text(json.dumps(settings))
+        argv = [req["claude"]]
+        if req.get("session"):
+            argv += ["--resume", req["session"]]
+            session = req["session"]
+        argv += ["--settings", str(run / "settings.json")]
+        argv += [str(a) for a in req.get("args") or []]
+        if req.get("remote_control"):
+            argv += ["--remote-control", req["remote_control"]]
+        if req.get("task"):
+            argv += ["--", req["task"]]           # the first prompt: work starts at once
+    else:
+        argv = [exe] + want[1:]
+        if agent == "kimi" and isinstance(req.get("kimi_prompt"), str):
+            # Kimi takes no first prompt in its window: it reads the summary
+            # in a run of its own, and the window opens that session
+            session, why = _kimi_reads(exe, path, req["kimi_prompt"])
+            if session is None:
+                return {"ok": False, "error": why or "Kimi could not read the summary"}
+            argv += ["-S", session]
+    _write_json(run / "window.json", {
+        "v": 1, "name": name, "agent": agent, "path": path, "started": began,
+        "session": session, "relay": req.get("relay"), "attempt": req.get("attempt"),
+        "perm": req.get("perm"), "quit_keys": QUIT_KEYS.get(agent)})
     # git settings for a copy from another system (GIT_CONFIG_*), never in
     # .git/config
     genv = {k: str(v) for k, v in (req.get("env") or {}).items()
             if re.fullmatch(r"GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)", str(k))}
-    line = ("cd %s && env DISABLE_AUTOUPDATER=1 %s%s; st=$?; cd /; "
-            "printf '\\n[aht] the agent exited (%%s); this window closes in a minute\\n' "
-            "\"$st\"; sleep 60"
-            % (shlex.quote(path), "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(genv.items())),
-               " ".join(shlex.quote(a) for a in argv)))
+    # when the agent ends, the line notes it (`exited`: its status and the time)
+    line = ("cd " + shlex.quote(path) + " && env DISABLE_AUTOUPDATER=1 "
+            + "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(genv.items()))
+            + " ".join(shlex.quote(a) for a in argv) + "; st=$?; cd /; "
+            "printf '{\"status\": %s, \"at\": %s}\\n' \"$st\" \"$(date +%s)\" > "
+            + shlex.quote(str(run / "exited")) + "; "
+            "printf '\\n[aht] the agent exited (%s); this window closes in a minute\\n' "
+            "\"$st\"; sleep 60")
     (run / "command.txt").write_text(line + "\n")
     new = _tmux_socket() + ["new-session", "-d", "-s", name, "-x", "200", "-y", "50",
                             "-c", path, line]
@@ -7334,30 +7607,107 @@ def _agent_start(req: dict) -> dict:
     if re.fullmatch(r"[0-9A-Za-z-]{1,40}", str(req.get("attempt") or "")):
         (run / f"attempt-{req['attempt']}").write_text(_now() + "\n")
     started, attention, screen = False, None, []
-    end = time.time() + float(req.get("wait") or 12)
+    opened = time.time()
+    end = opened + float(req.get("wait") or 12)
     while time.time() < end:
         time.sleep(1.0)
         screen = _tmux_screen(name)
         text = " ".join(screen).lower()
-        if running_sessions(inside=path):
+        if agent == "claude" and running_sessions(inside=path):
             started = True
         if "trust this folder" in text or "trust the files" in text:
             attention = "it asks whether you trust the folder"
             break
-        if "the agent exited" in text:
+        if "the agent exited" in text or (run / "exited").exists():
             attention = "the agent exited right away"
             break
+        # another agent leaves no record of its own: it runs once its window
+        # stays open for two seconds
+        if agent != "claude" and time.time() - opened >= 2 and _tmux_has(name):
+            started = True
         if started:
             break
-    return {"ok": True, "mux": os.path.basename(mux), "name": name,
-            "started": started, "attention": attention, "screen": screen,
+    screen = [redact(l) for l in screen]
+    return {"ok": True, "mux": os.path.basename(mux), "name": name, "agent": agent,
+            "session": session, "started": started, "attention": attention, "screen": screen,
             "keep_awake": _awake_tool()[0] if awake else None}
+
+def _turn_state(path: str, agent: str, since=None, sid=None) -> tuple:
+    """(state, session) of another agent's turn in the folder `path`: its
+    session `sid`, or the first one it began after `since`.  "closed" when
+    its own message is the last thing in it, "open" when the user's or a
+    tool call is, None when aht finds no such session."""
+    f = session_file(path, agent, sid) if isinstance(sid, str) and sid else None
+    if f is None and since:
+        sid = _first_session_after(path, agent, since)
+        f = session_file(path, agent, sid) if sid else None
+    if f is None:
+        return None, None
+    last = None
+    try:
+        for _end, ev in session_events(agent, str(f)):
+            if ev.get("role") in ("user", "agent", "tool"):
+                last = ev["role"]
+    except Exception:
+        return None, sid
+    return ("closed" if last == "agent" else "open" if last else None), sid
+
+def _stop_window(path: str, name: str, agent: str, req: dict) -> dict:
+    """End another agent in its window, only when the window wrote nothing
+    for 2 minutes (STOP_QUIET) and the agent's own history shows its own
+    message last: then its quit keys, up to three times.  Refusals:
+    `not-quiet`, `turn-open` (also when aht cannot see its session),
+    `no-reaction`, and `no-answer` (tmux did not answer, so whether the
+    agent runs is not known).  `check_only`: only whether it would."""
+    st = window_state(name)
+    keys = QUIT_KEYS.get(agent) or ["C-c", "C-c"]
+    out = {"ok": True, "stopped": False, "agent": agent, "quit_keys": keys,
+           "quiet_for": st["quiet_for"], "raw_status": st["raw_status"]}
+    if st["not_running"]:
+        if req.get("check_only"):
+            return dict(out, would_stop=True, exited=True)
+        if st["alive"]:
+            _tmux("kill-session", "-t", "=" + name)
+        _end_awake(name)
+        return dict(out, stopped=True, exited=True)
+    if st["alive"] is None:                 # it may still run: nothing is typed
+        return dict(out, reason="no-answer")
+    need = _secs("AHT_STOP_QUIET", STOP_QUIET)
+    if st["quiet_for"] is None or st["quiet_for"] < need:
+        return dict(out, reason="not-quiet", need=int(need))
+    turn, sid = _turn_state(path, agent, st["started"], st["session"])
+    out["session"] = sid
+    if turn != "closed":
+        return dict(out, reason="turn-open", seen=turn is not None)
+    if req.get("check_only"):
+        return dict(out, would_stop=True)
+    for _try in range(3):
+        for k in keys:
+            _tmux("send-keys", "-t", f"={name}:", k)
+            time.sleep(0.4)
+        end = time.time() + 5
+        while time.time() < end and not (run_dir(name) / "exited").exists() \
+                and _tmux_has(name):
+            time.sleep(0.2)
+        if (run_dir(name) / "exited").exists() or not _tmux_has(name):
+            break
+    else:
+        return dict(out, reason="no-reaction")
+    if _tmux_has(name):                     # it waits a minute after the agent ended
+        _tmux("kill-session", "-t", "=" + name)
+    _end_awake(name)
+    return dict(out, stopped=True)
 
 def _agent_stop(req: dict) -> dict:
     """End an IDLE session the way its user would: Ctrl-C, never text typed
     into the prompt — so a half-written message can not be sent by accident.
-    A working session is left alone."""
+    A working session is left alone.  Another agent in its window: by the
+    rules of _stop_window."""
     path, name = req["path"], req["name"]
+    agent = req.get("agent") or (window_state(name).get("agent")
+                                 if _WINDOW_NAME.fullmatch(str(name or "")) else None)
+    if agent in FAR_AGENTS:
+        return _stop_window(path, name, agent, req)
     end = time.time() + float(req.get("wait") or 30)
     pressed = 0
     while True:
@@ -7383,14 +7733,32 @@ def _agent_stop(req: dict) -> dict:
     return {"ok": True, "stopped": True}
 
 def _agent_close(req: dict) -> dict:
-    """Close the window a handover opened, once no session is left in it."""
-    if running_sessions(inside=req["path"]):
+    """Close the window a handover opened, once no session is left in it:
+    Claude Code's by its records; another agent's only once it exited (its
+    window's `exited`, or the window gone), never while it runs.  Not when
+    tmux does not answer (`no-answer`)."""
+    name = req["name"]
+    ok_name = bool(_WINDOW_NAME.fullmatch(str(name or "")))
+    st = window_state(name) if ok_name else {}
+    if ok_name and st["alive"] is None and not st["not_running"]:
+        # tmux did not answer: whatever runs there may still run, and its
+        # window.json stays
+        return {"ok": True, "closed": False, "reason": "no-answer", "agent": st["agent"]}
+    if st.get("agent") in FAR_AGENTS and not st.get("not_running"):
+        return {"ok": True, "closed": False, "reason": "running", "agent": st["agent"]}
+    if st.get("agent") not in FAR_AGENTS and running_sessions(inside=req["path"]):
         return {"ok": True, "closed": False}
-    had = _tmux_has(req["name"])
+    had = _tmux_has(name)
     if had:
-        _tmux("kill-session", "-t", "=" + req["name"])
+        _tmux("kill-session", "-t", "=" + name)
         time.sleep(0.5)
-    _end_awake(req["name"])
+    _end_awake(name)
+    if ok_name:                             # off the board: nothing runs there now
+        for f in ("window.json", "exited"):
+            try:
+                (run_dir(name) / f).unlink()
+            except OSError:
+                pass
     return {"ok": True, "closed": had}
 
 # ---- keeping this machine awake while a handed-over agent works ------------- #
@@ -7516,7 +7884,8 @@ def _spawn_awake(path: str, name: str):
 def cmd_awake(args):
     """`aht _awake --path P [--name W] [--hours H]`, on the machine a project
     was handed over to.  Every 30 s it looks at the folder: while a session
-    there works or waits, it holds caffeinate (macOS) or systemd-inhibit
+    there works or waits, or another agent in the window W wrote output in
+    the last 10 minutes, it holds caffeinate (macOS) or systemd-inhibit
     (Linux; GNOME's gnome-session-inhibit where polkit refuses that to an
     ssh session: the tool is picked once, at the start); it lets go when
     the work is idle.  It ends after three looks with no session there,
@@ -7544,11 +7913,17 @@ def cmd_awake(args):
     # machine awake after the helper is gone, even when it was killed
     then = ["/bin/sh", "-c", f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 5; done"]
     held, empty = None, 0
+    quiet_ok = _secs("AHT_AWAKE_QUIET", AWAKE_QUIET)
     try:
         while time.time() < end and empty < AWAKE_EMPTY:
             sess = running_sessions(inside=real)
-            empty = 0 if sess else empty + 1
-            busy = any(s.get("status") != "idle" for s in sess)
+            # another agent in the window: working while it wrote output in
+            # the last 10 minutes
+            win = window_state(args.name) if pidf else {}
+            runs = win.get("agent") in FAR_AGENTS and not win.get("not_running")
+            empty = 0 if sess or runs else empty + 1
+            busy = any(s.get("status") != "idle" for s in sess) or (
+                runs and win.get("quiet_for") is not None and win["quiet_for"] < quiet_ok)
             if held is not None and held.poll() is not None:
                 log(f"AWAKE {real}: {os.path.basename(tool)} ended by itself; "
                     "this machine may sleep", "warn")
@@ -7592,10 +7967,18 @@ def _stop_proc(p) -> None:
             pass
 
 def _agent_peek(req: dict) -> dict:
+    """The window a handover opened, looked at: its last screen lines (only
+    when asked: `screen`, masked), what runs in it (window_state) and in
+    the folder."""
     path, name = req["path"], req.get("name") or ""
+    ok_name = bool(_WINDOW_NAME.fullmatch(str(name)))
     act = activity_in(path) if os.path.isdir(path) else {"sessions": [], "processes": []}
-    return {"ok": True, "window": bool(name) and _tmux_has(name),
-            "screen": _tmux_screen(name) if name else [], **act}
+    n = max(1, min(int(req.get("lines") or 14), 200))
+    screen = [redact(l) for l in _tmux_screen(name, n)] \
+        if ok_name and req.get("screen", True) else []
+    return {"ok": True, "window": ok_name and _tmux_has(name), "screen": screen,
+            "state": dict(window_state(name), pids=pane_pids(name)) if ok_name else None,
+            **act}
 
 ASIDE_KEEP, ASIDE_DAYS = 5, 30      # set-aside folders: the newest 5, and every
                                     # one younger than 30 days
@@ -7812,7 +8195,9 @@ def _agent_mark_handing(req: dict) -> dict:
            "holder": hname, "holder_id": holder.get("machine_id"),
            "host": holder.get("host") or hname, "system": holder.get("system"),
            "driven_by": "there", "path": real, "remote_path": holder.get("path"),
-           "since": _now(), "agent": "claude", "session": sid, "window": None,
+           "since": _now(), "session": sid, "window": None,
+           # who goes on there: Claude Code, or another agent that reads a summary
+           "agent": holder.get("agent") if holder.get("agent") in AGENT_NAMES else "claude",
            "mux": "local", "relay": req.get("relay"), "task": None,
            "claude": out["claude_version"], "transfer": "aht"}
     try:
@@ -8139,6 +8524,22 @@ def _agent_return_apply(req: dict, inp, out) -> dict:
             for r in read_relays(real):
                 if relay_row(r, real).get("open"):
                     close_relay(real, r["id"], "sent-back")
+            # another agent worked there: its catch-up, made there, for the
+            # Claude Code session that left (aht's hook tells it once)
+            cu = req.get("catchup") if isinstance(req.get("catchup"), dict) else {}
+            if a.get("agent") in FAR_AGENTS or cu.get("agent") in FAR_AGENTS:
+                try:
+                    back.update(_back_relay(
+                        real, dict(a, agent=cu.get("agent") if cu.get("agent") in FAR_AGENTS
+                                   else a.get("agent"), relay=a.get("relay") or cu.get("relay")),
+                        {"text": cu.get("text") if isinstance(cu.get("text"), str) else None,
+                         "session": cu.get("session") if isinstance(cu.get("session"), str)
+                         and _SESSION_ID.fullmatch(cu["session"]) else None,
+                         "title": _line(cu.get("title")), "last_t": _number(cu.get("last_t")),
+                         "error": None if cu.get("text") else "it sent none"},
+                        holder, a.get("remote_path") or ""))
+                except OSError as x:
+                    warn(f"SEND BACK {real}: the catch-up could not be written ({x})")
             _update_entry(uid, away=None, returned=back)
             _end_pause(uid, a.get("remote"))
             _retire_manifest(hd)
@@ -9740,7 +10141,12 @@ def resolve_handing(uid: str, force: bool = False) -> list:
              "info": {"kind": "handover", "project": real, "remote": there}}]
 
 def cmd_handover(args):
-    out = {"command": "handover", "applied": False, "blockers": [], "warnings": []}
+    agent = getattr(args, "agent", None) or "claude"
+    # `agent`: who goes on there; another agent than Claude Code starts with
+    # the summary as its first turn (`start_line`, `tokens`)
+    out = {"command": "handover", "applied": False, "blockers": [], "warnings": [],
+           "agent": agent, "start_line": None, "tokens": None, "first_prompt": None,
+           "relay": None}
     lines = []
     if not handover_supported():
         out["blockers"].append("handover needs rsync and ssh; it is not available "
@@ -9885,7 +10291,10 @@ def cmd_handover(args):
         here_ver = claude_version(mine) if mine else None
         out["claude"] = {"here": here_ver, "there": info.get("claude_version")}
         install = None
-        if not args.no_start:
+        if not args.no_start and agent != "claude" \
+                and not (info.get("agent_clis") or {}).get(agent):
+            out["blockers"].append(f"{AGENT_NAMES[agent]} is not installed on {rem.name}")
+        if not args.no_start and agent == "claude":
             if not here_ver:
                 out["warnings"].append("Claude Code was not found on this machine; "
                                        "the other side keeps its own version")
@@ -9913,13 +10322,47 @@ def cmd_handover(args):
             out["blockers"].append(f"no session {args.session} in this project")
         out["session"] = sid
         out["sessions"] = len(sids)
-        # the level the session runs in here: the one there starts in it
-        perm = out["perm"] = perm_for("claude", session_level(real, "claude", sid),
-                                      "the session here", bool(info.get("claude_sandbox")),
-                                      f"Claude Code on {rem.name}")
         dig = session_digest(Path(store) / f"{sid}.jsonl", real) if sid else \
             session_digest(os.devnull, real)
         out["title"] = dig.get("title")
+        # another agent there reads a summary of the session here: Claude
+        # Code's, or (none) the newest of another agent
+        src = src_dig = None
+        if agent != "claude":
+            pool = [s for s in list_sessions(real)
+                    if not (s["agent"] == "claude" and _is_scripted(s["file"]))]
+            src = next((s for s in list_sessions(real, agents=["claude"]) if s["id"] == sid),
+                       None) if sid else next(iter(pool), None)
+            src_dig = (dig if src["agent"] == "claude" else events_digest(src, real)) \
+                if src else None
+            if src is None and not args.no_start:
+                out["blockers"].append(f"there is no session in this project for "
+                                       f"{AGENT_NAMES[agent]} to read about: hand it over "
+                                       "without --agent, or with --no-start")
+        # the level the session runs in here: the one there starts in it
+        perm = out["perm"] = perm_for("claude", session_level(real, "claude", sid),
+                                      "the session here", bool(info.get("claude_sandbox")),
+                                      f"Claude Code on {rem.name}") if agent == "claude" else \
+            perm_for(agent, session_level(real, src["agent"], src["id"]) if src else None,
+                     "the session here", None, f"{AGENT_NAMES[agent]} on {rem.name}")
+        argv = kimi_p = rid = None
+        if agent != "claude" and src is not None:
+            kimi_p = agent == "kimi" and kimi_reads_ok(perm)
+            rid = new_relay_id()
+            ask = _far_ask(f"{AGENT_NAMES[src['agent']]} on {_here()}",
+                           f".aht/handover/relay-{rid}.md", args.task)
+            argv = far_start_argv(agent, ask, perm["flags"], kimi_p)
+            # (it runs in sh there, also when a PC hands it over)
+            out["start_line"] = " ".join(shlex.quote(a) for a in argv) \
+                + (" -S <the session Kimi starts there>" if kimi_p else "")
+            if agent == "kimi" and not kimi_p:
+                out["first_prompt"] = ask
+                out["tokens"] = (f"Kimi Code opens on {rem.name} without reading the summary: "
+                                 "paste the first prompt when you open it (that turn uses "
+                                 "tokens)")
+            else:
+                out["tokens"] = (f"{AGENT_NAMES[agent]} starts on {rem.name} and reads the "
+                                 "summary as its first turn: that uses tokens")
         carried = list(extras)
         out["outside_not_carried"] = [p for p in dig["outside"]
                                       if not any(_inside(p, c) for c in carried)]
@@ -9980,12 +10423,23 @@ def cmd_handover(args):
                       + (f" at {shown}" if shown != real else ""),
                       f"   files to send  {out['plan']['files']} "
                       f"({_human(out['plan']['bytes'])}), history "
-                      f"{_human(out['plan']['history_bytes'])}",
-                      f"   session        {dig.get('title') or sid or 'none yet'}",
-                      f"   level          {perm['text']}",
-                      f"   Claude Code    {here_ver or '?'} here, "
-                      f"{info.get('claude_version') or 'none'} there"
-                      + (f" → {install} gets installed" if install else "")]
+                      f"{_human(out['plan']['history_bytes'])}"]
+            if agent == "claude":
+                lines += [f"   session        {dig.get('title') or sid or 'none yet'}",
+                          f"   level          {perm['text']}",
+                          f"   Claude Code    {here_ver or '?'} here, "
+                          f"{info.get('claude_version') or 'none'} there"
+                          + (f" → {install} gets installed" if install else "")]
+            elif src is not None:
+                lines += [f"   summary of     {AGENT_NAMES[src['agent']]}: "
+                          f"{(src_dig or {}).get('title') or src['id']}",
+                          f"   agent there    {AGENT_NAMES[agent]}, a new session"
+                          + ("" if args.no_start else f" — {out['tokens']}"),
+                          f"   level          {perm['text']}"]
+                if not args.no_start:
+                    lines.append(f"   starts with    {_clip(out['start_line'], 160)}")
+                if out["first_prompt"]:
+                    lines.append(f"   paste          {out['first_prompt']}")
             if out["outside_not_carried"]:
                 lines.append("   stays here     " + ", ".join(out["outside_not_carried"][:5])
                              + "   (carry with --include <path>)")
@@ -10014,9 +10468,10 @@ def cmd_handover(args):
                 "holder": info.get("host") or rem.name, "holder_id": info.get("machine_id"),
                 "host": info.get("host"), "system": info.get("system"),
                 "driven_by": "here", "path": real, "remote_path": rem.there(real),
-                "since": _now(), "agent": "claude", "session": sid,
+                "since": _now(), "agent": agent, "session": sid,
                 "window": _mux_name(real, uid), "mux": "byobu" if tools.get("byobu") else "tmux",
-                "relay": None, "task": args.task, "claude": here_ver, "transfer": mover}
+                "relay": rid if src is not None else None, "task": args.task, "claude": here_ver,
+                "transfer": mover}
         if rem.sandbox:
             away["mux"] = "tmux"            # a tmux server of its own
         with ProjectLock(uid):
@@ -10044,10 +10499,34 @@ def cmd_handover(args):
                             <= SCRATCH_MAX_BYTES:
                         shutil.copytree(sdir, keep / sid, symlinks=True)
                         scratch = True
-                brief, note = write_brief(real, sid, dig, _here(), info.get("host") or rem.name,
-                                          info.get("system"), carried, scratch, args.task,
-                                          there_path=shown)
-                out["brief"] = str(brief)
+                note = text = None
+                if agent == "claude":
+                    brief, note = write_brief(real, sid, dig, _here(),
+                                              info.get("host") or rem.name, info.get("system"),
+                                              carried, scratch, args.task, there_path=shown)
+                elif src is not None:
+                    # the summary the agent there reads first: it travels in
+                    # the project, with the relay that records the hand-off
+                    head = {"kind": "handover", "at": time.time(),
+                            "from": {"agent": src["agent"], "session": src["id"],
+                                     "machine": _here()},
+                            "to": {"agent": agent, "machine": rem.name,
+                                   "system": info.get("system"), "path": shown}}
+                    text = relay_brief(real, "full", src, relay=head, dig=src_dig)
+                    rec = write_relay(real, "handover",
+                                      {"agent": src["agent"], "session": src["id"],
+                                       "title": (src_dig or {}).get("title"),
+                                       "last_t": (src_dig or {}).get("last_t") or src["updated"],
+                                       "git": _git_mark(real)},
+                                      {"machine": rem.name, "machine_id": info.get("machine_id"),
+                                       "system": info.get("system"), "path": shown,
+                                       "agent": agent, "session": None, "mode": "new"},
+                                      text, rid=rid, perm=perm)
+                    brief = relay_dir(real) / rec["brief"]
+                    out["relay"] = rid = away["relay"] = rec["id"]
+                else:
+                    brief = None
+                out["brief"] = str(brief) if brief else None
                 say(f"sending the project to {rem.name} …")
                 sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty(),
                                     attempt=attempt)
@@ -10106,12 +10585,26 @@ def cmd_handover(args):
                                        .get("hasTrustDialogAccepted"))
                     except Exception:
                         pass
-                    if trusted and cfg_get("handover_carry_trust", True):
+                    if trusted and cfg_get("handover_carry_trust", True) and agent == "claude":
                         out["trust"] = rem.agent("trust", path=rem.there(real)).get("trust")
-                    say(f"starting the session on {rem.name} …")
+                    say(f"starting {AGENT_NAMES[agent]} on {rem.name} …")
                     handing = dict(handing, step="starting", at=time.time())
                     _update_entry(uid, handing=handing)
-                    st = rem.agent("start", timeout=90, path=rem.there(real), session=sid,
+                    if agent != "claude":
+                        frm = f"{AGENT_NAMES[src['agent']]} on {_here()}"
+                        ask = _far_ask(frm, f".aht/handover/{brief.name}", args.task)
+                        argv = far_start_argv(agent, ask, perm["flags"], kimi_p)
+                        # Kimi reads the summary there first: that run may take minutes
+                        st = rem.agent("start", timeout=700 if kimi_p else 90,
+                                       path=rem.there(real), name=away["window"],
+                                       attempt=attempt, env=git_env_vars(gset), agent=agent,
+                                       start_argv=argv, relay=rid, perm=perm_record(perm),
+                                       kimi_prompt=_kimi_prompt(text, frm, False, args.task)
+                                       if kimi_p else None,
+                                       keep_awake=bool(cfg_get("handover_keep_awake", True)))
+                    else:
+                        st = None
+                    st = st or rem.agent("start", timeout=90, path=rem.there(real), session=sid,
                                    env=git_env_vars(gset),
                                    name=away["window"], attempt=attempt,
                                    claude=info["claude"], note=note,
@@ -10164,11 +10657,18 @@ def cmd_handover(args):
                   f"{_human(out['sent']['bytes'])}; history "
                   f"{_human(out['sent']['history_bytes'])}  "
                   f"({_human(out['sent']['wire_bytes'])} on the wire)",
-                  f"   session   {dig.get('title') or sid or 'a new one'}",
+                  (f"   session   {dig.get('title') or sid or 'a new one'}" if agent == "claude"
+                   else f"   agent     {AGENT_NAMES[agent]}"
+                   + ("" if args.no_start else ": a new session reads the summary there")),
                   f"   level     {perm['text']}",
                   f"   summary   {brief}",
                   "   open it   " + _argv_line(out["attach"]),
-                  "   back      aht reclaim " + shlex.quote(real) + " --apply"]
+                  "   back      aht reclaim " + shlex.quote(real) + " --apply"
+                  + ("" if agent == "claude" else
+                     f"   (--stop ends {AGENT_NAMES[agent]} there first, once it has been quiet "
+                     f"for {int(_secs('AHT_STOP_QUIET', STOP_QUIET) // 60)} minutes)")]
+        if out["first_prompt"] and not args.no_start:
+            lines.append(f"   paste     {out['first_prompt']}")
         if out.get("ends_pause"):
             lines.append(f"   Keep in sync with {rem.name} goes on again once you take it back "
                          "(the copy Release left there is set aside there)")
@@ -10181,6 +10681,108 @@ def cmd_handover(args):
     return code
 
 # ---- reclaim ------------------------------------------------------------------ #
+
+def _stop_refusal(who: str, where: str, st: dict) -> str:
+    """Why --stop did not end another agent there, in words."""
+    q = st.get("quiet_for")
+    if st.get("reason") == "not-quiet":
+        quiet = "under a minute" if q is None or q < 60 else f"{int(q // 60)} min"
+        return (f"{who} on {where} has been quiet for only {quiet} — wait, or end it yourself "
+                f"(--stop needs {int(_secs('AHT_STOP_QUIET', STOP_QUIET) // 60)} minutes "
+                "without output)")
+    if st.get("reason") == "turn-open":
+        if st.get("seen") is False:
+            return (f"aht cannot see {who}'s own last message on {where}, so it cannot tell "
+                    "whether its turn ended — end it yourself")
+        return f"{who}'s last turn is still open on {where} — wait, or end it yourself"
+    if st.get("reason") == "no-reaction":
+        keys = " ".join(st.get("quit_keys") or [])
+        return f"{who} on {where} did not react to its quit keys ({keys}) — end it yourself"
+    if st.get("reason") == "no-answer":
+        return _tmux_silent(who, f"on {where}")
+    return f"{who} on {where} could not be ended — end it yourself"
+
+def _tmux_silent(who: str, where: str) -> str:
+    """tmux there did not answer: whether the agent still runs is not known."""
+    return (f"tmux {where} did not answer, so aht cannot tell whether {who} still runs in "
+            "its window — try again in a moment, or end it yourself")
+
+def _far_catchup(rem: Remote, real: str, away: dict) -> dict:
+    """Take Back of a project another agent worked on there: what it did
+    since the project left, as a catch-up made (and masked) on that machine
+    by relay-info -> {text, session, title, last_t, error}."""
+    agent = away.get("agent") or "claude"
+    rid = str(away.get("relay") or "")
+    rel = next((r for r in read_relays(real) if r["id"] == rid), None)
+    git = ((rel or {}).get("from") or {}).get("git")
+    cand = {"id": rid if _RELAY_ID.fullmatch(rid) else new_relay_id(),
+            "at": _when(away.get("since")) or time.time(), "machine": rem.name,
+            "agent": "claude", "session": away.get("session") or "", "to_agent": agent,
+            "git": git}
+    head = {"kind": "back", "at": time.time(),
+            "from": {"machine": rem.name, "system": away.get("system"), "git": git},
+            "to": {"machine": _here(), "system": platform.system(), "path": real,
+                   "agent": "claude"}}
+    try:
+        got = rem.agent("relay-info", timeout=300, there=rem.there(real), brief=True,
+                        catchup_only=True, back=[cand], name=rem.name, now=time.time(),
+                        head=head)
+    except HandoverError as e:
+        return {"text": None, "error": str(e)}
+    s = next((x for x in got.get("sessions") or [] if x.get("agent") == agent), None) or {}
+    text = got.get("catchup") if isinstance(got.get("catchup"), str) else None
+    return {"text": text, "session": s.get("id"), "title": s.get("title"),
+            "last_t": s.get("updated"),
+            "error": None if text else (got.get("match") or {}).get("error")
+            or "it sent no catch-up"}
+
+def _back_relay(real: str, away: dict, cu: dict, holder: str, there_path: str) -> dict:
+    """The relay that brings another agent's work back to the Claude Code
+    session that left (its `note_for`, which aht's hook tells once): the
+    catch-up made where the work was done, or, when none came, a line that
+    says the files may differ -> {agent, relay}."""
+    agent = away.get("agent") if away.get("agent") in AGENT_NAMES else "claude"
+    text = cu.get("text")
+    if not text:
+        text = (f"# Catch-up: {os.path.basename(real)}\n\n"
+                + _unread_work([agent], _when(away.get("since")) or time.time())
+                + f"\n\naht could not get a summary of that work from {holder}"
+                + (f" ({_line(cu['error'])})" if cu.get("error") else "") + ".\n")
+    sid = away.get("session") if isinstance(away.get("session"), str) \
+        and _SESSION_ID.fullmatch(away["session"]) else None
+    rid = str(away.get("relay") or "")
+    rec = write_relay(real, "back",
+                      {"machine": holder if _MACHINE_NAME.fullmatch(str(holder or "")) else None,
+                       "machine_id": away.get("holder_id")
+                       if _MACHINE_ID.fullmatch(str(away.get("holder_id") or "")) else None,
+                       "system": away.get("system"), "path": there_path, "agent": agent,
+                       "session": cu.get("session"), "title": cu.get("title"),
+                       "last_t": _number(cu.get("last_t"))},
+                      {"agent": "claude", "session": sid, "mode": "resume"},
+                      _clip_to(redact(text), CATCHUP_MAX),
+                      back_of=rid if _RELAY_ID.fullmatch(rid) else None, note_for=sid)
+    return {"agent": agent, "relay": rec["id"]}
+
+def _holder_catchup(real: str):
+    """Send Back of a project another agent worked on here: the catch-up for
+    the session at home that left, made here since the hand-off (the relay
+    of the Hand Over or Bring Here that started that agent) -> {text, relay,
+    agent, session, title, last_t}, or None when no other agent took it."""
+    rel = next((r for r in read_relays(real) if r.get("kind") in ("handover", "bring")
+                and r.get("closed") is None
+                and (r.get("to") or {}).get("agent") in FAR_AGENTS), None)
+    if rel is None:
+        return None
+    frm, agent = rel.get("from") or {}, rel["to"]["agent"]
+    origin = {"agent": frm.get("agent") or "claude", "id": frm.get("session") or ""}
+    head = {"kind": "back", "at": time.time(), "back_of": rel["id"],
+            "from": {"machine": _here(), "system": platform.system(), "git": frm.get("git")},
+            "to": {"agent": origin["agent"]}}
+    text = relay_brief(real, "catchup", origin, rel["at"], head, had=[agent],
+                       where=f"on {_here()}")
+    s = next(iter(list_sessions(real, agents=[agent])), None) or {}
+    return {"text": text, "relay": rel["id"], "agent": agent, "session": s.get("id"),
+            "title": _line(_session_title(s)) if s else None, "last_t": s.get("updated")}
 
 def _conflict_name(rel: str, there: str, day: str) -> str:
     head, tail = os.path.split(rel)
@@ -10566,7 +11168,49 @@ def cmd_reclaim(args):
 
         say(f"checking {rem.name} …")
         info = rem.connect(real)
-        if not copy and not info["sessions"] and away.get("window") and \
+        agent = (away or {}).get("agent") or "claude"
+        if not copy and agent in FAR_AGENTS and away.get("window"):
+            # another agent there: it ends only by --stop's rules, never while
+            # it may still work (_stop_window)
+            wst = rem.agent("peek", path=rem.there(real), name=away["window"],
+                            screen=False).get("state") or {}
+            out["window"] = {k: wst.get(k) for k in ("name", "raw_status", "quiet_for",
+                                                    "not_running")}
+            who, quiet_min = AGENT_NAMES[agent], int(_secs("AHT_STOP_QUIET", STOP_QUIET) // 60)
+            if not wst.get("not_running"):
+                # the agent's own processes (its window's): the lines below
+                # say it runs; only other programs in the folder block as such
+                own = set(wst.get("pids") or [])
+                info = dict(info, processes=[
+                    p for p in info.get("processes") or [] if p.get("pid") not in own
+                    and agent not in str(p.get("name")).lower()])
+            if wst.get("raw_status") == "unknown":
+                # tmux there did not answer: it may still run, so nothing ends
+                out["blockers"].append(_tmux_silent(who, f"on {rem.name}"))
+            elif not wst.get("not_running") and not args.stop:
+                out["blockers"].append(
+                    f"{who} still runs in its window on {rem.name} ("
+                    f"{window_words(wst.get('raw_status'), wst.get('quiet_for'))}) — end it "
+                    f"there, or pass --stop to end it from here once it has been quiet for "
+                    f"{quiet_min} minutes and its last turn ended")
+            elif not wst.get("not_running"):
+                if args.apply:
+                    say(f"ending {who} on {rem.name} …")
+                st = rem.agent("stop", timeout=120, path=rem.there(real), name=away["window"],
+                               agent=agent, check_only=not args.apply)
+                out["stop"] = {k: st.get(k) for k in ("stopped", "reason", "quiet_for",
+                                                      "quit_keys", "would_stop", "seen")}
+                if st.get("stopped"):
+                    out["stopped"] = True
+                    rem.agent("close", path=rem.there(real), name=away["window"])
+                    info = rem.connect(real)
+                elif st.get("would_stop"):
+                    out["would_stop"] = True
+                else:
+                    out["blockers"].append(_stop_refusal(who, rem.name, st))
+            elif rem.agent("close", path=rem.there(real), name=away["window"]).get("closed"):
+                info = rem.connect(real)    # it ended: its window is closed now
+        if not copy and agent == "claude" and not info["sessions"] and away.get("window") and \
                 rem.agent("close", path=rem.there(real), name=away["window"]).get("closed"):
             info = rem.connect(real)        # the window it ran in is closed now
         if not copy and info["sessions"] and args.stop and \
@@ -10760,7 +11404,10 @@ def cmd_reclaim(args):
                          "machine cannot hold: " + ", ".join(u["there"] for u in rp["unsafe"][:5]))
         lines += git_lines(out["git"], "")
         if not args.apply:
-            if out.get("would_stop"):
+            if out.get("would_stop") and agent in FAR_AGENTS:
+                lines.append(f"   {AGENT_NAMES[agent]} on {rem.name} would be ended first "
+                             f"(its quit keys: {' '.join((out.get('stop') or {}).get('quit_keys') or [])})")
+            elif out.get("would_stop"):
                 lines.append(f"   the idle session on {rem.name} would be ended first")
             lines.append("(dry run — pass --apply to do it)")
             return _emit(args, out, lines)
@@ -10844,6 +11491,14 @@ def cmd_reclaim(args):
             # both copies as they stand now: the next sync, or handover,
             # compares the one there with this list
             write_there(uid, real, rem, _our_trees(real, extras)[0], theirs, "take-back")
+            if not copy and agent in FAR_AGENTS:
+                # what the other agent did there, for the Claude Code session
+                # that left: made (and masked) there, in a relay whose note
+                # that session hears when it is resumed here
+                back.update(_back_relay(real, was, _far_catchup(rem, real, was), rem.name,
+                                        out["there_path"]))
+                out["catchup"] = {k: back.get(k) for k in ("relay", "agent")}
+                out["catchup"]["brief"] = str(relay_dir(real) / f"relay-{back['relay']}.md")
             if copy:
                 _update_entry(uid, returned=back)
             else:
@@ -10900,6 +11555,10 @@ def cmd_reclaim(args):
         for u in out.get("unsafe_names") or []:
             lines.append(f"   ! kept aside, as this machine cannot hold its name: {u['there']}"
                          f"  →  {u['kept_as']}")
+        if out.get("catchup"):
+            lines.append(f"   catch-up  what {AGENT_NAMES[out['catchup']['agent']]} did on "
+                         f"{rem.name}: {out['catchup']['brief']} (the Claude Code session hears "
+                         "of it when you resume it)")
         if latest:
             lines.append(f"   continue with:  cd {shlex.quote(real)} && "
                          f"claude --resume {latest}")
@@ -11056,7 +11715,9 @@ def cmd_bring(args):
     """Bring Here: fetch a project from the machine that has it, with Claude
     Code's history, and continue it here.  Its home keeps the record that it
     is here; Send Back returns it."""
-    out = {"command": "bring", "applied": False, "blockers": [], "warnings": []}
+    agent = getattr(args, "agent", None) or "claude"
+    out = {"command": "bring", "applied": False, "blockers": [], "warnings": [],
+           "agent": agent, "start_line": None, "tokens": None, "first_prompt": None}
     lines = []
     if not args.from_remote:
         out["blockers"].append("name the machine it is on: --from NAME")
@@ -11081,7 +11742,7 @@ def cmd_bring(args):
             return _emit(args, out, lines)
         far = _far_arg(rem, args.path)
         shown_far = rem._logical(far)
-        out.update(there_path=shown_far, mode="bring", agent="claude",
+        out.update(there_path=shown_far, mode="bring", agent=agent,
                    allow_idle=bool(args.allow_idle))
         say(f"checking {rem.name} …")
         info = rem.info = rem.agent("probe", path=far, claude=rem.claude)
@@ -11110,8 +11771,32 @@ def cmd_bring(args):
                               open=next((s.get("status") for s in chk.get("sessions") or []),
                                         None))
         # the level of the session there, read there: it goes on here in it
-        perm = out["perm"] = perm_for("claude", (chk.get("session") or {}).get("perm"),
+        perm = out["perm"] = perm_for(agent, (chk.get("session") or {}).get("perm"),
                                       f"the session on {rem.name}")
+        # another agent goes on here: a new session reads a summary of that
+        # session first (one turn: tokens)
+        rid = new_relay_id()
+        # Kimi reads the summary in a run of its own only when its window
+        # opens here; with --no-open the line it prints opens Kimi, and you
+        # paste the first prompt
+        kimi_p = agent == "kimi" and kimi_reads_ok(perm) and not args.no_open
+        frm_words = f"Claude Code on {rem.name}"
+        if agent != "claude":
+            if not agent_cli(agent):
+                out["blockers"].append(f"{AGENT_NAMES[agent]} is not installed on this machine")
+            if not sid:
+                out["blockers"].append(f"there is no Claude Code session in it on {rem.name} "
+                                       f"for {AGENT_NAMES[agent]} to read about: bring it "
+                                       "without --agent")
+            ask = _ask(frm_words, f".aht/handover/relay-{rid}.md", False)
+            out["start_line"] = agent_start_line(agent, "new", None, ask, perm["flags"], kimi_p)
+            if agent == "kimi" and not kimi_p:
+                out["first_prompt"] = ask
+                out["tokens"] = ("Kimi Code opens here without reading the summary: paste the "
+                                 "first prompt (that turn uses tokens)")
+            else:
+                out["tokens"] = (f"{AGENT_NAMES[agent]} starts here and reads the summary as "
+                                 "its first turn: that uses tokens")
         out["sessions"] = chk.get("sessions_count", 0)
         out["other_histories"] = chk.get("other_histories") or []
         # where it goes here
@@ -11166,6 +11851,7 @@ def cmd_bring(args):
                 out["trust"] = set_trust(here)
             dig = session_digest(store / f"{sid}.jsonl", here) if sid else \
                 session_digest(os.devnull, here)
+            text = _bring_brief(here, shown_far, rem.name, info.get("system"), sid, dig)
             if not any(x.get("id") == rid for x in read_relays(here)):
                 try:
                     write_relay(here, "bring",
@@ -11174,10 +11860,10 @@ def cmd_bring(args):
                                  "system": info.get("system"),
                                  "path": chk.get("path") or far, "agent": "claude",
                                  "session": sid, "title": _line(dig.get("title") or "")},
-                                {"agent": "claude", "session": sid, "mode": "resume"},
-                                _bring_brief(here, shown_far, rem.name, info.get("system"),
-                                             sid, dig),
-                                rid=rid, perm=perm)
+                                {"agent": "claude", "session": sid, "mode": "resume"}
+                                if agent == "claude" else
+                                {"agent": agent, "session": None, "mode": "new"},
+                                text, rid=rid, perm=perm)
                 except OSError as e:
                     out["warnings"].append(f"the summary could not be written ({e})")
             out["relay"] = rid
@@ -11194,9 +11880,27 @@ def cmd_bring(args):
                 else:
                     shutil.rmtree(aside, ignore_errors=True)
                 prune_set_asides(aside.parent)
-            line = ("" if os.name == "nt" else "exec ") + shell_quote(find_claude() or "claude") \
-                + "".join(" " + shell_quote(f) for f in perm["flags"]) \
-                + (" --resume " + shell_quote(sid) if sid else "")
+            if agent == "claude":
+                line = shell_quote(find_claude() or "claude") \
+                    + "".join(" " + shell_quote(f) for f in perm["flags"]) \
+                    + (" --resume " + shell_quote(sid) if sid else "")
+            else:
+                # a new session of that agent reads the summary first; Kimi in
+                # a run of its own (never-ask), then its session opens
+                ask = _ask(frm_words, f".aht/handover/relay-{rid}.md", False)
+                asid, reads = None, kimi_p
+                if kimi_p:
+                    asid, why = _kimi_reads(agent_cli("kimi"), here,
+                                            _kimi_prompt(text, frm_words, False))
+                    if asid is None:
+                        reads = False
+                        out["first_prompt"] = ask
+                        out["warnings"].append(f"Kimi did not read the summary here ("
+                                               f"{why or 'no session'}): paste the first "
+                                               "prompt when it opens")
+                line = agent_start_line(agent, "new", asid, ask, perm["flags"], reads)
+                out["start_line"], out["agent_session"] = line, asid
+            line = ("" if os.name == "nt" else "exec ") + line
             env = git_env_vars(gset)
             out["command_line"] = env_prefix(env) + cd_then(here) + line
             out["opened"] = False
@@ -11212,11 +11916,16 @@ def cmd_bring(args):
                           f"   files     {out['fetched']['files']} "
                           f"({_human(out['fetched']['bytes'])}); "
                           f"history {_human(out['fetched']['history_bytes'])}",
-                          f"   session   {dig.get('title') or sid or 'a new one'}"
+                          (f"   session   {dig.get('title') or sid or 'a new one'}"
+                           if agent == "claude" else
+                           f"   agent     {AGENT_NAMES[agent]}: a new session reads the summary "
+                           f"of “{dig.get('title') or sid}”")
                           + (" — opened in a new window" if out["opened"] else ""),
                           f"   level     {perm['text']}",
                           "   continue  " + out["command_line"],
                           f"   back      aht send-back {_arg(here)} --apply"])
+            if out["first_prompt"]:
+                lines.append(f"   paste     {out['first_prompt']}")
             return _emit(args, out, lines)
 
         ha = chk.get("here_already") or {}
@@ -11332,8 +12041,13 @@ def cmd_bring(args):
                       f"({_human(out['plan']['bytes'])}); Claude history "
                       f"{_human(out['plan']['history_bytes'])}",
                       f"   session     {out['session'].get('title') or sid or 'none yet'}"
-                      + (" — opens here; nothing runs until you type" if sid else ""),
+                      + ((" — opens here; nothing runs until you type" if sid else "")
+                         if agent == "claude" else
+                         f" — {AGENT_NAMES[agent]} reads a summary of it in a new session"),
                       f"   level       {perm['text']}"]
+            if agent != "claude":
+                lines += [f"   tokens      {out['tokens']}",
+                          f"   starts with {_clip(out['start_line'], 160)}"]
             if out["plan"]["set_aside"]:
                 lines.append(f"   here        {_n(out['plan']['set_aside'], 'file')} in the "
                              "folder here are set aside first")
@@ -11352,11 +12066,11 @@ def cmd_bring(args):
 
         # do it.  Home records the attempt before anything travels
         attempt = f"{_stamp()}-{os.urandom(2).hex()}"
-        rid = new_relay_id()
         say(f"telling {rem.name} …")
         marked = True                   # from now on, a failure undoes it there
         got = rem.agent("mark-handing", path=far, uuid=uid, attempt=attempt,
-                        allow_idle=bool(args.allow_idle), holder=_holder_end(here), relay=rid)
+                        allow_idle=bool(args.allow_idle),
+                        holder=dict(_holder_end(here), agent=agent), relay=rid)
         if got.get("blockers"):
             out["blockers"] += got["blockers"]
             return _emit(args, out, lines)
@@ -11532,6 +12246,40 @@ def cmd_send_back(args):
             for a in sorted(agents_running_nt()):
                 out["warnings"].append(f"{AGENT_NAMES.get(a, a)} is running on this PC; aht "
                                        "cannot tell in which folder")
+        in_window = None
+        if c.get("kind") == "handover":
+            # another agent the handover started here, still in its window
+            ws = window_state(_mux_name(c.get("from_path") or real, uid))
+            if ws["agent"] in FAR_AGENTS and ws["raw_status"] == "unknown":
+                in_window = ws["agent"]
+                out["blockers"].append(_tmux_silent(AGENT_NAMES[ws["agent"]], "here"))
+            elif ws["agent"] in FAR_AGENTS and not ws["not_running"]:
+                in_window = ws["agent"]
+                out["blockers"].append(
+                    f"{AGENT_NAMES[ws['agent']]} still runs in its window here ("
+                    f"{window_words(ws['raw_status'], ws['quiet_for'])}) — end it first "
+                    f"(its quit keys: {' '.join(QUIT_KEYS[ws['agent']])})")
+        # the other agent the Bring Here or Hand Over started here (its open
+        # relay says which), still open in this folder: it blocks, as an
+        # open Claude Code session does; it may be in the middle of a turn
+        took = next(((r.get("to") or {}).get("agent") for r in read_relays(real)
+                     if r.get("kind") in ("bring", "handover") and r.get("closed") is None
+                     and (r.get("to") or {}).get("agent") in FAR_AGENTS), None)
+        if took and took != in_window:
+            pids = sorted({p["pid"] for p in agent_processes() if p["agent"] == took
+                           and p.get("project")
+                           and _inside(os.path.realpath(p["project"]), real)})
+            what = (f"{AGENT_NAMES[took]} is still open in this project here (pid"
+                    f"{'s' if len(pids) > 1 else ''} {', '.join(map(str, pids))})")
+            if pids and not args.allow_processes:
+                out["blockers"].append(
+                    what + " — exit it first, or pass --allow-processes to send the project "
+                    "back while it runs (what it does after that stays here)")
+            elif pids:
+                out["warnings"].append(what + "; what it does from now on stays here")
+        # what another agent did here goes home with it, for the session that left
+        cu = _holder_catchup(real)
+        out["catchup"] = {"agent": cu["agent"], "relay": cu["relay"]} if cu else None
         say(f"checking {rem.name} …")
         info = rem.info = rem.agent("probe", path=far, claude=rem.claude)
         out["there"] = {"host": info.get("host"), "system": info.get("system"),
@@ -11659,6 +12407,9 @@ def cmd_send_back(args):
             lines.append(f"   ! {_n(len(out['unsafe_names']), 'file')} with names {rem.name} "
                          "cannot hold are kept aside there")
         lines += git_lines(out["git"], "")
+        if cu:
+            lines.append(f"   catch-up  what {AGENT_NAMES[cu['agent']]} did here goes to "
+                         f"{rem.name} with it, for the session that left")
         if out["blockers"] or not args.apply:
             if not args.apply:
                 lines.append("(dry run — pass --apply to do it)")
@@ -11681,7 +12432,7 @@ def cmd_send_back(args):
         say(f"sending it back to {rem.name} …")
         try:
             res, wire = rem.stream("return-apply", dict(
-                req, plan_id=got.get("plan_id"), compress=comp,
+                req, plan_id=got.get("plan_id"), compress=comp, catchup=cu,
                 entries=[{k: v for k, v in e.items() if k != "src"} for e in ents]),
                 frames=frames)
         except LinkError as x:
@@ -12226,6 +12977,8 @@ def cmd_attach(args):
         print(f"this project was brought to {away.get('holder') or away.get('host')}: its "
               "session runs in a terminal there, not in a window aht can open", file=sys.stderr)
         return 2
+    if getattr(args, "peek", False):
+        return _attach_peek(args, real, away)
     try:
         rem = get_remote(away.get("remote"))
         if find_tool("mosh"):
@@ -12242,6 +12995,41 @@ def cmd_attach(args):
         # the default): ssh -t <machine> tmux attach -t <window>
         return open_terminal(_argv_line(cmd), f"attach-{away.get('window')}")
     os.execvp(cmd[0], cmd)
+
+def _attach_peek(args, real: str, away: dict) -> int:
+    """`aht attach <path> --peek`: the last lines of the session's screen
+    there (keys masked there), and what runs in its window, without opening
+    it.  Read only when asked."""
+    agent = away.get("agent") or "claude"
+    out = {"project": real, "remote": away.get("remote"), "window": away.get("window"),
+           "agent": agent, "open": False, "status": None, "raw_status": None,
+           "quiet_for": None, "screen": [], "error": None}
+    try:
+        rem = get_remote(away.get("remote"))
+        rem.pin(real, away.get("remote_path") or rem.path(real))
+        got = rem.agent("peek", timeout=60, path=rem.there(real), name=away["window"],
+                        lines=max(1, min(int(args.lines or 14), 200)))
+        st = got.get("state") or {}
+        out.update(open=bool(got.get("window")), screen=got.get("screen") or [])
+        if agent in FAR_AGENTS:
+            out.update(raw_status=st.get("raw_status"), quiet_for=st.get("quiet_for"),
+                       status=window_words(st.get("raw_status"), st.get("quiet_for")))
+        else:                               # Claude Code: by its records there
+            s = next(iter(got.get("sessions") or []), None)
+            out.update(raw_status=s["status"] if s else "exited",
+                       status=_STATUS_WORDS.get(s["status"], s["status"]) if s else "exited")
+    except HandoverError as e:
+        out["error"] = str(e)
+    if args.json:
+        print(json.dumps(out, indent=2))
+    elif out["error"]:
+        print(out["error"], file=sys.stderr)
+    else:
+        print(f"{AGENT_NAMES.get(agent, agent)} on {out['remote']} ({out['window']}): "
+              f"{out['status']}" + ("" if out["open"] else ", its window is closed"))
+        for l in out["screen"]:
+            print("   " + l)
+    return 1 if out["error"] else 0
 
 TERMINALS = ("iTerm", "Terminal")         # apps that run a .command file they open
 
@@ -12427,7 +13215,9 @@ def _relay_notes(cwd: str, sid) -> list:
             notes.append(f"[aht] This project was handed to {to} at {_clock(mine['at'])}, "
                          "after this session's last turn. The files may differ from what you "
                          f"remember: read them before editing. Summary: {brief}")
+    # (a Hand Over's or a Bring Here's relay: the handover note says it)
     there = next((r for r in opens if r.get("side") not in ("to", "both")
+                  and r.get("kind") not in ("handover", "bring")
                   and _known_from(r["from"])), None)
     if there:
         where = there["to"].get("machine") or "another machine"
@@ -12574,6 +13364,9 @@ def _handover_note(cwd: str) -> str:
             if b.get("conflicts"):
                 msg += (" Changed on BOTH machines, so both versions were kept: "
                         + ", ".join(b["conflicts"][:8]) + ".")
+            if b.get("agent") in FAR_AGENTS and _RELAY_ID.fullmatch(str(b.get("relay") or "")):
+                msg += (f" {AGENT_NAMES[b['agent']]} worked on it there, not Claude Code: what "
+                        f"it did is in .aht/handover/relay-{b['relay']}.md.")
             _update_entry(uid, returned=dict(b, told=True))
             return msg
     except Exception as e:
@@ -16411,15 +17204,18 @@ def _kimi_reads(exe: str, real: str, prompt: str, sid: str = None) -> tuple:
         or _session_after(real, "kimi", started)
     return (new, None) if new else (None, "Kimi could not read the summary: no session")
 
-def _kimi_prompt(text: str, frm: str, catchup: bool) -> str:
-    if catchup:
-        return ("While you were away, other agents worked on this project. This is what "
-                "they did since your last turn:\n\n" + text + "\nDo not start working yet. "
-                "Reply in two or three lines with what changed; the user continues in this "
-                "session.")
-    return (f"You are taking over this project from {frm}. This is where the work "
-            "stood:\n\n" + text + "\nDo not start working yet. Reply in two or three lines "
-            "with what you understood; the user continues in this session.")
+def _kimi_prompt(text: str, frm: str, catchup: bool, task: str = None) -> str:
+    """What Kimi reads in its run of its own: the summary (or the catch-up),
+    then either the task it works on right away, or to wait for the user."""
+    head = ("While you were away, other agents worked on this project. This is what "
+            "they did since your last turn:\n\n" if catchup else
+            f"You are taking over this project from {frm}. This is where the work "
+            "stood:\n\n") + text + "\n"
+    if task:
+        return head + "Then work on this: " + " ".join(str(task).split())[:2000]
+    return head + ("Do not start working yet. Reply in two or three lines with what "
+                   + ("changed" if catchup else "you understood")
+                   + "; the user continues in this session.")
 
 def agents_running_nt() -> set:
     """Windows: the agent CLIs running on this PC now, by program name
@@ -17182,7 +17978,7 @@ def _agent_relay_info(req: dict) -> dict:
         src = next((s for s in pool if not (s["agent"] == "claude" and _is_scripted(s["file"]))),
                    pool[0] if pool else None)
     where = f"on {head['from']['machine']}"
-    if src is not None:
+    if src is not None and not req.get("catchup_only"):    # (Take Back: the catch-up only)
         dig = events_digest(src, folder)
         out["source"] = {"agent": src["agent"], "session": src["id"],
                          "title": _line(dig.get("title") or _session_title(src)),
@@ -17750,11 +18546,21 @@ def open_sessions_here(names: bool = False) -> list:
             stops = {h["session"]: dict(h, auto=auto) for h in limit_stops(12) if not h["over"]}
         except Exception as e:
             warn(f"BOARD names: {e}")
+    wrows = window_rows()
+    # the windows a handover opened with Claude Code: its rows name them
+    cwin = {}
+    for f in (aht_home() / "remote" / "run").glob("*/window.json") \
+            if (aht_home() / "remote" / "run").is_dir() else []:
+        w = _json_or_none(f) or {}
+        if w.get("agent") == "claude" and isinstance(w.get("path"), str):
+            cwin[os.path.realpath(w["path"])] = f.parent.name
     for s in running_sessions():
         n = named.get(s["pid"]) or {}
         c = check.get(s["pid"]) or {}
         stop = stops.get(s.get("session") or "")
         rows.append({"agent": "claude", "project": s["cwd"], "pid": s["pid"],
+                     "window": cwin.get(os.path.realpath(s["cwd"] or "/")),
+                     "quiet_for": None, "not_running": False,
                      "session": s.get("session"), "name": s.get("name"),
                      "title": n.get("name"), "title_origin": n.get("origin"),
                      "tab": n.get("tab"), "pending_title": n.get("pending"),
@@ -17766,7 +18572,25 @@ def open_sessions_here(names: bool = False) -> list:
                      "status": _STATUS_WORDS.get(s["status"], s["status"]),
                      "raw_status": s["status"], "waiting_for": s.get("waiting_for"),
                      "since": s.get("since")})
-    rows += agent_processes()
+    # another agent in a window aht opened, and the same agent's process in
+    # that folder, are one row: the window's, with the process's pid; only
+    # while the window runs, and only a process of that window (its pane's
+    # tree), so that one started elsewhere keeps a row of its own
+    procs = agent_processes()
+    for w in wrows:
+        if w["not_running"] or not procs:
+            continue
+        own = set(pane_pids(w["window"]))
+        hit = next((p for p in procs if p["agent"] == w["agent"] and p["pid"] in own
+                    and p.get("project")
+                    and _inside(os.path.realpath(p["project"]), os.path.realpath(w["project"]))),
+                   None)
+        if hit is not None:
+            w["pid"] = hit["pid"]
+            procs.remove(hit)
+    rows += wrows
+    rows += [dict(p, window=None, quiet_for=None, raw_status="running", not_running=False)
+             for p in procs]
     return rows
 
 def _agent_board(req: dict) -> dict:
@@ -17856,13 +18680,24 @@ def session_board(remotes: bool = True, names: bool = False, only=None) -> list:
             b["stale"] = not h.get("heard") or now - float(h["heard"]) >= BOARD_STALE
             b["last_sessions"] = h.get("sessions") or []
         boards += found
-    away = {os.path.realpath(e["real_path"]): (e.get("away") or {})
-            for e in load_registry().get("projects", {}).values() if e.get("away")}
+    # a row there is a project handed over from here: by its window's name
+    # first, then by the project's path there (it may differ from the path
+    # here), then by the same path
+    aways = [dict(e["away"], path=e["real_path"]) for e in load_registry().get(
+        "projects", {}).values() if e.get("away")]
     for b in boards:
+        if b["local"]:
+            continue
+        mine = [a for a in aways if a.get("remote") == b["machine"]]
         for s in b["sessions"] + ([] if b["reachable"] else b["last_sessions"]):
-            a = away.get(os.path.realpath(s.get("project") or "/"))
-            if a and not b["local"] and a.get("remote") == b["machine"]:
+            p = s.get("project") or "/"
+            a = next((a for a in mine if s.get("window") and a.get("window") == s["window"]),
+                     None) or next((a for a in mine if a.get("remote_path") == p), None) \
+                or next((a for a in mine if os.path.realpath(a["path"]) == os.path.realpath(p)),
+                        None)
+            if a:
                 s["handed_over"] = True
+                s["here_path"] = a["path"]
     return boards
 
 def _board_lines(rows: list) -> list:
@@ -18113,10 +18948,37 @@ def check_notices(remotes: bool = None) -> list:
     fresh.update({k: v for k, v in seen.items()
                   if v.get("machine") not in answered and v.get("machine") in kept})
     finished_after = float(cfg_get("notify_finished_minutes", 3)) * 60
+    quiet_after = _secs("AHT_WENT_QUIET", WENT_QUIET)
     for b in boards:
         if not b["reachable"]:
             continue
         for s in b["sessions"]:
+            if s["agent"] != "claude" and s.get("window"):
+                # another agent in a window: "went quiet" once it wrote nothing
+                # for a minute after working (done, or it waits for you), or
+                # ended; a shorter pause still counts as working
+                key = f"{b['machine']}:window:{s['window']}"
+                raw, prev = s.get("raw_status") or "", seen.get(key) or {}
+                if raw == "unknown":            # tmux did not answer: as it was
+                    raw = prev.get("raw") or raw
+                if raw == "quiet" and prev.get("raw") == "working" \
+                        and (s.get("quiet_for") or 0) < quiet_after:
+                    raw = "working"
+                fresh[key] = {"machine": b["machine"], "raw": raw, "project": s.get("project")}
+                if prev.get("raw") == "working" and raw in ("quiet", "exited") \
+                        and cfg_get("notify_finished", True):
+                    name = os.path.basename(s.get("project") or "") or "a session"
+                    where = f" on {b['machine']}" if named or not b.get("local") else ""
+                    who = AGENT_NAMES.get(s["agent"], s["agent"])
+                    out.append({"kind": "went-quiet", "title": f"{name}{where} went quiet",
+                                "message": f"{who}: done, or it waits for you" if raw == "quiet"
+                                else f"{who} ended",
+                                "info": {"kind": "went-quiet", "machine": b["machine"],
+                                         "local": bool(b.get("local")), "window": s["window"],
+                                         "agent": s["agent"], "project": s.get("project")},
+                                **({} if b.get("local") or not b.get("phone_here")
+                                   else {"phone": False})})
+                continue
             if s["agent"] != "claude":
                 continue
             key = f"{b['machine']}:{s.get('pid')}:{s.get('session')}"
@@ -23440,6 +24302,10 @@ def build_parser():
                    help="open the session in this terminal afterwards")
     s.add_argument("--task", metavar="TEXT",
                    help="what the session should start working on over there")
+    s.add_argument("--agent", choices=SWITCH_TARGETS, default="claude",
+                   help="who goes on there: Claude Code resumes its session (the default); "
+                        "Codex, Kimi, agy or Vibe starts a new session that reads a summary "
+                        "first (uses tokens)")
     s.add_argument("--allow-processes", action="store_true", dest="allow_processes",
                    help="leave other programs running in the folder behind "
                         "(an open agent session always blocks)")
@@ -23491,6 +24357,10 @@ def build_parser():
                         "types into it later, Send Back keeps both versions)")
     s.add_argument("--no-open", action="store_true", dest="no_open",
                    help="open no terminal for the session afterwards")
+    s.add_argument("--agent", choices=SWITCH_TARGETS, default="claude",
+                   help="who goes on here: Claude Code resumes its session (the default); "
+                        "Codex, Kimi, agy or Vibe starts a new session that reads a summary "
+                        "first (uses tokens)")
     s.add_argument("--status-file", dest="status_file", metavar="FILE")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
@@ -23506,6 +24376,10 @@ def build_parser():
                         "goes to and put this one next to it (there, the default), or take "
                         "this machine's and set theirs aside there (here)")
     s.add_argument("--ignore-version", action="store_true", dest="ignore_version")
+    s.add_argument("--allow-processes", action="store_true", dest="allow_processes",
+                   help="send it back although the agent Bring Here or Hand Over started "
+                        "is still open in the folder (an open Claude Code session always "
+                        "blocks)")
     s.add_argument("--status-file", dest="status_file", metavar="FILE")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
@@ -23515,6 +24389,10 @@ def build_parser():
     s.add_argument("path")
     s.add_argument("--print", action="store_true", help="only show the command")
     s.add_argument("--window", action="store_true", help="in a new terminal window")
+    s.add_argument("--peek", action="store_true",
+                   help="only print the session's last screen lines and its state")
+    s.add_argument("--lines", type=int, default=14, help="with --peek: how many lines")
+    s.add_argument("--json", action="store_true", help="with --peek: as JSON")
     s.set_defaults(fn=cmd_attach)
 
     s = sub.add_parser("resume-here", help="continue a project's session in a "

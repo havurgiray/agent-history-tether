@@ -235,6 +235,8 @@ struct Project: Identifiable, Hashable {
     let awayDrivenBy: String?       // "there": that machine took it with Bring Here
     let awaySystem: String?         // Darwin, Linux or Windows: the machine that has it
     let awayHolder: String?         // that machine's own name for itself
+    let awayAgent: String?          // the agent working on it there (`away_agent`); nil: not said
+    let awayWindow: String?         // the window aht runs it in there (`away_window`): Peek
     let mirror: String?
     let syncedAt: Double?
     let syncStatus: String?
@@ -281,8 +283,10 @@ struct Project: Identifiable, Hashable {
     var parent: String {
         ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
     }
+    /// The agent working on it there, in words ("Codex"); nil: not said.
+    var awayAgentLabel: String? { awayAgent.map { AGENT_LABEL[$0] ?? $0 } }
     var place: String {
-        if let host = away { return "on " + host }
+        if let host = away { return "on " + host + (awayAgentLabel.map { " (\($0))" } ?? "") }
         if let h = handing { return "handing over to " + h.machine }
         if !exists { return "missing" }
         switch open {
@@ -309,6 +313,8 @@ struct Project: Identifiable, Hashable {
         awayDrivenBy = firstText(d["away_driven_by"], aw?["driven_by"])
         awaySystem = firstText(d["away_system"], aw?["system"])
         awayHolder = firstText(d["away_holder"], aw?["holder"])
+        awayAgent = firstText(d["away_agent"], aw?["agent"])
+        awayWindow = firstText(d["away_window"], aw?["window"])
         mirror = d["mirror"] as? String
         syncedAt = (d["mirror_synced_at"] as? NSNumber)?.doubleValue
         syncStatus = d["mirror_status"] as? String
@@ -934,12 +940,21 @@ func replaceThereLine(_ s: SyncPause, _ to: String) -> String {
 /// Bring Them Here names the removals here when they are over the limit
 /// (`removals.over`: going ahead allows them); `synced`: Keep in sync with
 /// that machine is on, so the sync goes on after it.
-func takeBackText(_ plan: [String: Any], _ remote: String, copy: Bool, synced: Bool) -> String {
+func takeBackText(_ plan: [String: Any], _ remote: String, copy: Bool, synced: Bool,
+                  agent: String? = nil) -> String {
     let n = ((plan["plan"] as? [String: Any])?["project"] as? [String: Any]) ?? [:]
     var body = "\(tally(n["take"]) ?? 0) file(s) changed there, \(tally(n["new"]) ?? 0) new, "
         + "\(tally(n["delete"]) ?? 0) removed. Whatever they replace here is set aside, not deleted.\n"
     if !copy && plan["would_stop"] as? Bool ?? false {
-        body += "\nThe idle session on \(remote) is ended first.\n"
+        // another agent there (`agent`, the project's away_agent) ends by --stop's rules
+        if let a = agent, a != "claude" {
+            let q = ((plan["stop"] as? [String: Any])?["quiet_for"] ?? (plan["window"] as? [String: Any])?["quiet_for"])
+                as? NSNumber
+            body += "\n\(AGENT_LABEL[a] ?? a) on \(remote) is ended first: it has been "
+                + (q.map { quietText($0.doubleValue) } ?? "quiet") + ", and its last turn has ended.\n"
+        } else {
+            body += "\nThe idle session on \(remote) is ended first.\n"
+        }
     }
     if copy, let r = Removals(plan["removals"]), r.over {
         body += "\nIt removes \(r.counted) here, because they are gone from the copy on \(remote): "
@@ -1380,7 +1395,7 @@ func planFiles(_ d: [String: Any]) -> Int? {
 }
 
 /// Bring Here's plan in words (`bring <path there> --from M --json`).
-func bringText(_ d: [String: Any], machine: String) -> String {
+func bringText(_ d: [String: Any], machine: String, agent: String = "claude") -> String {
     let n = (d["plan"] as? [String: Any]) ?? [:]
     let bytes = (n["bytes"] ?? d["bytes"]) as? NSNumber
     let hist = (n["history_bytes"] ?? d["history_bytes"]) as? NSNumber
@@ -1388,7 +1403,10 @@ func bringText(_ d: [String: Any], machine: String) -> String {
     s += bytes.map { " (\(byteText($0)))" } ?? ""
     s += hist.map { ", with \(byteText($0)) of Claude history." } ?? ", with its history."
     let ses = (d["session"] as? [String: Any]) ?? [:]
-    if firstText(ses["id"]) == nil {
+    if agent != "claude" {
+        s += "\n\(agentStarts(agent, on: nil))" + (firstText(ses["title"]).map { " (“\($0)”)" } ?? "")
+            + ", in a new terminal window."
+    } else if firstText(ses["id"]) == nil {
         s += "\nNo Claude Code session yet: nothing opens here."
     } else {
         s += "\nSession: " + (firstText(ses["title"]).map { "“\($0)”" } ?? "the latest one")
@@ -1431,10 +1449,13 @@ func sendBackText(_ d: [String: Any], machine: String, preferHere: Bool = false)
 }
 
 /// What Bring Here did (`bring … --apply --json`).
-func bringDoneText(_ d: [String: Any], machine: String) -> String {
+func bringDoneText(_ d: [String: Any], machine: String, agent: String = "claude") -> String {
     if let why = pickupProblems(d) { return "Bring Here did not go through:\n\n" + why }
     var s = "Brought here from \(machine)" + (firstText(d["here_path"]).map { ": " + tilde($0) } ?? "") + "."
-    if d["opened"] as? Bool == true {
+    if d["opened"] as? Bool == true && agent != "claude" {
+        s += " \(AGENT_LABEL[agent] ?? agent) is open in a new terminal window"
+            + (agent == "kimi" && farFirst(d) != nil ? "." : ": it reads aht's summary of the work as its first turn.")
+    } else if d["opened"] as? Bool == true {
         s += " Its session is open in a new terminal window; nothing runs until you type."
     } else if let line = firstText(d["command_line"], d["start_line"]) {
         s += " To go on in its session: " + line
@@ -1458,6 +1479,10 @@ func sendBackDoneText(_ d: [String: Any], machine: String) -> String {
     let kept = nameList(done["eol_kept"])
     if !kept.isEmpty { s += "\nLine endings kept as they were on \(machine): " + kept.prefix(3).joined(separator: ", ") }
     if let aside = firstText(d["set_aside"]) { s += "\nReplaced files are kept on \(machine) in: " + aside }
+    // another agent worked here: what it did is summed up for Claude Code there
+    if let a = firstText((d["catchup"] as? [String: Any])?["agent"]) {
+        s += "\nWhat \(AGENT_LABEL[a] ?? a) did here is summed up for the Claude Code session on \(machine)."
+    }
     s += "\nThis folder stays here as a copy."
     for w in nameList(d["warnings"]) { s += "\n⚠ " + w }
     return s
@@ -1485,13 +1510,31 @@ struct BringView: Identifiable {
     var loading = false
     var dry: [String: Any] = [:]
     var allowIdle = false           // --allow-idle
+    var agent = "claude"            // Agent here: Claude Code's own session, or another agent (--agent)
     var applying = false
     var done: [String: Any]?
 }
 
+/// Peek at the window aht runs the agent in on the other machine:
+/// `attach <path> --peek --json` -> {agent, open, status, raw_status,
+/// quiet_for, screen, error}.
+struct PeekView: Identifiable {
+    let id = UUID()
+    let project: Project
+    var loading = true
+    var d: [String: Any] = [:]
+}
+
+/// Peek's state line: the window's words ("quiet for 6 min") and their hint,
+/// else the core's status.
+func peekState(_ d: [String: Any]) -> (text: String, hint: String?)? {
+    windowStatus(raw: d["raw_status"] as? String, quietFor: (d["quiet_for"] as? NSNumber)?.doubleValue,
+                 notRunning: d["not_running"] as? Bool ?? false) ?? firstText(d["status"]).map { ($0, nil) }
+}
+
 func bringArgs(_ v: BringView, apply: Bool = false) -> [String] {
     ["bring", v.picked ?? "", "--from", v.machine] + (v.allowIdle ? ["--allow-idle"] : [])
-        + (apply ? ["--apply"] : []) + ["--json"]
+        + (v.agent == "claude" ? [] : ["--agent", v.agent]) + (apply ? ["--apply"] : []) + ["--json"]
 }
 
 func bringReady(_ v: BringView) -> Bool {
@@ -1539,8 +1582,8 @@ func sendBackBlocked(_ p: Project, _ ms: [Machine]) -> String? {
 func awayLine(_ p: Project) -> String? {
     guard let host = p.awayHolder ?? p.away, p.awayDrivenBy == "there" else { return nil }
     let at = clock(p.awaySince)
-    return "On \(host)" + (at.isEmpty ? "" : " since \(at)") + " (brought there from \(host)). "
-        + "Send it back from \(host)."
+    return "On \(host)" + (at.isEmpty ? "" : " since \(at)") + (p.awayAgentLabel.map { ", in " + $0 } ?? "")
+        + " (brought there from \(host)). Send it back from \(host)."
 }
 
 /// How the folders here match the folders on a machine (`remotes.<name>.paths`).
@@ -1734,8 +1777,17 @@ struct BoardRow: Identifiable, Hashable {
     var installed: String? = nil
     var limitResets: String? = nil  // stopped at Claude's usage limit
     var limitAuto = false           // … and Claude Code goes on by itself then
+    var rawStatus: String? = nil    // a window's: working | quiet | exited (Claude Code's: busy | waiting | idle …)
+    var quietFor: Double? = nil     // seconds the window has shown no output
+    var window: String? = nil       // the window aht runs the agent in there
+    var notRunning = false          // the agent there ended
+    var herePath: String? = nil     // another machine's row: the project here it is (`here_path`)
     var name: String { (project as NSString).lastPathComponent }
-    var state: String { status + (waitingFor.map { ": " + $0 } ?? "") }
+    /// A window aht runs another agent in: its status from the window's output.
+    var windowWords: (text: String, hint: String?)? {
+        windowStatus(raw: rawStatus, quietFor: quietFor, notRunning: notRunning)
+    }
+    var state: String { (windowWords?.text ?? status) + (waitingFor.map { ": " + $0 } ?? "") }
 }
 
 struct BoardMachine: Identifiable, Hashable {
@@ -1782,7 +1834,10 @@ func boardRow(_ r: [String: Any], machine: String, local: Bool) -> BoardRow {
              canRestart: r["can_restart"] as? Bool ?? false,
              version: r["version"] as? String, installed: r["installed"] as? String,
              limitResets: (r["limit"] as? [String: Any])?["resets"] as? String,
-             limitAuto: (r["limit"] as? [String: Any])?["auto"] as? Bool ?? false)
+             limitAuto: (r["limit"] as? [String: Any])?["auto"] as? Bool ?? false,
+             rawStatus: r["raw_status"] as? String, quietFor: (r["quiet_for"] as? NSNumber)?.doubleValue,
+             window: firstText(r["window"]), notRunning: r["not_running"] as? Bool ?? false,
+             herePath: firstText(r["here_path"]))
 }
 
 /// `board --json`'s machines, sessions that wait for you first.
@@ -1801,6 +1856,219 @@ func boardMachines(_ d: [String: Any]) -> [BoardMachine] {
                             lastHeard: (m["last_heard"] as? NSNumber)?.doubleValue,
                             stale: m["stale"] as? Bool ?? false, lastRows: rows("last_sessions"))
     }
+}
+
+// ---- another agent on the other machine (phase 8) ---------------------------
+// Hand Over can start Codex, Kimi Code, Antigravity or Mistral Vibe on the other machine
+// instead of resuming Claude Code's session there (`handover --agent X`),
+// and Bring Here can open one of them here (`bring --agent X`). That agent
+// reads aht's summary of the work as its first turn, which uses tokens;
+// Claude Code resuming its own session does not. The dry run for the agent
+// chosen carries the level it starts in (`perm`, phase 7b).
+
+let OTHER_AGENTS = ["codex", "kimi", "agy", "vibe"]
+
+/// The agents Hand Over can start on the other machine: Claude Code, and the
+/// others the dry run says are installed there (`agents_there`: a list, or
+/// {agent: its path or null}); a core that does not say: all of them (the
+/// dry run for one that is missing there says so).
+func agentsThere(_ d: [String: Any]) -> [String] {
+    let t = d["agents_there"] ?? (d["there"] as? [String: Any])?["agents"]
+    var has: [String]? = nil
+    if let l = t as? [String] {
+        has = l
+    } else if let m = t as? [String: Any] {
+        has = m.compactMap { k, v in v is NSNull || (v as? Bool) == false ? nil : k }
+    }
+    return ["claude"] + OTHER_AGENTS.filter { has?.contains($0) ?? true }
+}
+
+/// …and Bring Here: the agent CLIs installed on this Mac.
+func agentsHere(_ clis: [String]) -> [String] { ["claude"] + OTHER_AGENTS.filter { clis.contains($0) } }
+
+/// An agent in the "Agent there" / "Agent here" choice.
+func agentChoice(_ a: String) -> String { a == "claude" ? "Claude Code (its own session)" : AGENT_LABEL[a] ?? a }
+
+/// What starting `agent` costs. `on`: the other machine (Hand Over), nil:
+/// here (Bring Here); `task`: a task given with it; `d`: the dry run for
+/// that agent: its `tokens` (the core's sentence), as given; Kimi below
+/// never-ask opens without reading the summary (`first_prompt`).
+func agentCost(_ agent: String, on: String?, task: Bool = false, _ d: [String: Any] = [:]) -> String {
+    let place = on.map { "on " + $0 } ?? "here"
+    if agent != "claude", let t = firstText(d["tokens"])?.trimmingCharacters(in: .whitespaces), !t.isEmpty {
+        return t.prefix(1).uppercased() + t.dropFirst() + (t.hasSuffix(".") ? "" : ".")
+    }
+    if agent == "claude" {
+        if task { return "With a task, Claude Code starts on it at once \(place): that uses tokens." }
+        return on.map { "Claude Code resumes its own session on \($0): nothing runs until someone types there, "
+            + "so it uses no tokens." } ?? "Claude Code's own session opens here: nothing runs until you type, "
+            + "so it uses no tokens."
+    }
+    if agent == "kimi" && (d["kimi_reads"] as? Bool == false || farFirst(d) != nil) {
+        return "Kimi Code opens \(place) without reading the summary: its run that reads it first works only in "
+            + "never-ask mode, so you paste the first message aht shows you" + (on == nil ? "" : " into its window there")
+            + ". That turn uses tokens."
+    }
+    return "Starting \(AGENT_LABEL[agent] ?? agent) \(place) uses tokens: it reads aht's summary of the work as its "
+        + "first turn."
+}
+
+/// Kimi below never-ask, started by Hand Over or Bring Here: the first
+/// message to paste (`first_prompt`), or nil.
+func farFirst(_ d: [String: Any]) -> String? {
+    firstText(d["first_prompt"]).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+}
+
+/// What happens there, in one sentence (no full stop).
+func agentStarts(_ agent: String, on: String?) -> String {
+    agent == "claude" ? (on == nil ? "Its session opens here in a new terminal window" : "The session is resumed there")
+        : "\(AGENT_LABEL[agent] ?? agent) starts \(on.map { "on " + $0 } ?? "here") with aht's summary of the work"
+}
+
+/// Hand Over's command: the dry run, or `apply` it (with its status file and
+/// task); `--agent X` only for another agent than Claude Code.
+func handoverArgs(_ path: String, to: String?, agent: String = "claude", replace: Bool = false,
+                  apply: Bool = false, file: String? = nil, task: String = "") -> [String] {
+    ["handover", path] + (apply ? ["--apply"] : []) + ["--json"] + (file.map { ["--status-file", $0] } ?? [])
+        + (to.map { ["--to", $0] } ?? []) + (replace ? ["--replace-there"] : [])
+        + (task.isEmpty ? [] : ["--task=" + task]) + (agent == "claude" ? [] : ["--agent", agent])
+}
+
+/// A board row of a window aht started for an agent other than Claude Code
+/// on another machine: its status comes from the window's output, not from
+/// the agent's records. `raw_status` "working" (output in the last 15 s),
+/// "quiet" (none for `quiet_for` seconds: done, or it waits for you),
+/// "exited" (the agent ended); `not_running`: the agent there ended (its
+/// window may be gone). nil for any other row (Claude Code keeps its own
+/// words; a process-only row's "running" too).
+func windowStatus(raw: String?, quietFor: Double?, notRunning: Bool) -> (text: String, hint: String?)? {
+    switch raw {
+    case "exited": return ("exited", nil)
+    case _ where notRunning: return ("not running", nil)
+    case "working": return ("working", nil)
+    case "quiet": return (quietText(quietFor), "done, or it waits for you")
+    default: return nil
+    }
+}
+
+/// "quiet for 6 min", from seconds, as the core says it (window_words).
+func quietText(_ s: Double?) -> String {
+    guard let s = s, s >= 0, s.isFinite else { return "quiet" }
+    let m = Int(s / 60)
+    return m < 1 ? "quiet for under a minute" : m < 120 ? "quiet for \(m) min" : "quiet for \(m / 60) h"
+}
+
+/// Seconds in words: "40 s", "2 min".
+func spanText(_ s: Double) -> String { s < 60 ? "\(Int(s.rounded())) s" : "\(Int(s / 60)) min" }
+
+/// Take Back with --stop ends the agent there only when that is safe; for an
+/// agent other than Claude Code, when its window has shown no output for 2
+/// minutes and its last turn has ended. Otherwise it refuses: `not-quiet`
+/// (the agent there still prints) or `turn-open` (a turn is not finished, or
+/// aht cannot see whether it is: `seen` false); at --apply also
+/// `no-reaction` (it did not quit on its quit keys).
+struct StopRefusal: Equatable {
+    let reason: String              // not-quiet | turn-open | no-reaction
+    let agent: String?
+    let machine: String?
+    let quiet: Double?              // seconds without output, so far
+    let need: Double                // seconds of quiet aht waits for
+    let said: String?               // the core's own sentence
+    let others: [String]            // the other blockers
+    var seen = true                 // aht could see the agent's last message there
+    var keys: [String] = []         // its quit keys
+    var label: String { agent.map { AGENT_LABEL[$0] ?? $0 } ?? "The agent" }
+}
+
+let STOP_REASONS = ["not-quiet", "turn-open", "no-reaction"]
+func notQuietText(_ t: String) -> Bool {
+    t.range(of: "quiet for only", options: .caseInsensitive) != nil || t.range(of: "still prints", options: .caseInsensitive) != nil
+}
+func turnOpenText(_ t: String) -> Bool {
+    ["turn is still open", "turn is not finished", "whether its turn ended"].contains {
+        t.range(of: $0, options: .caseInsensitive) != nil }
+}
+func noReactionText(_ t: String) -> Bool { t.range(of: "did not react to its quit keys", options: .caseInsensitive) != nil }
+func refusalText(_ t: String) -> Bool { notQuietText(t) || turnOpenText(t) || noReactionText(t) }
+func refusalText(_ t: String, _ reason: String) -> Bool {
+    reason == "not-quiet" ? notQuietText(t) : reason == "turn-open" ? turnOpenText(t) : noReactionText(t)
+}
+
+/// The refusal, read from `stop` ({stopped, reason, quiet_for, quit_keys,
+/// seen}), a bare reason (`stop_reason`), or the core's own sentence in the
+/// blockers or warnings ("Codex on box has been quiet for only 1 min — wait,
+/// or end it yourself (--stop needs 2 minutes without output)", "Codex's last
+/// turn is still open on box — wait, or end it yourself"); nil: none.
+/// `others` leaves out the agent's own processes there, which end with it.
+func stopRefusal(_ d: [String: Any], awayAgent: String? = nil, machine: String? = nil) -> StopRefusal? {
+    let o = [d["stop_refused"], d["stop"], d["stopped"]].compactMap { $0 as? [String: Any] }
+        .first { STOP_REASONS.contains(firstText($0["reason"]) ?? "") } ?? [:]
+    var reason = firstText(o["reason"])
+        ?? [d["stop_refused"], d["stop_reason"], d["reason"]].compactMap { $0 as? String }.first { STOP_REASONS.contains($0) }
+    let blockers = (d["blockers"] as? [String]) ?? []
+    let texts = blockers + ((d["warnings"] as? [String]) ?? [])
+    var said = firstText(o["text"])
+    if let r = reason, said == nil { said = texts.first { refusalText($0, r) } }
+    if reason == nil {
+        guard let s = texts.first(where: { refusalText($0) }) else { return nil }
+        said = s
+        reason = STOP_REASONS.first { refusalText(s, $0) }
+    }
+    var quiet = (o["quiet_for"] as? NSNumber)?.doubleValue ?? (d["quiet_for"] as? NSNumber)?.doubleValue
+    if quiet == nil, let s = said,
+       let rx = try? NSRegularExpression(pattern: #"quiet for only (\d+)\s*(s|sec|min)"#, options: .caseInsensitive),
+       let m = rx.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+       let n = Range(m.range(at: 1), in: s), let u = Range(m.range(at: 2), in: s) {
+        quiet = (Double(s[n]) ?? 0) * (s[u].lowercased().hasPrefix("m") ? 60 : 1)
+    }
+    let agent = firstText(o["agent"], d["agent_there"], awayAgent)
+        ?? OTHER_AGENTS.first { a in said?.contains(AGENT_LABEL[a] ?? a) ?? false }
+    var need = (o["need"] as? NSNumber)?.doubleValue ?? (o["quiet_needed"] as? NSNumber)?.doubleValue
+        ?? (d["quiet_needed"] as? NSNumber)?.doubleValue
+    if need == nil, let s = said,
+       let rx = try? NSRegularExpression(pattern: #"needs (\d+) minutes?"#, options: .caseInsensitive),
+       let m = rx.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)), let n = Range(m.range(at: 1), in: s) {
+        need = (Double(s[n]) ?? 2) * 60
+    }
+    // the agent's own processes there ("codex (4242)"): they end with it, no news
+    let own = { (b: String) -> Bool in
+        guard let a = agent, b.lowercased().hasPrefix("still running in this folder"), let c = b.firstIndex(of: ":") else { return false }
+        return b[b.index(after: c)...].split(separator: ",").allSatisfy {
+            $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix(a) }
+    }
+    return StopRefusal(reason: reason ?? "not-quiet", agent: agent, machine: firstText(o["machine"], d["remote"], machine),
+                       quiet: quiet, need: need ?? 120, said: said,
+                       others: blockers.filter { $0 != said && !refusalText($0) && !own($0) },
+                       seen: o["seen"] as? Bool != false && !(said?.contains("whether its turn ended") ?? false),
+                       keys: (o["quit_keys"] as? [String]) ?? [])
+}
+
+/// The refusal in plain words, and what to do.
+func stopWords(_ x: StopRefusal) -> (title: String, text: String) {
+    let who = x.label + (x.machine.map { " on " + $0 } ?? "")
+    if x.reason == "not-quiet" {
+        return ("\(who) is still printing",
+                "\(x.label)'s window \(x.machine == nil ? "" : "there ")showed new output "
+                + (x.quiet.map { spanText($0) + " ago" } ?? "a moment ago")
+                + ", so it may be in the middle of its work. aht ends it only after \(spanText(x.need)) without new output."
+                + "\n\nWhat to do: wait until it has been quiet for \(spanText(x.need)), then choose Take Back again. "
+                + "Or open its window, see what it does, and end it yourself.")
+    }
+    if x.reason == "no-reaction" {
+        return ("\(who) did not quit",
+                "aht pressed its quit keys" + (x.keys.isEmpty ? "" : " (\(x.keys.joined(separator: " ")))")
+                + ", and \(x.label) still runs.\n\nWhat to do: open its window and end it yourself, then choose Take Back again.")
+    }
+    if !x.seen {
+        return ("aht cannot tell whether \(x.label)'s last turn ended",
+                "aht cannot see \(x.label)'s own last message" + (x.machine.map { " on " + $0 } ?? "")
+                + ", so it cannot tell whether its turn ended, and it does not end an agent in the middle of a turn."
+                + "\n\nWhat to do: open its window and look. If it is done, end it yourself there, then choose Take Back again.")
+    }
+    return ("\(x.label)'s last turn is not finished",
+            "\(who) has not finished its last turn: it may still be working on it, or wait for an answer. aht does "
+            + "not end an agent in the middle of a turn.\n\nWhat to do: open its window to see what it waits for; "
+            + "answer it, or let it finish. Then choose Take Back again. Or end it yourself there.")
 }
 
 struct SearchHit: Identifiable, Hashable {
@@ -1900,6 +2168,7 @@ struct HandoverPlan: Identifiable {
     var replaceThere = false        // the copy there changed: set it aside (--replace-there)
     var dry: [String: Any] = [:]    // the dry run: paths, names, line endings, git
     var blocked = false             // names or the folder there stand in the way
+    var agent = "claude"            // Agent there: Claude Code's own session, or another agent (--agent)
 }
 
 struct RulesView: Identifiable {
@@ -2966,6 +3235,7 @@ final class AppModel: ObservableObject {
     @Published var offsite: OffsiteView?        // Fetch Backups From…
     @Published var pickup: PickupView?          // Pick Up from M, Leave a Note on M
     @Published var bring: BringView?            // Bring Here from M
+    @Published var peek: PeekView?              // Peek: the agent's window there, its last lines
     @Published var sendBack: SendBackView?      // Send Back to M
     @Published var pathsOf: [String: PathMap] = [:]  // each machine's folders (`remote paths --json`)
     var openWelcome: (() -> Void)?              // the welcome window, again
@@ -3242,9 +3512,9 @@ final class AppModel: ObservableObject {
                     // the core's warning says what is set aside there; an older one does not
                     body += "\n" + replaceThereLine(changedThere(plan) ?? r, remote) + "\n"
                 }
-                body += "\nThe session is resumed there and this folder is marked as "
-                    + "away until you take it back."
-                self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body,
+                // what starts there, and that this folder is marked as away: the
+                // sheet says it, for the agent chosen there
+                self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body.trimmingCharacters(in: .newlines),
                                                  replaceThere: replacing != nil, dry: plan)
             }
         }
@@ -3252,15 +3522,14 @@ final class AppModel: ObservableObject {
 
     func confirmHandover(_ plan: HandoverPlan) {
         let p = plan.project, remote = plan.remote
-        let to = machine.map { ["--to", $0] } ?? []
         let task = plan.task.trimmingCharacters(in: .whitespacesAndNewlines)
         let file = self.stageFile(p.path)
+        let label = AGENT_LABEL[plan.agent] ?? plan.agent
         do {
                 self.busy("handing \(p.name) over…", follow: file) {
-                    let d = ahtJSON(["handover", p.path, "--apply", "--json",
-                                     "--status-file", file] + to
-                                    + (plan.replaceThere ? ["--replace-there"] : [])
-                                    + (task.isEmpty ? [] : ["--task=" + task])) ?? [:]
+                    let d = ahtJSON(handoverArgs(p.path, to: self.machine, agent: plan.agent,
+                                                 replace: plan.replaceThere, apply: true, file: file,
+                                                 task: task)) ?? [:]
                     if let why = self.problems(d) {
                         self.note(p.path, "The handover did not go through:\n\n" + why)
                         return
@@ -3268,10 +3537,25 @@ final class AppModel: ObservableObject {
                     let s = (d["sent"] as? [String: Any]) ?? [:]
                     var done = "Handed over to \(remote): \(s["files"] as? Int ?? 0) "
                         + "file(s) sent, \(byteText(s["wire_bytes"])) over the network."
+                    if plan.agent != "claude" { done += " \(label) started there with aht's summary of the work." }
                     if !task.isEmpty { done += "\nIt started on: " + task }
                     for w in (d["warnings"] as? [String]) ?? [] { done += "\n⚠ " + w }
                     self.note(p.path, done)
+                    // Kimi below never-ask opened without reading the summary: the
+                    // first message to paste into its window there (Open Session)
+                    if plan.agent == "kimi", let first = farFirst(d) {
+                        DispatchQueue.main.async { self.firstPrompts[p.path] = first }
+                    }
                 }
+        }
+    }
+
+    /// Hand Over's dry run for another agent there (`--agent X`), asked when
+    /// it is chosen in the sheet.
+    func handoverDry(_ p: Project, agent: String, replace: Bool, then: @escaping ([String: Any]) -> Void) {
+        guard !demo else { return }
+        askCore(handoverArgs(p.path, to: machine, agent: agent, replace: replace)) { d, said in
+            then(self.answered(d, said))
         }
     }
 
@@ -3288,6 +3572,11 @@ final class AppModel: ObservableObject {
             let plan = copy ? pastRemovals(asked) : asked
             let allow = copy ? Removals(plan["removals"])?.allow ?? [] : []
             DispatchQueue.main.async {
+                // the agent there cannot be ended safely yet (--stop): why, and what to do
+                if !copy, let r = stopRefusal(plan, awayAgent: p.awayAgent, machine: p.awayRemote ?? p.away) {
+                    self.stopRefused(p, r)
+                    return
+                }
                 if let why = self.problems(plan) {
                     self.note(p.path, (copy ? "Cannot bring them here now:\n\n"
                                             : "Cannot be taken back now:\n\n") + why)
@@ -3296,7 +3585,7 @@ final class AppModel: ObservableObject {
                 let remote = plan["remote"] as? String ?? p.syncPaused?.machine ?? p.mirror
                     ?? "the other machine"
                 // the sync goes on after it only when Keep in sync with that machine is on
-                var body = takeBackText(plan, remote, copy: copy, synced: p.mirror == remote)
+                var body = takeBackText(plan, remote, copy: copy, synced: p.mirror == remote, agent: p.awayAgent)
                 let title = copy ? "Bring the changes from \(remote) into “\(p.name)”?"
                                  : "Take “\(p.name)” back from \(remote)?"
                 let both = ((plan["conflicts"] as? [String: [String]]) ?? [:])
@@ -3319,6 +3608,13 @@ final class AppModel: ObservableObject {
                           follow: file) {
                     let d = ahtJSON(["reclaim", p.path, "--apply", "--json",
                                      "--status-file", file] + stop + extra + allow) ?? [:]
+                    // the agent there began to print again, or opened a turn, after the dry run
+                    if !copy, d["applied"] as? Bool != true,
+                       let r = stopRefusal(d, awayAgent: p.awayAgent, machine: p.awayRemote ?? p.away) {
+                        self.refresh()
+                        DispatchQueue.main.async { self.stopRefused(p, r, after: true) }
+                        return
+                    }
                     if let why = self.problems(d) {
                         self.note(p.path, (copy ? "Bringing them here did not go through:\n\n"
                                                 : "Taking it back did not go through:\n\n") + why)
@@ -3336,6 +3632,13 @@ final class AppModel: ObservableObject {
                     if let aside = d["set_aside"] as? String {
                         done += "\nReplaced files are kept in: " + aside
                     }
+                    // another agent worked there: what it did is summed up for
+                    // Claude Code's session here, which aht's hook tells it
+                    let cu = (d["catchup"] as? [String: Any]) ?? [:]
+                    if let a = firstText(cu["agent"]) {
+                        done += "\nWhat \(AGENT_LABEL[a] ?? a) did on \(remote) is summed up for your Claude Code session"
+                            + (firstText(cu["brief"]).map { ": " + $0 } ?? ".")
+                    }
                     if d["handed_over_session"] as? String != nil {
                         let last = (d["session_title"] as? String) ?? ""
                         done += "\nOn \(remote) you last worked in "
@@ -3345,8 +3648,35 @@ final class AppModel: ObservableObject {
                     }
                     for w in (d["warnings"] as? [String]) ?? [] { done += "\n⚠ " + w }
                     self.note(p.path, done)
+                    if let f = firstText(cu["brief"]) { DispatchQueue.main.async { self.summaries[p.path] = f } }
                 }
             }
+        }
+    }
+
+    /// Peek: the last lines the agent's window there shows (`attach --peek
+    /// --json`); nothing is typed there.
+    func peekThere(_ p: Project) {
+        let v = PeekView(project: p)
+        peek = v
+        guard !demo else { return }
+        askCore(["attach", p.path, "--peek", "--json"]) { d, said in
+            guard self.peek?.id == v.id else { return }
+            self.peek?.loading = false
+            self.peek?.d = self.answered(d, said)
+        }
+    }
+
+    /// Take Back's --stop refused: in plain words, with what to do (Try
+    /// Again, or Open Session: the agent's window there).
+    func stopRefused(_ p: Project, _ r: StopRefusal, after: Bool = false) {
+        let w = stopWords(r)
+        var text = (after ? "Nothing was taken back. " : "") + w.text
+        if !r.others.isEmpty { text += "\n\nAlso in the way:\n" + r.others.map { "• " + $0 }.joined(separator: "\n") }
+        switch choose(w.title, text, ["Try Again", "Open Its Window", "Cancel"]) {
+        case 0: takeBack(p)
+        case 1: openSession(p)
+        default: break
         }
     }
 
@@ -4276,13 +4606,17 @@ final class AppModel: ObservableObject {
     /// anyway" (--allow-idle) changes.
     func lookBring(_ path: String) {
         guard bring != nil, bring?.done == nil else { return }
-        if bring?.picked != path { bring?.allowIdle = false }
+        if bring?.picked != path {
+            bring?.allowIdle = false
+            bring?.agent = "claude"
+        }
         bring?.picked = path
         bring?.loading = true
         bring?.dry = [:]
         guard !demo, let v = bring else { return }
         askCore(bringArgs(v)) { d, said in
-            guard let now = self.bring, now.id == v.id, now.picked == path, now.allowIdle == v.allowIdle
+            guard let now = self.bring, now.id == v.id, now.picked == path, now.allowIdle == v.allowIdle,
+                  now.agent == v.agent
             else { return }
             self.bring?.loading = false
             self.bring?.dry = d ?? [:]
@@ -5457,6 +5791,7 @@ struct MainView: View {
         .sheet(item: $m.offsite) { _ in FetchBackupsSheet() }
         .sheet(item: $m.pickup) { _ in PickupSheet() }
         .sheet(item: $m.bring) { _ in BringSheet() }
+        .sheet(item: $m.peek) { _ in PeekSheet() }
         .sheet(item: $m.sendBack) { _ in SendBackSheet() }
     }
 }
@@ -5606,6 +5941,7 @@ struct DetailView: View {
         if let host = p.away {
             return (p.awayDrivenBy == "there" ? "brought to \(host)" : "handed over to \(host)")
                 + (p.awaySince.map { ", " + ago($0) } ?? "")
+                + (p.awayAgentLabel.map { "; \($0) works on it there" } ?? "")
         }
         if !p.exists { return "the folder is gone; its histories are safe" }
         return "\(p.sessions) session(s), \(byteText(NSNumber(value: p.bytes))) of history"
@@ -5883,6 +6219,8 @@ struct BoardRowView: View {
     var old = false                 // a machine that did not answer: its last row, greyed, no buttons
 
     var color: Color {
+        // a window aht runs another agent in: blue while it prints
+        if let w = r.windowWords { return w.text == "working" ? .blue : .secondary }
         switch r.status {
         case "waiting for you": return .orange
         case "idle": return .secondary
@@ -5990,14 +6328,18 @@ struct BoardRowView: View {
                 .frame(width: 100, alignment: .leading)
             Text(r.state).foregroundColor(r.status == "waiting for you" ? .orange : .primary)
                 .fontWeight(r.status == "waiting for you" ? .semibold : .regular).lineLimit(1)
+            if let hint = r.windowWords?.hint {
+                Text(hint).font(.caption).italic().foregroundColor(.secondary).lineLimit(1)
+            }
             if let t = r.since {
                 Text(ago(NSNumber(value: t))).foregroundColor(.secondary)
             }
             Spacer()
             if old {
                 EmptyView()
-            } else if r.handedOver, let p = m.projects.first(where: { $0.away != nil
-                                                                 && r.project.hasSuffix($0.path) }) {
+            } else if r.handedOver, let p = m.projects.first(where: { q in q.away != nil
+                                                                 && (r.herePath.map { $0 == q.path }
+                                                                     ?? r.project.hasSuffix(q.path)) }) {
                 Button("Open Session") { m.openSession(p) }.controlSize(.small)
             } else if r.local, m.projects.contains(where: { $0.path == r.project }) {
                 Button("Show Project") { m.show(r.project) }.controlSize(.small)
@@ -6140,6 +6482,7 @@ struct SearchHitView: View {
 struct HandoverSheet: View {
     @EnvironmentObject var m: AppModel
     @State var plan: HandoverPlan
+    @State var dries: [String: [String: Any]] = [:]     // another agent's dry run, by agent
 
     var body: some View {
         if plan.blocked { blocked } else { asking }
@@ -6182,16 +6525,17 @@ struct HandoverSheet: View {
             Text(plan.body).frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
-            PermLine(d: plan.dry, agent: firstText(plan.dry["agent"]) ?? "claude",
-                     source: firstText(plan.dry["agent"]) ?? "claude", on: plan.remote,
-                     leaving: { "the \($0.map { $0 + " " } ?? "")session here" })
+            Divider()
+            agentThere
             CrossingNotes(d: plan.dry, receiver: plan.remote, keeper: plan.remote)
             Text("A task to start on over there (optional)").padding(.top, 6)
             TextEditor(text: $plan.task)
                 .font(.body).frame(height: 70)
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
-            Text("With a task, the session begins working on it as soon as it has resumed; "
-                 + "you can follow it and answer its questions from the Claude app.")
+            Text(plan.agent == "claude"
+                 ? "With a task, the session begins working on it as soon as it has resumed; "
+                    + "you can follow it and answer its questions from the Claude app."
+                 : "With a task, \(label) works on it right after reading the summary.")
                 .font(.caption).foregroundColor(.secondary)
             HStack {
                 Spacer()
@@ -6202,9 +6546,61 @@ struct HandoverSheet: View {
                     m.confirmHandover(p)
                 }
                 .keyboardShortcut(.defaultAction)
+                .disabled(current == nil || stopped != nil)
             }
         }
         .padding(20).frame(width: 520)
+    }
+
+    // ---- Agent there: Claude Code's own session, or another agent ----
+
+    var label: String { AGENT_LABEL[plan.agent] ?? plan.agent }
+    /// The dry run for the agent chosen: the plan itself for Claude Code; for
+    /// another agent its own (`--agent X`), nil while it is asked.
+    var current: [String: Any]? { plan.agent == "claude" ? plan.dry : dries[plan.agent] }
+    /// What stops the agent chosen there (its own dry run's blockers).
+    var stopped: String? { plan.agent == "claude" ? nil : current.flatMap { m.problems($0) } }
+
+    @ViewBuilder var agentThere: some View {
+        let agents = agentsThere(plan.dry)
+        if agents.count > 1 {
+            Picker("Agent there", selection: Binding(get: { plan.agent }, set: { pick($0) })) {
+                ForEach(agents, id: \.self) { a in Text(agentChoice(a)).tag(a) }
+            }
+            .frame(maxWidth: 380)
+        }
+        if let d = current {
+            if let why = stopped {
+                Text("Not possible with \(label):\n\n" + why).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            } else {
+                Text(agentStarts(plan.agent, on: plan.remote) + " and this folder is marked as away until you take it back.")
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(agentCost(plan.agent, on: plan.remote,
+                               task: !plan.task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, d))
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                if plan.agent != "claude" {
+                    let had = (plan.dry["warnings"] as? [String]) ?? []
+                    ForEach(((d["warnings"] as? [String]) ?? []).filter { !had.contains($0) }, id: \.self) { w in
+                        Text("⚠ " + w).font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                PermLine(d: d, agent: plan.agent, source: firstText(plan.dry["agent"]) ?? "claude", on: plan.remote,
+                         leaving: { "the \($0.map { $0 + " " } ?? "")session here" })
+            }
+        } else {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Asking \(plan.remote) about \(label)…").foregroundColor(.secondary)
+            }
+        }
+    }
+
+    /// Another agent's dry run is asked once, when it is first chosen.
+    func pick(_ a: String) {
+        plan.agent = a
+        guard a != "claude", dries[a] == nil else { return }
+        m.handoverDry(plan.project, agent: a, replace: plan.replaceThere) { d in dries[a] = d }
     }
 }
 
@@ -6399,16 +6795,19 @@ struct BringSheet: View {
                     PathPair(from: "On \(v.machine)", fromPath: firstText(v.dry["there_path"]) ?? v.picked ?? "",
                              to: "Here", toPath: firstText(v.dry["here_path"]) ?? "?", hereFirst: false)
                     if let d = v.done {
-                        Text(bringDoneText(d, machine: v.machine))
+                        Text(bringDoneText(d, machine: v.machine, agent: v.agent))
                             .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                        if v.agent == "kimi", let first = farFirst(d) { FirstPromptBox(line: first) }
                     } else {
-                        Text(bringText(v.dry, machine: v.machine)).fixedSize(horizontal: false, vertical: true)
+                        agentHere(v)
+                        Text(bringText(v.dry, machine: v.machine, agent: v.agent)).fixedSize(horizontal: false, vertical: true)
                             .textSelection(.enabled)
-                        // the level its session opens in here, like it ran there
+                        // the level its session opens in here, like it ran there; or
+                        // the level the agent chosen starts in
                         let ses = (v.dry["session"] as? [String: Any]) ?? [:]
-                        if pickupProblems(v.dry) == nil, firstText(ses["id"]) != nil {
-                            let a = firstText(ses["agent"], v.dry["agent"]) ?? "claude"
-                            PermLine(d: v.dry, agent: a, source: a,
+                        if pickupProblems(v.dry) == nil, firstText(ses["id"]) != nil || v.agent != "claude" {
+                            let from = firstText(ses["agent"], v.agent == "claude" ? v.dry["agent"] : nil) ?? "claude"
+                            PermLine(d: v.dry, agent: v.agent == "claude" ? from : v.agent, source: from,
                                      leaving: { "the \($0.map { $0 + " " } ?? "")session on \(v.machine)" })
                         }
                         CrossingNotes(d: v.dry, receiver: "this Mac", keeper: "this Mac")
@@ -6418,6 +6817,25 @@ struct BringSheet: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+        }
+    }
+
+    /// Agent here: Claude Code's own session (no tokens), or another agent
+    /// installed here that starts with the summary (one turn); its own dry
+    /// run says what stops it and the level it starts in.
+    @ViewBuilder func agentHere(_ v: BringView) -> some View {
+        let agents = agentsHere(m.agentCLIs)
+        if agents.count > 1 || v.agent != "claude" {
+            Picker("Agent here", selection: Binding(
+                get: { m.bring?.agent ?? "claude" },
+                set: { m.bring?.agent = $0; m.lookBring(v.picked ?? "") })) {
+                ForEach(agents.contains(v.agent) ? agents : agents + [v.agent], id: \.self) { a in
+                    Text(agentChoice(a)).tag(a)
+                }
+            }
+            .frame(maxWidth: 380)
+            Text(agentCost(v.agent, on: nil, v.dry)).font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -6456,6 +6874,53 @@ struct BringSheet: View {
                           + "and open its session here")
             }
         }
+    }
+}
+
+/// Peek: the last lines of the agent's window there, its state, and a way
+/// into the window.
+struct PeekSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let v = m.peek ?? PeekView(project: Project([:]))
+        let label = v.project.awayAgentLabel ?? "The agent"
+        let lines = nameList(v.d["screen"])
+        VStack(alignment: .leading, spacing: 10) {
+            headed("\(label) on \(v.project.awayRemote ?? v.project.away ?? "the other machine")", "Hand a project over")
+            if v.loading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking at its window…").foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
+            } else {
+                if let st = peekState(v.d) {
+                    HStack(spacing: 8) {
+                        Text(st.text).fontWeight(.medium)
+                        if let h = st.hint { Text(h).font(.caption).italic().foregroundColor(.secondary) }
+                    }
+                }
+                if let e = firstText(v.d["error"]) {
+                    Text(e).foregroundColor(.orange).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                }
+                ScrollView {
+                    Text(lines.isEmpty ? (v.d["error"] == nil ? "Its window shows nothing yet." : "") : lines.joined(separator: "\n"))
+                        .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                }
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+                Text("The last lines its window shows; nothing is typed there. Open Its Window to answer it or end it.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack {
+                Button("Look Again") { m.peekThere(v.project) }.disabled(v.loading)
+                Button("Open Its Window") { m.openSession(v.project) }
+                Spacer()
+                Button("Close") { m.peek = nil }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20).frame(width: 640, height: 460)
     }
 }
 
@@ -6676,6 +7141,10 @@ struct AwayButtons: View {
             Button("Take Back…") { m.takeBack(p) }
                 .keyboardShortcut(.defaultAction)
             Button("Open Session") { m.openSession(p) }
+            if p.awayWindow != nil {
+                Button("Peek…") { m.peekThere(p) }
+                    .help("The last lines the agent's window there shows; nothing is typed there")
+            }
             Button("Release…") { m.release(p) }
                 .help("Stop waiting for it: the files here stay as they are, "
                       + "and the copy over there is not touched")
@@ -11041,7 +11510,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
             // with chimes on, a notice they cover comes without its own sound:
             // a session here chimed already, one elsewhere and the limit now
             if model.flag("chimes", false),
-               let k = ["waiting": "waiting", "finished": "done", "limit": "limit"][
+               let k = ["waiting": "waiting", "finished": "done", "went-quiet": "done", "limit": "limit"][
                    info["kind"] as? String ?? ""] {
                 c.sound = nil
                 if !(info["local"] as? Bool ?? false) { chime(k) }
@@ -13060,6 +13529,166 @@ if CommandLine.arguments.contains("--selftest") {
         opSeen = "second_opinion_dry.json: " + l.agents.joined(separator: ", ") + (l.warnings.isEmpty ? "" : ", \(l.warnings.count) warning(s)")
     }
     print("SECOND OPINION LEVEL BEFORE START \(opDryOK ? "OK" : "FAIL \(l0) \(said2)") [\(opSeen)]")
+    // Phase 8, another agent on the other machine: Agent there (Hand Over)
+    // and Agent here (Bring Here) with their token lines and commands; the
+    // board's window statuses; Take Back's --stop refusals in plain words;
+    // the away row naming the agent there
+    let agents8 = agentsThere([:]) == ["claude", "codex", "kimi", "agy", "vibe"]
+        && agentsThere(["agents_there": ["codex"]]) == ["claude", "codex"]
+        && agentsThere(["there": ["agents": ["kimi": "/usr/bin/kimi", "agy": NSNull(), "codex": false]]]) == ["claude", "kimi"]
+        && agentsHere(["claude", "codex", "agy"]) == ["claude", "codex", "agy"] && agentsHere(["claude"]) == ["claude"]
+        && agentChoice("claude") == "Claude Code (its own session)" && agentChoice("agy") == "Antigravity"
+    let cost8 = agentCost("claude", on: "box")
+            == "Claude Code resumes its own session on box: nothing runs until someone types there, so it uses no tokens."
+        && agentCost("claude", on: nil) == "Claude Code's own session opens here: nothing runs until you type, so it uses no tokens."
+        && agentCost("claude", on: "box", task: true) == "With a task, Claude Code starts on it at once on box: that uses tokens."
+        && agentCost("codex", on: "box") == "Starting Codex on box uses tokens: it reads aht's summary of the work as its first turn."
+        && agentCost("agy", on: nil) == "Starting Antigravity here uses tokens: it reads aht's summary of the work as its first turn."
+        && agentCost("kimi", on: "box", ["kimi_reads": false]).contains("paste the first message aht shows you into its window there")
+        && agentCost("kimi", on: "box", ["kimi_reads": true]).hasPrefix("Starting Kimi Code on box uses tokens")
+        // the core's own words (`tokens`), as given, with a full stop
+        && agentCost("codex", on: "box", ["tokens": "Codex starts on box and reads the summary as its first turn: that uses tokens"])
+            == "Codex starts on box and reads the summary as its first turn: that uses tokens."
+        && agentCost("claude", on: "box", ["tokens": NSNull()]).hasPrefix("Claude Code resumes its own session")
+        && agentCost("kimi", on: "box", ["first_prompt": "Read it first."]).contains("without reading the summary")
+        && farFirst(["first_prompt": "  Read it first. "]) == "Read it first." && farFirst(["first_prompt": NSNull()]) == nil
+        && agentStarts("codex", on: "box") == "Codex starts on box with aht's summary of the work"
+        && agentStarts("claude", on: "box") == "The session is resumed there"
+    let args8 = handoverArgs("/x/api", to: "box") == ["handover", "/x/api", "--json", "--to", "box"]
+        && handoverArgs("/x/api", to: "box", agent: "codex") == ["handover", "/x/api", "--json", "--to", "box", "--agent", "codex"]
+        && handoverArgs("/x/api", to: "box", replace: true, apply: true, file: "/s.json", task: "fix it")
+            == ["handover", "/x/api", "--apply", "--json", "--status-file", "/s.json", "--to", "box", "--replace-there", "--task=fix it"]
+        && handoverArgs("/x/api", to: nil, agent: "kimi", apply: true) == ["handover", "/x/api", "--apply", "--json", "--agent", "kimi"]
+    var bv8 = BringView(machine: "box")
+    bv8.picked = "/home/me/code/shop"
+    let bringC8 = bringArgs(bv8)
+    bv8.agent = "codex"
+    let ses8: [String: Any] = ["session": ["id": "s1", "title": "Checkout"]]
+    let bring8 = bringC8 == ["bring", "/home/me/code/shop", "--from", "box", "--json"]
+        && bringArgs(bv8, apply: true) == ["bring", "/home/me/code/shop", "--from", "box", "--agent", "codex", "--apply", "--json"]
+        && bringText(ses8, machine: "box", agent: "codex").contains("\nCodex starts here with aht's summary of the work (“Checkout”), in a new terminal window.")
+        && bringText(ses8, machine: "box").contains("opens here in a new terminal window; nothing runs until you type")
+        && bringDoneText(["opened": true], machine: "box", agent: "codex")
+            .contains("Codex is open in a new terminal window: it reads aht's summary of the work as its first turn.")
+        && bringDoneText(["opened": true], machine: "box").contains("nothing runs until you type")
+    let win8 = { (raw: String?, q: Double?, nr: Bool) in windowStatus(raw: raw, quietFor: q, notRunning: nr)?.text }
+    let board8 = win8("working", 3, false) == "working" && win8("quiet", 372, false) == "quiet for 6 min"
+        && win8("quiet", 30, false) == "quiet for under a minute" && win8("quiet", 7500, false) == "quiet for 2 h"
+        && win8("quiet", 7100, false) == "quiet for 118 min" && win8("quiet", nil, false) == "quiet"
+        && win8("exited", nil, true) == "exited" && win8("quiet", 40, true) == "not running"
+        && windowStatus(raw: "exited", quietFor: nil, notRunning: true)?.hint == nil
+        && win8("busy", nil, false) == nil && win8("waiting", nil, false) == nil && win8(nil, nil, false) == nil
+        && win8("running", nil, false) == nil
+        && windowStatus(raw: "quiet", quietFor: 400, notRunning: false)?.hint == "done, or it waits for you"
+    let rows8 = boardMachines(["machines": [["machine": "box", "reachable": true, "sessions": [
+        ["agent": "codex", "project": "/home/me/code/api", "status": "running", "window": "aht-api-1a2b3c",
+         "raw_status": "quiet", "quiet_for": 372, "not_running": false],
+        ["agent": "claude", "project": "/home/me/code/web", "status": "waiting for you", "raw_status": "waiting",
+         "window": "aht-web-9f8e7d", "waiting_for": "approve Bash: make test"]]]]]).first?.rows ?? []
+    let rowsOK8 = rows8.map { $0.state }.sorted() == ["quiet for 6 min", "waiting for you: approve Bash: make test"]
+        && rows8.first { $0.agent == "codex" }?.window == "aht-api-1a2b3c"
+    // as the core says them: `stop` {stopped, reason, quiet_for, quit_keys,
+    // would_stop, seen}, its sentence in the blockers, the agent's own
+    // processes there next to it
+    let nq8 = stopRefusal(["remote": "box",
+                           "stop": ["stopped": false, "reason": "not-quiet", "quiet_for": 60, "quit_keys": ["C-c", "C-c"],
+                                    "would_stop": false],
+                           "blockers": ["Codex on box has been quiet for only 1 min — wait, or end it yourself (--stop "
+                                        + "needs 2 minutes without output)", "still running in this folder on box: codex (4242)",
+                                        "still running in this folder on box: node"]], awayAgent: "codex")
+    let unseen8 = stopRefusal(["remote": "box", "stop": ["stopped": false, "reason": "turn-open", "quiet_for": 400, "seen": false],
+                               "blockers": ["aht cannot see Codex's own last message on box, so it cannot tell whether "
+                                            + "its turn ended — end it yourself"]], awayAgent: "codex")
+    let nr8 = stopRefusal(["remote": "box", "applied": false,
+                           "stop": ["stopped": false, "reason": "no-reaction", "quit_keys": ["C-c", "C-c"]],
+                           "blockers": ["Codex on box did not react to its quit keys (C-c C-c) — end it yourself"]],
+                          awayAgent: "codex")
+    let to8 = stopRefusal(["blockers": ["Codex's last turn is still open on box — wait, or end it yourself"], "remote": "box"])
+    let nqt8 = stopRefusal(["blockers": ["Codex on box has been quiet for only 40 s — wait, or end it yourself"]], machine: "box")
+    let late8 = stopRefusal(["stopped": false, "stop_reason": "not-quiet", "warnings": [Any]()], awayAgent: "kimi", machine: "box")
+    let w1 = nq8.map(stopWords), w2 = to8.map(stopWords)
+    let stop8 = nq8?.reason == "not-quiet" && nq8?.quiet == 60 && nq8?.need == 120 && nq8?.agent == "codex"
+        && nq8?.others == ["still running in this folder on box: node"]
+        && w1?.title == "Codex on box is still printing"
+        && (w1?.text ?? "").hasPrefix("Codex's window there showed new output 1 min ago, so it may be in the middle of its "
+                                      + "work. aht ends it only after 2 min without new output.")
+        && (w1?.text ?? "").contains("What to do: wait until it has been quiet for 2 min, then choose Take Back again.")
+        && to8?.reason == "turn-open" && to8?.agent == "codex" && w2?.title == "Codex's last turn is not finished"
+        && (w2?.text ?? "").hasPrefix("Codex on box has not finished its last turn")
+        && nqt8?.reason == "not-quiet" && nqt8?.quiet == 40 && nqt8.map(stopWords)?.text.contains("40 s ago") == true
+        && late8?.reason == "not-quiet" && late8?.label == "Kimi Code" && late8?.quiet == nil
+        && unseen8?.seen == false && unseen8?.others == [] && unseen8.map(stopWords)?.title == "aht cannot tell whether Codex's last turn ended"
+        && nr8?.reason == "no-reaction" && nr8.map(stopWords)?.title == "Codex on box did not quit"
+        && (nr8.map(stopWords)?.text ?? "").hasPrefix("aht pressed its quit keys (C-c C-c), and Codex still runs.")
+        && stopRefusal(["blockers": ["a session is working in /x on box"]]) == nil && stopRefusal([:]) == nil
+        && takeBackText(["would_stop": true, "stop": ["quiet_for": 372]], "box", copy: false, synced: false, agent: "codex")
+            .contains("Codex on box is ended first: it has been quiet for 6 min, and its last turn has ended.")
+        && takeBackText(["would_stop": true], "box", copy: false, synced: false, agent: "claude").contains("The idle session on box")
+        && peekState(["raw_status": "quiet", "quiet_for": 372])?.text == "quiet for 6 min"
+        && peekState(["status": "waiting for you", "raw_status": "waiting"])?.text == "waiting for you"
+    let awayP8 = Project(["real_path": "/x/api", "exists": true, "away": "box.lan", "away_remote": "box",
+                          "away_agent": "codex", "away_driven_by": "here"])
+    let heldP8 = Project(["real_path": "/x/notes", "exists": true, "away": "DESKTOP-PC", "away_remote": "pc",
+                          "away_holder": "pc", "away_agent": "kimi", "away_driven_by": "there"])
+    let away8 = awayP8.place == "on box.lan (Codex)" && awayP8.awayAgentLabel == "Codex"
+        && Project(["real_path": "/x/shop", "exists": true, "away": "box.lan"]).place == "on box.lan"
+        && (awayLine(heldP8) ?? "").hasPrefix("On pc") && (awayLine(heldP8) ?? "").contains(", in Kimi Code (brought there from pc).")
+        && Project(["real_path": "/x/r", "exists": true, "away": ["host": "box", "agent": "agy"]]).awayAgent == "agy"
+        && Project(["real_path": "/x/api", "away": "box", "away_window": "aht-api-1a2b3c"]).awayWindow == "aht-api-1a2b3c"
+        && sendBackDoneText(["applied": true, "catchup": ["agent": "codex", "relay": "r1"]], machine: "mac")
+            .contains("What Codex did here is summed up for the Claude Code session on mac.")
+    let p8OK = agents8 && cost8 && args8 && bring8 && board8 && rowsOK8 && stop8 && away8
+    print("AGENT THERE \(p8OK ? "OK" : "FAIL — agents \(agents8) cost \(cost8) args \(args8) bring \(bring8) board \(board8) rows \(rowsOK8) stop \(stop8) away \(away8)")")
+    if !p8OK { print("   \(rows8.map { $0.state }) | \(w1?.text ?? "-") | \(awayLine(heldP8) ?? "-")") }
+    // … and the core's phase-8 samples: AHT_FIXTURES_PHASE8 (board rows of
+    // windows, a dry run with --agent, projects with away_agent, a refusal)
+    let dir8 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE8"] ?? ""
+    let files8 = ((try? FileManager.default.contentsOfDirectory(atPath: dir8)) ?? []).filter { $0.hasSuffix(".json") }.sorted()
+    if !dir8.isEmpty && !files8.isEmpty {
+        var miss: [String] = [], seen: [String] = []
+        for n in files8 {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir8).appendingPathComponent(n))
+            guard let d = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] else {
+                miss.append(n + " (not JSON)")
+                continue
+            }
+            if d["machines"] is [Any] {
+                let rs = boardMachines(d).flatMap { $0.rows + $0.lastRows }.filter { $0.windowWords != nil }
+                if rs.isEmpty || rs.contains(where: { $0.state.contains("Optional(") }) { miss.append(n + " (no window row in words)") }
+                seen.append("\(n): " + rs.map { "\(AGENT_LABEL[$0.agent] ?? $0.agent) \($0.state)" }.joined(separator: ", "))
+                continue
+            }
+            // `projects --json`'s rows, or one row (or named rows) as a sample
+            let rows = (d["projects"] as? [[String: Any]]) ?? (d["real_path"] != nil ? [d] : nil)
+                ?? d.values.compactMap { $0 as? [String: Any] }.filter { $0["real_path"] != nil }
+            if !rows.isEmpty {
+                let named = rows.map(Project.init).filter { $0.away != nil }.compactMap { p in p.awayAgentLabel.map { "\(p.name) \($0)" } }
+                if named.isEmpty { miss.append(n + " (no away_agent)") }
+                seen.append("\(n): " + named.joined(separator: ", "))
+                continue
+            }
+            if let r = stopRefusal(d) {
+                let w = stopWords(r)
+                if w.title.contains("Optional(") || w.text.contains("Optional(") { miss.append(n) }
+                seen.append("\(n): \(r.reason), \(w.title)")
+                continue
+            }
+            // a dry run (or --apply) for another agent: its level and its token line
+            let agent = firstText((d["perm"] as? [String: Any])?["agent"], d["agent"]) ?? "claude"
+            let on = (d["command"] as? String) == "handover" || n.hasPrefix("handover") ? firstText(d["remote"]) ?? "box" : nil
+            guard agent != "claude", let p = permInfo(d, agent: agent, setting: "follow"), p.text != nil else {
+                miss.append(n + " (no other agent's perm)")
+                continue
+            }
+            seen.append("\(n): \(AGENT_LABEL[agent] ?? agent) \(p.level)" + (on.map { " on " + $0 } ?? " here") + " — "
+                        + agentCost(agent, on: on, d))
+        }
+        let s8OK = miss.isEmpty && !seen.isEmpty
+        print("PHASE 8 SAMPLES \(s8OK ? "OK" : "FAIL \(miss)") — \(dir8) [" + seen.joined(separator: "; ") + "]")
+    } else {
+        print("PHASE 8 SAMPLES not checked (" + (dir8.isEmpty ? "AHT_FIXTURES_PHASE8 names no folder"
+                                                         : "no samples in \(dir8) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -13606,6 +14235,123 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
             snapshot(PermLine(d: d, agent: agent, source: src, leaving: { "the \($0.map { $0 + " " } ?? "")session you are leaving" })
                         .padding(12).frame(width: 520).environmentObject(demo),
                      dir + "/perm-sample-" + (n as NSString).deletingPathExtension + ".png", NSSize(width: 520, height: 120))
+        }
+        exit(0)
+    }
+    if args.contains("--agents-only") {
+        // Another agent on the other machine: Hand Over's Agent there (Claude
+        // Code, Codex, an agent missing there), Bring Here's Agent here, the
+        // Sessions board's windows ("working", "quiet for 6 min", "exited"),
+        // and the away rows naming the agent there; made-up answers in the
+        // shape of the core's JSON, then the core's own samples
+        // (AHT_FIXTURES_PHASE8) when there are some. Nothing asks the core or
+        // another machine.
+        let now = Date().timeIntervalSince1970
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 8", "tracked": 4, "hook_installed": true,
+                       "agent_clis": ["claude": "claude", "codex": "codex", "kimi": "kimi", "agy": "agy"],
+                       "handover": ["supported": true, "can_reach": true, "default_remote": "box", "remotes": [
+                           "box": ["ssh": "me@box", "system": "Linux", "paths": "same"]]]]
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+        let paper = Project(["real_path": home + "/code/paper", "exists": true, "sessions": 3, "agents": ["claude"]])
+        let perm8 = { (agent: String, level: String, flags: [String], text: String) -> [String: Any] in
+            ["agent": agent, "level": level, "sandbox": false, "from": "command_line", "read": "edits", "flags": flags, "text": text]
+        }
+        let body = "812 file(s) to send (5.1 MB), history 879 KB.\nSession: add rate limits"
+        let ho: [String: Any] = ["command": "handover", "remote": "box", "agent": "claude", "there_path": home + "/code/paper",
+                                 "blockers": [], "warnings": [],
+                                 "perm": perm8("claude", "edits", ["--permission-mode", "acceptEdits"],
+                                               "Claude Code on box starts in edits mode, like the Claude Code session here")]
+        let hoCodex = ho.merging(["agent": "codex", "warnings": ["Codex on box is 0.40; this machine has 0.52"],
+                                  "perm": perm8("codex", "edits", ["-a", "on-request", "-s", "workspace-write"],
+                                                "Codex on box starts in edits mode, like the Claude Code session here")]) { $1 }
+        let hoAgy = ho.merging(["agent": "agy", "blockers": ["Antigravity (agy) is not installed on box: install it there, "
+                                                             + "or choose another agent"]]) { $1 }
+        snapshot(HandoverSheet(plan: HandoverPlan(project: paper, remote: "box", body: body, dry: ho))
+                    .environmentObject(demo), dir + "/agent-handover-claude.png", NSSize(width: 520, height: 640))
+        var hp = HandoverPlan(project: paper, remote: "box", body: body, dry: ho)
+        hp.agent = "codex"
+        snapshot(HandoverSheet(plan: hp, dries: ["codex": hoCodex]).environmentObject(demo),
+                 dir + "/agent-handover-codex.png", NSSize(width: 520, height: 680))
+        hp.agent = "agy"
+        snapshot(HandoverSheet(plan: hp, dries: ["agy": hoAgy]).environmentObject(demo),
+                 dir + "/agent-handover-agy-missing.png", NSSize(width: 520, height: 600))
+        var bv = BringView(machine: "box")
+        (bv.listing, bv.picked, bv.agent) = (false, home + "/code/shop", "codex")
+        bv.list = ["remote": "box", "projects": [["path": home + "/code/shop", "here_path": home + "/code/shop",
+                                                  "title": "Checkout flow refactor", "sessions": 3]]]
+        bv.dry = ["command": "bring", "applied": false, "blockers": [], "warnings": [], "remote": "box", "agent": "codex",
+                  "here_path": home + "/code/shop", "there_path": home + "/code/shop",
+                  "session": ["id": "0f3a9c2e", "title": "Checkout flow refactor", "agent": "claude"],
+                  "plan": ["files": 1204, "bytes": 40_055_603, "history_bytes": 4_299_161, "file_history": true],
+                  "perm": perm8("codex", "edits", ["-a", "on-request", "-s", "workspace-write"],
+                                "Codex starts in edits mode, like the Claude Code session on box")]
+        demo.bring = bv
+        snapshot(BringSheet().environmentObject(demo), dir + "/agent-bring-codex.png", NSSize(width: 660, height: 640))
+        let win = { (p: String, agent: String, raw: String, quiet: Double, off: Bool) -> [String: Any] in
+            ["agent": agent, "project": "/home/me/code/" + p, "status": "running", "window": "aht-\(p)-1a2b3c",
+             "raw_status": raw, "quiet_for": quiet, "not_running": off, "since": now - 1800]
+        }
+        demo.board = boardMachines(["machines": [
+            ["machine": "mac", "local": true, "reachable": true, "last_heard": now, "stale": false,
+             "sessions": [["agent": "claude", "project": home + "/code/paper", "status": "working", "raw_status": "busy",
+                           "since": now - 300]]],
+            ["machine": "box", "local": false, "reachable": true, "last_heard": now - 20, "stale": false,
+             "sessions": [win("api", "codex", "working", 3, false), win("shop", "kimi", "quiet", 372, false),
+                          win("site", "agy", "exited", 30, true), win("notes", "codex", "quiet", 40, false)]]]])
+        demo.boardAt = Date()
+        demo.tab = .sessions
+        snapshot(MainView().environmentObject(demo), dir + "/agent-sessions-windows.png", NSSize(width: 900, height: 520))
+        let row = { (name: String, extra: [String: Any]) -> Project in
+            Project(["real_path": home + "/code/" + name, "exists": true, "sessions": 4, "bytes": 2_400_000,
+                     "agents": ["claude"]].merging(extra) { $1 })
+        }
+        demo.projects = [
+            row("api", ["away": "box", "away_remote": "box", "away_since": "2026-10-28T10:43:07", "away_driven_by": "here",
+                        "away_system": "Linux", "away_agent": "codex", "away_window": "aht-api-40400d"]),
+            row("notes", ["away": "pc", "away_since": now - 7200, "away_driven_by": "there", "away_holder": "pc",
+                          "away_system": "Windows", "away_remote": NSNull(), "away_agent": "kimi"])]
+        for (p, name) in zip(demo.projects, ["handed-over-codex", "held-by-pc-kimi"]) {
+            demo.selection = p.path
+            snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                     dir + "/agent-detail-\(name).png", NSSize(width: 900, height: 176))
+        }
+        demo.tab = .projects
+        snapshot(MainView().environmentObject(demo), dir + "/agent-projects.png", NSSize(width: 900, height: 520))
+        var pv = PeekView(project: demo.projects[0])
+        pv.loading = false
+        pv.d = ["agent": "codex", "open": true, "status": "quiet for 6 min", "raw_status": "quiet", "quiet_for": 401,
+                "screen": ["• Ran the tests: 41 passed, 1 failed (test_login_redirect)", "",
+                           "Shall I fix the redirect now? (y/n)", "› "], "error": NSNull()]
+        demo.peek = pv
+        snapshot(PeekSheet().environmentObject(demo), dir + "/agent-peek.png", NSSize(width: 640, height: 460))
+        // the core's own samples
+        let dir8 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE8"] ?? ""
+        let load8 = { (n: String) -> [String: Any]? in
+            (try? Data(contentsOf: URL(fileURLWithPath: dir8).appendingPathComponent(n)))
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        }
+        if let d = load8("board_windows.json") {
+            demo.board = boardMachines(d)
+            demo.tab = .sessions
+            snapshot(MainView().environmentObject(demo), dir + "/agent-sample-board.png", NSSize(width: 900, height: 620))
+        }
+        if let d = load8("handover_agent_dry.json") {
+            var sp = HandoverPlan(project: paper, remote: firstText(d["remote"]) ?? "box", body: body, dry: ho)
+            sp.agent = firstText((d["perm"] as? [String: Any])?["agent"], d["agent"]) ?? "codex"
+            snapshot(HandoverSheet(plan: sp, dries: [sp.agent: d]).environmentObject(demo),
+                     dir + "/agent-sample-handover.png", NSSize(width: 520, height: 680))
+        }
+        if let d = load8("bring_agent_dry.json") {
+            var sb = BringView(machine: firstText(d["remote"]) ?? "box")
+            (sb.listing, sb.picked, sb.dry) = (false, firstText(d["there_path"]) ?? home + "/code/shop", d)
+            sb.list = ["remote": sb.machine, "projects": [["path": sb.picked ?? "", "here_path": d["here_path"] ?? NSNull(),
+                                                           "title": (d["session"] as? [String: Any])?["title"] ?? NSNull()]]]
+            sb.agent = firstText((d["perm"] as? [String: Any])?["agent"], d["agent"]) ?? "codex"
+            demo.bring = sb
+            snapshot(BringSheet().environmentObject(demo), dir + "/agent-sample-bring.png", NSSize(width: 660, height: 640))
         }
         exit(0)
     }

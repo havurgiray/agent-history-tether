@@ -1,0 +1,95 @@
+{
+  "command": "bring",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "agent": "codex",
+  "start_line": "/opt/homebrew/bin/codex -a on-request -s workspace-write 'You are taking over this project from Claude Code on box. Read .aht/handover/relay-20261028-104333-b15b.md first: it records where the work stood, the latest exchanges and the open items. Then tell me in two or three lines what you understood, and wait for my next instruction.'",
+  "tokens": "Codex starts here and reads the summary as its first turn: that uses tokens",
+  "first_prompt": null,
+  "remote": "box",
+  "there_path": "/home/me/code/shop",
+  "mode": "bring",
+  "allow_idle": false,
+  "there": {
+    "host": "box",
+    "system": "Darwin",
+    "claude_version": "9.9.9",
+    "sessions": [],
+    "processes": [],
+    "aht": {
+      "installed": true,
+      "version": "0.13.0",
+      "protocol": 2,
+      "phone_here": false
+    }
+  },
+  "uuid": "adf2c93d6bf147b8a98feb8109f0b204",
+  "session": {
+    "id": "7d6e5f4a-2222-4333-8444-555566667777",
+    "title": "Checkout refactor",
+    "perm": {
+      "level": "edits",
+      "sandbox": false,
+      "from": "transcript"
+    },
+    "open": null
+  },
+  "perm": {
+    "agent": "codex",
+    "level": "edits",
+    "sandbox": false,
+    "flags": [
+      "-a",
+      "on-request",
+      "-s",
+      "workspace-write"
+    ],
+    "from": "transcript",
+    "read": "edits",
+    "text": "Codex starts in edits mode, like the session on box"
+  },
+  "sessions": 1,
+  "other_histories": [],
+  "project": "/Users/me/code/shop",
+  "here_path": "/Users/me/code/shop",
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "here": {
+    "sessions": [],
+    "processes": [],
+    "system": "Darwin"
+  },
+  "names": [],
+  "plan": {
+    "files": 2,
+    "bytes": 42,
+    "history_files": 1,
+    "history_bytes": 417,
+    "replaces": 0,
+    "set_aside": 0,
+    "plans": 0,
+    "file_history": false,
+    "free_bytes": 27569655808
+  },
+  "modes_lost": [],
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9"
+  },
+  "git": {
+    "is_git": false,
+    "gitattributes": false,
+    "suggest": [],
+    "env": {},
+    "how": null
+  },
+  "eol_only": [],
+  "unsafe_names": []
+}

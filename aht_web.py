@@ -64,7 +64,13 @@ COMMANDS = {
     "night-shift", "backup", "restore", "icons", "backends", "adopt", "setup", "update",
     "getting-started", "doctor", "reconcile", "reload", "version", "notices", "limits",
     "logs", "checkup", "forget", "orphans", "prune", "guide", "bind", "autostart",
+    "attach",
 }
+
+# commands the window may run only in one of these ways: `attach` would
+# otherwise take over the terminal it runs in (ssh into the other machine);
+# the window opens the agent's window there in a new terminal (--window)
+COMMAND_NEEDS = {"attach": ("--window", "--peek", "--print")}
 
 # what the window may open on (the tray's Projects brought here ▸ Send Back…):
 # AHT_WINDOW_PROJECT=<a folder> and AHT_WINDOW_DO=<one of these> in the
@@ -427,6 +433,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "args: a list of strings"})
             if args[0] not in COMMANDS:
                 return self._json(403, {"error": f"the window does not run `aht {args[0]}`"})
+            need = COMMAND_NEEDS.get(args[0])
+            if need and not any(a in need for a in args[1:]):
+                return self._json(403, {"error": f"the window runs `aht {args[0]}` only with "
+                                                 + " or ".join(need)})
             if path == "/api/run":
                 return self._json(200, self.server.run(args))
             follow = body.get("follow")
@@ -913,6 +923,8 @@ def selftest() -> int:
        "another host name is refused (DNS rebinding)")
     st, body, _ = call("/api/run", ok, {"args": ["install"]}, cookie)
     ck(st == 403, "a command outside the list is refused")
+    st, body, _ = call("/api/run", ok, {"args": ["attach", "/x"]}, cookie)
+    ck(st == 403, "attach only in a new terminal (--window): never in the server's own")
     st, body, _ = call("/api/run", ok, {"args": ["version"]}, cookie)
     ans = json.loads(body or b"{}")
     ck(st == 200 and ans.get("ok") and aht.VERSION in ans.get("out", ""),

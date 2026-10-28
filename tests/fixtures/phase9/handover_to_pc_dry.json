@@ -1,0 +1,79 @@
+{
+  "command": "handover",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "agent": "claude",
+  "start_line": null,
+  "tokens": null,
+  "first_prompt": null,
+  "relay": null,
+  "project": "/Users/me/code/shop",
+  "remote": "pc",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "pc": true,
+  "here_path": "/Users/me/code/shop",
+  "there_path": "C:\\Users\\me\\code\\shop",
+  "there": {
+    "host": "pc",
+    "system": "Windows",
+    "home": "C:\\Users\\me",
+    "claude": "C:\\Users\\me\\.local\\bin\\claude.exe",
+    "claude_version": "9.9.9",
+    "path_exists": false,
+    "path_writable": true,
+    "free_bytes": 26325483520,
+    "sessions": [],
+    "processes": [],
+    "path": "C:\\Users\\me\\code\\shop"
+  },
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "names": [],
+  "git": {
+    "is_git": false,
+    "gitattributes": null,
+    "suggest": [],
+    "env": {
+      "core.filemode": "false"
+    },
+    "how": "in your own terminal on pc:  git -c core.filemode=false status   (aht's session there has this set)"
+  },
+  "transfer": "aht",
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9"
+  },
+  "session": "5d6e7f80-1111-4222-8333-444455556666",
+  "sessions": 1,
+  "title": "Checkout flow",
+  "perm": {
+    "agent": "claude",
+    "level": "ask",
+    "sandbox": false,
+    "flags": [],
+    "from": "unknown",
+    "read": "ask",
+    "text": "Claude Code on pc starts in ask mode: aht could not tell the level of the session here"
+  },
+  "outside_not_carried": [],
+  "task": null,
+  "plan": {
+    "files": 2,
+    "bytes": 37,
+    "history_bytes": 701,
+    "extras": [],
+    "install_claude": null,
+    "free_bytes": 26325483520
+  },
+  "other_histories": []
+}

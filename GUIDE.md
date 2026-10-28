@@ -278,8 +278,9 @@ Getting started.
 
 From a Windows PC, aht can ask your Mac and Linux machines what runs
 there, pick up their work, hand projects over to them and bring their
-projects here. It uses Windows' own ssh. The PC always does the asking and
-is never asked itself, so it needs no ssh server.
+projects here. It uses Windows' own ssh. For all of this the PC does the
+asking, so it needs no ssh server. To let a Mac or Linux machine hand
+projects over to the PC as well, see *A Windows PC that answers*.
 
 > **Example.** A long Claude Code session runs on your Linux box at home.
 > On the PC at work you add it under **Machines → Add a Machine…** as
@@ -335,8 +336,7 @@ and press **Check…**. Its rows come in two groups:
 **What a PC can do today:**
 
 - add, check and remove your Mac and Linux machines; `aht remote
-  discover` lists the ones on your Tailscale network (Windows machines
-  there are left out, since they cannot be asked);
+  discover` lists the machines on your Tailscale network;
 - see their open sessions in the Sessions tab;
 - **Watch** a machine: the tray tells you when a session there waits for
   you or is done (see *Hand a project over to another machine*);
@@ -382,15 +382,15 @@ for asking it.
   is reading) is tried again 5 times, 0.2 s apart. If it is still held,
   that one file is named as not fetched; the rest arrive.
 
-**What it cannot do yet:**
+**What the PC still starts itself:**
 
-- be asked by another machine. Adding a PC as a machine on a Mac or on
-  Linux stops with *aht cannot ask a Windows machine yet*, and makes
-  nothing on the PC. So a Mac cannot pick up work from the PC or leave a
-  note on it, hand a project over to it, or take back a project the PC
-  brought there: the PC sends it back. While the PC holds it, the
-  project on the Mac says *On pc since 14:10 (brought there from pc).
-  Send it back from pc.*, with **Release…** for a PC that is gone.
+- Pick Up, Leave a Note, Bring Here and Send Back. A Mac cannot pick up
+  work from the PC or leave a note on it, and it cannot take back a
+  project the PC brought there: the PC sends it back. While the PC holds
+  it, the project on the Mac says *On pc since 14:10 (brought there from
+  pc). Send it back from pc.*, with **Release…** for a PC that is gone.
+  A PC that answers (next section) also takes Hand Over and Take Back
+  from a Mac or Linux machine.
 
 **In the terminal:**
 
@@ -419,6 +419,118 @@ for asking it.
   bringing one here would do.
 - `aht send-back $HOME\code\shop` — show what sending it back would
   change on homebox; `--apply` does it.
+
+## A Windows PC that answers
+
+Optional. With an ssh server on the PC, your Mac or Linux machine can
+hand a project over to the PC and take it back, watch the PC, list its
+sessions and search them. Without one, the PC still does everything in
+the section above.
+
+> **Example.** You leave the Mac for the PC in the other room. On the
+> Mac, **Hand Over…** sends shop to pc. No session starts on the PC: its
+> tray says *shop came from mac — Continue here*. Click it, and Claude
+> Code opens in a console on the PC, in the session you left on the Mac.
+> Nothing runs until you type. Back at the Mac, **Take Back** brings
+> home what you did on the PC.
+
+**What works, and what does not.**
+
+- **Hand Over to the PC.** The files, Claude Code's history and the
+  handover summary go to the PC with aht's own copy (no rsync). No session
+  starts there. The PC's tray offers **Continue here** once as a notice
+  and then in its menu, until you use it (or dismiss it) or the project
+  leaves. Continue here opens Claude Code in a console, in the session
+  that was handed over, in the permission level the handover named (never
+  more, whatever the session ran in before) and told, as on any machine,
+  that it changed machines.
+- **Continue here works once.** Run again (`aht _arrival --continue
+  <name>` on the PC), it says it was already used, since that session may
+  still be open there; `--again` opens it once more anyway.
+- **Take Back from the PC**, as from any machine: what changed on the
+  PC comes back, and the PC drops its Continue here.
+- **Watch** the PC, its open sessions on the board, and **search** its
+  sessions (with **Also on my other machines**).
+- **Claude Code** must be installed on the PC. If its version differs from
+  this machine's, the first handover runs `claude install <version>`
+  there.
+- Not on a PC: no session starts by itself, so a handover's task waits
+  in the summary until you continue; `--agent` (Codex, Kimi Code,
+  Antigravity, Mistral Vibe) and the night shift go to Mac and Linux
+  machines only. aht never ends a session on the PC: `--stop` does not,
+  so exit it there before you take the project back. **Open Session**
+  has nothing to open. Pick Up, Leave a Note, Bring Here and Send Back
+  with a PC still start on the PC.
+
+**What answers on the PC.** aht installed on the PC answers when it is at
+least as new as this release. Otherwise aht's own copy answers, with the
+PC's Python 3 (`py`, or `python`). With neither, adding the PC stops
+with *install aht on pc* and makes nothing there. **Check…** names what
+answered in the row *aht answers there*. Install aht on the PC in any
+case: its tray is what offers Continue here. An aht there older than this
+release has no Continue here yet: the row *aht installed there* then says
+*update aht there*.
+
+**Once, on the PC** (in an administrator PowerShell where it says so):
+
+1. **OpenSSH Server.** Settings → System → Optional features → View
+   features → *OpenSSH Server* → Add. Then, as administrator:
+   `Start-Service sshd; Set-Service sshd -StartupType Automatic`.
+2. **Your key.** On the Mac, show your public key: `cat
+   ~/.ssh/id_ed25519.pub` (make one with `ssh-keygen -t ed25519` if there
+   is none). On the PC, paste that one line into a file:
+   - a standard account: `C:\Users\<you>\.ssh\authorized_keys`;
+   - an account in the Administrators group: Windows reads only
+     `C:\ProgramData\ssh\administrators_authorized_keys`, never the
+     file in your own folder. Edit it in an administrator Notepad. Then,
+     as administrator, let only Administrators and SYSTEM read it:
+     `icacls C:\ProgramData\ssh\administrators_authorized_keys
+     /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"`.
+3. **Try it from the Mac:** `ssh <you>@pc`. It must log in without a
+   password; answer *yes* to the machine's key once (aht never accepts a
+   key for you). Type `exit`.
+4. **Passwords off.** In an administrator Notepad, open
+   `C:\ProgramData\ssh\sshd_config` and set `PasswordAuthentication no`
+   (remove the `#` in front). Save, then as administrator:
+   `Restart-Service sshd`. From now on only your key logs in. Do this
+   after step 3 works.
+5. **The firewall.** The OpenSSH Server feature opens port 22 to every
+   network. Let it answer only on your Tailscale network, or only on your
+   own local network, as administrator, one of:
+   - `Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -InterfaceAlias
+     Tailscale` (only over Tailscale);
+   - `Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -RemoteAddress
+     LocalSubnet` (only from your own network).
+   `Get-NetFirewallRule -Name OpenSSH-Server-In-TCP |
+   Get-NetFirewallAddressFilter` shows what it lets in.
+6. **Never change the network's profile.** Leave Windows' network as it
+   is (Public stays Public). The scoped rule is all ssh needs; making a
+   network Private opens more than ssh.
+7. **aht, or Python.** Install aht on the PC (its tray offers Continue
+   here), or at least Python 3: `winget install Python.Python.3.12`.
+8. **Leave ssh's shell as it is.** Windows' ssh server runs commands in
+   cmd.exe. aht's command line reads the same in PowerShell, but cmd.exe
+   is the one it is tried with.
+
+Then, on the Mac: `aht remote add pc <you>@pc` (or **Machines → Add a
+Machine…**), and **Check…**. A PC has its own rows: *aht answers there*,
+*Claude Code there*, *aht installed there (its tray offers Continue
+here)* and *no session starts there*. There are no rows for tmux, keeping
+awake or mosh. `aht remote discover` lists the PC when it is on your
+Tailscale network.
+
+**What aht reads and writes on the PC** is in PRIVACY.md (*A PC that
+answers*): the project folder, Claude Code's history for it, the trust
+entry in `~/.claude.json`, and in `~\.aht` aht's copy, the copy note
+and the record that waits for Continue here.
+
+**In the terminal (on the Mac):**
+
+- `aht remote add pc you@pc` — add the PC; it says what answers there.
+- `aht remote check pc` — check it.
+- `aht handover ~/code/shop --to pc` — show what handing shop over to
+  the PC would send, and where it goes there; `--apply` does it.
+- `aht reclaim ~/code/shop --apply` — take it back.
 
 ## New versions
 
@@ -1724,11 +1836,13 @@ the laptop or your phone.
   newest 12 others are kept, of both kinds. A handover sends that folder
   along and never removes anything from it there; Keep in sync leaves it
   out.
-- **A Windows PC** cannot be the other machine yet. **Check and Add**
-  (`aht remote add`, `aht remote check`) stops with *aht cannot ask a
-  Windows machine yet*, and nothing is made on the PC. A PC hands
-  projects over to your Mac and Linux machines and brings theirs to
-  itself, though: see *A Windows PC with your other machines*.
+- **A Windows PC** is the other machine only when it answers (an ssh
+  server on it: see *A Windows PC that answers*). Then a handover to it
+  starts no session there: its tray offers *Continue here*. A PC without
+  one stops **Check and Add** with *install aht on pc*, and nothing is made
+  on it. A PC hands projects over to your Mac and Linux machines and
+  brings theirs to itself in any case: see *A Windows PC with your other
+  machines*.
 
 **Keep in sync looks first.** Before each sync, aht compares the copy on
 the other machine with the list of that copy it kept after the last sync,
@@ -2476,10 +2590,11 @@ same repository for example, and the copies may sit at different paths.
     folder while the work is out hears *[aht] This project was picked up on
     “pc” at 09:10 (Codex). Work may go on there: if the user asks to
     continue that work, check with them before changing anything here.*
-- **A PC starts every exchange.** No machine can ask a Windows PC. So at
-  the PC, Pick Up from the Mac; before you leave the PC, Leave a Note (or
-  Hand Back) on the Mac. Aimed at a PC, both stop with *aht cannot ask a
-  Windows machine yet. On the PC, use Pick Up or Leave a Note.*
+- **A PC starts every exchange.** At the PC, Pick Up from the Mac;
+  before you leave the PC, Leave a Note (or Hand Back) on the Mac. Aimed
+  at a PC, both stop with *A Windows PC does this from its own side: on
+  the PC, use Pick Up or Leave a Note.* (A PC that answers takes Hand
+  Over and Take Back from the Mac.)
 - **What it costs.** Writing the summary costs nothing: aht reads the
   histories itself. **Open in** makes the agent read the summary as its
   first turn, which uses tokens (in never-ask mode Kimi reads it in a run

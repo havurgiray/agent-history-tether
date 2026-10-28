@@ -237,6 +237,7 @@ struct Project: Identifiable, Hashable {
     let awayHolder: String?         // that machine's own name for itself
     let awayAgent: String?          // the agent working on it there (`away_agent`); nil: not said
     let awayWindow: String?         // the window aht runs it in there (`away_window`): Peek
+    let awayArrival: Bool           // handed over to a PC (`away_arrival`): Continue here waits there
     let mirror: String?
     let syncedAt: Double?
     let syncStatus: String?
@@ -269,9 +270,17 @@ struct Project: Identifiable, Hashable {
     /// while that is open: Hand Back to it is `leave-note --on` it.
     var pickedUpFrom: String? { pickedUp.flatMap { knowsPickupFrom ? $0.remote : $0.name } }
     /// Take Back can ask the machine that has it from here: one this Mac set
-    /// up, and not a PC (a PC answers no other machine).
-    var canTakeBack: Bool {
-        away != nil && awaySystem != "Windows" && (awayDrivenBy != "there" || awayRemote != nil)
+    /// up, and not a PC that cannot be asked (see Machine.asks); with no
+    /// machines known, never a PC.
+    var canTakeBack: Bool { takesBack([]) }
+    func takesBack(_ ms: [Machine]) -> Bool {
+        away != nil && (!pcAway(ms) || machineAnswers(awayRemote, ms))
+            && (awayDrivenBy != "there" || awayRemote != nil)
+    }
+    /// The machine that has it is a Windows PC (`away_system`, `away_arrival`,
+    /// or that machine's own `system` here).
+    func pcAway(_ ms: [Machine]) -> Bool {
+        away != nil && (awayArrival || awaySystem == "Windows" || ms.first { $0.name == awayRemote }?.system == "Windows")
     }
     /// The machine Send Back returns this folder to: it was brought (or
     /// handed over) here from there.
@@ -286,6 +295,8 @@ struct Project: Identifiable, Hashable {
     /// The agent working on it there, in words ("Codex"); nil: not said.
     var awayAgentLabel: String? { awayAgent.map { AGENT_LABEL[$0] ?? $0 } }
     var place: String {
+        // handed over to a PC: nothing runs there until Continue here
+        if awayArrival, let host = away { return "Continue here waits on " + (awayRemote ?? host) }
         if let host = away { return "on " + host + (awayAgentLabel.map { " (\($0))" } ?? "") }
         if let h = handing { return "handing over to " + h.machine }
         if !exists { return "missing" }
@@ -315,6 +326,7 @@ struct Project: Identifiable, Hashable {
         awayHolder = firstText(d["away_holder"], aw?["holder"])
         awayAgent = firstText(d["away_agent"], aw?["agent"])
         awayWindow = firstText(d["away_window"], aw?["window"])
+        awayArrival = (d["away_arrival"] as? Bool ?? aw?["arrival"] as? Bool) == true
         mirror = d["mirror"] as? String
         syncedAt = (d["mirror_synced_at"] as? NSNumber)?.doubleValue
         syncStatus = d["mirror_status"] as? String
@@ -489,11 +501,14 @@ struct CopyOf: Hashable {
     let remote: String?             // … by this Mac's name for it, when the core knows one
     let kind: String                // "sync" | "handover" | "brought" | "returned"
     let at: Date?
-    let system: String?             // the home's system ("Windows": a PC, which no machine can ask)
+    let system: String?             // the home's system ("Windows": a PC)
 
-    /// Its home is a PC: it goes back from there (Take Back on the PC), never
-    /// with Send Back from here.
+    /// Its home is a PC: it gets it back from there (Take Back on the PC).
     var pcHome: Bool { system == "Windows" }
+    /// Send Back cannot return it: its home is a PC, also one that answers
+    /// (the PC keeps the project's record; the core refuses Send Back to
+    /// any PC).  `ms` is kept for the callers; any PC blocks.
+    func pcBlocks(_ ms: [Machine]) -> Bool { pcHome }
 
     init?(_ any: Any?) {
         guard let d = any as? [String: Any],
@@ -821,8 +836,8 @@ func stoppedText(_ to: String, ok: Bool, err: String, now: Project?, changed: Bo
 }
 
 /// The line under a folder that is a copy of a project on another machine.
-func copyLine(_ c: CopyOf) -> String {
-    if c.pcHome && (c.kind == "handover" || c.kind == "brought") {
+func copyLine(_ c: CopyOf, _ ms: [Machine] = []) -> String {
+    if c.pcBlocks(ms) && (c.kind == "handover" || c.kind == "brought") {
         return (c.kind == "brought" ? "Brought here from " : "Handed over from ") + "\(c.from): "
             + "take it back on \(c.remote ?? c.from)"
     }
@@ -1111,16 +1126,51 @@ struct Machine: Identifiable, Hashable {
     var watch = false               // asked every 2 minutes for sessions that wait for you
     var system = ""                 // Darwin, Linux or Windows, as it answered when added
     var paths: PathMap? = nil       // its folders: the same paths, home to home, or pairs
+    var saysAnswers = false         // the core says whether a PC answers (`answers` is there)
+    var answers: Bool? = nil        // … true, false, or nil: not asked yet
+    var answersWhy: String? = nil   // … and why not (`answers_why`): an older aht there, no ssh server
     var id: String { name }
+
+    /// aht here can ask it: a Mac or Linux machine; a Windows PC when the
+    /// core says it answers (`answers` true: aht or its own copy answered
+    /// there).  `answers` false (why in `answers_why`: "install aht on pc:
+    /// …", "not asked yet: …"), or no `answers` at all (an older core,
+    /// which cannot ask a PC): it cannot be asked.
+    var asks: Bool { system != "Windows" || (saysAnswers && answers == true) }
+    /// Why aht cannot ask this PC, in the core's words; nil when it can.
+    var cannotAsk: String? { asks ? nil : answersWhy ?? "aht cannot ask a Windows machine yet." }
 }
 
+/// Whether aht can ask the machine set up here under `name` (see Machine.asks);
+/// a machine not set up here cannot be asked.
+func machineAnswers(_ name: String?, _ ms: [Machine]) -> Bool {
+    ms.first { $0.name == name }?.asks ?? false
+}
+
+/// Why aht cannot ask that machine, in the core's words when it said them.
+func machineCannotAsk(_ name: String?, _ ms: [Machine]) -> String {
+    ms.first { $0.name == name }?.cannotAsk ?? "aht cannot ask a Windows machine yet."
+}
+
+/// `remote add` refused a Windows PC (it does not answer yet): its sheet
+/// gets a "?" to the guide's PC setup.
+func pcAddFailure(_ said: String) -> Bool {
+    said.contains("Windows") || said.range(of: #"\bPC\b"#, options: .regularExpression) != nil
+}
+
+/// The guide's section on setting up a Windows PC that your Mac can ask.
+let PC_SETUP_TOPIC = "A Windows PC that answers"
+
 /// The machines set up (`status --json`'s `handover.remotes`, or
-/// `remote list --json`'s `remotes`: the same {name: settings}).
+/// `remote list --json`'s `remotes`: the same {name: settings}, with
+/// `answers` and `answers_why`).
 func machinesFrom(_ remotes: Any?) -> [Machine] {
     ((remotes as? [String: Any]) ?? [:]).map { k, v in
         let d = (v as? [String: Any]) ?? [:]
         return Machine(name: k, target: d["ssh"] as? String ?? "", watch: d["watch"] as? Bool ?? false,
-                       system: d["system"] as? String ?? "", paths: pathMap(d["paths"]))
+                       system: d["system"] as? String ?? "", paths: pathMap(d["paths"]),
+                       saysAnswers: d.keys.contains("answers"), answers: d["answers"] as? Bool,
+                       answersWhy: firstText(d["answers_why"]))
     }.sorted { $0.name < $1.name }
 }
 
@@ -1566,24 +1616,36 @@ func sendBackReady(_ v: SendBackView) -> Bool {
         && nameProblems(v.dry).isEmpty
 }
 
-/// The line over a project another machine took from here with Bring Here:
-/// "On pc since 14:10 (brought there from pc). Send it back from pc."
 /// Why Send Back cannot ask the project's home from here: it is not set up
-/// here (copy_of.remote is null), or it is a PC, which answers no machine.
+/// here (copy_of.remote is null), or it is a PC (which keeps the record, also
+/// when it answers).
 func sendBackBlocked(_ p: Project, _ ms: [Machine]) -> String? {
     guard let c = p.copyOf, let to = p.sendBackTo else { return nil }
-    if c.pcHome { return "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)" }
+    if c.pcBlocks(ms) {
+        return machineAnswers(c.remote, ms)
+            ? "\(to) is a Windows PC, which keeps this project's record: take it back on \(to)"
+            : "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)"
+    }
     guard let r = c.remote, let mc = ms.first(where: { $0.name == r }) else {
         return "\(c.from) is not set up on this Mac: add it under Machines, then send it back"
     }
-    return mc.system == "Windows" ? "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)" : nil
+    return mc.asks ? nil : "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)"
 }
 
-func awayLine(_ p: Project) -> String? {
-    guard let host = p.awayHolder ?? p.away, p.awayDrivenBy == "there" else { return nil }
+/// The line over a project that is on another machine and shows no session
+/// of its own here: one that machine took with Bring Here ("On pc since
+/// 14:10 (brought there from pc). Send it back from pc."), or one handed
+/// over to a PC, where no session starts ("On pc since 14:10: continue it
+/// on the PC (its tray offers Continue here).").
+func awayLine(_ p: Project, _ ms: [Machine] = []) -> String? {
     let at = clock(p.awaySince)
+    if p.awayDrivenBy != "there", p.pcAway(ms), let pc = p.awayRemote ?? p.awayHolder ?? p.away {
+        return "On \(pc)" + (at.isEmpty ? "" : " since \(at)") + ": continue it on the PC (its tray offers Continue here)."
+    }
+    guard let host = p.awayHolder ?? p.away, p.awayDrivenBy == "there" else { return nil }
     return "On \(host)" + (at.isEmpty ? "" : " since \(at)") + (p.awayAgentLabel.map { ", in " + $0 } ?? "")
-        + " (brought there from \(host)). Send it back from \(host)."
+        + " (brought there from \(host)). Send it back from \(host)"
+        + (p.pcAway(ms) && p.takesBack(ms) ? ", or take it back here." : ".")
 }
 
 /// How the folders here match the folders on a machine (`remotes.<name>.paths`).
@@ -1685,6 +1747,15 @@ func checkRows(_ d: [String: Any]) -> (rows: [Check], error: String?) {
               group: $0["group"] as? String)
     }
     return (rows, row["error"] as? String ?? (d.isEmpty ? "aht gave no answer" : nil))
+}
+
+/// Under a PC's check, when aht can ask it: no session starts there (unless
+/// the core's own row "no session starts there" says so).
+func pcCheckNote(_ mc: Machine, _ rows: [Check]) -> String? {
+    let ask = rows.contains { $0.group != nil } ? rows.filter { $0.group == "ask" } : rows
+    guard mc.system == "Windows", mc.asks, !ask.isEmpty, ask.allSatisfy({ $0.ok || !$0.needed }),
+          !rows.contains(where: { $0.name.lowercased().hasPrefix("no session starts") }) else { return nil }
+    return "No session starts on a PC: its tray offers Continue here."
 }
 
 /// The checks in their groups: what aht needs to ask the machine at all
@@ -1923,6 +1994,45 @@ func farFirst(_ d: [String: Any]) -> String? {
 func agentStarts(_ agent: String, on: String?) -> String {
     agent == "claude" ? (on == nil ? "Its session opens here in a new terminal window" : "The session is resumed there")
         : "\(AGENT_LABEL[agent] ?? agent) starts \(on.map { "on " + $0 } ?? "here") with aht's summary of the work"
+}
+
+/// Hand Over to a Windows PC: the dry run says so (`pc`), or names Windows
+/// there (`there.system`, or `system`), or the machine it goes to is a PC.
+func handoverToPC(_ d: [String: Any], _ mc: Machine?) -> Bool {
+    d["pc"] as? Bool == true
+        || (firstText((d["there"] as? [String: Any])?["system"], d["system"]) ?? mc?.system) == "Windows"
+}
+
+/// What Hand Over to a PC says where another machine's sheet names the
+/// agent that starts there: no session starts on a PC.
+func pcStartsText(_ pc: String) -> String {
+    "No session starts on \(pc): aht copies the project there, and the PC's tray offers “Continue here”, "
+        + "which opens it in Claude Code. This folder is marked as away until you take it back."
+}
+
+/// `handover --apply` to a PC: no session was started there (`started:
+/// false` with `start_reason` or `reason` "windows", at the top or under
+/// `start`).
+func startedNotOnPC(_ d: [String: Any]) -> Bool {
+    let s = (d["start"] as? [String: Any]) ?? d
+    return s["started"] as? Bool == false && firstText(s["start_reason"], s["reason"]) == "windows"
+}
+
+/// What Hand Over says when it went through: what was sent, and what runs
+/// there (nothing on a PC: `toPC`, from the dry run, or the core's answer).
+func handoverDoneText(_ d: [String: Any], remote: String, agent: String = "claude", task: String = "",
+                      toPC: Bool = false) -> String {
+    let s = (d["sent"] as? [String: Any]) ?? [:]
+    var done = "Handed over to \(remote): \(s["files"] as? Int ?? 0) "
+        + "file(s) sent, \(byteText(s["wire_bytes"])) over the network."
+    if toPC || startedNotOnPC(d) {
+        done += " No session started there: its tray offers “Continue here”."
+    } else {
+        if agent != "claude" { done += " \(AGENT_LABEL[agent] ?? agent) started there with aht's summary of the work." }
+        if !task.isEmpty { done += "\nIt started on: " + task }
+    }
+    for w in (d["warnings"] as? [String]) ?? [] { done += "\n⚠ " + w }
+    return done
 }
 
 /// Hand Over's command: the dry run, or `apply` it (with its status file and
@@ -2169,6 +2279,7 @@ struct HandoverPlan: Identifiable {
     var dry: [String: Any] = [:]    // the dry run: paths, names, line endings, git
     var blocked = false             // names or the folder there stand in the way
     var agent = "claude"            // Agent there: Claude Code's own session, or another agent (--agent)
+    var toPC = false                // a Windows PC: no session starts there, its tray offers Continue here
 }
 
 struct RulesView: Identifiable {
@@ -2504,10 +2615,24 @@ struct MachineItem: Hashable {
     let kind: String                // "back" | "pickup" | "note"
 }
 
-/// The machines Pick Up and Leave a Note can ask: all but a Windows PC,
-/// which answers no other machine.
+/// The machines Pick Up, Leave a Note and Bring Here can ask: Mac and Linux
+/// ones.  A Windows PC starts these itself, also one that answers (that one
+/// takes Hand Over, Take Back, Watch, search and Check from here): the core
+/// refuses them for every PC.
 func askableMachines(_ ms: [Machine]) -> [String] {
-    ms.filter { $0.system != "Windows" }.map { $0.name }
+    ms.filter { $0.asks && $0.system != "Windows" }.map { $0.name }
+}
+
+/// A machine set up here under `name` is a Windows PC.
+func machineIsPC(_ name: String?, _ ms: [Machine]) -> Bool {
+    ms.first { $0.name == name }?.system == "Windows"
+}
+
+/// The board's Open Session for a handed-over session: not for one on a PC,
+/// where no session runs for aht to open (`attach` refuses it; the PC's tray
+/// offers Continue here).
+func boardOpens(_ r: BoardRow, _ p: Project, _ ms: [Machine]) -> Bool {
+    !p.pcAway(ms) && !machineIsPC(r.machine, ms)
 }
 
 /// The Machines menu: Hand Back first, then Pick Up from each machine, then
@@ -3513,18 +3638,18 @@ final class AppModel: ObservableObject {
                     body += "\n" + replaceThereLine(changedThere(plan) ?? r, remote) + "\n"
                 }
                 // what starts there, and that this folder is marked as away: the
-                // sheet says it, for the agent chosen there
+                // sheet says it, for the agent chosen there (on a PC: nothing starts)
                 self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body.trimmingCharacters(in: .newlines),
-                                                 replaceThere: replacing != nil, dry: plan)
+                                                 replaceThere: replacing != nil, dry: plan,
+                                                 toPC: handoverToPC(plan, self.machines.first { $0.name == remote }))
             }
         }
     }
 
     func confirmHandover(_ plan: HandoverPlan) {
         let p = plan.project, remote = plan.remote
-        let task = plan.task.trimmingCharacters(in: .whitespacesAndNewlines)
+        let task = plan.toPC ? "" : plan.task.trimmingCharacters(in: .whitespacesAndNewlines)
         let file = self.stageFile(p.path)
-        let label = AGENT_LABEL[plan.agent] ?? plan.agent
         do {
                 self.busy("handing \(p.name) over…", follow: file) {
                     let d = ahtJSON(handoverArgs(p.path, to: self.machine, agent: plan.agent,
@@ -3534,13 +3659,7 @@ final class AppModel: ObservableObject {
                         self.note(p.path, "The handover did not go through:\n\n" + why)
                         return
                     }
-                    let s = (d["sent"] as? [String: Any]) ?? [:]
-                    var done = "Handed over to \(remote): \(s["files"] as? Int ?? 0) "
-                        + "file(s) sent, \(byteText(s["wire_bytes"])) over the network."
-                    if plan.agent != "claude" { done += " \(label) started there with aht's summary of the work." }
-                    if !task.isEmpty { done += "\nIt started on: " + task }
-                    for w in (d["warnings"] as? [String]) ?? [] { done += "\n⚠ " + w }
-                    self.note(p.path, done)
+                    self.note(p.path, handoverDoneText(d, remote: remote, agent: plan.agent, task: task, toPC: plan.toPC))
                     // Kimi below never-ask opened without reading the summary: the
                     // first message to paste into its window there (Open Session)
                     if plan.agent == "kimi", let first = farFirst(d) {
@@ -3564,7 +3683,8 @@ final class AppModel: ObservableObject {
     /// Back's plan, "keep both" and set-aside; no session there to end), and
     /// then the sync goes on.
     func takeBack(_ p: Project, copy: Bool = false) {
-        let stop = copy ? [] : ["--stop"]
+        // aht ends no session on a PC: one open there blocks, in the core's words
+        let stop = copy || p.pcAway(machines) ? [] : ["--stop"]
         note(p.path, nil)
         busy("checking \(p.name)…") {
             let asked = ahtJSON(["reclaim", p.path, "--json"] + stop) ?? [:]
@@ -4639,7 +4759,7 @@ final class AppModel: ObservableObject {
     /// Send Back on a project brought here: home plans the return against
     /// its own copy (a dry run), the sheet shows it.
     func openSendBack(_ p: Project) {
-        guard let to = p.sendBackTo, p.copyOf?.pcHome != true else { return }
+        guard let to = p.sendBackTo, p.copyOf?.pcBlocks(machines) != true else { return }
         sendBack = SendBackView(project: p, machine: to)
         lookSendBack()
     }
@@ -5308,8 +5428,17 @@ final class AppModel: ObservableObject {
         showGuideWindow(topic)
     }
 
+    /// Open the session there in a new terminal; when `attach` refuses (a PC,
+    /// where no session runs for aht to open), the core's reason.
     func openSession(_ p: Project) {
-        background { aht(["attach", p.path, "--window"]) }
+        background {
+            let r = shWithStderr(PY, [ahtScript(), "attach", p.path, "--window"])
+            guard !r.ok else { return }
+            let said = (r.err + r.out).trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                _ = alert("The session did not open", said.isEmpty ? "aht gave no answer." : said)
+            }
+        }
     }
 
     func continueHere(_ p: Project, handedOver: Bool = false) {
@@ -5392,6 +5521,9 @@ final class AppModel: ObservableObject {
                 self.checkError[m.name] = error
                 for (n, t) in checkTransfers(d) { self.movers[n] = Mover(mode: mode, transfer: t) }
             }
+            // a PC: whether it answers, as the core now has it
+            let said = ((d["machines"] as? [[String: Any]]) ?? []).first?["system"] as? String
+            if m.system == "Windows" || said == "Windows" { self.refresh() }
         }
     }
 
@@ -5469,6 +5601,10 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 if r.ok {
                     self.check(Machine(name: name, target: target))
+                } else if pcAddFailure(r.out) {
+                    // a PC that does not answer yet: the core's reason, and the guide's setup
+                    self.textSheet = TextSheet(title: "\(name) could not be added", text: r.out, project: nil,
+                                               topic: PC_SETUP_TOPIC)
                 } else {
                     _ = alert("\(name) could not be added", r.out)
                 }
@@ -5877,13 +6013,13 @@ struct DetailView: View {
                 Text(tilde(p.path)).font(.caption).foregroundColor(.secondary)
                     .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
                 if let c = p.copyOf, p.away == nil {
-                    Label(copyLine(c), systemImage: c.kind == "sync" ? "arrow.triangle.2.circlepath"
+                    Label(copyLine(c, m.machines), systemImage: c.kind == "sync" ? "arrow.triangle.2.circlepath"
                                                                      : "laptopcomputer.and.arrow.down")
                         .font(.callout).foregroundColor(.secondary).lineLimit(1)
                         .help(c.at.map { "Since " + clock($0) } ?? "")
                 }
                 if let h = p.handing, h.state != "running" { HandingBanner(p: p, h: h) }
-                if let line = awayLine(p) { HeldThereBanner(p: p, line: line) }
+                if let line = awayLine(p, m.machines) { HeldThereBanner(p: p, line: line) }
                 if let s = p.syncPaused, let to = p.mirror, p.away == nil, p.handing == nil {
                     SyncPausedBanner(p: p, s: s, to: s.machine ?? to)
                 }
@@ -5938,6 +6074,9 @@ struct DetailView: View {
     }
 
     func state(_ p: Project) -> String {
+        if p.awayArrival, p.away != nil {       // a PC: nothing runs there until Continue here
+            return p.place + (p.awaySince.map { ", " + ago($0) } ?? "")
+        }
         if let host = p.away {
             return (p.awayDrivenBy == "there" ? "brought to \(host)" : "handed over to \(host)")
                 + (p.awaySince.map { ", " + ago($0) } ?? "")
@@ -6340,7 +6479,14 @@ struct BoardRowView: View {
             } else if r.handedOver, let p = m.projects.first(where: { q in q.away != nil
                                                                  && (r.herePath.map { $0 == q.path }
                                                                      ?? r.project.hasSuffix(q.path)) }) {
-                Button("Open Session") { m.openSession(p) }.controlSize(.small)
+                if boardOpens(r, p, m.machines) {
+                    Button("Open Session") { m.openSession(p) }.controlSize(.small)
+                } else {
+                    // a PC: no session runs there for aht to open
+                    Text("Open it on the PC").font(.caption).foregroundColor(.secondary)
+                        .help("No session runs on \(p.awayRemote ?? r.machine) for aht to open: on the PC, "
+                              + "its tray offers Continue here")
+                }
             } else if r.local, m.projects.contains(where: { $0.path == r.project }) {
                 Button("Show Project") { m.show(r.project) }.controlSize(.small)
             }
@@ -6447,7 +6593,12 @@ struct SearchHitView: View {
                     Text("deleted — in a backup").font(.caption).foregroundColor(.orange)
                 }
                 Spacer()
-                if let mc = h.machine {
+                if let mc = h.machine, machineIsPC(mc, m.machines) {
+                    // a PC's: it starts every Pick Up itself
+                    Text("Continue it on \(mc)").font(.caption).foregroundColor(.secondary)
+                        .help("A Windows PC starts Pick Up and Leave a Note itself: on \(mc), "
+                              + "Leave a Note on this Mac to go on with it here")
+                } else if let mc = h.machine {
                     // another machine's: Pick Up that session here
                     Button("Continue Here…") { m.pickUpHit(h) }.controlSize(.small)
                         .disabled(!m.canReach || m.pickup != nil)
@@ -6526,17 +6677,26 @@ struct HandoverSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             Divider()
-            agentThere
+            if plan.toPC {
+                // no session starts on a PC: no agent to choose, no task to start on
+                Text(pcStartsText(plan.remote)).fixedSize(horizontal: false, vertical: true)
+                PermLine(d: plan.dry, agent: "claude", source: firstText(plan.dry["agent"]) ?? "claude", on: plan.remote,
+                         leaving: { "the \($0.map { $0 + " " } ?? "")session here" })
+            } else {
+                agentThere
+            }
             CrossingNotes(d: plan.dry, receiver: plan.remote, keeper: plan.remote)
-            Text("A task to start on over there (optional)").padding(.top, 6)
-            TextEditor(text: $plan.task)
-                .font(.body).frame(height: 70)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
-            Text(plan.agent == "claude"
-                 ? "With a task, the session begins working on it as soon as it has resumed; "
-                    + "you can follow it and answer its questions from the Claude app."
-                 : "With a task, \(label) works on it right after reading the summary.")
-                .font(.caption).foregroundColor(.secondary)
+            if !plan.toPC {
+                Text("A task to start on over there (optional)").padding(.top, 6)
+                TextEditor(text: $plan.task)
+                    .font(.body).frame(height: 70)
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+                Text(plan.agent == "claude"
+                     ? "With a task, the session begins working on it as soon as it has resumed; "
+                        + "you can follow it and answer its questions from the Claude app."
+                     : "With a task, \(label) works on it right after reading the summary.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { m.handoverPlan = nil }.keyboardShortcut(.cancelAction)
@@ -7056,10 +7216,13 @@ struct HeldThereBanner: View {
             Image(systemName: "laptopcomputer.and.arrow.down").foregroundColor(.blue)
             Text(line).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 8)
-            if p.canTakeBack { Button("Take Back…") { m.takeBack(p) }.disabled(!m.supported) }
-            Button("Release…") { m.release(p) }
-                .help("Stop waiting for it: the files here stay as they are, and the copy on "
-                      + "\(p.awayHolder ?? p.away ?? "that machine") is not touched")
+            // handed over to a PC from here: its buttons are the project's own (AwayButtons)
+            if p.awayDrivenBy == "there" {
+                if p.takesBack(m.machines) { Button("Take Back…") { m.takeBack(p) }.disabled(!m.supported) }
+                Button("Release…") { m.release(p) }
+                    .help("Stop waiting for it: the files here stay as they are, and the copy on "
+                          + "\(p.awayHolder ?? p.away ?? "that machine") is not touched")
+            }
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.08)))
@@ -7137,7 +7300,17 @@ struct AwayButtons: View {
     let p: Project
 
     var body: some View {
-        if p.awayDrivenBy != "there" {
+        if p.awayDrivenBy != "there" && p.pcAway(m.machines) {
+            // a PC: no session started there, so none to open or peek at
+            Button("Take Back…") { m.takeBack(p) }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!p.takesBack(m.machines))
+                .help(p.takesBack(m.machines) ? "Bring the work done on the PC back here"
+                      : machineCannotAsk(p.awayRemote, m.machines))
+            Button("Release…") { m.release(p) }
+                .help("Stop waiting for it: the files here stay as they are, "
+                      + "and the copy over there is not touched")
+        } else if p.awayDrivenBy != "there" {
             Button("Take Back…") { m.takeBack(p) }
                 .keyboardShortcut(.defaultAction)
             Button("Open Session") { m.openSession(p) }
@@ -7159,10 +7332,11 @@ struct HereButtons: View {
     let p: Project
 
     var body: some View {
-        if let to = p.sendBackTo, p.copyOf?.pcHome == true {
-            // a PC cannot be asked: the project goes back from there
+        if let to = p.sendBackTo, p.copyOf?.pcBlocks(m.machines) == true {
+            // a PC: the project goes back from there
             Text("Take it back on \(to)").foregroundColor(.secondary)
-                .help("\(to) is a Windows PC, which no other machine can ask: take the project back there")
+                .help((sendBackBlocked(p, m.machines) ?? "") + (machineAnswers(p.copyOf?.remote, m.machines)
+                      ? "" : ". " + machineCannotAsk(p.copyOf?.remote, m.machines)))
         } else if let to = p.sendBackTo {
             let why = sendBackBlocked(p, m.machines)
             Button("Send Back to \(to)…") { m.openSendBack(p) }
@@ -7198,7 +7372,7 @@ struct HereButtons: View {
             .disabled(m.machine == nil || !m.supported || p.handing != nil || refused)
             .help(!refused ? ""
                   : p.sendBackTo != nil ? "This folder is \(p.sendBackTo ?? "")'s project, brought here: "
-                    + (p.copyOf?.pcHome == true ? "take it back on \(p.sendBackTo ?? "")" : "Send Back returns the work")
+                    + (p.copyOf?.pcBlocks(m.machines) == true ? "take it back on \(p.sendBackTo ?? "")" : "Send Back returns the work")
                   : "This folder is \(m.machine ?? "that machine")'s synced copy: syncing "
                     + "it back would overwrite one copy with the other")
     }
@@ -8952,15 +9126,18 @@ struct MachinesView: View {
                                         .cornerRadius(4)
                                 }
                                 Spacer()
-                                if mc.name != m.machine {
+                                // a PC that cannot be asked is never handed a project
+                                if mc.name != m.machine && mc.asks {
                                     Button("Use for Handover") { m.use(mc) }
                                 }
-                                Menu("Sync") {
-                                    Button("Keep All Projects in Sync…") { m.syncAll(mc, on: true) }
-                                    Button("Stop Keeping All in Sync…") { m.syncAll(mc, on: false) }
-                                        .disabled(m.mirroredCount == 0)
+                                if mc.asks {
+                                    Menu("Sync") {
+                                        Button("Keep All Projects in Sync…") { m.syncAll(mc, on: true) }
+                                        Button("Stop Keeping All in Sync…") { m.syncAll(mc, on: false) }
+                                            .disabled(m.mirroredCount == 0)
+                                    }
+                                    .fixedSize()
                                 }
-                                .fixedSize()
                                 let held = pausedWith(m.projects, mc.name)
                                 if !held.isEmpty {
                                     // syncs with this machine that wait for an answer
@@ -8968,7 +9145,8 @@ struct MachinesView: View {
                                         .buttonStyle(.borderless).foregroundColor(.orange)
                                         .help(pausedHelp(held, mc.name))
                                 }
-                                if mc.system != "Windows" {
+                                // a PC brings nothing here from its side: Bring Here starts on the PC
+                                if mc.asks && mc.system != "Windows" {
                                     Button("Bring Here…") { m.openBring(from: mc.name) }
                                         .disabled(!m.canReach)
                                         .help("Bring a project aht keeps on \(mc.name) here, with its history")
@@ -8980,8 +9158,8 @@ struct MachinesView: View {
                             HStack(spacing: 10) {
                                 Toggle("Watch", isOn: Binding(get: { mc.watch }, set: { m.watch(mc, $0) }))
                                     .toggleStyle(.switch).controlSize(.small)
-                                    .disabled(!m.canReach)
-                                    .help("aht asks \(mc.name) every 2 minutes and tells you when a "
+                                    .disabled(!m.canReach || !mc.asks)
+                                    .help(mc.cannotAsk ?? "aht asks \(mc.name) every 2 minutes and tells you when a "
                                           + "session there waits for you or is done")
                                 if let b = m.heard(mc.name) {
                                     // a core without `last_heard`: it answered when the board was read
@@ -8992,8 +9170,19 @@ struct MachinesView: View {
                                 }
                             }
                             if let pm = m.pathsFor(mc) { PathMapLine(mc: mc, map: pm) }
+                            // a PC that cannot be asked: the core's reason, and how to set one up
+                            if let why = mc.cannotAsk, m.checkError[mc.name] == nil {
+                                HStack(spacing: 6) {
+                                    Text(why).font(.callout).foregroundColor(.orange)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    HelpButton(PC_SETUP_TOPIC)
+                                }
+                            }
                             if let e = m.checkError[mc.name] {
-                                Text("✗ " + e).foregroundColor(.red)
+                                HStack(spacing: 6) {
+                                    Text("✗ " + e).foregroundColor(.red)
+                                    if mc.system == "Windows" { HelpButton(PC_SETUP_TOPIC) }
+                                }
                             }
                             ForEach(checkGroups(m.checks[mc.name] ?? []), id: \.title) { g in
                                 if !g.title.isEmpty {
@@ -9001,6 +9190,9 @@ struct MachinesView: View {
                                         .foregroundColor(.secondary).padding(.top, 2)
                                 }
                                 ForEach(g.rows) { c in CheckRow(c: c) }
+                            }
+                            if let t = pcCheckNote(mc, m.checks[mc.name] ?? []) {
+                                Text(t).font(.caption).foregroundColor(.secondary)
                             }
                             // `transfer`: what copies files to and from it, unless a row says so
                             if let t = m.checkedMover(mc.name),
@@ -13688,6 +13880,192 @@ if CommandLine.arguments.contains("--selftest") {
     } else {
         print("PHASE 8 SAMPLES not checked (" + (dir8.isEmpty ? "AHT_FIXTURES_PHASE8 names no folder"
                                                          : "no samples in \(dir8) yet") + ")")
+    }
+    // Phase 9, a Windows PC that answers: what the core says of each PC
+    // (`answers` true, null or false with `answers_why`; none from an older
+    // core) decides whether it is a machine like the others
+    // as the core's rows say it: `answers` on every row (Mac and Linux always
+    // true); a PC answers when a runner is noted, else why not
+    let ms9 = machinesFrom(["box": ["ssh": "me@box", "system": "Linux", "answers": true, "answers_why": NSNull()],
+                            "pc": ["ssh": "me@pc", "system": "Windows", "runner": "py", "answers": true,
+                                   "answers_why": NSNull()],
+                            "pcnew": ["ssh": "me@pcnew", "system": "Windows", "answers": false,
+                                      "answers_why": "not asked yet: aht remote check pcnew asks it"],
+                            "pcold": ["ssh": "me@pcold", "system": "Windows", "answers": false,
+                                      "answers_why": "update aht on pcold: aht.exe 0.12.0 answers with protocol 2"],
+                            "pcpre": ["ssh": "me@pcpre", "system": "Windows"],
+                            // a runner alone (no `answers`): not a sign any more
+                            "pcrun": ["ssh": "me@pcrun", "system": "Windows", "runner": "aht"]])
+    let byName9 = Dictionary(uniqueKeysWithValues: ms9.map { ($0.name, $0) })
+    let helper9 = byName9["box"]?.asks == true && byName9["pc"]?.asks == true && byName9["pcnew"]?.asks == false
+        && byName9["pcold"]?.asks == false && byName9["pcpre"]?.asks == false && byName9["pcrun"]?.asks == false
+        && byName9["pcnew"]?.cannotAsk == "not asked yet: aht remote check pcnew asks it"
+        && byName9["pcold"]?.cannotAsk == "update aht on pcold: aht.exe 0.12.0 answers with protocol 2"
+        && byName9["pcpre"]?.cannotAsk == "aht cannot ask a Windows machine yet." && byName9["pc"]?.cannotAsk == nil
+        && askableMachines(ms9) == ["box"] && machineAnswers("pc", ms9) && !machineAnswers("pcold", ms9)
+        && !machineAnswers("gone", ms9) && machineCannotAsk("pcold", ms9).hasPrefix("update aht on pcold")
+        && pcAddFailure("✗ aht cannot ask a Windows machine yet.") && !pcAddFailure("✗ me@box refused the connection.")
+    let at9 = "2026-10-28T14:10:00"
+    let onPC9 = Project(["real_path": "/x/paper", "exists": true, "away": "DESKTOP-PC", "away_remote": "pc",
+                         "away_since": at9, "away_driven_by": "here", "away_system": "Windows"])
+    let onOld9 = Project(["real_path": "/x/old", "exists": true, "away": "pcold", "away_remote": "pcold",
+                          "away_since": at9, "away_driven_by": "here"])
+    let tookPC9 = Project(["real_path": "/x/site", "exists": true, "away": "DESKTOP-PC", "away_remote": "pc",
+                           "away_holder": "pc", "away_since": at9, "away_driven_by": "there", "away_system": "Windows"])
+    let onBox9 = Project(["real_path": "/x/api", "exists": true, "away": "box", "away_remote": "box",
+                          "away_since": at9, "away_driven_by": "here", "away_system": "Linux"])
+    let away9 = awayLine(onPC9, ms9) == "On pc since \(clock(at9)): continue it on the PC (its tray offers Continue here)."
+        && onPC9.takesBack(ms9) && !onPC9.canTakeBack && onPC9.pcAway(ms9)
+        && onOld9.pcAway(ms9) && !onOld9.takesBack(ms9) && awayLine(onOld9, ms9)?.hasPrefix("On pcold since ") == true
+        && awayLine(tookPC9, ms9) == "On pc since \(clock(at9)) (brought there from pc). Send it back from pc, or take it back here."
+        && awayLine(tookPC9) == "On pc since \(clock(at9)) (brought there from pc). Send it back from pc."
+        && tookPC9.takesBack(ms9) && !tookPC9.canTakeBack
+        && awayLine(onBox9, ms9) == nil && onBox9.takesBack(ms9) && !onBox9.pcAway(ms9)
+    // `away_arrival`: handed over to a PC, Continue here waits there (no agent works on it)
+    let arr9 = Project(["real_path": "/x/shop", "exists": true, "away": "pc", "away_remote": "pc", "away_since": at9,
+                        "away_driven_by": "here", "away_agent": "claude", "away_window": "aht-shop-8f9349",
+                        "away_arrival": true])
+    let arrival9 = arr9.awayArrival && arr9.pcAway(ms9) && arr9.place == "Continue here waits on pc"
+        && arr9.takesBack(ms9) && !onPC9.awayArrival && onPC9.place == "on DESKTOP-PC"
+        && awayLine(arr9, ms9) == "On pc since \(clock(at9)): continue it on the PC (its tray offers Continue here)."
+    let sent9: [String: Any] = ["sent": ["files": 812, "wire_bytes": 2_000_000]]
+    let hand9 = handoverToPC(["there": ["system": "Windows", "home": "C:\\Users\\me"]], nil) && handoverToPC(["pc": true], nil)
+        && handoverToPC(["system": "Windows"], nil) && handoverToPC([:], byName9["pc"])
+        && !handoverToPC(["there": ["system": "Linux"]], byName9["pc"]) && !handoverToPC([:], byName9["box"])
+        && pcStartsText("pc") == "No session starts on pc: aht copies the project there, and the PC's tray offers "
+            + "“Continue here”, which opens it in Claude Code. This folder is marked as away until you take it back."
+        && handoverDoneText(sent9.merging(["started": false, "reason": "windows"]) { a, _ in a }, remote: "pc")
+            == "Handed over to pc: 812 file(s) sent, \(byteText(2_000_000)) over the network. "
+            + "No session started there: its tray offers “Continue here”."
+        && handoverDoneText(sent9.merging(["start": ["started": false, "reason": "windows"]]) { a, _ in a },
+                            remote: "pc", task: "fix it").hasSuffix("its tray offers “Continue here”.")
+        && startedNotOnPC(["started": false, "start_reason": "windows", "arrival": "aht-api-1a2b3c"])
+        && handoverDoneText(sent9, remote: "pc", toPC: true).hasSuffix("No session started there: its tray offers “Continue here”.")
+        && !startedNotOnPC(["started": false, "reason": "tmux"]) && !startedNotOnPC(sent9)
+        && handoverDoneText(sent9, remote: "box", agent: "codex", task: "fix it")
+            == "Handed over to box: 812 file(s) sent, \(byteText(2_000_000)) over the network. Codex started there "
+            + "with aht's summary of the work.\nIt started on: fix it"
+    let pcCopy9 = Project(["real_path": "/x/pcwork", "exists": true,
+                           "copy_of": ["from": "DESKTOP-PC", "kind": "handover", "remote": "pc", "system": "Windows"]])
+    let oldCopy9 = Project(["real_path": "/x/oldwork", "exists": true,
+                            "copy_of": ["from": "pcold", "kind": "brought", "remote": "pcold", "system": "Windows"]])
+    // fix round: a PC that answers keeps the project's record: no Send Back to it either
+    let send9 = sendBackBlocked(pcCopy9, ms9) == "pc is a Windows PC, which keeps this project's record: take it back on pc"
+        && pcCopy9.copyOf?.pcBlocks(ms9) == true
+        && copyLine(pcCopy9.copyOf!, ms9) == "Handed over from DESKTOP-PC: take it back on pc"
+        && sendBackBlocked(oldCopy9, ms9)?.contains("Windows PC") == true && oldCopy9.copyOf?.pcBlocks(ms9) == true
+        && copyLine(oldCopy9.copyOf!, ms9) == "Brought here from pcold: take it back on pcold"
+        && sendBackBlocked(pcCopy9, [])?.hasSuffix("take it back on pc") == true
+    let okRows9 = [Check(name: "reachable", ok: true, needed: true, detail: "DESKTOP-PC (Windows)", fix: nil, group: "ask"),
+                   Check(name: "tmux there", ok: false, needed: true, detail: "missing", fix: nil, group: "handover")]
+    let badRows9 = [Check(name: "reachable", ok: false, needed: true, detail: "refused", fix: nil, group: "ask")]
+    let check9 = pcCheckNote(byName9["pc"]!, okRows9) == "No session starts on a PC: its tray offers Continue here."
+        && pcCheckNote(byName9["pc"]!, badRows9) == nil && pcCheckNote(byName9["box"]!, okRows9) == nil
+        && pcCheckNote(byName9["pcold"]!, okRows9) == nil && pcCheckNote(byName9["pc"]!, []) == nil
+        // the core's own row says it: no second line
+        && pcCheckNote(byName9["pc"]!, okRows9 + [Check(name: "no session starts there", ok: true, needed: false,
+                                                        detail: "a project handed over waits on the PC", fix: nil,
+                                                        group: "handover")]) == nil
+    let pc9OK = helper9 && away9 && arrival9 && hand9 && send9 && check9
+    print("PC THAT ANSWERS \(pc9OK ? "OK" : "FAIL — helper \(helper9) away \(away9) arrival \(arrival9) hand over \(hand9) send back \(send9) check \(check9)")")
+    // fix round: what the core refuses for every PC (Pick Up, Leave a Note,
+    // Bring Here, Send Back, attach) is not offered for one that answers
+    // either; Hand Over, Take Back, Watch, search and Check still are
+    let local9 = Project(["real_path": "/x/api", "exists": true])
+    let items9 = machineItems(local9, askableMachines(ms9))
+    let relay9 = askableMachines(ms9) == ["box"] && !items9.contains { $0.machine == "pc" }
+        && items9.map { $0.title } == ["Pick Up from box…", "Leave a Note on box…"]
+        && machineIsPC("pc", ms9) && machineIsPC("pcold", ms9) && !machineIsPC("box", ms9) && !machineIsPC("gone", ms9)
+        && byName9["pc"]?.asks == true && onPC9.takesBack(ms9)
+    let pcRow9 = boardRow(["agent": "claude", "project": "C:\\Users\\me\\code\\shop", "status": "idle",
+                           "handed_over": true, "here_path": "/x/shop"], machine: "pc", local: false)
+    let boxRow9 = boardRow(["agent": "claude", "project": "/home/me/code/api", "status": "idle",
+                            "handed_over": true, "here_path": "/x/api"], machine: "box", local: false)
+    let open9 = !boardOpens(pcRow9, arr9, ms9) && !boardOpens(pcRow9, onPC9, ms9)
+        && !boardOpens(pcRow9, Project(["real_path": "/x/shop", "exists": true, "away": "pc", "away_remote": "pc"]), ms9)
+        && boardOpens(boxRow9, onBox9, ms9)
+    let gate9OK = relay9 && open9
+    print("PC RELAY AND OPEN SESSION NOT OFFERED \(gate9OK ? "OK" : "FAIL — relay \(relay9) open session \(open9) \(items9.map { $0.title })")")
+    if !pc9OK { print("   \(awayLine(onPC9, ms9) ?? "-") | \(awayLine(tookPC9, ms9) ?? "-") | \(copyLine(pcCopy9.copyOf!, ms9))") }
+    // … and the core's phase-9 samples: AHT_FIXTURES_PHASE9 (a PC's check,
+    // Hand Over to a PC dry and applied, a project on a PC, an arrival)
+    let dir9 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE9"] ?? ""
+    let files9 = ((try? FileManager.default.contentsOfDirectory(atPath: dir9)) ?? []).filter { $0.hasSuffix(".json") }.sorted()
+    if !dir9.isEmpty && !files9.isEmpty {
+        var miss: [String] = [], seen: [String] = []
+        for n in files9 {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir9).appendingPathComponent(n))
+            let any = data.flatMap { try? JSONSerialization.jsonObject(with: $0) }
+            // the arrival queue: one record, a list, or {"arrivals": [...]}
+            if n.hasPrefix("arrival") {
+                let recs = (any as? [[String: Any]]) ?? ((any as? [String: Any])?["arrivals"] as? [[String: Any]])
+                    ?? (any as? [String: Any]).map { [$0] } ?? []
+                let ok = !recs.isEmpty && recs.allSatisfy { r in
+                    firstText(r["project"], r["path"]) != nil && firstText(r["from"]) != nil && r["at"] != nil
+                        && firstText(r["name"]) != nil && firstText(r["text"]) != nil && firstText(r["action"]) != nil }
+                if !ok { miss.append(n + " (no name, project, from, at, text and action)") }
+                // as the PC's tray offers it: text — action
+                seen.append("\(n): " + recs.map { "\(firstText($0["text"]) ?? "?") — \(firstText($0["action"]) ?? "?")" }
+                    .joined(separator: ", "))
+                continue
+            }
+            guard let d = any as? [String: Any] else {
+                miss.append(n + " (not JSON)")
+                continue
+            }
+            if let rows = d["machines"] as? [[String: Any]], rows.contains(where: { $0["checks"] != nil || $0["error"] != nil }) {
+                // remote check --json for a PC: its rows, and whether it answers
+                let r = rows.first ?? [:]
+                let (checks, err) = checkRows(d)
+                let mc = Machine(name: firstText(r["remote"]) ?? "pc", target: firstText(r["target"]) ?? "",
+                                 system: firstText(r["system"]) ?? "", saysAnswers: r.keys.contains("answers") || err == nil,
+                                 answers: (r["answers"] as? Bool) ?? (err == nil ? true : false), answersWhy: firstText(r["answers_why"]))
+                if mc.system != "Windows" { miss.append(n + " (no system Windows)") }
+                if checks.isEmpty && err == nil { miss.append(n + " (no rows)") }
+                if err == nil && !checks.contains(where: { $0.name == "aht answers there" }) { miss.append(n + " (no aht answers there)") }
+                seen.append("\(n): \(mc.name) \(checks.count) row(s): " + checks.map { ($0.ok ? "✓ " : $0.needed ? "✗ " : "· ") + $0.name }
+                                .joined(separator: ", ")
+                            + (err.map { ", error: " + $0 } ?? "")
+                            + (pcCheckNote(mc, checks).map { " — " + $0 } ?? ""))
+                continue
+            }
+            if let rows = d["machines"] as? [[String: Any]], !rows.isEmpty {
+                let bm = boardMachines(d)
+                seen.append("\(n): board " + bm.map { "\($0.name) \($0.rows.count)" }.joined(separator: ", "))
+                continue
+            }
+            let rows = (d["projects"] as? [[String: Any]]) ?? (d["real_path"] != nil ? [d] : nil)
+            if let rows = rows {
+                // a project on a PC: its line, with that PC set up here and answering
+                let ps = rows.map(Project.init).filter { $0.away != nil }
+                let lines = ps.compactMap { p -> String? in
+                    let ms = [Machine(name: p.awayRemote ?? p.away ?? "pc", target: "", system: "Windows",
+                                      saysAnswers: true, answers: true)]
+                    return awayLine(p, ms).map { "\(p.name) (\(p.place)): " + $0 + (p.takesBack(ms) ? " [Take Back]" : "") }
+                }
+                if lines.isEmpty { miss.append(n + " (no project on a PC)") }
+                seen.append("\(n): " + lines.joined(separator: "; "))
+                continue
+            }
+            if firstText(d["command"]) == "handover" || n.hasPrefix("handover") {
+                let to = firstText(d["remote"]) ?? "pc"
+                if d["applied"] as? Bool == true {
+                    if !startedNotOnPC(d) { miss.append(n + " (no started: false, start_reason: windows)") }
+                    seen.append("\(n): " + handoverDoneText(d, remote: to))
+                } else {
+                    if !handoverToPC(d, nil) || d["pc"] as? Bool != true { miss.append(n + " (no pc: true, Windows not named there)") }
+                    if let why = pickupProblems(d) { miss.append(n + " (blocked: \(why))") }
+                    seen.append("\(n): " + (handoverToPC(d, nil) ? pcStartsText(to) : "not a PC"))
+                }
+                continue
+            }
+            miss.append(n + " (a shape this test does not know)")
+        }
+        let s9OK = miss.isEmpty && !seen.isEmpty
+        print("PHASE 9 SAMPLES \(s9OK ? "OK" : "FAIL \(miss)") — \(dir9) [" + seen.joined(separator: "; ") + "]")
+    } else {
+        print("PHASE 9 SAMPLES not checked (" + (dir9.isEmpty ? "AHT_FIXTURES_PHASE9 names no folder"
+                                                         : "no samples in \(dir9) yet") + ")")
     }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)

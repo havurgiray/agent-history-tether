@@ -52,7 +52,35 @@ import sys
 import json
 import uuid as _uuid
 import shutil
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    # Windows without aht's entry point, which brings windows/src/win_fcntl:
+    # the copy of aht a Mac or Linux machine runs on a PC with its Python.
+    # Just flock, on a byte-range lock of the lock file's first byte
+    import msvcrt
+
+    class fcntl:                    # noqa: N801 (stands in for the module)
+        LOCK_SH, LOCK_EX, LOCK_NB, LOCK_UN = 1, 2, 4, 8
+
+        @staticmethod
+        def flock(fh, op):
+            fd = fh.fileno() if hasattr(fh, "fileno") else fh
+            os.lseek(fd, 0, os.SEEK_SET)
+            if op & 8:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+                return
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    if op & 4:
+                        raise
+                    time.sleep(0.1)
 import time
 import argparse
 import platform
@@ -3427,6 +3455,9 @@ def cmd_projects(args):
                "away_agent": ((e.get("away") or {}).get("agent") or "claude")
                if e.get("away") else None,
                "away_window": (e.get("away") or {}).get("window"),
+               # handed over to a PC: no session runs there, its tray offers
+               # Continue here (no Open; Take Back as usual)
+               "away_arrival": bool((e.get("away") or {}).get("arrival")),
                "mirror": (e.get("mirror") or {}).get("remote")
                if (e.get("mirror") or {}).get("enabled") else None,
                "mirror_synced_at": (e.get("mirror") or {}).get("synced_at"),
@@ -4333,7 +4364,8 @@ def can_send_projects() -> bool:
     back, Bring Here, Send Back, keep in sync, the night shift and the
     offsite copy.  Wherever aht runs, since its own copy needs nothing but
     Python on both sides (a PC hands over and takes back from Mac and Linux
-    machines; it is never asked itself)."""
+    machines; asked, it answers a Hand Over and a Take Back, and no session
+    starts there)."""
     return True
 
 def can_reach_machines() -> bool:
@@ -4772,7 +4804,14 @@ def _human(n) -> str:
 
 # ---- this install, and the copy of it that runs on the other machine ------- #
 
-AGENT_PROTOCOL = 2      # what the far end speaks; its probe also names its ops
+AGENT_PROTOCOL = 3      # what the far end speaks; its probe also names its ops
+# A PC answers from protocol 3 on: no session starts there (`start` queues
+# "Continue here" for its tray instead), and it runs aht's core without sh.
+# These are the ops a Mac or Linux machine asks a PC; an aht.exe there that
+# speaks an older protocol, or lacks one of them, is not asked
+PC_PROTOCOL = 3
+PC_OPS = ("probe", "manifest", "hash", "prepare", "trust", "install-claude", "start",
+          "stop", "close", "written-by", "board", "search", "prune", "pack", "unpack")
 
 def _core_text() -> bytes:
     """The core's own bytes: what runs on the other machine.  In the Windows
@@ -5124,6 +5163,17 @@ def _entries_in(path: str):
         return sum(1 for n in os.listdir(path) if not _skip_name(n, HANDOVER_SKIP))
     except OSError:
         return None
+
+def identity_fix(name: str, real: str, shown: str) -> str:
+    """The command that maps the folder holding `real` to another folder on
+    `name`: one of this machine's name next to `shown` there, in that
+    machine's own form (C:\\… on a PC, in single quotes for the sh it is
+    typed into here)."""
+    fl = ntpath if _DRIVE.match(shown) or shown.startswith("\\\\") else posixpath
+    ftop = fl.dirname(shown.rstrip("/\\") if fl is ntpath else shown.rstrip("/"))
+    alt = fl.join(ftop, re.sub(r"[^A-Za-z0-9._-]+", "-", _here()) or "here")
+    return (f"aht remote paths {name} --add {_arg(os.path.dirname(real))} "
+            + (shlex.quote(alt) if "\\" in alt else _arg(alt)))
 
 def identity_check(ident: dict, uid: str, where: str, folder: str, fix: str,
                    command: str = None) -> tuple:
@@ -5526,8 +5576,148 @@ def _num(s: str) -> int:
 # run from the tray would flash one)
 _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
-WINDOWS_FAR = ("aht cannot ask a Windows machine yet. On the PC, use Pick Up or "
-               "Leave a Note.")
+# what a PC still does from its own side (it answers Hand Over, Take Back,
+# the board, Watch and search)
+WINDOWS_FAR = ("A Windows PC does this from its own side: on the PC, use Pick Up or Leave a "
+               "Note. From here, aht hands projects over to it, takes them back, watches it "
+               "and searches it.")
+NO_SH_ON_PC = "aht runs no sh script on a Windows PC"
+
+# ---- a Windows PC that answers ---------------------------------------------- #
+#
+# Windows' ssh server hands a command to cmd.exe (or to PowerShell, when the
+# PC is set up so), so aht's far end on a PC is one command line that both
+# read alike: no %, $, `, ^, &, |, <, > or !, and one pair of double quotes
+# around an argument.  Which program answers there (remotes.<name>.runner):
+#   "aht"     the installed aht.exe (`aht _agent`), when its protocol is in
+#             range (PC_PROTOCOL, PC_OPS);
+#   "py"      else aht's own copy, ~/.aht/remote/aht-<core id>.py, run by
+#   "python"  the Python launcher (`py -3`) or `python`, written there by a
+#             line of the same kind that reads it from stdin;
+# else a plain refusal: install aht on the PC.  A sandbox (tests on a real
+# PC) is an argument, `_agent --sandbox C:\path`, not variables of a shell.
+
+NT_RUNNERS = ("aht", "py", "python")
+_RUNNER_WORDS = {"aht": "aht.exe", "py": "aht's own copy, with py -3",
+                 "python": "aht's own copy, with python"}
+FIX_PC_AHT = ("On the PC: install aht (winget install havurgiray.aht, or the installer from "
+              "aht's releases page), or Python 3 (winget install Python.Python.3.12).")
+_NT_UNSAFE = re.compile(r'[%$`^&|<>!"\r\n]')
+# what aht's own copy on a PC says about itself (and a sh push, cut short).
+# The `-c` lines build them from two halves, so a traceback that quotes the
+# line never reads as one of them
+NT_COPY_MISSING, NT_COPY_WRITTEN, NT_COPY_CUT = \
+    "aht-copy-missing", "aht-copy-written", "aht-copy-cut-short"
+
+def _nt_said(word: str) -> str:
+    """Python that yields `word` without holding it literally."""
+    return f"'aht-copy-'+{word[len('aht-copy-'):]!r}"
+_NT_SANDBOX = re.compile(r"[A-Za-z]:(\\[A-Za-z0-9_.-][A-Za-z0-9 _.-]*)+")
+
+def nt_sandbox_ok(p: str) -> bool:
+    """A sandbox folder on a PC that the far end's command line can carry:
+    C:\\a\\b, letters, digits, space . _ - (no part that is . or .., none
+    that ends in a space or a dot)."""
+    p = str(p or "")
+    return bool(_NT_SANDBOX.fullmatch(p)) and not any(
+        x in (".", "..") or x.endswith((" ", ".")) for x in p.split("\\")[1:])
+
+def nt_agent_line(runner: str, sandbox: str = "", cid: str = None, write: str = None) -> str:
+    """The command line that runs aht's far end on a PC (see above).
+    `write`: instead, the line that writes aht's copy there from stdin,
+    through a file named `write` first."""
+    if sandbox and not nt_sandbox_ok(sandbox):
+        raise HandoverError(f"not a sandbox folder aht can use on a PC: {sandbox!r}")
+    tail = ["_agent"] + (["--sandbox", sandbox] if sandbox else [])
+    if runner == "aht":
+        line = "aht " + " ".join(f'"{a}"' if "\\" in a or " " in a else a for a in tail)
+        return line
+    if runner not in ("py", "python"):
+        raise HandoverError(f"unknown way to run aht on a PC: {runner!r}")
+    cid = cid or core_id()
+    home = repr(sandbox + "\\home") if sandbox else "os.path.expanduser('~')"
+    d = f"os.path.join({home},'.aht','remote')"
+    if write:
+        # the copy is named by its checksum: one cut short on the way (the
+        # link dropped) is not written at all, and goes again next time
+        code = (f"import os,sys,hashlib;d={d};b=sys.stdin.buffer.read();"
+                f"hashlib.sha256(b).hexdigest()[:12]=={cid!r} or "
+                f"sys.exit({_nt_said(NT_COPY_CUT)});os.makedirs(d,exist_ok=True);"
+                f"t=os.path.join(d,{write!r});f=open(t,'wb');f.write(b);f.close();"
+                f"os.replace(t,os.path.join(d,'aht-{cid}.py'));"
+                "o=sorted((x for x in os.listdir(d) if x.startswith('aht-') and "
+                "x.endswith('.py')),key=lambda x:os.path.getmtime(os.path.join(d,x)));"
+                f"[os.remove(os.path.join(d,x)) for x in o[:-3]];print({_nt_said(NT_COPY_WRITTEN)})")
+    else:
+        code = (f"import os,runpy,sys;p=os.path.join({d},'aht-{cid}.py');"
+                f"os.path.isfile(p) or sys.exit({_nt_said(NT_COPY_MISSING)});"
+                f"sys.argv=[p,{','.join(repr(a) for a in tail)}];"
+                "runpy.run_path(p,run_name='__main__')")
+    if _NT_UNSAFE.search(code):
+        raise HandoverError("aht's command line for a PC would hold a character cmd.exe or "
+                            "PowerShell reads as their own")
+    return ("py -3" if runner == "py" else "python") + f' -X utf8 -c "{code}"'
+
+def _nt_absent(r) -> bool:
+    """The program a PC was asked to run did not run aht there: no answer of
+    aht's (AGENT_MARK), no word of aht's own copy and no Python traceback
+    (a Python that ran it).  Whatever else cmd.exe or PowerShell (a program
+    that is not there), the Store's stand-in python or a Python launcher
+    without a Python said, in whatever language Windows speaks there."""
+    if AGENT_MARK in (r.stdout or ""):
+        return False
+    t = (r.stderr or "") + (r.stdout or "")
+    return not any(s in t for s in (NT_COPY_MISSING, NT_COPY_WRITTEN, NT_COPY_CUT,
+                                    "Traceback (most recent call last)"))
+
+def _nt_copy_missing(r) -> bool:
+    return NT_COPY_MISSING in (r.stderr or "") and AGENT_MARK not in (r.stdout or "")
+
+def sh_push_script(cid: str, tmp: str) -> str:
+    """The sh script that writes aht's copy on a Mac or Linux machine from
+    stdin: under a name of its own first, then, only when its checksum is
+    `cid` (a copy cut short on the way is removed, nothing is put in place),
+    as aht-<cid>.py; the newest 3 stay, and the aht.py older versions used
+    goes."""
+    return ('d="$HOME/.aht/remote" && mkdir -p "$d" && chmod 700 "$d" && '
+            f'cat > "$d/{tmp}" && if [ "$(python3 -c \'import hashlib,sys;print(hashlib.'
+            f'sha256(open(sys.argv[1],"rb").read()).hexdigest()[:12])\' "$d/{tmp}")" = '
+            f'"{cid}" ]; then mv -f "$d/{tmp}" "$d/aht-{cid}.py"; else rm -f "$d/{tmp}"; '
+            f'echo "{NT_COPY_CUT}: aht\'s copy did not arrive whole" >&2; exit 3; fi && '
+            'rm -f "$d/aht.py" "$d/aht.py.new" && cd "$d" && '
+            'ls -t aht-*.py | tail -n +4 | while read -r f; do rm -f "$f"; done')
+
+def _cut_short(name: str) -> str:
+    return (f"aht's copy did not arrive whole on {name}, so nothing was put in place there "
+            "(the link may have dropped, or python3 is missing there): try again")
+
+def _agent_answer(r):
+    """The far end's answer in a run's output, or None."""
+    i = (r.stdout or "").rfind(AGENT_MARK + "{")
+    if i < 0:
+        return None
+    try:
+        return json.loads(r.stdout[i + len(AGENT_MARK):])
+    except ValueError:
+        return None
+
+def pc_out_of_range(ans: dict):
+    """Why an aht.exe on a PC is not asked (its protocol is too old for a
+    PC that answers, or it lacks an op this aht asks), or None."""
+    if int(ans.get("protocol") or 0) < PC_PROTOCOL:
+        return f"protocol {ans.get('protocol') or 1}, {PC_PROTOCOL} is needed"
+    lack = sorted(set(PC_OPS) - set(ans.get("ops") or []))
+    return f"it lacks {', '.join(lack)}" if lack else None
+
+def pc_unanswered(name: str, old: str = None, why: str = None) -> str:
+    """The plain refusal when nothing on a PC can answer for aht."""
+    if why:
+        return f"aht's copy did not run on {name}: {why}"
+    if old:
+        return (f"update aht on {name}: the aht there ({old}) cannot answer this machine "
+                f"(aht {VERSION} or newer can); or install Python 3 there")
+    return (f"install aht on {name}: a Windows PC answers through aht there (or through "
+            "aht's own copy, when Python 3 is installed there)")
 
 def _decoded(r):
     """A finished run's output as text: bytes travel, UTF-8 is read here (a
@@ -5549,8 +5739,11 @@ class Remote:
         self.name = name
         self.target = str(spec.get("ssh") or "")
         self.root = str(spec.get("root") or "").rstrip("/")
-        self.sandbox = str(spec.get("sandbox") or "").rstrip("/") if self.target else ""
+        self.sandbox = str(spec.get("sandbox") or "").rstrip("/\\") if self.target else ""
         self.system = spec.get("system")
+        # a PC: what runs aht's far end there (NT_RUNNERS), once known
+        self.runner = spec.get("runner") if spec.get("runner") in NT_RUNNERS else None
+        self.shell = None               # a PC's: "cmd" or "powershell", once asked
         self.claude = spec.get("claude")
         self.info = {}
         self.on_percent = None          # called with rsync's percentage
@@ -5708,6 +5901,8 @@ class Remote:
             e["AHT_MACHINE_NAME"] = os.environ["AHT_REMOTE_MACHINE_NAME"]
         if os.environ.get("AHT_REMOTE_AGENT_PROCS"):    # tests: the agents running there
             e["AHT_AGENT_PROCS"] = os.environ["AHT_REMOTE_AGENT_PROCS"]
+        if self.system == "Windows":    # tests: a PC (its core answers as Windows does)
+            e["AHT_TEST_FAR_NT"] = "1"
         return e
 
     def _sandboxed(self, script: str) -> str:
@@ -5723,9 +5918,10 @@ class Remote:
                 + 'mkdir -p "$HOME" "$TMUX_TMPDIR" && ' + script)
 
     def sh(self, script: str, stdin=None, timeout: float = 120, raw: bool = False):
-        """Run a sh script there.  `raw`: as it is, without the sandbox."""
+        """Run a sh script there.  `raw`: as it is, without the sandbox (and
+        a PC's command line, which never goes through sh)."""
         if self.system == "Windows" and not raw:
-            raise HandoverError(WINDOWS_FAR)
+            raise HandoverError(NO_SH_ON_PC)
         if isinstance(stdin, str):
             stdin = stdin.encode("utf-8")
         kw = {"input": stdin, "capture_output": True, "timeout": timeout, "cwd": "/",
@@ -5751,15 +5947,15 @@ class Remote:
     def check_shell(self) -> None:
         """Before the first sh script to a machine: which shell answers there.
         `echo aht-os %OS% $env:OS` is harmless in sh, cmd.exe and PowerShell,
-        and the two Windows shells name Windows_NT in it.  A Windows answer
-        stops here, so nothing is made on a PC (cmd.exe would make folders
-        named -p and $HOME)."""
+        and the two Windows shells name Windows_NT in it.  A PC is then asked
+        through its own command line (nt_agent_line), never with a sh script
+        (cmd.exe would make folders named -p and $HOME)."""
         if self.local:
             return
         r = self.sh("echo aht-os %OS% $env:OS", timeout=60, raw=True)
         if "Windows_NT" in (r.stdout or ""):
             self.system = "Windows"
-            raise HandoverError(WINDOWS_FAR)
+            self.shell = "powershell" if "%OS%" in r.stdout else "cmd"
 
     def push_agent(self) -> None:
         """The other side runs this very file, so both ends always agree.  It
@@ -5768,13 +5964,22 @@ class Remote:
         if self.local:
             return                          # a test machine runs the core itself
         cid, tmp = core_id(), f".aht-new-{os.urandom(4).hex()}"
-        r = self.sh('d="$HOME/.aht/remote" && mkdir -p "$d" && chmod 700 "$d" && '
-                    f'cat > "$d/{tmp}" && mv -f "$d/{tmp}" "$d/aht-{cid}.py" && '
-                    'rm -f "$d/aht.py" "$d/aht.py.new" && cd "$d" && '
-                    'ls -t aht-*.py | tail -n +4 | while read -r f; do rm -f "$f"; done',
-                    stdin=_core_text())
+        if self.system == "Windows":
+            if self.runner == "aht":
+                return                      # aht.exe there brings its own core
+            r = self.sh(nt_agent_line(self.runner or "py", self.sandbox, cid, write=tmp),
+                        stdin=_core_text(), raw=True)
+            if NT_COPY_CUT in (r.stderr or ""):
+                raise HandoverError(_cut_short(self.name))
+            if NT_COPY_WRITTEN not in (r.stdout or ""):
+                raise HandoverError(f"could not prepare {self.name}: "
+                                    + ((r.stderr or r.stdout or "").strip()[-200:]
+                                       or "its Python wrote nothing"))
+            return
+        r = self.sh(sh_push_script(cid, tmp), stdin=_core_text())
         if r.returncode != 0:
-            raise HandoverError(f"could not prepare {self.name}: "
+            raise HandoverError(_cut_short(self.name) if NT_COPY_CUT in (r.stderr or "")
+                                else f"could not prepare {self.name}: "
                                 + (r.stderr or "").strip()[-200:])
 
     def _run_local(self, data: bytes, timeout: float):
@@ -5787,19 +5992,88 @@ class Remote:
         except subprocess.TimeoutExpired:
             raise LinkError(f"{self.name} did not answer within {timeout:.0f} s")
 
+    # ---- a PC: its own command line, and which program answers there ---- #
+
+    def _nt_run(self, runner: str, data: bytes, timeout: float):
+        return self.sh(nt_agent_line(runner, self.sandbox), stdin=data, timeout=timeout,
+                       raw=True)
+
+    def _nt_pick(self) -> str:
+        """Which program answers for aht on this PC: the installed aht.exe when
+        its protocol is in range, else aht's own copy with the Python there
+        (sent first), else a plain refusal.  Noted as remotes.<name>.runner."""
+        probe = json.dumps({"op": "probe"}).encode("utf-8")
+        old = why = None
+        for runner in NT_RUNNERS:
+            r = self._nt_run(runner, probe, 120)
+            if runner != "aht" and _nt_copy_missing(r):
+                self.runner = runner
+                self.push_agent()
+                r = self._nt_run(runner, probe, 120)
+            if _nt_absent(r):
+                continue
+            ans = _agent_answer(r)
+            if runner == "aht":
+                # an aht.exe that answers out of range, or not at all (one older
+                # than --sandbox, say): the next way is tried.  It is called
+                # older only when it answered with its version
+                bad = pc_out_of_range(ans) if ans and ans.get("ok") else "no answer"
+                if bad:
+                    if ans and ans.get("version"):
+                        old = f"{ans.get('version')}, {bad}"
+                    log(f"REMOTE {self.name}: aht.exe there is not asked ({bad})")
+                    continue
+            elif not (ans and ans.get("ok")):
+                why = why or ((r.stderr or r.stdout or "").strip()[-300:] or "no answer")
+                continue
+            self.runner = runner
+            if not self.local:
+                _remember_remote(self.name, runner=runner, answers_why=None)
+            log(f"REMOTE {self.name}: a PC; aht answers there through "
+                + _RUNNER_WORDS[runner])
+            return runner
+        self.runner = None
+        text = pc_unanswered(self.name, old, None if old else why)
+        if not self.local:
+            _remember_remote(self.name, runner=None, answers_why=text)
+        raise HandoverError(text)
+
+    def _nt_ask(self, data: bytes, timeout: float):
+        runner = self.runner or self._nt_pick()
+        r = self._nt_run(runner, data, timeout)
+        if runner != "aht" and _nt_copy_missing(r):
+            self.push_agent()
+            r = self._nt_run(runner, data, timeout)
+        elif _nt_absent(r):                 # it went away since: what answers now
+            self.runner = None
+            r = self._nt_run(self._nt_pick(), data, timeout)
+        return r
+
     def agent(self, op: str, timeout: float = 120, **req) -> dict:
         """One operation there.  The copy of aht there is asked first; when it
-        is not there yet ("can't open file"), it is sent and asked again."""
+        is not there yet ("can't open file"), it is sent and asked again.  A
+        PC is asked through its own command line (_nt_ask)."""
         req["op"] = op
         data = json.dumps(req).encode("utf-8")
         if self.local:
             r = self._run_local(data, timeout)
+        elif self.system == "Windows":
+            r = self._nt_ask(data, timeout)
         else:
             line = f'exec python3 "$HOME/.aht/remote/aht-{core_id()}.py" _agent'
             r = self.sh(line, stdin=data, timeout=timeout)
             if r.returncode == 2 and "can't open file" in (r.stderr or ""):
                 self.push_agent()
                 r = self.sh(line, stdin=data, timeout=timeout)
+            elif AGENT_MARK not in (r.stdout or ""):
+                # perhaps cmd.exe or PowerShell, which ran nothing of it: a PC
+                # not known as one yet (set up before aht asked).  What they
+                # say depends on Windows' language; their answer to the
+                # shell check does not
+                self.check_shell()
+                if self.system == "Windows":
+                    _remember_system(self.name, "Windows")
+                    r = self._nt_ask(data, timeout)
         i = (r.stdout or "").rfind(AGENT_MARK)
         if i < 0:
             raise HandoverError(f"{self.name} gave no usable answer to “{op}”: "
@@ -5816,6 +6090,13 @@ class Remote:
         far = self.there(path) if path else None
         self.info = self.agent("probe", path=far, claude=self.claude,
                                **({"fs": True} if fs else {}))
+        if self.system == "Windows" and self.runner == "aht" and not self.local \
+                and pc_out_of_range(self.info):
+            # aht.exe there was replaced by an older one since: ask again
+            self.runner = None
+            self._nt_pick()
+            self.info = self.agent("probe", path=far, claude=self.claude,
+                                   **({"fs": True} if fs else {}))
         if self.info.get("home") and not self.local:
             self.far_home()             # noted for the next mapping
             if self.info.get("machine_id"):
@@ -6140,7 +6421,8 @@ class Remote:
         if self.local:
             return _aht_argv() + ["_agent"]
         if self.system == "Windows":
-            raise HandoverError(WINDOWS_FAR)
+            return [_ssh()] + self.ssh_opts() + [
+                self.dest, nt_agent_line(self.runner or self._nt_pick(), self.sandbox)]
         line = f'exec python3 "$HOME/.aht/remote/aht-{core_id()}.py" _agent'
         if self.sandbox:
             line = self._sandboxed(line)
@@ -6257,7 +6539,9 @@ class Remote:
         if res is not None:
             return res, wire, False
         stderr = b"".join(err).decode("utf-8", "replace")
-        if p.returncode == 2 and "can't open file" in stderr and not self.local and not out.n:
+        if not self.local and not out.n and (
+                (p.returncode == 2 and "can't open file" in stderr)
+                or (self.system == "Windows" and NT_COPY_MISSING in stderr)):
             return None, wire, True
         if st["stalled"]:
             raise LinkError(f"{self.name} went quiet for {STREAM_STALL} s; the copy "
@@ -6987,7 +7271,8 @@ def find_claude(hint: str = None, prefer_user: bool = False):
     if os.environ.get("AHT_CLAUDE"):            # tests: a stand-in CLI
         return os.environ["AHT_CLAUDE"]
     home = Path.home()
-    user = [home / ".local/bin/claude"]
+    user = [home / ".local/bin/claude"] + ([home / ".local/bin/claude.exe"]
+                                           if os.name == "nt" else [])
     rest = [shutil.which("claude"), "/opt/homebrew/bin/claude",
             home / ".npm-global/bin/claude", "/usr/local/bin/claude"]
     order = ([hint] if hint else []) + (user + rest if prefer_user else rest + user)
@@ -7263,11 +7548,17 @@ def _can_write(folder: str) -> bool:
         pass
     return True
 
+def far_is_pc() -> bool:
+    """This far end is a Windows PC (tests: AHT_TEST_FAR_NT, a test machine
+    that stands in for one: its core answers as a PC's does)."""
+    return os.name == "nt" or os.environ.get("AHT_TEST_FAR_NT") == "1"
+
 def _agent_probe(req: dict) -> dict:
     path = req.get("path")
     exe = find_claude(req.get("claude"), prefer_user=True)
     info = {"ok": True, "host": platform.node().split(".")[0],
-            "system": platform.system(), "home": str(Path.home()),
+            "system": "Windows" if far_is_pc() else platform.system(),
+            "home": str(Path.home()),
             "python": platform.python_version(), "version": VERSION,
             "claude_home": str(claude_home()), "claude": exe,
             "claude_version": claude_version(exe) if exe else None,
@@ -7432,6 +7723,8 @@ def _agent_prepare(req: dict) -> dict:
     cn = req.get("copy_note")           # the folder this sync or handover fills
     if isinstance(cn, dict) and isinstance(cn.get("path"), str):
         _note_copy(cn["path"], cn)
+        if cn.get("kind") != "handover":    # taken back (or synced): nothing to continue
+            drop_arrivals(cn["path"])
     their = req.get("their_home")
     mine = str(Path.home())
     if their and os.path.realpath(their) != os.path.realpath(mine):
@@ -7496,15 +7789,276 @@ def _agent_install_claude(req: dict) -> dict:
     ver = str(req.get("version") or "")
     if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
         return {"ok": False, "error": f"not a version: {ver!r}"}
-    r = subprocess.run(["/bin/sh", "-c",
-                        f"curl -fsSL https://claude.ai/install.sh | bash -s {ver}"],
-                       capture_output=True, text=True, timeout=900)
+    if far_is_pc():
+        # a PC has no sh and no curl | bash: Claude Code installs a version of
+        # itself there (`claude install <version>`), so it must be there first
+        have = find_claude(None, prefer_user=True)
+        if not have:
+            return {"ok": False, "error": "Claude Code is not installed there: install it on "
+                    "the PC first (in PowerShell: irm https://claude.ai/install.ps1 | iex)"}
+        r = subprocess.run([have, "install", ver], capture_output=True, text=True,
+                           timeout=900, cwd=str(Path.home()),
+                           env={**os.environ, "DISABLE_AUTOUPDATER": "1"}, **_NO_WINDOW)
+    else:
+        r = subprocess.run(["/bin/sh", "-c",
+                            f"curl -fsSL https://claude.ai/install.sh | bash -s {ver}"],
+                           capture_output=True, text=True, timeout=900)
     exe = find_claude(None, prefer_user=True)
     got = claude_version(exe) if exe else None
     if got != ver:
         return {"ok": False, "error": f"installing Claude Code {ver} failed "
                 f"(found {got}): {(r.stderr or r.stdout).strip()[-300:]}"}
     return {"ok": True, "claude": exe, "claude_version": got}
+
+# ---- a PC that answers: "Continue here" instead of a session ------------- #
+#
+# No session starts on a PC (R2): `start` there writes an arrival record,
+# ~/.aht/arrivals/<window name>.json, and the PC's tray offers "<project>
+# came from mac — Continue here" (once as a notice, then in its menu until
+# you use it or dismiss it, while the project is there).  Continue here runs
+# `aht _arrival --continue <name>`: Claude Code in a new console, in the
+# session handed over, with the level's flags the handover named (never
+# more) and its SessionStart note (run/<name>/: note.txt, settings.json, as
+# a session on a Mac or Linux machine gets them), the record noted as
+# continued.  A second Continue here is refused (that session may still be
+# open) unless asked with --again.  The record goes when the project leaves
+# (Take Back from home: its copy note is no longer a handover's).
+
+ARRIVAL_ACTION = "Continue here"
+
+def arrivals_dir() -> Path:
+    return aht_home() / "arrivals"
+
+def _arrival_texts(proj: str, frm: str, sid) -> dict:
+    return {"text": f"{proj} came from {frm}", "action": ARRIVAL_ACTION,
+            "detail": f"{ARRIVAL_ACTION} opens Claude Code in {proj}"
+                      + (", in the session handed over from " + frm if sid else "")
+                      + ". Nothing runs until you type."}
+
+def _note_hook(note: Path, nt: bool = None) -> dict:
+    """The settings of a SessionStart hook that hands `note` (a file) to
+    Claude Code.  Claude Code runs hooks through sh everywhere, through Git
+    Bash on Windows (seen with 2.1.302), so it is `cat` there too, with the
+    path's slashes turned forward (`nt`), which Git Bash reads as is."""
+    nt = os.name == "nt" if nt is None else nt
+    cmd = "cat " + shlex.quote(str(note).replace("\\", "/") if nt else str(note))
+    return {"hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "timeout": 5, "command": cmd}]}]}}
+
+def _arrival_settings(name: str, sandbox: bool) -> Path:
+    """run/<name>/settings.json for Continue here: the hook that tells the
+    session the note the handover wrote (run/<name>/note.txt), and Claude
+    Code's sandbox when the level named it."""
+    run = run_dir(name)
+    run.mkdir(parents=True, exist_ok=True)
+    note = run / "note.txt"
+    if not note.is_file():
+        note.write_text("", encoding="utf-8")
+    settings = _note_hook(note)
+    if sandbox:                     # never-ask inside Claude Code's own sandbox
+        settings.update(CLAUDE_SANDBOX)
+    f = run / "settings.json"
+    f.write_text(json.dumps(settings), encoding="utf-8")
+    return f
+
+def _arrival_flags(args) -> list:
+    """The flags a handover named for Claude Code (the level's, then
+    handover_claude_args), as they are; none at all when one of them is not
+    a word a console takes as it is (a control character, or on Windows %
+    or "), since dropping one would shift the rest: Claude Code then asks
+    for everything, which is never more than they say."""
+    bad = r'[\x00-\x1f%"]' if os.name == "nt" else r"[\x00-\x1f]"
+    if not isinstance(args, list) or len(args) > 40 or not all(
+            isinstance(a, str) and a and not re.search(bad, a) for a in args):
+        return []
+    return list(args)
+
+def _queue_arrival(req: dict) -> dict:
+    """`start` on a PC: the arrival record instead of a session, and the
+    trace of this attempt's start (run/<name>/attempt-<id>, for
+    resolve_handing).  The level's flags (`args`), the sandbox
+    (`claude_sandbox`) and the note go with it: Continue here starts Claude
+    Code with exactly those (run/<name>/note.txt, settings.json)."""
+    path, name = str(req["path"]), req["name"]
+    agent = req.get("agent") or "claude"
+    if agent != "claude":
+        return {"ok": False, "error": f"{AGENT_NAMES.get(agent, agent)} does not start on a "
+                "PC: hand over to Claude Code (Continue here opens it there)"}
+    if not os.path.isdir(path):
+        return {"ok": False, "error": f"there is no folder {path} here"}
+    sid = req.get("session") if _SESSION_ID.fullmatch(str(req.get("session") or "")) else None
+    frm = re.sub(r"[\x00-\x1f]", "", str(req.get("from") or "another machine"))[:80]
+    proj = os.path.basename(path.rstrip("/\\")) or path
+    task = str(req.get("task") or "").strip()
+    run = run_dir(name)
+    run.mkdir(parents=True, exist_ok=True)
+    note = str(req.get("note") or "")
+    (run / "note.txt").write_text(note, encoding="utf-8")
+    sandbox = bool(req.get("claude_sandbox"))
+    _arrival_settings(name, sandbox)
+    rec = {"v": 1, "name": name, "kind": "handover", "path": path, "project": proj,
+           "from": frm, "from_id": req.get("from_id"), "agent": agent, "session": sid,
+           "title": _clip(redact(str(req.get("title") or "")), 120) or None,
+           "task": _clip(redact(task), 400) if task else None,
+           "attempt": req.get("attempt"), "at": time.time(),
+           **_arrival_texts(proj, frm, sid),
+           "argv": ["_arrival", "--continue", name],
+           "resume": ["resume-here", path] + (["--session", sid] if sid else []),
+           # how Continue here starts Claude Code: the level the handover
+           # named, never more (not read again here), and its note
+           "args": _arrival_flags(req.get("args")), "claude_sandbox": sandbox,
+           "note": str(run / "note.txt") if note else None,
+           "notified": None, "continued": None}
+    arrivals_dir().mkdir(parents=True, exist_ok=True)
+    _write_json(arrivals_dir() / f"{name}.json", rec)
+    for old in run.glob("attempt-*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    if re.fullmatch(r"[0-9A-Za-z-]{1,40}", str(req.get("attempt") or "")):
+        (run / f"attempt-{req['attempt']}").write_text(_now() + "\n")
+    log(f"ARRIVAL {proj} from {frm}: {ARRIVAL_ACTION} is offered ({name})")
+    return {"ok": True, "started": False, "reason": "windows", "arrival": name,
+            "mux": None, "name": name, "agent": agent, "session": sid, "attention": None,
+            "screen": [], "keep_awake": None}
+
+def _arrival_live(rec: dict) -> bool:
+    """Still here to continue: the folder is there, and this machine's copy
+    note still calls it a handover's."""
+    p = str(rec.get("path") or "")
+    if not p or not os.path.isdir(p):
+        return False
+    try:
+        c = copy_of(p)
+    except Exception:
+        c = None
+    return not c or c.get("kind") == "handover"
+
+def read_arrivals(prune: bool = True) -> list:
+    """The arrivals on this machine, newest first; with `prune`, a record
+    whose project left (or whose folder is gone) is removed."""
+    rows = []
+    d = arrivals_dir()
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("name") != f.stem:
+            continue
+        if not _arrival_live(rec):
+            if prune:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            continue
+        rows.append(rec)
+    return sorted(rows, key=lambda r: -float(r.get("at") or 0))
+
+def drop_arrivals(path: str) -> int:
+    """Forget the arrivals of the folder at `path` (it left this machine),
+    also when it is named through a link."""
+    path = str(path)
+    if not (_DRIVE.match(path) or path.startswith("\\\\")):
+        path = os.path.realpath(path)
+    n = 0
+    d = arrivals_dir()
+    for f in d.glob("*.json") if d.is_dir() else []:
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and _same_dir(str(rec.get("path") or ""), str(path)):
+            try:
+                f.unlink()
+                n += 1
+            except OSError:
+                pass
+    if n:
+        log(f"ARRIVAL {path}: no longer offered (it left)")
+    return n
+
+def _arrival_notices() -> list:
+    """An arrival not announced yet: one notice (the tray shows it, and its
+    click is Continue here)."""
+    out = []
+    for rec in read_arrivals():
+        if rec.get("notified"):
+            continue
+        rec["notified"] = time.time()
+        _write_json(arrivals_dir() / f"{rec['name']}.json", rec)
+        out.append({"kind": "arrival", "title": rec["text"], "message": rec["detail"],
+                    "info": {"kind": "arrival", "name": rec["name"], "project": rec["path"],
+                             "from": rec.get("from"), "session": rec.get("session"),
+                             "action": rec.get("action") or ARRIVAL_ACTION}})
+    return out
+
+def arrival_line(rec: dict) -> str:
+    """What Continue here runs in the project's folder: Claude Code with the
+    flags the handover named (never more than its level: the level is not
+    read again here), resuming the session handed over, with the settings
+    whose SessionStart hook tells it the handover's note."""
+    name = str(rec["name"])
+    settings = _arrival_settings(name, bool(rec.get("claude_sandbox")))
+    sid = rec.get("session") if _SESSION_ID.fullmatch(str(rec.get("session") or "")) else None
+    words = [find_claude(None, prefer_user=True) or "claude"] \
+        + _arrival_flags(rec.get("args")) \
+        + (["--resume", sid] if sid else []) + ["--settings", str(settings)]
+    return ("" if os.name == "nt" else "exec ") + " ".join(shell_quote(w) for w in words)
+
+def cmd_arrival(args):
+    """`aht _arrival`: the PC's tray asks it.  Without a name, the arrivals
+    (Continue here offers) as JSON; --continue NAME opens the session in a
+    new console (arrival_line) and notes it, once: again only with --again;
+    --dismiss NAME drops the offer."""
+    name = args.continue_ or args.dismiss
+    if not name:
+        rows = read_arrivals()
+        if args.json:
+            print(json.dumps({"arrivals": rows}, indent=2))
+        else:
+            for r in rows:
+                print(f"{r['text']} — {r['action']}" + ("   (continued)"
+                                                         if r.get("continued") else ""))
+        return 0
+    out = {"name": name, "applied": False, "error": None}
+    f = arrivals_dir() / f"{name}.json"
+    rec = next((r for r in read_arrivals() if r["name"] == name), None) \
+        if _WINDOW_NAME.fullmatch(str(name)) else None
+    if rec is None:
+        out["error"] = f"nothing to continue under {name!r}: the project left, or never came"
+    elif args.dismiss:
+        try:
+            f.unlink()
+            out["applied"] = True
+        except OSError as e:
+            out["error"] = str(e)
+    elif rec.get("continued") and not getattr(args, "again", False):
+        # a stray second click would open a second `claude --resume` of a
+        # session that may still be open
+        out["project"], out["continued"] = rec["path"], rec["continued"]
+        out["error"] = (f"{ARRIVAL_ACTION} was already used for {rec.get('project')} at "
+                        f"{_clock(rec['continued'])}: Claude Code may still be open there in "
+                        "that session. To open it once more anyway:  aht _arrival --continue "
+                        f"{name} --again")
+    else:
+        out["project"] = rec["path"]
+        real = rec["path"]
+        code = open_terminal(arrival_line(rec), "resume-" + os.path.basename(real.rstrip("/\\")),
+                             cwd=real, env=_copy_git_env(real))
+        out["applied"] = code == 0
+        if code == 0:
+            rec["continued"] = time.time()
+            _write_json(f, rec)
+        else:
+            out["error"] = "no terminal opened here; the line to type is printed"
+    if args.json:
+        print(json.dumps(out, indent=2))
+    elif out["error"]:
+        print(out["error"], file=sys.stderr)
+    return 0 if out["applied"] else 1
 
 def _agent_start(req: dict) -> dict:
     """Open the window a handover runs in: Claude Code resuming its session
@@ -7517,6 +8071,8 @@ def _agent_start(req: dict) -> dict:
     agent = req.get("agent") or "claude"
     if not _WINDOW_NAME.fullmatch(str(name or "")):
         return {"ok": False, "error": f"not a window name: {name!r}"}
+    if far_is_pc():
+        return _queue_arrival(req)          # no session starts on a PC
     # a tmux server of its own (a sandbox) is plain tmux: byobu picks its own
     mux = (None if _tmux_socket() else shutil.which("byobu")) or shutil.which("tmux")
     if not shutil.which("tmux"):
@@ -7704,6 +8260,11 @@ def _agent_stop(req: dict) -> dict:
     A working session is left alone.  Another agent in its window: by the
     rules of _stop_window."""
     path, name = req["path"], req["name"]
+    if far_is_pc():
+        # a session on a PC runs in a console there, which aht did not open
+        # and never types into: the user ends it there
+        return {"ok": True, "stopped": False, "reason": "windows",
+                "sessions": running_sessions(inside=path) if os.path.isdir(path) else []}
     agent = req.get("agent") or (window_state(name).get("agent")
                                  if _WINDOW_NAME.fullmatch(str(name or "")) else None)
     if agent in FAR_AGENTS:
@@ -7738,6 +8299,10 @@ def _agent_close(req: dict) -> dict:
     window's `exited`, or the window gone), never while it runs.  Not when
     tmux does not answer (`no-answer`)."""
     name = req["name"]
+    if far_is_pc():
+        # no window there; Continue here stays offered until the project
+        # leaves (its copy note: _agent_prepare)
+        return {"ok": True, "closed": False, "reason": "windows"}
     ok_name = bool(_WINDOW_NAME.fullmatch(str(name or "")))
     st = window_state(name) if ok_name else {}
     if ok_name and st["alive"] is None and not st["not_running"]:
@@ -7973,6 +8538,9 @@ def _agent_peek(req: dict) -> dict:
     path, name = req["path"], req.get("name") or ""
     ok_name = bool(_WINDOW_NAME.fullmatch(str(name)))
     act = activity_in(path) if os.path.isdir(path) else {"sessions": [], "processes": []}
+    if far_is_pc():
+        return {"ok": True, "window": False, "screen": [], "state": None,
+                "reason": "windows", **act}
     n = max(1, min(int(req.get("lines") or 14), 200))
     screen = [redact(l) for l in _tmux_screen(name, n)] \
         if ok_name and req.get("screen", True) else []
@@ -8108,7 +8676,7 @@ def _path_owner(path: str, marker) -> str:
 #   unmark        it did not arrive: the record goes
 #   return-plan   the way back, planned here against the record (return_plan)
 #   return-apply  (streamed) the files of that plan, placed here
-# A PC that brought a project is never asked anything: it asks.
+# A PC that brought a project asks; it is not asked for these.
 
 def _home_entry(req: dict):
     """(uuid, entry, real path) of the project a request names here, or a
@@ -8589,6 +9157,14 @@ def cmd_agent(args):
     after AGENT_MARK on stdout.  pack and unpack (aht's own copy) read the
     request's first line and then frames, as bytes."""
     inp, out = sys.stdin.buffer, sys.stdout.buffer
+    sbx = str(getattr(args, "sandbox", None) or "").rstrip("/\\")
+    if sbx and _is_abs(sbx):
+        # what the sh line sets for a sandbox elsewhere (Remote._sandboxed)
+        home = sbx + ("\\" if "\\" in sbx else "/") + "home"
+        os.environ.update(_sandbox_env(home))
+        os.environ["USERPROFILE"] = home        # Windows' Path.home()
+        os.environ["PATH"] = os.path.join(sbx, "bin") + os.pathsep + os.environ.get("PATH", "")
+        os.makedirs(home, exist_ok=True)
     try:
         line = inp.readline()
         try:
@@ -10050,7 +10626,7 @@ def resolve_handing(uid: str, force: bool = False) -> list:
     name, there = os.path.basename(real) or real, h.get("remote") or "the other machine"
     if h.get("driven_by") == "there":
         # the machine that brings it finishes it (mark-away) or undoes it
-        # (unmark); this one never asks it (a PC is never asked).  After an
+        # (unmark); this one never asks it (it may be a PC).  After an
         # hour with neither, Release is offered
         holder = h.get("holder") or h.get("host") or there
         began = float(h.get("at") or now)
@@ -10119,6 +10695,7 @@ def resolve_handing(uid: str, force: bool = False) -> list:
                    + ("the session there runs" if runs else
                       "the copy there was worked on" if changed else
                       "the conversation went on there" if talked else
+                      f"{ARRIVAL_ACTION} waits there" if h.get("system") == "Windows" else
                       "the session there started, and has ended since")
                    + f" (the link had dropped at {dropped})")
             title = f"{name} is on {there}"
@@ -10211,9 +10788,6 @@ def cmd_handover(args):
 
         # (2) the other machine, and where the project goes there
         say(f"checking {rem.name} …")
-        if rem.there_system() == "Windows" and not rem.local:
-            raise HandoverError(f"aht cannot hand a project over to a Windows PC: on "
-                                f"{rem.name}, use Bring Here instead")
         try:
             rpath = rem.there(real)
             for p in extras:
@@ -10222,9 +10796,8 @@ def cmd_handover(args):
             out["blockers"].append(str(e))
             return _emit(args, out, lines)
         info = rem.connect(real, fs=True)
-        if info.get("system") == "Windows" and not rem.local:
-            raise HandoverError(f"aht cannot hand a project over to a Windows PC: on "
-                                f"{rem.name}, use Bring Here instead")
+        # a PC: no session starts there; its tray offers Continue here (R2)
+        pc = out["pc"] = info.get("system") == "Windows"
         shown = rem._logical(rpath)
         out["here_path"], out["there_path"] = real, shown
         out["there"] = {k: info.get(k) for k in
@@ -10248,8 +10821,6 @@ def cmd_handover(args):
         # the same project there, or nothing: never another folder
         # another place: projects of this folder go into a folder of this
         # machine's name next to it there
-        top, ftop = os.path.dirname(real), posixpath.dirname(shown.rstrip("/"))
-        alt = posixpath.join(ftop, re.sub(r"[^A-Za-z0-9._-]+", "-", _here()) or "here")
         ident = info
         if info.get("path_owner") == "own" and info.get("path_marker") \
                 and info["path_marker"] == (uid or read_marker(real)):
@@ -10263,8 +10834,7 @@ def cmd_handover(args):
                                        "handover goes into it")
         out["identity"], why = identity_check(
             ident, uid or read_marker(real), f"on {rem.name}", shown,
-            "Move it away there, or choose another place",
-            f"aht remote paths {rem.name} --add {_arg(top)} {_arg(alt)}")
+            "Move it away there, or choose another place", identity_fix(rem.name, real, shown))
         if why:
             out["blockers"].append(why)
         far_fs = dict(info.get("fs") or {}, system=info.get("system"))
@@ -10282,7 +10852,7 @@ def cmd_handover(args):
         tools = info.get("tools") or {}
         mover = rem.transfer()
         out["transfer"] = mover
-        for t in (("rsync",) if mover == "rsync" else ()) + ("tmux",):
+        for t in (("rsync",) if mover == "rsync" else ()) + (() if pc else ("tmux",)):
             if not tools.get(t) and not (t == "tmux" and args.no_start):
                 out["blockers"].append(f"{t} is missing on {rem.name}"
                                        + (" (handover_transfer is rsync)" if t == "rsync"
@@ -10291,10 +10861,20 @@ def cmd_handover(args):
         here_ver = claude_version(mine) if mine else None
         out["claude"] = {"here": here_ver, "there": info.get("claude_version")}
         install = None
-        if not args.no_start and agent != "claude" \
+        if pc and agent != "claude":
+            out["blockers"].append(f"{AGENT_NAMES[agent]} does not start on {rem.name}: no "
+                                   "session starts on a PC. Hand over without --agent: its "
+                                   f"tray then offers {ARRIVAL_ACTION}, which opens Claude Code")
+        elif not args.no_start and agent != "claude" \
                 and not (info.get("agent_clis") or {}).get(agent):
             out["blockers"].append(f"{AGENT_NAMES[agent]} is not installed on {rem.name}")
-        if not args.no_start and agent == "claude":
+        if not args.no_start and agent == "claude" and pc and not info.get("claude"):
+            # a PC has no curl | bash: Claude Code installs its versions there
+            # itself (`claude install`), so it must be there first
+            out["blockers"].append(f"Claude Code is not installed on {rem.name}: install it "
+                                   "there first (in PowerShell: irm "
+                                   "https://claude.ai/install.ps1 | iex)")
+        elif not args.no_start and agent == "claude":
             if not here_ver:
                 out["warnings"].append("Claude Code was not found on this machine; "
                                        "the other side keeps its own version")
@@ -10308,7 +10888,7 @@ def cmd_handover(args):
                                        "why, then hand over again")
             elif info.get("claude_version") != here_ver:
                 install = here_ver
-                if not tools.get("curl"):
+                if not tools.get("curl") and not pc:
                     out["blockers"].append(f"Claude Code {here_ver} is needed on "
                                            f"{rem.name} (it has "
                                            f"{info.get('claude_version') or 'none'}) and "
@@ -10367,6 +10947,10 @@ def cmd_handover(args):
         out["outside_not_carried"] = [p for p in dig["outside"]
                                       if not any(_inside(p, c) for c in carried)]
         out["task"] = args.task
+        if pc and args.task and not args.no_start:
+            out["warnings"].append(f"no session starts on {rem.name}, so nothing works on the "
+                                   "task until you continue there; it is in the summary that "
+                                   "travels with the project")
         try:
             found = scan_secrets(real)
         except Exception:
@@ -10430,6 +11014,10 @@ def cmd_handover(args):
                           f"   Claude Code    {here_ver or '?'} here, "
                           f"{info.get('claude_version') or 'none'} there"
                           + (f" → {install} gets installed" if install else "")]
+                if pc and not args.no_start:
+                    lines.append(f"   on {rem.name:<11} no session starts there: its tray offers "
+                                 f"“{os.path.basename(real)} came from {_here()} — "
+                                 f"{ARRIVAL_ACTION}”")
             elif src is not None:
                 lines += [f"   summary of     {AGENT_NAMES[src['agent']]}: "
                           f"{(src_dig or {}).get('title') or src['id']}",
@@ -10472,7 +11060,9 @@ def cmd_handover(args):
                 "window": _mux_name(real, uid), "mux": "byobu" if tools.get("byobu") else "tmux",
                 "relay": rid if src is not None else None, "task": args.task, "claude": here_ver,
                 "transfer": mover}
-        if rem.sandbox:
+        if pc:
+            away.update(mux=None, arrival=not args.no_start)
+        elif rem.sandbox:
             away["mux"] = "tmux"            # a tmux server of its own
         with ProjectLock(uid):
             hd = handover_dir(uid)
@@ -10608,6 +11198,9 @@ def cmd_handover(args):
                                    env=git_env_vars(gset),
                                    name=away["window"], attempt=attempt,
                                    claude=info["claude"], note=note,
+                                   # a PC: what its tray says (the arrival)
+                                   **({"from": _here(), "from_id": machine_id(create=True),
+                                       "title": dig.get("title")} if pc else {}),
                                    # the level's flags; handover_claude_args after them
                                    args=_without_settings(perm["flags"])
                                    + list(cfg_get("handover_claude_args") or []),
@@ -10619,6 +11212,9 @@ def cmd_handover(args):
                     away["mux"] = st.get("mux") or away["mux"]
                     out["started"] = st.get("started")
                     out["screen"] = st.get("screen")
+                    if st.get("reason") == "windows":
+                        out["start_reason"] = "windows"
+                        out["arrival"] = st.get("arrival")
                     if st.get("attention"):
                         out["warnings"].append(f"the session on {rem.name} needs you: "
                                                f"{st['attention']} — open it to answer")
@@ -10645,13 +11241,15 @@ def cmd_handover(args):
                 raise
         out["applied"] = True
         out["away"] = away
-        out["attach"] = attach_command(rem, away["mux"], away["window"])
+        out["attach"] = None if pc else attach_command(rem, away["mux"], away["window"])
         if _end_pause(uid, rem.name):       # Release's: this copy went over that one
             out["ends_pause"] = rem.name
         log(f"HANDOVER {real} -> {rem.name} (session {sid}, "
             f"{_human(out['sent']['bytes'] + out['sent']['history_bytes'])})")
         apply_badge(real, desired_marks(real, True))
-        notify_user("Handed over", f"{os.path.basename(real)} now runs on {rem.name}")
+        notify_user("Handed over", f"{os.path.basename(real)} is on {rem.name} now: "
+                    f"{ARRIVAL_ACTION} there" if pc else
+                    f"{os.path.basename(real)} now runs on {rem.name}")
         lines += [f"handed over:  {real}  →  {rem.name}",
                   f"   sent      {out['sent']['files']} file(s), "
                   f"{_human(out['sent']['bytes'])}; history "
@@ -10662,6 +11260,9 @@ def cmd_handover(args):
                    + ("" if args.no_start else ": a new session reads the summary there")),
                   f"   level     {perm['text']}",
                   f"   summary   {brief}",
+                  (f"   on {rem.name:<6} nothing runs there yet: its tray offers "
+                   f"{ARRIVAL_ACTION}" if out.get("arrival") else
+                   f"   on {rem.name:<6} nothing runs there") if pc else
                   "   open it   " + _argv_line(out["attach"]),
                   "   back      aht reclaim " + shlex.quote(real) + " --apply"
                   + ("" if agent == "claude" else
@@ -10676,7 +11277,7 @@ def cmd_handover(args):
         out["error"] = str(e)
         warn(f"HANDOVER {real}: {e}")
     code = _emit(args, out, lines)
-    if out.get("applied") and args.attach and not args.json:
+    if out.get("applied") and args.attach and not args.json and out.get("attach"):
         os.execvp(out["attach"][0], out["attach"])
     return code
 
@@ -11141,20 +11742,15 @@ def cmd_reclaim(args):
                     "--release) and bring over what you need by hand")
             holder = away.get("holder") or away.get("host") or "the other machine"
             if not away.get("remote") and away.get("v"):
-                # brought there by a machine this one has no name for (a PC
-                # is never asked): only that machine can send it back
+                # brought there by a machine this one has no name for (a
+                # PC, say): only that machine can send it back
                 out["blockers"].append(
                     f"{os.path.basename(real)} was brought to {holder}, which this machine "
                     f"cannot ask: send it back from {holder}, or release it here (aht "
                     f"reclaim {shlex.quote(real)} --release)")
                 return _emit(args, out, lines)
             rem = get_remote(away.get("remote"))
-            if rem.there_system() == "Windows" and not rem.local:
-                out["blockers"].append(
-                    f"{holder} is a Windows PC, which this machine cannot ask: send it back "
-                    f"from {holder}, or release it here (aht reclaim {shlex.quote(real)} "
-                    "--release)")
-                return _emit(args, out, lines)
+            # (a PC that a handover went to answers: it is asked as any other)
             # where it went, as its record says, whatever the mapping says now
             rem.pin(real, away.get("remote_path") or rem.path(real))
             there = away.get("host") or rem.name
@@ -11213,7 +11809,8 @@ def cmd_reclaim(args):
         if not copy and agent == "claude" and not info["sessions"] and away.get("window") and \
                 rem.agent("close", path=rem.there(real), name=away["window"]).get("closed"):
             info = rem.connect(real)        # the window it ran in is closed now
-        if not copy and info["sessions"] and args.stop and \
+        pc = info.get("system") == "Windows"
+        if not copy and info["sessions"] and args.stop and not pc and \
                 all(s.get("status") == "idle" for s in info["sessions"]):
             if args.apply:
                 say(f"ending the idle session on {rem.name} …")
@@ -11226,6 +11823,7 @@ def cmd_reclaim(args):
                         "not-ours": "the session there was not started by aht; "
                                     "exit it yourself",
                         "no-reaction": "the session did not react; exit it yourself",
+                        "windows": f"aht does not end a session on a PC: exit it on {rem.name}",
                     }.get(st.get("reason"), "the session could not be ended"))
                 info = rem.connect(real)
             else:
@@ -11235,7 +11833,11 @@ def cmd_reclaim(args):
                         "processes": info.get("processes"),
                         "claude_version": info.get("claude_version")}
         blocked = _activity_blockers(info, f"on {rem.name}")
-        if blocked and not copy and not args.stop and \
+        if blocked and pc:
+            # a session there runs in a console aht did not open: only the
+            # user at the PC ends it
+            blocked = [b + " (aht does not end a session on a PC)" for b in blocked]
+        elif blocked and not copy and not args.stop and \
                 all(s.get("status") == "idle" for s in info["sessions"]):
             blocked = [b + ", or pass --stop to end it from here" for b in blocked]
         out["blockers"] += blocked
@@ -11577,7 +12179,7 @@ def cmd_reclaim(args):
 # Back (at the holder) pushes it home again.  Home keeps the record, as for a
 # Hand Over: the holder asks it through the ops mark-handing, mark-away,
 # unmark, return-plan and return-apply (aht's own copy of aht answers there,
-# at protocol 2 or newer).  So a PC, which is never asked anything, brings
+# at protocol 2 or newer).  So a PC, without being asked anything, brings
 # projects from Mac and Linux machines and sends them back.
 
 HOME_PROTOCOL = 2
@@ -11732,8 +12334,8 @@ def cmd_bring(args):
         rem.on_percent = prog.percent
         out["remote"] = rem.name
         if rem.there_system() == "Windows" and not rem.local:
-            raise HandoverError(f"{rem.name} is a Windows PC, which aht cannot ask: on "
-                                f"{rem.name}, use Hand Over instead")
+            raise HandoverError(f"{rem.name} is a Windows PC: on {rem.name}, use Hand Over "
+                                "instead (from here, Hand Over and Take Back work with it)")
         if args.list:
             return _bring_list(args, rem, out, lines)
         if not args.path:
@@ -11748,7 +12350,8 @@ def cmd_bring(args):
         info = rem.info = rem.agent("probe", path=far, claude=rem.claude)
         rem.far_home()
         if info.get("system") == "Windows" and not rem.local:
-            raise HandoverError(f"{rem.name} is a Windows PC, which aht cannot ask")
+            raise HandoverError(f"{rem.name} is a Windows PC: on {rem.name}, use Hand Over "
+                                "instead (from here, Hand Over and Take Back work with it)")
         out["there"] = {k: info.get(k) for k in ("host", "system", "claude_version",
                                                    "sessions", "processes")}
         out["there"]["aht"] = info.get("aht_there")
@@ -12218,10 +12821,10 @@ def cmd_send_back(args):
             out["blockers"].append("this folder holds another project now (its id changed)")
             return _emit(args, out, lines)
         if c.get("system") == "Windows":
-            # handed over by a PC, which is never asked anything: it asks
+            # handed over by a PC, which keeps the record: it takes it back
             frm = c.get("from") or "the PC it came from"
-            out["blockers"].append(f"{frm} is a Windows PC, which aht cannot ask: take it "
-                                   f"back on {frm}")
+            out["blockers"].append(f"{frm} is a Windows PC, which keeps this project's "
+                                   f"record: take it back on {frm}")
             return _emit(args, out, lines)
         name = args.to or (c.get("remote") if c.get("remote") in remotes_config() else
                            _remote_for(c.get("from"), c.get("from_id")))
@@ -12478,7 +13081,7 @@ def discover_machines(notes: list = None) -> list:
             for p in (json.loads(r.stdout).get("Peer") or {}).values():
                 system = str(p.get("OS") or "").lower()
                 host = str(p.get("DNSName") or "").split(".")[0] or p.get("HostName")
-                if host and system in ("linux", "macos", "freebsd"):
+                if host and system in ("linux", "macos", "freebsd", "windows"):
                     rows[host] = {"name": host, "host": host, "system": system,
                                   "online": bool(p.get("Online")), "via": "tailscale"}
         except Exception as e:
@@ -12526,10 +13129,24 @@ def _reach_rows(rem: Remote, info: dict = None, err: str = None) -> list:
     if info is not None:
         ck("reachable", True, f"{info.get('host')} ({info.get('system')})")
         ck("key login without a prompt", True, "yes")
-        ck("python3 there", True, info.get("python") or "yes")
+        if rem.system == "Windows" or info.get("system") == "Windows":
+            # a PC: which program answers there (Remote._nt_pick)
+            ck("aht answers there", True,
+               f"aht.exe {info.get('version')} (protocol {info.get('protocol')})"
+               if rem.runner == "aht" else
+               f"{_RUNNER_WORDS.get(rem.runner, 'aht')} (Python {info.get('python')})")
+        else:
+            ck("python3 there", True, info.get("python") or "yes")
         return rows
     if WINDOWS_FAR in e:
         ck("reachable", False, e)
+        return rows
+    if rem is not None and rem.system == "Windows" and any(
+            s in e for s in ("install aht on", "update aht on", "aht's copy did not run on")):
+        # the PC answered ssh, but nothing there runs aht's far end
+        ck("reachable", True, f"{host} (Windows)")
+        ck("key login without a prompt", True, "yes")
+        ck("aht answers there", False, e, FIX_PC_AHT)
         return rows
     key = "permission denied" in low or "too many authentication failures" in low
     hostkey = "host key verification failed" in low or "identification has changed" in low \
@@ -12585,12 +13202,15 @@ def remote_checks(rem: Remote, info: dict) -> list:
     # Windows), else aht's own copy, which needs nothing more.  rsync is then
     # optional: it makes big changes faster
     mover, forced = rem.transfer(), transfer_setting() == "rsync"
+    pc = rem.system == "Windows" or info.get("system") == "Windows"
     rows.append({"check": "copies files with", "key": "transfer", "transfer": mover,
                  "ok": True, "needed": False, "group": "handover",
                  "detail": f"rsync {rs.get('version')}" if mover == "rsync"
-                 else "aht's own copy" + ("" if os.name == "nt" or forced else
+                 else "aht's own copy" + ("" if os.name == "nt" or forced or pc else
                                           " (with rsync 3 here and any rsync there, "
                                           "rsync moves big changes faster)")})
+    if pc:
+        return rows + pc_checks(rem, info)
     if os.name != "nt":                 # Windows has no rsync: aht's own copy
         ck("rsync on this machine", rs, rs.get("version") or "missing",
            "here:  brew install rsync" if IS_MAC else "here:  install rsync 3",
@@ -12670,6 +13290,56 @@ def remote_checks(rem: Remote, info: dict) -> list:
            needed=False)
     return rows
 
+def pc_checks(rem: Remote, info: dict) -> list:
+    """`remote check`'s handover rows for a PC that answers: where projects
+    go, Claude Code there (a handover installs this machine's version with
+    `claude install`), aht installed there (its tray offers Continue here),
+    and that no session starts there.  No tmux, keep-awake or mosh rows."""
+    rows = []
+    def ck(name, ok, detail, fix=None, needed=True):
+        rows.append({"check": name, "ok": bool(ok), "detail": str(detail),
+                     "needed": needed and can_send_projects(), "group": "handover",
+                     **({"fix": fix} if fix and not ok else {})})
+    try:
+        rule = rem.rule()
+    except HandoverError:
+        rule = None
+    if rule not in (None, "same"):
+        fh = rem.far_home()
+        rows.append({"check": "where projects go there", "key": "paths", "paths": rule,
+                     "ok": True, "needed": False, "group": "handover",
+                     "detail": (f"below its home folder ({fh})" if rule == "home" else
+                                f"{_n(len(rule), 'folder')} of yours mapped, the rest below "
+                                f"its home folder ({fh})")
+                     + f"; change it with:  aht remote paths {rem.name}"})
+    mine = find_claude()
+    ck("Claude Code there", info.get("claude"),
+       f"{info.get('claude_version') or 'missing'} "
+       f"(here: {claude_version(mine) if mine else 'missing'})",
+       "nothing to do: the first handover installs this machine's version there "
+       "(claude install)" if info.get("claude") else
+       "install it on the PC (in PowerShell: irm https://claude.ai/install.ps1 | iex)")
+    if info.get("logged_in") is not None:
+        ck("Claude Code is logged in there", info["logged_in"],
+           "yes" if info["logged_in"] else "no", "run once there:  claude")
+    there = info.get("aht_there") or {}
+    try:
+        proto = int(there.get("protocol") or 0)
+    except (TypeError, ValueError):
+        proto = 0
+    # its tray offers Continue here from the protocol that brought it on
+    tray = bool(there.get("installed")) and proto >= PC_PROTOCOL
+    ck("aht installed there (its tray offers Continue here)", tray,
+       f"aht {there.get('version')}" if tray else
+       f"aht {there.get('version') or '(an older version)'}: update aht there: its tray does "
+       "not show Continue here yet" if there.get("installed") else
+       "no: a project handed over waits there without a tray to say so",
+       "update aht on the PC (winget upgrade havurgiray.aht)" if there.get("installed")
+       else "install aht on the PC (winget install havurgiray.aht)", needed=False)
+    ck("no session starts there", True, "a project handed over waits on the PC: its tray "
+       "offers Continue here, which opens Claude Code in it", needed=False)
+    return rows
+
 def _remember_system(name: str, system) -> None:
     """remotes.<name>.system: what answered there (Darwin, Linux or Windows)."""
     if system:
@@ -12698,8 +13368,22 @@ def remote_rows() -> dict:
     heard = _board_heard()
     return {n: dict(s, watch=bool(s.get("watch")),
                     system=s.get("system") if s.get("system") in SYSTEMS else None,
-                    last_heard=(heard.get(n) or {}).get("heard"))
+                    last_heard=(heard.get(n) or {}).get("heard"), **pc_answers(n, s))
             for n, s in remotes_config().items() if isinstance(s, dict)}
+
+def pc_answers(name: str, spec: dict) -> dict:
+    """{answers, answers_why}: whether aht can ask that machine, as last
+    found (nothing is asked).  A PC answers once a program there was found
+    to run aht's far end (remotes.<name>.runner); else why not, as noted
+    when it was asked, or that it was not asked yet.  A Mac or Linux
+    machine always does (its python3 runs aht's copy)."""
+    if spec.get("system") != "Windows":
+        return {"answers": True, "answers_why": None}
+    if spec.get("runner") in NT_RUNNERS:
+        return {"answers": True, "answers_why": None}
+    return {"answers": False,
+            "answers_why": spec.get("answers_why") or
+            f"not asked yet: aht remote check {name} asks it"}
 
 def _watch(name: str, on: bool) -> dict:
     """remotes.<name>.watch: whether the notices ask that machine every 2
@@ -12710,9 +13394,6 @@ def _watch(name: str, on: bool) -> dict:
         rs = dict(cfg.get("remotes") or {})
         if name not in rs:
             out["error"] = f"unknown machine {name!r}"
-            return out
-        if on and rs[name].get("system") == "Windows":
-            out["error"] = WINDOWS_FAR
             return out
         rs[name] = dict(rs[name], watch=on)
         cfg["remotes"] = rs
@@ -12767,13 +13448,17 @@ def cmd_remote(args):
         if args.sandbox:
             # a test machine: from the first connect on, everything there
             # stays inside this folder, never in that machine's own ~/.aht
-            if not args.sandbox.startswith("/"):
+            # (on a PC a folder such as C:\Users\me\aht-sbx)
+            if not (args.sandbox.startswith("/") or nt_sandbox_ok(args.sandbox.rstrip("\\"))):
                 print("--sandbox takes a full path on that machine", file=sys.stderr)
                 return 2
-            spec["sandbox"] = args.sandbox.rstrip("/")
+            spec["sandbox"] = args.sandbox.rstrip("/\\")
         rem = Remote(args.name, spec)
         try:
             rem.check_shell()               # before any sh script goes there
+            if rem.system == "Windows" and rem.sandbox.startswith("/"):
+                raise HandoverError(f"{args.name} is a Windows PC: its sandbox is a folder "
+                                    "such as C:\\Users\\me\\aht-sbx")
             info = rem.connect()
         except HandoverError as e:
             print(f"✗ {e}", file=sys.stderr)
@@ -12790,6 +13475,7 @@ def cmd_remote(args):
             # (aht remote paths changes it)
             rs[args.name] = dict(kept, **spec, system=info.get("system"),
                                  paths=kept.get("paths", "home"),
+                                 **({"runner": rem.runner} if rem.runner else {}),
                                  **({"home": rem._logical(info["home"])}
                                     if info.get("home") else {}),
                                  **({"machine_id": info["machine_id"]}
@@ -12799,7 +13485,9 @@ def cmd_remote(args):
             save_config(cfg)
             _forget_heard(args.name)        # nothing heard from a machine set up anew
         print(f"✓ {args.name}: {info.get('host')} ({info.get('system')}), Claude Code "
-              f"{info.get('claude_version') or 'not installed'}")
+              f"{info.get('claude_version') or 'not installed'}"
+              + (f"; aht answers there through {_RUNNER_WORDS[rem.runner]}"
+                 if rem.runner else ""))
         return 0
     if act in ("remove", "default"):
         with Lock():
@@ -12844,11 +13532,13 @@ def cmd_remote(args):
                 rows = remote_checks(rem, info)
                 results.append({"remote": rem.name, "target": rem.target, "checks": rows,
                                 "system": info.get("system"), "transfer": rem.transfer(),
+                                # a PC: what answers for aht there (NT_RUNNERS)
+                                "runner": rem.runner if rem.system == "Windows" else None,
                                 "ok": all(c["ok"] for c in rows if c["needed"])})
                 _remember_system(rem.name, info.get("system"))
             except HandoverError as e:
                 results.append({"remote": n, "ok": False, "error": str(e), "transfer": None,
-                                "target": rem.target if rem else None,
+                                "runner": None, "target": rem.target if rem else None,
                                 "checks": _reach_rows(rem, err=str(e)) if rem else [],
                                 "system": rem.system if rem else None})
                 if rem is not None and rem.system == "Windows":
@@ -12976,6 +13666,10 @@ def cmd_attach(args):
     if away.get("driven_by") == "there" or not away.get("window"):
         print(f"this project was brought to {away.get('holder') or away.get('host')}: its "
               "session runs in a terminal there, not in a window aht can open", file=sys.stderr)
+        return 2
+    if away.get("system") == "Windows":
+        print(f"no session runs on {away.get('remote')} for aht to open: on the PC, its tray "
+              f"offers {ARRIVAL_ACTION}, which opens Claude Code there", file=sys.stderr)
         return 2
     if getattr(args, "peek", False):
         return _attach_peek(args, real, away)
@@ -17626,7 +18320,8 @@ def cmd_relays(args):
 # (`relay-note`, which only adds files).  Both keep the same relay record on
 # both machines.  When the work comes back the way it went (an open relay to
 # that machine, or from it), the summary is a catch-up of what happened since,
-# for the session that left.  A Windows PC is never asked: it starts both.
+# for the session that left.  A Windows PC starts both itself (asked, it
+# answers a Hand Over and a Take Back, not these).
 
 NOTE_MAX = 200 * 1024           # bytes: the most one file relay-note writes
 INCOMING_KEEP = 300             # lines of run/incoming.jsonl kept
@@ -19037,6 +19732,10 @@ def check_notices(remotes: bool = None) -> list:
         out += _incoming_notices(st.get("at"), now)
     except Exception as e:
         warn(f"NOTICE incoming: {e}")
+    try:
+        out += _arrival_notices()           # a PC: a project came, Continue here
+    except Exception as e:
+        warn(f"NOTICE arrival: {e}")
     update_told = st.get("update_told")
     if cfg_get("update_check"):
         try:
@@ -21708,7 +22407,7 @@ def plan_night_shift(project: str, task: str, start: str, back: str,
         res["blockers"].append("no machine to hand over to; add one first (aht remote add)")
     elif (remotes_config().get(rem) or {}).get("system") == "Windows":
         res["blockers"].append(f"{rem} is a Windows PC: the night shift goes to a Mac or Linux "
-                               "machine (a PC is never handed a project)")
+                               "machine (no session starts on a PC)")
     now = time.time()
     try:
         t0 = now if start in (None, "", "now") else _next_time(start, now)
@@ -24708,7 +25407,16 @@ def build_parser():
     s.set_defaults(fn=cmd_window)
 
     s = sub.add_parser("_agent")           # the far end of a handover (stdin: JSON)
+    s.add_argument("--sandbox", help=argparse.SUPPRESS)    # a PC's test folder
     s.set_defaults(fn=cmd_agent)
+
+    s = sub.add_parser("_arrival")         # a PC's tray: Continue here
+    s.add_argument("--continue", dest="continue_", metavar="NAME")
+    s.add_argument("--dismiss", metavar="NAME")
+    s.add_argument("--again", action="store_true",
+                   help="with --continue: open it although it was continued before")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_arrival)
 
     s = sub.add_parser("_core")            # the core this build carries
     s.add_argument("--id", action="store_true", help="its checksum id")

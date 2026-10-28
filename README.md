@@ -97,11 +97,12 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Welcome and setup, Getting started, new versions (opt-in) | ✓ | ✓ | ✓ |
 | Search, journal, report and AI-use statement, share, secrets check, project rules, loose ends, tidy, show sessions | ✓ | ✓ | ✓ |
 | Switch agent and hand back, second opinion, informed sessions (use tokens; off by default) | ✓ | ✓ | ✓, not yet tried on Windows |
-| Ask your other machines: add and check them, Watch, their sessions and notices, search everywhere | ✓ | ✓ | ✓ (asks Mac and Linux machines, over Windows' own ssh) |
+| Ask your other machines: add and check them, Watch, their sessions and notices, search everywhere | ✓ (also a PC that answers) | ✓ (also a PC that answers) | ✓ (asks Mac and Linux machines, over Windows' own ssh) |
 | Pick Up and Leave a Note: a project's context moves between machines, git moves the files | ✓ | ✓ | ✓ (the PC starts every exchange, with Mac and Linux machines) |
-| Be asked by your other machines | ✓ | ✓ | — (a PC is never asked, so it needs no ssh server) |
+| Be asked by your other machines | ✓ | ✓ | optional, with OpenSSH Server on the PC (a PC that answers): Hand Over, Take Back, Watch, its sessions, search; without it a PC only asks, and needs no ssh server |
 | Backups on another machine: copy them there, fetch them back | ✓ | ✓ | ✓ (to and from Mac and Linux machines) |
-| Hand Over and Take Back, keep in sync, night shift | ✓ | ✓ | ✓ (to Mac and Linux machines; nothing is handed over to a PC) |
+| Hand Over and Take Back, keep in sync, night shift | ✓ | ✓ | ✓ (to Mac and Linux machines) |
+| Hand Over to a PC and Take Back from it (no session starts on the PC: its tray offers *Continue here* until you use it, which opens Claude Code in the session handed over, in the permission level the handover named and told that it changed machines) | ✓ | ✓ | the PC receives it (aht there answers, or aht's own copy with its Python 3) |
 | Bring Here and Send Back (the machine that gets the work starts it) | ✓ | ✓ | ✓ (from Mac and Linux machines) |
 | Hand Over or Bring Here into Codex, Kimi Code, Antigravity or Mistral Vibe there (uses tokens: that agent reads a summary), its state on the board, and a catch-up for Claude Code on the way back | ✓ | ✓ | ✓ (Hand Over to Mac and Linux machines; Bring Here into an agent on the PC), not yet tried on Windows |
 | Projects at other paths on each machine; names, line endings, executable marks and git across systems | ✓ | ✓ | ✓ |
@@ -111,13 +112,20 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Session names from iTerm2 tabs, Go to Tab, workspace restore, restart in its tab | ✓ (iTerm2) | — | — |
 | The session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
 
-A Windows PC asks; it is never asked.  From a PC, aht adds and checks
-your Mac and Linux machines, watches them, shows their sessions, searches
-them, picks up their work, leaves notes on them and keeps a copy of its
-backups on one of them.  It also hands projects over to them and takes
-them back, and brings their projects to the PC and sends them back.  The
-guide's *A Windows PC with your other machines* says how to set up the
-keys.
+A Windows PC asks; it needs no ssh server for that.  From a PC, aht adds
+and checks your Mac and Linux machines, watches them, shows their
+sessions, searches them, picks up their work, leaves notes on them and
+keeps a copy of its backups on one of them.  It also hands projects over
+to them and takes them back, and brings their projects to the PC and
+sends them back.  The guide's *A Windows PC with your other machines* says
+how to set up the keys.  Optionally the PC answers too, with OpenSSH
+Server on it: then a Mac or Linux machine hands projects over to the PC
+(no session starts there; its tray offers *Continue here*, once, which
+opens Claude Code in the session handed over, in the permission level the
+handover named, never more), takes them
+back, watches it and searches it.  The guide's *A Windows PC that
+answers* says how to set it up safely (key login only, a firewall rule
+for Tailscale or your own network).
 
 CI runs the whole test suite on Linux and macOS for every push, including
 aht's window (its doors, its page and a command through it), and on real

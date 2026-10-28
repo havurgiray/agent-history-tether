@@ -1,0 +1,36 @@
+{
+  "uuid": "8f93490f48fd410aa9cfaa983d996911",
+  "real_path": "/Users/me/code/shop",
+  "exists": true,
+  "stores": [
+    "claude"
+  ],
+  "updated_at": "2026-10-28T15:06:38",
+  "is_git": false,
+  "away": "pc",
+  "away_remote": "pc",
+  "away_since": "2026-10-28T15:06:44",
+  "away_driven_by": "here",
+  "away_holder": "pc",
+  "away_path": "C:\\Users\\me\\code\\shop",
+  "away_system": "Windows",
+  "away_agent": "claude",
+  "away_window": "aht-shop-8f9349",
+  "away_arrival": true,
+  "mirror": null,
+  "mirror_synced_at": null,
+  "mirror_status": null,
+  "mirror_paused": null,
+  "handing": null,
+  "copy_of": null,
+  "relay": null,
+  "pickup_from": null,
+  "agents": [
+    "claude"
+  ],
+  "open": null,
+  "limit": null,
+  "sessions": 1,
+  "bytes": 701,
+  "last_activity": "2026-10-28T15:06:37"
+}

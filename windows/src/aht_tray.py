@@ -281,7 +281,74 @@ def _send_back(path):
     return lambda: act_open_window(path, "send-back")
 
 
+# ---- arrivals: a project another machine handed over to this PC ------------
+# No session starts on a PC: the core keeps an arrival record for each
+# (~/.aht/arrivals/<name>.json; aht.read_arrivals, newest first, drops one
+# whose project left) and announces it once through the notices (a click on
+# that notice is Continue here).  The menu offers "<project> came from mac
+# — Continue here", which runs `aht _arrival --continue <name>`
+# (resume-here in the session handed over), until it is used or the project
+# leaves; Dismiss (`--dismiss`) takes an offer away without opening it.
+
+
+def arrivals(rows=None):
+    """The arrivals to offer, newest first, at most 10: [(name, label)]."""
+    try:
+        rows = aht.read_arrivals() if rows is None else rows
+    except Exception:
+        return []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or not r.get("name") or r.get("continued"):
+            continue
+        text = r.get("text") or f"{r.get('project') or 'a project'} came from " \
+            f"{r.get('from') or 'another machine'}"
+        out.append((str(r["name"]), f"{text} — {r.get('action') or 'Continue here'}"))
+    return out[:10]
+
+
+def _arrival_run(name, how, failed):
+    """`aht _arrival --continue|--dismiss <name> --json`; when it cannot,
+    aht's words ({"name", "applied", "error"})."""
+    def go():
+        def work():
+            r = _run_cli("_arrival", how, name, "--json")
+            if r.returncode == 0:
+                return
+            # the core's words (a refusal, say: that arrival was continued
+            # already); its JSON itself is never shown
+            try:
+                err, raw = json.loads(r.stdout or "{}").get("error"), ""
+            except (ValueError, AttributeError):
+                err, raw = None, r.stdout
+            msgbox(failed, str(err or r.stderr or raw or f"aht ended with {r.returncode}").strip()[:900])
+        _in_thread(work)
+    return go
+
+
+def _continue_here(name):
+    """Continue here: aht opens the session in a new console window."""
+    return _arrival_run(name, "--continue", "Continue here did not work")
+
+
+def _dismiss(name):
+    """Dismiss: the offer goes; the project stays here as it is."""
+    return _arrival_run(name, "--dismiss", "The offer was not dismissed")
+
+
+def notice_clicked():
+    """A click on a notice: an arrival's continues it here; any other opens
+    aht's window.  The notice counts once: a second click opens the window."""
+    info = LAST_NOTICE[0] if isinstance(LAST_NOTICE[0], dict) else {}
+    LAST_NOTICE[0] = None
+    if info.get("kind") == "arrival" and info.get("name"):
+        _continue_here(str(info["name"]))()
+    else:
+        act_open_window()
+
+
 NOTICING = [False]
+LAST_NOTICE = [None]                    # the info of the notice shown last
 NOTICE_QUEUE = aht.aht_home() / "run" / "tray-notices.jsonl"
 TRAY_ALIVE = aht.aht_home() / "run" / "tray-alive"
 QUEUE_AT = [0]
@@ -328,9 +395,14 @@ def pump_notices():
         except ValueError:
             continue
         balloon(n.get("title") or "aht", n.get("message") or "")
+        LAST_NOTICE[0] = n.get("info")          # after balloon(), which clears it
 
 
 def balloon(title, msg):
+    # a new balloon is not the notice shown before: a click on it (the tray's
+    # own, Restart watcher or Settings say) opens the window, never an
+    # earlier arrival's Continue here; pump_notices sets the core's info after
+    LAST_NOTICE[0] = None
     # the previous balloon goes first (an empty text takes it away): Windows
     # shows a new one only then, not as an update of one it already showed
     clear = _nid(NIF_INFO)
@@ -725,6 +797,14 @@ def build_menu():
     sep(root)
 
     add(root, "Open aht…", act_open_window)
+    # a project another machine handed over here: no session started here
+    came = arrivals()
+    for name, label in came:
+        add(root, label, _continue_here(name))
+    if came:
+        gone = submenu(root, "Dismiss")
+        for name, label in came:
+            add(gone, label.rsplit(" — ", 1)[0], _dismiss(name))
     # projects of another machine's, brought here: each opens the window on
     # it, with Send Back's dry run
     brought = brought_here()
@@ -835,7 +915,7 @@ def wnd_proc(hwnd, msg, wparam, lparam):
         if lparam in (WM_RBUTTONUP, WM_LBUTTONUP):
             show_menu()
         elif lparam == NIN_BALLOONUSERCLICK:      # a notice: open the window
-            act_open_window()
+            notice_clicked()                      # (an arrival's: Continue here)
         return 0
     if msg == WM_TIMER:
         if wparam == 2:

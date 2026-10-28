@@ -17,5 +17,9 @@ echo
 echo "=== Windows badge cache and entry point (any OS; apply() on Windows only) ==="
 "$PY" ../windows/tests/winbadge_test.py
 "$PY" ../windows/tests/aht_main_test.py
+"$PY" ../windows/tests/aht_tray_test.py
+echo
+echo "=== the far end asked directly: copy ops, and a PC that answers (any OS; cmd.exe on Windows) ==="
+"$PY" ../windows/tests/agent_smoke.py
 echo
 echo "✅ ALL AHT SUITES PASSED"

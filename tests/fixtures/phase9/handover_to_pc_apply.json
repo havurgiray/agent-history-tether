@@ -1,0 +1,105 @@
+{
+  "command": "handover",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "agent": "claude",
+  "start_line": null,
+  "tokens": null,
+  "first_prompt": null,
+  "relay": null,
+  "project": "/Users/me/code/shop",
+  "remote": "pc",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "pc": true,
+  "here_path": "/Users/me/code/shop",
+  "there_path": "C:\\Users\\me\\code\\shop",
+  "there": {
+    "host": "pc",
+    "system": "Windows",
+    "home": "C:\\Users\\me",
+    "claude": "C:\\Users\\me\\.local\\bin\\claude.exe",
+    "claude_version": "9.9.8",
+    "path_exists": false,
+    "path_writable": true,
+    "free_bytes": 26323775488,
+    "sessions": [],
+    "processes": [],
+    "path": "C:\\Users\\me\\code\\shop"
+  },
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "names": [],
+  "git": {
+    "is_git": false,
+    "gitattributes": null,
+    "suggest": [],
+    "env": {
+      "core.filemode": "false"
+    },
+    "how": "in your own terminal on pc:  git -c core.filemode=false status   (aht's session there has this set)"
+  },
+  "transfer": "aht",
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.8"
+  },
+  "session": "5d6e7f80-1111-4222-8333-444455556666",
+  "sessions": 1,
+  "title": "Checkout flow",
+  "perm": {
+    "agent": "claude",
+    "level": "ask",
+    "sandbox": false,
+    "flags": [],
+    "from": "unknown",
+    "read": "ask",
+    "text": "Claude Code on pc starts in ask mode: aht could not tell the level of the session here"
+  },
+  "outside_not_carried": [],
+  "task": null,
+  "brief": "/Users/me/code/shop/.aht/handover/20261028-1506-to-pc.md",
+  "sent": {
+    "files": 4,
+    "bytes": 741,
+    "history_bytes": 701,
+    "wire_bytes": 2877
+  },
+  "trust": "carried over",
+  "started": false,
+  "screen": [],
+  "start_reason": "windows",
+  "arrival": "aht-shop-8f9349",
+  "away": {
+    "v": 2,
+    "attempt": "20261028-150644-3cf1",
+    "remote": "pc",
+    "holder": "pc",
+    "holder_id": null,
+    "host": "pc",
+    "system": "Windows",
+    "driven_by": "here",
+    "path": "/Users/me/code/shop",
+    "remote_path": "C:\\Users\\me\\code\\shop",
+    "since": "2026-10-28T15:06:44",
+    "agent": "claude",
+    "session": "5d6e7f80-1111-4222-8333-444455556666",
+    "window": "aht-shop-8f9349",
+    "mux": null,
+    "relay": null,
+    "task": null,
+    "claude": "9.9.9",
+    "transfer": "aht",
+    "arrival": true
+  },
+  "attach": null
+}

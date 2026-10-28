@@ -4,7 +4,8 @@
 # (Summary Only, and the permission level a switch carries) and relays,
 # limits, sessions, workspace, asking other
 # machines over Windows' own ssh (status, remote add, pickup), Bring Here's
-# list and dry run from a test-mode machine (also into Codex); and the hidden ones
+# list and dry run from a test-mode machine (also into Codex), what a PC that
+# answers does (start queues Continue here: _arrival); and the hidden ones
 # another aht uses: `_core --id`
 # (the core inside the exe is this checkout's aht.py, byte for byte) and
 # `_agent`.  Runs natively on Windows from Git Bash with
@@ -255,6 +256,45 @@ if [ -z "${AHT_SMOKE_POSIX:-}" ]; then
   printf '%s' "$OUT" | grep -q 'export ' && fail "resume-here --print on a PC uses sh's export: $OUT"
 fi
 rm -f "$T/home/.aht/remote/copies.json"
+
+echo "== a PC that answers: start queues Continue here, stop says windows =="
+# what a Mac or Linux machine asks a PC (phase 9): no session starts here;
+# the arrival record waits for the tray (`_arrival`), whose Continue here
+# opens Claude Code in a console (here noted in a log, nothing opens).  On
+# macOS or Linux the core is told to answer as a PC does
+[ -n "${AHT_SMOKE_POSIX:-}" ] && export AHT_TEST_FAR_NT=1
+ARR="aht-paper-abc123"
+REQ="{\"op\": \"start\", \"path\": \"$(J "$PAPER")\", \"name\": \"$ARR\", \"session\": \"s1\", \"from\": \"mac\", \"title\": \"Heron deploy\", \"args\": [\"--permission-mode\", \"auto\"], \"note\": \"[aht] handed over from mac\"}"
+OUT=$(printf '%s' "$REQ" | W _agent)
+has "$OUT" '"started": false' "start on a PC started something"
+has "$OUT" '"reason": "windows"' "start on a PC does not say windows"
+OUT=$(W _arrival --json)
+has "$OUT" '"text": "paper came from mac"' "_arrival --json does not list what came"
+has "$OUT" '"action": "Continue here"' "the arrival offers no Continue here"
+OUT=$(printf '%s' "{\"op\": \"stop\", \"path\": \"$(J "$PAPER")\", \"name\": \"$ARR\"}" | W _agent)
+has "$OUT" '"reason": "windows"' "stop on a PC does not say windows"
+OUT=$(AHT_TERMINAL_LOG="$(P term.log)" W _arrival --continue "$ARR" --json)
+has "$OUT" '"applied": true' "Continue here did not open the session"
+# cmd.exe's line quotes every word ("--resume" "s1")
+grep -q -E -- '--resume"? "?s1' "$T/term.log" || fail "Continue here did not resume the session handed over"
+# in the level the handover named (never read again here), with its note
+tr -d '"' < "$T/term.log" | grep -q -- "--permission-mode auto --resume s1 --settings" \
+  || fail "Continue here did not start in the level the handover named: $(cat "$T/term.log")"
+grep -q "handed over from mac" "$T/home/.aht/remote/run/$ARR/note.txt" \
+  || fail "the handover's note is not kept for Continue here"
+# Claude Code runs hooks through sh everywhere (Git Bash on Windows): cat
+HOOK='"command": "cat '
+grep -q "$HOOK" "$T/home/.aht/remote/run/$ARR/settings.json" \
+  || fail "the note's hook is not $HOOK: $(cat "$T/home/.aht/remote/run/$ARR/settings.json")"
+# a second Continue here is refused (that session may be open), unless --again
+OUT=$(AHT_TERMINAL_LOG="$(P term.log)" W _arrival --continue "$ARR" --json || true)
+has "$OUT" '"applied": false' "a second Continue here opened the session again"
+has "$OUT" 'was already used' "a second Continue here does not say it was used"
+OUT=$(AHT_TERMINAL_LOG="$(P term.log)" W _arrival --continue "$ARR" --again --json)
+has "$OUT" '"applied": true' "Continue here --again did not open it"
+W _arrival --dismiss "$ARR" --json >/dev/null
+[ ! -e "$T/home/.aht/arrivals/$ARR.json" ] || fail "_arrival --dismiss left the record"
+unset AHT_TEST_FAR_NT
 
 echo "== limits / sessions / tab names / workspace / checkup =="
 has "$(W limits --json)" '"limits": \[\]' "limits failed"

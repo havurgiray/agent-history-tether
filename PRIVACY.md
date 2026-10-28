@@ -268,7 +268,7 @@ encrypt it.
 
 | What | What it holds | How long it is kept |
 |---|---|---|
-| `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`), whether you watch it (`remotes.<name>.watch`), the path of your home folder there (`remotes.<name>.home`), where projects go there (`remotes.<name>.paths`: `same`, `home`, or pairs of a folder here and a folder there) and the random identifier of aht there (`remotes.<name>.machine_id`), so that a project brought from there goes back to the right machine | until you delete it, or `aht uninstall --purge` |
+| `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`), whether you watch it (`remotes.<name>.watch`), the path of your home folder there (`remotes.<name>.home`), where projects go there (`remotes.<name>.paths`: `same`, `home`, or pairs of a folder here and a folder there) and the random identifier of aht there (`remotes.<name>.machine_id`), so that a project brought from there goes back to the right machine; for a Windows PC that answers, what answers there (`remotes.<name>.runner`: `aht`, `py` or `python`), or why it does not (`remotes.<name>.answers_why`) | until you delete it, or `aht uninstall --purge` |
 | `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, syncs or hands a project over to another machine (whose `copies.json` names this computer by it), brings a project here (whose home then records it as here, on this computer), or writes a record of a switch, a Pick Up or a note into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
 | `install.json` | the version of the aht installed on this computer and the number of the protocol it speaks with your other machines (`version`, `protocol`), written by every aht command run here (never by the copy of aht another machine runs here).  When another machine asks this one, the answer says whether aht is installed here, with that version and protocol number, so that machine can tell whether this one keeps the records Bring Here and Send Back need | until you delete it; rewritten when aht is updated |
 | `offsite.json` | which backups were sent to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched; it replaces `run/offsite.json`, which older versions wrote and aht removes | rewritten at each copy and fetch |
@@ -282,6 +282,7 @@ encrypt it.
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
 | `handover/<project id>/` | for a project handed over, or brought to another machine with Bring Here: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files); for a project handed over or kept in sync, one file per machine in `there/` (`there/<machine>.json`; an older `there.json` is read the same way): the lists of its files and folders and of its Claude history on both machines (names, sizes, times, link targets, and checksums of the files there up to 64 MB each) as they were after the last sync, handover or take-back with that machine, with that machine's name in aht and the folder's path there, which the next sync, Hand Over and *Bring Them Here* compare the copy there with; in `replaced/` what a take-back (also *Bring Them Here*) or a Send Back from another machine replaced or removed here, and in `replaced/<time>/kept-aside/` files a take-back brought whose names this computer cannot hold, under safe names (`a%3Ab.txt`), or, when their path would be too long here, under a short name of one part (`0-notes.txt`); while a Send Back arrives, its files wait in an `incoming-…` folder; for a project brought here, in `brought/`, what was in the folder here before and was replaced or did not belong to the project | the list until the project is back or released, then the newest 5 earlier lists; each machine's file in `there/` until the next sync, handover or take-back with that machine replaces it; in `replaced/` and in `brought/` the newest 5 folders and every one younger than 30 days; the `incoming-…` folder until the Send Back ends |
 | `remote/copies.json` | the folders on this computer that are copies of another machine's projects, each with the kind of copy, the project's identifier, the machine it came from (its name and its aht's random id), the project's path and system there, whether git converts line endings there (`autocrlf`), which attempt it came with, and since when.  aht writes a note when you bring a project here (`brought`, then `returned` once you send it back), and when another machine keeps a project in sync here or hands one over to this computer (see [What can leave your device](#what-can-leave-your-device)) | until you delete the file; a later copy into the same folder replaces that folder's note |
+| `arrivals/<name>.json` | Windows, on a PC that answers: one record for each project a Mac or Linux machine handed over to this PC, which waits for **Continue here** in the tray (see [What can leave your device](#what-can-leave-your-device), *A PC that answers*) | until the project is taken back, its folder is gone, or you dismiss it |
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
 | `run/` | short-lived state: notices already shown (with when each of your other machines was last asked for them, and since when one that holds a project of yours has not answered), open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
 | `run/perm.json` | the permission level aht started an agent in at each hand-off on this computer (Switch, Hand Back, Pick Up → Open in, Bring Here): the hand-off's identifier, the agent, the project's path, the session id when known, the level, whether inside a sandbox, the flags, and when.  aht reads the level a Hand Back continues in only from here, never from the record in the project | the newest 400 |
@@ -352,19 +353,24 @@ features below send data, and only after you set them up.
    Back, `aht mirror`, `offsite_backup` and fetching backups, `aht
    night-shift`, Pick Up and Leave a Note, and the session list, notices,
    Watch and search for those machines).  This works between macOS,
-   Windows and Linux.  A Windows PC only asks your other machines: it
-   hands projects over to them and takes them back, keeps projects in sync
-   with them, brings their projects to itself and sends them back, asks
-   for their sessions, notices, Watch and search, picks up their work and
+   Windows and Linux.  A Windows PC asks your other machines: it hands
+   projects over to them and takes them back, keeps projects in sync with
+   them, brings their projects to itself and sends them back, asks for
+   their sessions, notices, Watch and search, picks up their work and
    leaves notes on them, and copies its backups to one of them and fetches
-   backups from it (`offsite_backup`); it is never asked itself, so no
-   project is handed over to a PC.  aht
+   backups from it (`offsite_backup`).  Only when you set up an SSH server
+   on the PC is it asked itself: a Mac or Linux machine then hands
+   projects over to it and takes them back, watches it and searches it
+   (see *A PC that answers* below).  aht
    connects over SSH, or mosh if both machines have it, to the machines
    you add with `aht remote add`.
    Before its first command to a new machine, `aht remote add` and `aht
    remote check` ask which system answers there (`echo aht-os %OS%
-   $env:OS`); aht cannot ask a Windows PC yet, so for one it stops right
-   there and makes nothing on it.  The machine's system is kept in
+   $env:OS`).  To a Windows PC aht then sends no shell script: it runs its
+   far end with one command line that cmd.exe and PowerShell read alike,
+   through aht installed there (`aht _agent`) or else through its own copy
+   with the PC's Python (`py -3` or `python`).  With neither, it stops
+   there and makes nothing on the PC.  The machine's system is kept in
    `config.json` (`remotes.<name>.system`), and so are, once aht has
    asked, the path of your home folder there (`remotes.<name>.home`) and
    the random identifier of aht there (`remotes.<name>.machine_id`).
@@ -378,9 +384,10 @@ features below send data, and only after you set them up.
    and records of who handed the work to whom) goes with a handover, which
    never removes anything from it there; Keep in sync leaves it out.  aht
    also puts a copy of itself there,
-   `~/.aht/remote/aht-<checksum>.py`, named after its checksum: the newest
-   3 are kept, and the `~/.aht/remote/aht.py` that older versions put there
-   is removed.  It installs this computer's version of Claude Code there,
+   `~/.aht/remote/aht-<checksum>.py`, named after its checksum (a copy
+   that did not arrive whole is removed there, never put in place): the
+   newest 3 are kept, and the `~/.aht/remote/aht.py` that older versions
+   put there is removed.  It installs this computer's version of Claude Code there,
    downloaded from Anthropic.  To learn whether a folder can be written
    there, aht briefly makes and removes a `.aht-write-test-…` file in the
    project folder there, and, when it checks the machine, in the path of
@@ -465,6 +472,46 @@ features below send data, and only after you set them up.
    log there (`~/.aht/aht.log`).  `aht remote check` tries them there
    for a moment too, to tell whether one works.
    Copies on those machines stay there until you remove them.
+
+   **A PC that answers.**  Only when you set up an SSH server on a
+   Windows PC and add it on a Mac or Linux machine.  What goes there and
+   what is read from it are the same as for any machine (the project
+   folder, its Claude Code history, checkpoints and plans, the summary,
+   the set-asides in `~\.aht\remote\replaced\`, the note in
+   `~\.aht\remote\copies.json`, the trust in `~\.claude.json`, kept
+   with forward slashes as Claude Code writes it there), with these
+   differences.  aht's own copy, `~\.aht\remote\aht-<checksum>.py`, is
+   put there only when aht is not installed on the PC (or is older): it
+   is written by the PC's Python from what aht sends on the connection, and
+   the newest 3 are kept, and a copy that did not arrive whole (its
+   checksum is checked first) is not written at all.  No session starts
+   there and nothing is kept awake: there is no `window.json`, no command
+   and no keep-awake helper, and aht never types into a session on the PC
+   or ends one.  It writes when this handover reached the PC
+   (`~\.aht\remote\run\<window name>\attempt-<id>`), next to it the
+   note Continue here's session reads first (`note.txt`) and its settings
+   (`settings.json`: a hook that shows that note, with Claude Code's
+   sandbox turned on when the session here ran in it), and a record that
+   waits for you, `~\.aht\arrivals\<window name>.json`: the project's
+   path on the PC and its folder name, this computer's name and its
+   random identifier, the agent (Claude Code) and the identifier of the
+   session handed over and its title (masked), your task, if you gave one
+   (masked), the identifier of the attempt, when, the words the tray
+   shows (*shop came from mac*, *Continue here*), what Continue here
+   runs (`aht _arrival --continue <name>`), the flags it starts Claude
+   Code with (the permission level the handover named, and
+   `handover_claude_args`), whether inside Claude Code's sandbox, where
+   the note is, and when the PC's notices announced it and when you
+   continued.  aht on the PC reads it: its notices announce it once, its
+   tray offers Continue here until you use it (or dismiss it) or the
+   project leaves, and Continue here opens Claude Code in a console there,
+   in that level and with that note; nothing runs until you type.  A
+   second Continue here is refused (that session may still be open)
+   unless you add `--again`.  The record goes when the project is taken
+   back (or its folder is gone, or you dismiss it); the note and the
+   settings stay in their folder, as on a Mac or Linux machine.  When Claude Code there is another
+   version than here, aht runs `claude install <version>` there (Claude
+   Code's own installer, which downloads that version from Anthropic).
 
    **What aht reads from your other machines, when you ask.**  All of it
    travels over your SSH connection.

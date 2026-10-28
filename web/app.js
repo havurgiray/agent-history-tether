@@ -412,21 +412,38 @@ const sendsBack = (c) => !!c && (c.kind === "brought" || c.kind === "handover");
 /** …and this machine has no name for its home (`copy_of.remote` null):
  * Send Back needs that machine added first. */
 const noName = (c) => !!c && "remote" in c && !c.remote;
-/** …and its home is a PC (`copy_of.system`): aht cannot ask a PC, so it goes
- * back only from there (Take Back on the PC), never with Send Back here. */
+/** A machine set up here (its `status` row), or null. */
+const remoteRow = (name) => (name && ((S.status.handover || {}).remotes || {})[name]) || null;
+/** Whether aht can ask a machine (its `status` row): a Mac or Linux one,
+ * yes.  A Windows PC answers once aht there (or its own copy, with the
+ * PC's Python) answered over ssh: the core says so in the row (`answers`;
+ * when false, why in `answers_why`: "install aht on pc: …", "not asked
+ * yet: …").  A core that does not say cannot ask a PC. */
+const answers = (r) => !!r && (r.system !== "Windows" || r.answers === true);
+/** Why aht cannot ask a PC, in the core's words. */
+const pcWhy = (r) => { const t = String((r && r.answers_why) || "").trim(); return !t ? "aht cannot ask a Windows machine yet." : /[.!?]$/.test(t) ? t : t + "."; };
+/** The guide's section on setting a PC up so that aht can ask it. */
+const PC_SETUP = "A Windows PC that answers";
+const pcSetup = () => h("div", { class: "row small pc-setup" }, h("span", { class: "dim", text: "How to set a PC up so that aht can ask it:" }), helpBtn(PC_SETUP));
+/** …and its home is a PC (`copy_of.system`): it goes back only from there
+ * (Take Back on the PC), never with Send Back here, also when the PC
+ * answers (the PC keeps the project's record; the core refuses Send Back
+ * to any PC). */
 const pcHome = (c) => !!c && c.system === "Windows";
-/** A project of this machine's that is on another one: {name, system,
- * there: the holder brought it there (`away.driven_by`), since, agent: the
- * agent working on it there (`away.agent`, in words), take: Take Back can
- * fetch it}.  A PC cannot be reached, so what a PC holds goes back
- * only with Send Back there, or Release here; so does what a machine this
- * one has no name for brought there (`away_remote` null). */
+/** A project of this machine's that is on another one: {name, system, pc:
+ * a Windows PC holds it, there: the holder brought it there
+ * (`away.driven_by`), since, agent: the agent working on it there
+ * (`away.agent`, in words), take: Take Back can fetch it}.  What a PC that
+ * aht cannot ask holds goes back only with Send Back there, or Release
+ * here; so does what a machine this one has no name for brought there
+ * (`away_remote` null). */
 function awayOf(p) {
   if (!p.away) return null;
-  const r = ((S.status.handover || {}).remotes || {})[p.away_remote] || {};
+  const r = remoteRow(p.away_remote) || {};
   const there = p.away_driven_by === "there", system = p.away_system || r.system || null;
-  return { name: p.away_remote || p.away_holder || p.away, system, there, since: p.away_since, agent: awayAgentLabel(p),
-    take: CAN_HAND_OVER() && system !== "Windows" && !(there && !p.away_remote) };
+  return { name: p.away_remote || p.away_holder || p.away, system, pc: system === "Windows" || !!p.away_arrival, there, since: p.away_since,
+    agent: p.away_arrival ? null : awayAgentLabel(p),
+    take: CAN_HAND_OVER() && (system !== "Windows" || answers(remoteRow(p.away_remote))) && !(there && !p.away_remote) };
 }
 
 async function refresh() {
@@ -507,6 +524,8 @@ function draw() {
 function projState(p) {
   if (p.handing) return ["handover unfinished", "waiting"];
   // the agent working on it there (`away_agent`), when the core names it
+  // handed over to a PC: nothing runs there until Continue here
+  if (p.away && p.away_arrival) return [`Continue here waits on ${awayOf(p).name}`, "working"];
   if (p.away) return [(awayOf(p).there ? `on ${awayOf(p).name}` : `handed over to ${p.away}`) + (awayAgentLabel(p) ? ` (${awayAgentLabel(p)})` : ""), "working"];
   if (!p.exists) return ["folder gone", "waiting"];
   if (p.open === "waiting") return ["waiting for you", "waiting"];
@@ -559,6 +578,7 @@ function detail() {
   if (!p) { d.append(h("p", { class: "dim", text: "Select a project to continue a session, see what changed, or look back." })); return d; }
   const aw = awayOf(p);
   const st = p.handing ? `handover to ${handing(p).to} unfinished`
+    : p.away && p.away_arrival ? `Continue here waits on ${aw.name}${p.away_since ? ", " + ago(p.away_since) : ""}`
     : p.away ? `${aw.there ? "on " + aw.name : "handed over to " + p.away}${p.away_since ? ", " + ago(p.away_since) : ""}${awayAgentLabel(p) ? `; ${awayAgentLabel(p)} works on it there` : ""}`
     : !p.exists ? "the folder is gone; its histories are safe"
     : `${plural(p.sessions || 0, "session")}, ${bytes(p.bytes)} of history`;
@@ -567,7 +587,8 @@ function detail() {
   if (p.handing) d.append(handingBanner(p));
   else if (!p.away && p.exists && syncPaused(p)) d.append(pausedBanner(p));
   // brought to another machine, or held by a PC: it comes back from there
-  if (aw && !p.handing && (aw.there || !aw.take)) d.append(awayLine(p, aw));
+  // (or, from a PC that answers, with Take Back here too)
+  if (aw && !p.handing && (aw.there || !aw.take || aw.pc)) d.append(awayLine(p, aw));
   const copy = p.exists && !p.away ? copyOf(p) : null;
   if (copy) d.append(copyLine(copy, p));
   const relay = openRelay(p);
@@ -581,7 +602,7 @@ function detail() {
   if (p.away) {
     if (aw.take) row.append(h("button", { class: "primary", text: "Take Back…", onclick: () => takeBack(p) }));
     // the window aht runs the agent in there: its last screen lines
-    if (aw.take && !aw.there && p.away_window) row.append(h("button", { text: "Peek…", onclick: () => peekThere(p) }));
+    if (aw.take && !aw.there && !aw.pc && p.away_window) row.append(h("button", { text: "Peek…", onclick: () => peekThere(p) }));
   } else if (p.exists) {
     // while a handover is unfinished, nobody knows yet where the work goes on
     const held = !!p.handing;
@@ -885,13 +906,19 @@ async function handBack(p) {
 }
 
 // ---- across machines: Pick Up and Leave a Note ----------------------------------------
-// They move the context only; git moves the files.  Every machine but a
-// Windows PC can be asked, so a PC starts each exchange: at the PC, Pick Up
-// from the Mac; before leaving it, Leave a Note on the Mac.
+// They move the context only; git moves the files.  A Windows PC that aht
+// cannot ask (no ssh server there, or an aht that does not answer) starts
+// each exchange itself: at the PC, Pick Up from the Mac; before leaving it,
+// Leave a Note on the Mac.
 
-/** The machines Pick Up and Leave a Note can ask: all but a Windows PC. */
+/** The machines Pick Up, Leave a Note and Bring Here can ask: Mac and
+ * Linux ones.  A Windows PC starts these itself, also one that answers
+ * (that takes Hand Over, Take Back, Watch, search and Check from here):
+ * the core refuses them for every PC. */
 const askable = () => (CAN_REACH() ? Object.entries((S.status.handover || {}).remotes || {})
-  .filter(([, r]) => r.system !== "Windows").map(([n]) => n).sort() : []);
+  .filter(([, r]) => !!r && r.system !== "Windows").map(([n]) => n).sort() : []);
+/** A machine set up here that is a Windows PC. */
+const isPC = (name) => (remoteRow(name) || {}).system === "Windows";
 
 /** The relay on a project's row that crosses machines (`relay.machine`: the
  * other one), or null: {kind, machine, remote, arrived, told, since,
@@ -1906,6 +1933,16 @@ async function changedCopyBlock(p, plan, ch, remote) {
   if (pick === "Replace Them There…") return handOver(p, ch);
 }
 
+/** Hand Over to a Windows PC (the dry run's `pc`, its system there, or the
+ * machine's own): aht copies the project there and starts nothing; the
+ * PC's tray offers Continue here.  Only Claude Code continues there. */
+const toPc = (plan, remote) => plan.pc === true || (farSystem(plan) || (remoteRow(remote) || {}).system) === "Windows";
+const pcNoStart = (pc) => `No session starts on ${pc}: aht copies the project there, and the PC's tray offers “Continue here”, which opens it in Claude Code. This folder is marked as away until you take it back.`;
+/** The core started no session there (`started: false` with `start_reason`
+ * or `reason` "windows", on its own or under `start`). */
+const startedNot = (d) => [d, d && d.start].some((x) => x && typeof x === "object" && x.started === false
+  && (x.start_reason || x.reason) === "windows");
+
 // Handover (Linux)
 /** `replacing`: the changed copy there that Replace Them There… lets the
  * handover replace (`--replace-there`). */
@@ -1941,8 +1978,10 @@ async function handOver(p, replacing) {
   for (const t of arr(plan.notes)) body += "\n\n" + sentence(t).trim();
   // Agent there: Claude Code resumes its own session (the plan above), or
   // another agent starts with the summary: its own dry run (`--agent X`),
-  // asked when it is chosen, says what stops it and the level it starts in
-  const source = plan.agent || "claude", agents = agentsThere(plan), dries = { claude: plan };
+  // asked when it is chosen, says what stops it and the level it starts in.
+  // A PC starts no session (its tray offers Continue here): no choice
+  const pc = toPc(plan, remote);
+  const source = plan.agent || "claude", agents = pc ? ["claude"] : agentsThere(plan), dries = { claude: plan };
   let chosen = "claude";
   const there = h("div", { class: "stack agent-there" });
   const paint = () => {
@@ -1951,6 +1990,7 @@ async function handOver(p, replacing) {
     clear(there).append(agents.length > 1 ? agentPicker("Agent there", agents, chosen, pick) : null,
       !d ? h("div", { class: "dim small" }, h("span", { class: "spin" }), `asking ${remote} about ${label}…`)
         : stop ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: `Not possible with ${label}:\n\n${stop}` })
+        : pc ? [h("div", { class: "small starts", text: pcNoStart(remote) }), permPart(d, chosen, { on: remote, agent: source, leaving: (a) => `the ${a ? a + " " : ""}session here` })]
         : [h("div", { class: "small starts", text: `${agentStarts(chosen, remote)} and this folder is marked as away until you take it back.` }),
           h("div", { class: "dim small tokens", text: agentCost(chosen, remote, false, d) }),
           chosen === "claude" ? null : arr(d.warnings).filter((w) => !arr(plan.warnings).includes(w)).map((w) => h("p", { class: "warn small", text: "⚠ " + w })),
@@ -1982,7 +2022,7 @@ async function handOver(p, replacing) {
   const first = !problems(d) && chosen === "kimi" ? farFirst(d) : null;
   note(p, problems(d) ? "The handover did not go through:\n\n" + problems(d)
     : `Handed over to ${remote}: ${s.files || 0} file(s) sent, ${bytes(s.wire_bytes)} over the network.`
-      + (agent.length ? ` ${label} started there with aht's summary of the work.` : ""), null,
+      + (pc || startedNot(d) ? " No session started there: its tray offers “Continue here”." : agent.length ? ` ${label} started there with aht's summary of the work.` : ""), null,
     first ? [firstPromptPart(first), h("button", { class: "small", text: "Open Its Window", onclick: () => openWindowThere(p) })] : undefined);
   refresh();
 }
@@ -2017,7 +2057,8 @@ async function openWindowThere(p) {
  * than aht removes without asking (`removals.over`), the question names
  * them and going ahead allows them (`--allow-removals`). */
 async function takeBack(p, copy) {
-  const name = base(p.real_path), stop = copy ? [] : ["--stop"];
+  // aht ends no session on a PC: one open there blocks, in the core's words
+  const name = base(p.real_path), stop = (awayOf(p) || {}).pc ? [] : copy ? [] : ["--stop"];
   note(p, null);
   let plan = await busy(`checking ${name}…`, () => J("reclaim", p.real_path, ...stop, "--json"));
   copy = plan.mode ? plan.mode === "copy" : !!copy;
@@ -2238,11 +2279,14 @@ async function syncAnyway(p, how) {
  * sync from here back to mac is refused for it (the core says so). */
 function copyLine(c, p) {
   const m = c.from, at = c.since || c.at, since = at ? `, since ${clock(at)}` : "";
-  // a PC's project: no Send Back (the PC cannot be asked); it goes back there
+  // the project of a PC that aht cannot ask: no Send Back; it goes back there
   if (sendsBack(c) && pcHome(c)) {
-    const pc = c.remote || m;
+    const pc = c.remote || m, r = remoteRow(c.remote);
     return h("div", { class: "row copyof" }, h("span", { class: "badge", text: c.kind === "brought" ? `Brought here from ${m}` : `Handed over from ${m}` }),
-      h("span", { class: "dim small grow", text: `Take it back on ${pc}. aht cannot ask a PC, so there is no Send Back from here.` }));
+      h("span", { class: "dim small grow", text: answers(r) ? `Take it back on ${pc}: the PC keeps this project's record, so there is no Send Back from here.`
+        : r && r.answers_why ? `Take it back on ${pc}; there is no Send Back from here. ${pcWhy(r)}`
+        : `Take it back on ${pc}. aht cannot ask a PC, so there is no Send Back from here.` }),
+      helpBtn(PC_SETUP));
   }
   // `kind`: "sync" (Keep in sync on that machine), "handover" (handed over
   // here), "brought" (Bring Here) or "returned" (it went back)
@@ -2278,7 +2322,7 @@ function handing(p) {
     silent: g.unreachable_since, release: !!g.release, there: g.driven_by === "there" || p.away_driven_by === "there", since: g.since };
 }
 /** The machine that brings a project there drives it (mark-away, or unmark
- * when it fails); aht here never asks it (a PC cannot be asked).  The
+ * when it fails); aht here does not ask it.  The
  * notices check offers Release an hour after it began (the core's
  * HANDING_RELEASE_AFTER): "aht waits for pc; Release is offered after an
  * hour (at 15:10)." */
@@ -2374,7 +2418,8 @@ async function release(p) {
 // Four verbs between any two of Mac, Windows and Linux.  "Home" keeps the
 // project's record; the "holder" works on it meanwhile.  Hand Over and Take
 // Back run at home; Bring Here and Send Back run at the holder, and need aht
-// at home, which must be a machine aht can ask (not a PC).  A folder can sit
+// at home, which must be a machine aht can ask (not a PC that does not
+// answer).  A folder can sit
 // at another path on each machine: `remotes.<name>.paths` says where.
 
 const arr = (x) => (Array.isArray(x) ? x : []);
@@ -2531,9 +2576,17 @@ const sayLines = (d) => [arr(d.notes).map((t) => h("p", { class: "small", text: 
   arr(d.warnings).map((w) => h("p", { class: "warn small", text: "⚠ " + w }))];
 
 /** "On pc since 14:10 (brought there from pc). Send it back from pc." with
- * [Release…]: a project of this machine's that comes back from there. */
+ * [Release…]: a project of this machine's that comes back from there.  One
+ * handed over to a PC from here: no session started there, and the PC's
+ * tray offers Continue here; Take Back fetches it while the PC answers. */
 function awayLine(p, a) {
   const at = a.since ? " since " + clock(a.since) : "";
+  if (a.pc && !a.there) {
+    return h("div", { class: "row awayrow" },
+      h("span", { class: "grow", text: `On ${a.name}${at}: continue it on the PC (its tray offers Continue here).`
+        + (a.take ? "" : ` ${pcWhy(remoteRow(p.away_remote))}`) }),
+      a.take ? null : h("button", { class: "small", text: "Release…", onclick: () => release(p) }), helpBtn(a.take ? "Hand a project over" : PC_SETUP));
+  }
   return h("div", { class: "row awayrow" },
     h("span", { class: "grow", text: `On ${a.name}${at}${a.agent ? `, in ${a.agent}` : ""}${a.there ? ` (brought there from ${a.name})` : ""}. Send it back from ${a.name}${a.take ? ", or take it back here" : ""}.` }),
     h("button", { class: "small", text: "Release…", onclick: () => release(p) }), helpBtn("Hand a project over"));
@@ -3035,15 +3088,17 @@ function drawSearch(m) {
   const labelled = (S.searched || []).length > 0 || S.hits.some((r) => r.machine);
   for (const r of S.hits) {
     // a hit on another machine: Continue and Restore act here, so it offers
-    // Continue Here… (Pick Up from that machine, with that session) instead
-    const there = !!r.machine;
+    // Continue Here… (Pick Up from that machine, with that session) instead;
+    // not from a PC, which starts every Pick Up itself
+    const there = !!r.machine, fromPC = there && isPC(r.machine);
     const box = h("div", { class: "box", style: "margin-top:8px" },
       h("div", { class: "row" }, h("strong", { text: r.title || "(no title)" }),
         labelled ? h("span", { class: "badge" + (there ? " working" : ""), text: there ? r.machine : "this computer" }) : null,
         h("span", { class: "dim small", text: `${base(r.project)} · ${AGENTS[r.agent] || r.agent} · ${when(r.updated)}` }),
         h("span", { class: "grow" }),
         // as the core offers them: only where the project folder is there
-        there ? h("button", { class: "small", text: "Continue Here…", title: `Pick up this session's work from ${r.machine}`, onclick: () => continueFromThere(r) })
+        fromPC ? h("span", { class: "dim small pc-hit", text: `Continue it on ${r.machine}`, title: `A Windows PC starts Pick Up and Leave a Note itself: on ${r.machine}, Leave a Note on this computer to go on with it here.` })
+          : there ? h("button", { class: "small", text: "Continue Here…", title: `Pick up this session's work from ${r.machine}`, onclick: () => continueFromThere(r) })
           : r.resume ? h("button", { class: "small", text: "Continue", onclick: () => resume([r.project, "--session", r.session, "--agent", r.agent]) })
           : r.restore && r.restore.project ? h("button", { class: "small", text: "Restore…", onclick: async () => {
             if (!(await confirmIt("Bring this session back?", `“${r.title}” was deleted from ${base(r.project)}'s history; a backup still holds it. Restoring adds what is missing and changes nothing that is there.`, "Restore"))) return;
@@ -3077,14 +3132,15 @@ function drawMachines(m) {
   if (!remotes.length) m.append(h("p", { class: "dim", text: "None yet." }));
   else m.append(h("p", { class: "dim small", style: "margin:6px 0 0", text: "Watch: every 2 minutes aht asks that machine for sessions that wait for you, and tells you." }));
   for (const [name, r] of remotes) {
-    const winBox = r.system === "Windows";           // aht cannot ask a Windows machine yet
+    const winBox = !answers(r);                      // a PC aht cannot ask (or not yet)
     const box = h("div", { class: "box", style: "margin-top:8px" }, h("div", { class: "row" }, h("strong", { text: name }),
       h("span", { class: "dim mono", text: r.ssh || "" }), r.system ? h("span", { class: "dim small", text: SYSTEMS[r.system] || r.system }) : null,
       send && name === ho.default_remote ? h("span", { class: "badge ok", text: "used for handovers" }) : null,
       h("span", { class: "grow" }),
-      // a PC is never handed a project: it brings one there itself
+      // a PC aht cannot ask is never handed a project: it brings one there itself
       send && name !== ho.default_remote && !winBox ? h("button", { class: "small", text: "Use This One", onclick: async () => { await run(["remote", "default", name]); refresh(); } }) : null,
-      !winBox ? h("button", { class: "small", text: "Bring a Project Here…", onclick: () => bringList(name) }) : null,
+      // a PC brings nothing here from its side: Bring Here starts on the PC
+      r.system !== "Windows" ? h("button", { class: "small", text: "Bring a Project Here…", onclick: () => bringList(name) }) : null,
       send && !winBox ? menu("Sync", [["Keep All Projects in Sync…", () => syncAll(name, true)],
         ["Stop Keeping All in Sync…", () => syncAll(name, false), !S.projects.some((p) => p.mirror)]], { right: true, small: true }) : null,
       h("button", { class: "small", text: "Check…", onclick: () => checkMachine(name) }),
@@ -3096,9 +3152,13 @@ function drawMachines(m) {
         refresh();
       } })),
       h("div", { class: "row" },
-        h("label", { class: "check", title: winBox ? "aht cannot ask a Windows machine yet." : null },
+        h("label", { class: "check", title: winBox ? pcWhy(r) : null },
           h("input", { type: "checkbox", checked: !!r.watch, disabled: winBox, onchange: (e) => watchMachine(name, e.target) }), "Watch"),
         h("span", { class: "grow" }), heardLine(name, r)),
+      // why, in the core's words, and how to set the PC up
+      winBox ? h("div", { class: "row pc-why" }, h("span", { class: "warn small grow", text: pcWhy(r) }), helpBtn(PC_SETUP)) : null,
+      // a PC that answers starts no session: its tray offers Continue here
+      !winBox && r.system === "Windows" && send ? h("div", { class: "dim small pc-note", text: "No session starts on a PC: Hand Over copies a project there, and the PC's tray offers Continue here." }) : null,
       pathsLine(name, r),
       send ? syncLine(name) : null);
     m.append(box);
@@ -3203,7 +3263,11 @@ async function checkMachine(name) {
   clear(box);
   const d = a.json || {};
   const r = (d.machines || []).find((x) => x.remote === name) || (d.machines || [])[0];
-  if (!r) return box.append(h("p", { class: "warn", style: "white-space:pre-wrap", text: problems(d) || (a.err + a.out).trim() || `${name} did not answer.` }));
+  // a PC: how to set it up when it does not answer; the Machines tab then
+  // shows what the core learnt
+  const pc = (r && r.system || (remoteRow(name) || {}).system) === "Windows";
+  if (pc) refresh();
+  if (!r) return box.append(h("p", { class: "warn", style: "white-space:pre-wrap", text: problems(d) || (a.err + a.out).trim() || `${name} did not answer.` }), pc ? pcSetup() : null);
   noteMovers(d);
   const rows = r.checks || [];
   // `transfer`: what copies files to and from it, unless a row says so already
@@ -3215,14 +3279,19 @@ async function checkMachine(name) {
     h("span", { class: "mark " + (c.ok ? "okc" : c.needed === false ? "dim" : "warn"), text: c.ok ? "✓" : c.needed === false ? "·" : "✗" }),
     h("div", { class: "grow" }, h("div", {}, h("strong", { text: c.check || c.name }), c.detail ? h("span", { class: "dim", text: " — " + c.detail }) : null),
       c.fix && !c.ok ? fixLine(c.fix) : null))));
+  // a PC that does not answer (`answers` false, its reason in `answers_why`)
+  const why = pc && r.answers === false ? r.answers_why || r.error || null : null;
+  const noStart = pc && !lacks("ask") && !why && !(r.error && !rows.length) && !rows.some((c) => /^no session starts/i.test(c.check || ""))
+    ? " No session starts on a PC: its tray offers Continue here." : "";
   if (r.error && !rows.length) {
     box.append(h("div", { class: "callout" }, h("strong", { text: `aht could not ask ${name}` }),
       h("div", { class: "small", style: "white-space:pre-wrap" }, inline(r.error))));
   } else if (rows.some((c) => c.group)) {
-    box.append(h("p", { class: lacks("ask") || (send && lacks("handover")) ? "warn" : "okc", text: lacks("ask") ? `aht cannot ask ${name} yet: it needs what is marked ✗ under For asking.`
-      : !send ? `aht can ask ${name}: its sessions, Search and Watch work from here.`
-      : lacks("handover") ? `aht can ask ${name}; handing a project over to it needs what is marked ✗.` : `${name} is ready: aht can ask it and hand projects over to it.` }));
+    box.append(h("p", { class: lacks("ask") || why || (send && lacks("handover")) ? "warn" : "okc", text: lacks("ask") || why ? `aht cannot ask ${name} yet: ${why ? pcWhy({ answers_why: why }) : "it needs what is marked ✗ under For asking."}`
+      : !send ? `aht can ask ${name}: its sessions, Search and Watch work from here.` + noStart
+      : lacks("handover") ? `aht can ask ${name}; handing a project over to it needs what is marked ✗.` + noStart : `${name} is ready: aht can ask it and hand projects over to it.` + noStart }));
   }
+  if (pc && (why || lacks("ask") || (r.error && !rows.length))) box.append(pcSetup());
   if (mover) box.append(mover);
   if (rows.some((c) => c.group)) {
     const ask = rows.filter((c) => c.group === "ask"), hand = rows.filter((c) => c.group !== "ask");
@@ -3251,8 +3320,11 @@ async function addMachine() {
     add.disabled = false;
     if (!$("#sheet").contains(said)) return;
     if (!r.ok) {
+      const why = (r.err + r.out).trim().replace(/^✗\s*/, "");
+      // a PC that does not answer: how to set it up
       return clear(said).append(h("div", { class: "callout" }, h("strong", { text: "Not added" }),
-        h("div", { class: "small", style: "white-space:pre-wrap" }, inline((r.err + r.out).trim().replace(/^✗\s*/, "") || "aht gave no answer."))));
+        h("div", { class: "small", style: "white-space:pre-wrap" }, inline(why || "aht gave no answer.")),
+        /\bWindows\b|\bPC\b/.test(why) ? pcSetup() : null));
     }
     closeSheet();
     await refresh();

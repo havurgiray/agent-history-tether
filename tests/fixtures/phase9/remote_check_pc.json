@@ -1,0 +1,76 @@
+{
+  "ok": true,
+  "machines": [
+    {
+      "remote": "pc",
+      "target": "me@pc",
+      "checks": [
+        {
+          "check": "reachable",
+          "ok": true,
+          "detail": "pc (Windows)",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "key login without a prompt",
+          "ok": true,
+          "detail": "yes",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "aht answers there",
+          "ok": true,
+          "detail": "aht's own copy, with py -3 (Python 3.9.6)",
+          "needed": true,
+          "group": "ask"
+        },
+        {
+          "check": "copies files with",
+          "key": "transfer",
+          "transfer": "aht",
+          "ok": true,
+          "needed": false,
+          "group": "handover",
+          "detail": "aht's own copy"
+        },
+        {
+          "check": "where projects go there",
+          "key": "paths",
+          "paths": "home",
+          "ok": true,
+          "needed": false,
+          "group": "handover",
+          "detail": "below its home folder (C:\\Users\\me); change it with:  aht remote paths pc"
+        },
+        {
+          "check": "Claude Code there",
+          "ok": true,
+          "detail": "9.9.9 (here: 9.9.9)",
+          "needed": true,
+          "group": "handover"
+        },
+        {
+          "check": "aht installed there (its tray offers Continue here)",
+          "ok": false,
+          "detail": "no: a project handed over waits there without a tray to say so",
+          "needed": false,
+          "group": "handover",
+          "fix": "install aht on the PC (winget install havurgiray.aht)"
+        },
+        {
+          "check": "no session starts there",
+          "ok": true,
+          "detail": "a project handed over waits on the PC: its tray offers Continue here, which opens Claude Code in it",
+          "needed": false,
+          "group": "handover"
+        }
+      ],
+      "system": "Windows",
+      "transfer": "aht",
+      "runner": "py",
+      "ok": true
+    }
+  ]
+}

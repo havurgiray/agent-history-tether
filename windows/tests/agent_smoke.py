@@ -10,7 +10,17 @@ checked, not only the core against itself).
 From source it runs windows/src/aht_main.py, as the exe does.  Everything
 happens in a throwaway home.  On Windows it also holds a target file open
 during an unpack: aht tries again 5 times, 0.2 s apart, then reports that
-one file and places the rest."""
+one file and places the rest.
+
+A PC that answers (phase 9): `start` queues Continue here (the arrival
+record, which `_arrival --json` lists) instead of a session, with the level's
+flags and the note the handover named, which `_arrival --continue` starts
+Claude Code with (once: again only with --again); `stop` and `close` say
+"windows", the trust key has forward slashes.  Off Windows the
+far end is told to answer as a PC (AHT_TEST_FAR_NT).  On Windows the lines a
+Mac sends are also run the way Windows' ssh server runs them: as one
+command line after `cmd.exe /c` (aht.exe, and aht's own copy written and
+run with py -3 or python), and through PowerShell once."""
 import hashlib, json, os, shutil, struct, subprocess, sys, tempfile, time, zlib
 from pathlib import Path
 
@@ -97,6 +107,171 @@ def frames_of(files: list, compressed: bool) -> bytes:
         out.append(b"E" + struct.pack(">I", i) + hashlib.sha256(data).digest())
     return b"".join(out) + b"Z"
 
+
+def pc_checks(cmd, env, tmp: Path, exe) -> None:
+    """A PC that answers: the ops, then the command lines through cmd.exe."""
+    if os.name != "nt":
+        env = dict(env, AHT_TEST_FAR_NT="1")
+    home = Path(env["HOME"])
+    proj = tmp / "pc-project"
+    proj.mkdir()
+    name = "aht-pc-project-abc123"
+    sid = "5d6e7f80-1111-4222-8333-444455556666"
+    st, _ = ask(cmd, env, {"op": "start", "path": str(proj), "name": name, "session": sid,
+                           "attempt": "20261028-120000-ab12", "from": "mac",
+                           "title": "Checkout flow", "args": ["--permission-mode", "auto"],
+                           "claude_sandbox": False,
+                           "note": "[aht] This session was handed over from mac."})
+    rec_f = home / ".aht" / "arrivals" / f"{name}.json"
+    rec = json.loads(rec_f.read_text(encoding="utf-8")) if rec_f.is_file() else {}
+    ck(st.get("ok") and st.get("started") is False and st.get("reason") == "windows"
+       and st.get("arrival") == name and rec.get("text") == "pc-project came from mac"
+       and rec.get("action") == "Continue here"
+       and rec.get("argv") == ["_arrival", "--continue", name]
+       and rec.get("resume") == ["resume-here", str(proj), "--session", sid],
+       f"start on a PC: no session, Continue here queued ({st.get('reason')}, {rec.get('text')})")
+    cli = [c for c in cmd[:-1]]                 # the same program, another command
+    r = subprocess.run(cli + ["_arrival", "--json"], capture_output=True, env=env, timeout=120)
+    try:
+        listed = [a.get("name") for a in json.loads(r.stdout.decode("utf-8"))["arrivals"]]
+    except (ValueError, KeyError):
+        listed = r.stdout.decode("utf-8", "replace")[-300:] + r.stderr.decode("utf-8", "replace")[-300:]
+    ck(listed == [name], f"_arrival --json lists it for the tray ({listed})")
+    # Continue here: the level the handover named (never read again here),
+    # the session, and a SessionStart hook that tells it the note
+    term = tmp / "pc-term.log"
+    cenv = dict(env, AHT_TERMINAL_LOG=str(term), AHT_CLAUDE="claude")
+    def cont(*more):
+        r = subprocess.run(cli + ["_arrival", "--continue", name, "--json", *more],
+                           capture_output=True, env=cenv, timeout=120)
+        try:
+            return json.loads(r.stdout.decode("utf-8"))
+        except ValueError:
+            return {"unparsed": r.stdout.decode("utf-8", "replace")[-300:]
+                    + r.stderr.decode("utf-8", "replace")[-300:]}
+    c1 = cont()
+    line = term.read_text(encoding="utf-8") if term.is_file() else ""
+    run_d = home / ".aht" / "remote" / "run" / name
+    try:
+        hook = json.loads((run_d / "settings.json").read_text(encoding="utf-8"))[
+            "hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    except (OSError, ValueError, KeyError, IndexError):
+        hook = ""
+    note = (run_d / "note.txt").read_text(encoding="utf-8") if (run_d / "note.txt").is_file() \
+        else ""
+    # cmd.exe's line quotes every word; Claude Code runs hooks through sh (Git
+    # Bash on Windows), so the note is read with cat everywhere
+    ck(c1.get("applied") and f"--permission-mode auto --resume {sid} --settings"
+       in line.replace('"', "")
+       and note == "[aht] This session was handed over from mac."
+       and hook.startswith("cat "),
+       f"Continue here: the level and the note the handover named ({c1}, {line[-200:]}, {hook})")
+    c2, c3 = cont(), cont("--again")
+    ck(not c2.get("applied") and "was already used" in (c2.get("error") or "")
+       and c3.get("applied"),
+       f"…once: a second one is refused, --again opens it ({c2.get('error')}, {c3})")
+    sp, _ = ask(cmd, env, {"op": "stop", "path": str(proj), "name": name})
+    cl, _ = ask(cmd, env, {"op": "close", "path": str(proj), "name": name})
+    ck(sp.get("stopped") is False and sp.get("reason") == "windows"
+       and cl.get("closed") is False and cl.get("reason") == "windows" and rec_f.is_file(),
+       f"stop and close on a PC say windows; Continue here stays offered ({sp}, {cl})")
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    tr, _ = ask(cmd, env, {"op": "trust", "path": "C:\\Users\\me\\code\\shop"})
+    keys = list((json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+                 .get("projects") or {}))
+    ck(tr.get("trust") == "carried over" and keys == ["C:/Users/me/code/shop"],
+       f"trust on a PC: the key with forward slashes, as Claude Code writes it there ({keys})")
+    pr, _ = ask(cmd, env, {"op": "prepare", "dirs": [], "copy_note": {
+        "path": str(proj), "uuid": "0123456789abcdef0123456789abcdef", "from": "mac",
+        "kind": "returned"}})
+    ck(pr.get("ok") and not rec_f.exists(),
+       "taken back (its copy note is no longer a handover's): the arrival is gone")
+    if os.name == "nt":
+        through_cmd(exe, env, tmp)
+
+def through_cmd(exe, env, tmp: Path) -> None:
+    """The lines as Windows' ssh server runs them: `cmd.exe /c <line>`, the
+    line passed as it is (never re-quoted), the request on stdin."""
+    sys.path.insert(0, str(REPO))
+    import aht as core
+    probe = json.dumps({"op": "probe"}).encode("utf-8") + b"\n"
+    def run(line, data, shell="cmd"):
+        if shell == "cmd":
+            full = "cmd.exe /d /c " + line
+        else:
+            import base64
+            full = ("powershell.exe -NoProfile -NonInteractive -EncodedCommand "
+                    + base64.b64encode(line.encode("utf-16-le")).decode("ascii"))
+        return subprocess.run(full, input=data, capture_output=True, env=env, timeout=300)
+    def answer(r):
+        i = r.stdout.rfind(MARK + b"{")
+        return json.loads(r.stdout[i + len(MARK):].decode("utf-8")) if i >= 0 else {}
+    # aht.exe (or, from source, an aht.cmd standing in for it) on the PATH
+    bin_ = tmp / "pc-bin"
+    bin_.mkdir()
+    if exe:
+        path = str(Path(exe).resolve().parent)
+    else:
+        (bin_ / "aht.cmd").write_text(
+            f'@"{sys.executable}" "{REPO / "windows" / "src" / "aht_main.py"}" %*\r\n')
+        path = str(bin_)
+    env = dict(env, PATH=path + os.pathsep + env.get("PATH", ""))
+    sbx = Path(os.path.realpath(tmp)) / "pc-sbx"     # long names: no RUNNER~1
+    a = answer(run(core.nt_agent_line("aht"), probe))
+    ck(a.get("ok") and a.get("system") == "Windows"
+       and a.get("protocol", 0) >= core.PC_PROTOCOL and not core.pc_out_of_range(a),
+       f"through cmd.exe: `aht _agent` answers, in range ({a.get('protocol')}, "
+       f"{a.get('error')})")
+    if core.nt_sandbox_ok(str(sbx)):
+        a = answer(run(core.nt_agent_line("aht", str(sbx)), probe))
+        ck(a.get("home") == str(sbx / "home"),
+           f"through cmd.exe: `aht _agent --sandbox` keeps to the sandbox ({a.get('home')})")
+    else:
+        print(f"  SKIP the sandbox line: {sbx} is not a plain C:\\ folder")
+    # aht's own copy, written and then run by the Python there
+    def has_python(r):
+        v = run(r + (" -3" if r == "py" else "") + " --version", b"")
+        return v.returncode == 0 and b"Python 3" in v.stdout + v.stderr
+    py = next((r for r in ("py", "python") if has_python(r)), None)
+    if not py:
+        print("  SKIP aht's own copy through cmd.exe: neither py nor python here")
+        return
+    cid = hashlib.sha256((REPO / "aht.py").read_bytes()).hexdigest()[:12]
+    sb = str(sbx) if core.nt_sandbox_ok(str(sbx)) else ""
+    copy = (Path(sb) / "home" if sb else Path(env["USERPROFILE"])) / ".aht" / "remote" / \
+        f"aht-{cid}.py"
+    w = run(core.nt_agent_line(py, sb, cid, write=".aht-new-cut"),
+            (REPO / "aht.py").read_bytes()[:200_000])
+    left = list(copy.parent.glob(".aht-new-*")) if copy.parent.is_dir() else []
+    ck(b"aht-copy-cut-short" in w.stderr and not copy.exists() and not left,
+       f"through cmd.exe: aht's copy cut short is not put in place "
+       f"({w.stderr.decode('utf-8', 'replace')[-200:]})")
+    w = run(core.nt_agent_line(py, sb, cid, write=".aht-new-smoke"), (REPO / "aht.py").read_bytes())
+    ck(b"aht-copy-written" in w.stdout and copy.is_file()
+       and copy.read_bytes() == (REPO / "aht.py").read_bytes(),
+       f"through cmd.exe: {py} writes aht's copy from stdin, byte for byte "
+       f"({w.stderr.decode('utf-8', 'replace')[-200:]})")
+    a = answer(run(core.nt_agent_line(py, sb, cid), probe))
+    ck(a.get("ok") and a.get("system") == "Windows" and a.get("core_id") == cid,
+       f"through cmd.exe: {py} runs aht's copy as the far end, plain Python, no entry point "
+       f"({a.get('core_id')}, {a.get('error')})")
+    proj = tmp / "pc-project-2"
+    proj.mkdir()
+    pr = answer(run(core.nt_agent_line(py, sb, cid), json.dumps({
+        "op": "prepare", "dirs": [], "copy_note": {
+            "path": str(proj), "uuid": "0123456789abcdef0123456789abcdef", "from": "mac",
+            "kind": "handover"}}).encode("utf-8")))
+    ck(pr.get("ok"), f"…and takes aht's lock there without the entry point's fcntl "
+                     f"({pr.get('error')})")
+    r = run(core.nt_agent_line(py, sb, cid), probe, shell="powershell")
+    a = answer(r)
+    err = r.stderr.decode("utf-8", "replace")
+    if a:
+        ck(a.get("ok") and a.get("core_id") == cid, "through PowerShell: the same line answers")
+    else:
+        ck(not any(x in err for x in ("ParserError", "Unexpected token", "is not recognized")),
+           f"through PowerShell: the same line parses (no answer: PowerShell kept stdin) "
+           f"({err[-200:]})")
 
 def main(argv) -> int:
     exe = argv[0] if argv else None
@@ -231,6 +406,7 @@ def main(argv) -> int:
                and held.read_bytes() == b"open elsewhere",
                f"a file held open: 5 tries in {took:.1f} s, then reported "
                f"({probs.get('held.txt')}); the rest is placed")
+        pc_checks(cmd, env, tmp, exe)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("\nAGENT SMOKE:", "ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")

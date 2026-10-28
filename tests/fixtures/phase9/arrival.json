@@ -1,0 +1,38 @@
+{
+  "v": 1,
+  "name": "aht-shop-8f9349",
+  "kind": "handover",
+  "path": "C:\\Users\\me\\code\\shop",
+  "project": "shop",
+  "from": "mac",
+  "from_id": "31ed2b95a9c7",
+  "agent": "claude",
+  "session": "5d6e7f80-1111-4222-8333-444455556666",
+  "title": "Checkout flow",
+  "task": null,
+  "attempt": "20261028-150644-3cf1",
+  "at": 1793196407.944602,
+  "text": "shop came from mac",
+  "action": "Continue here",
+  "detail": "Continue here opens Claude Code in shop, in the session handed over from mac. Nothing runs until you type.",
+  "argv": [
+    "_arrival",
+    "--continue",
+    "aht-shop-8f9349"
+  ],
+  "resume": [
+    "resume-here",
+    "C:\\Users\\me\\code\\shop",
+    "--session",
+    "5d6e7f80-1111-4222-8333-444455556666"
+  ],
+  "args": [
+    "--permission-mode",
+    "auto",
+    "--verbose"
+  ],
+  "claude_sandbox": false,
+  "note": "C:\\Users\\me\\.aht\\remote\\run\\aht-shop-8f9349\\note.txt",
+  "notified": null,
+  "continued": null
+}

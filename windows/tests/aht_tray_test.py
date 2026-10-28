@@ -3,25 +3,40 @@
 core handed over runs Continue here only for an arrival's notice, never for
 a balloon the tray showed itself after it (Restart watcher, Settings,
 Folder badges…), and only once; the menu's "<project> came from mac —
-Continue here" items; and the core's words when `aht _arrival` refuses.
-The functions are lifted out of windows/src/aht_tray.py (it needs Win32 to
-import) and run with stand-ins.  Nothing is shown, nothing runs, and
+Continue here" items; the core's words when `aht _arrival` refuses; the
+"Projects brought here" list (a PC's project only while that PC answers);
+how winlayer.notify_user hands a notice over (the core's queue_notice,
+which starts the file over past 500 lines, or a plain append) and that the
+tray then shows only the new one; and watcher_owner=none: no logon entry
+for the watcher, a running one stopped (its stop event, else the pid it
+wrote), no watcher started by the tray, install or a stale entry, and the
+entry back with "agent".  The functions are lifted out of
+windows/src/aht_tray.py and winlayer.py (they need Win32 to import), and
+pc_answers out of aht.py, and run with stand-ins.  Nothing is shown, nothing runs, and
 nothing is written outside a throwaway folder.
 
     python windows/tests/aht_tray_test.py
 """
+import argparse
 import ast
 import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
+
+# a Windows console or pipe in cp1252 cannot print every character a
+# check names (✓, →): print them escaped there rather than stop
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="backslashreplace")
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "windows" / "src" / "aht_tray.py"
 WANT = {"arrivals", "_arrival_run", "_continue_here", "_dismiss", "notice_clicked",
-        "pump_notices", "balloon"}
+        "pump_notices", "balloon", "brought_here"}
 tree = ast.parse(SRC.read_text(encoding="utf-8"))
 mod = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in WANT],
                  type_ignores=[])
@@ -167,6 +182,157 @@ try:
            f"the core's sample (arrival.json): text — action ({got})")
     else:
         print("  --   the core's sample arrival.json: not there yet")
+    # ---- Projects brought here: a PC's project only while that PC answers -------------
+    core = ast.parse((ROOT / "aht.py").read_text(encoding="utf-8"))
+    cns = {}
+    exec(compile(ast.Module(body=[n for n in core.body if (isinstance(n, ast.FunctionDef) and n.name == "pc_answers")
+                                  or (isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "NT_RUNNERS" for t in n.targets))],
+                            type_ignores=[]), "aht.py", "exec"), cns)
+    C = "C:\\Users\\me\\code\\"
+    ns["aht"].read_copies = lambda: {
+        C + "shop": {"kind": "brought", "from": "mac", "at": "2026-10-28T10:00:00"},
+        C + "pcwork": {"kind": "brought", "from": "DESKTOP-B", "remote": "pcb", "system": "Windows", "at": "2026-10-28T11:00:00"},
+        C + "mute": {"kind": "brought", "from": "DESKTOP-C", "remote": "pcc", "system": "Windows", "at": "2026-10-28T12:00:00"},
+        C + "nameless": {"kind": "brought", "from": "DESKTOP-D", "system": "Windows", "at": "2026-10-28T13:00:00"},
+        C + "api": {"kind": "handover", "from": "mac", "at": "2026-10-28T14:00:00"}}
+    ns["aht"].remotes_config = lambda: {"pcb": {"ssh": "me@pcb", "system": "Windows", "runner": "aht"},
+                                        "pcc": {"ssh": "me@pcc", "system": "Windows", "answers_why": "install aht on pcc"}}
+    ns["aht"].pc_answers = cns["pc_answers"]
+    got = ns["brought_here"]()
+    ck(got == [(C + "pcwork", "pcwork", "DESKTOP-B"), (C + "shop", "shop", "mac")],
+       f"Projects brought here: Send Back to a PC that answers, not to one that does not or one not set up ({got})")
+    del ns["aht"].pc_answers                       # an older core: not to a PC
+    ck(ns["brought_here"]() == [(C + "shop", "shop", "mac")], "…an older core (no pc_answers): no PC's project")
+
+    # ---- winlayer.notify_user: the core's queue_notice, else a plain append ---------
+    wl = ast.parse((ROOT / "windows" / "src" / "winlayer.py").read_text(encoding="utf-8"))
+    toasts, handed = [], []
+    W = T / "wl"
+    (W / "run").mkdir(parents=True)
+    wns = {"os": types.SimpleNamespace(environ={}), "time": time, "json": json, "CREATE_NO_WINDOW": 0, "_TOAST_PS": "",
+           "subprocess": types.SimpleNamespace(run=lambda *a, **k: toasts.append(a)),
+           "aht": types.SimpleNamespace(cfg_get=lambda k, d=None: d, aht_home=lambda: W,
+                                        queue_notice=lambda path, rec: handed.append((path, rec)))}
+    exec(compile(ast.Module(body=[n for n in wl.body if isinstance(n, ast.FunctionDef) and n.name == "notify_user"],
+                            type_ignores=[]), "winlayer.py", "exec"), wns)
+    (W / "run" / "tray-alive").touch()
+    wns["notify_user"]("api waits for you", "Claude Code asks a question.", {"kind": "waiting"})
+    ck(len(handed) == 1 and handed[0][0] == W / "run" / "tray-notices.jsonl"
+       and set(handed[0][1]) == {"title", "message", "info", "at"} and handed[0][1]["info"] == {"kind": "waiting"}
+       and not (W / "run" / "tray-notices.jsonl").exists() and not toasts,
+       f"the tray runs: the notice goes to the core's queue_notice ({handed})")
+    del wns["aht"].queue_notice                    # an older core: the append as before
+    wns["notify_user"]("web is done", "Claude Code finished.")
+    lines = (W / "run" / "tray-notices.jsonl").read_text(encoding="utf-8").splitlines()
+    ck(len(lines) == 1 and json.loads(lines[0])["title"] == "web is done" and len(handed) == 1 and not toasts,
+       "…an older core without queue_notice: appended to tray-notices.jsonl")
+    os.utime(W / "run" / "tray-alive", (time.time() - 600, time.time() - 600))
+    wns["notify_user"]("shop is done", "Claude Code finished.")
+    ck(len(toasts) == 1 and len(lines) == len((W / "run" / "tray-notices.jsonl").read_text(encoding="utf-8").splitlines()),
+       "no tray: a toast, nothing queued")
+
+    # ---- the tray after the core started the queue over (past 500 lines) --------------
+    queue(*[{"title": f"old {i}", "message": "x", "at": 1.0 + i} for i in range(5)])
+    ns["pump_notices"]()
+    n0 = len(shown)
+    with open(ns["NOTICE_QUEUE"], "w", encoding="utf-8") as fh:   # as queue_notice does: only the new line
+        fh.write(json.dumps({"title": "box is back", "message": "box answers again.", "at": time.time()}) + "\n")
+    ns["pump_notices"]()
+    ck(shown[n0:] == [("box is back", "box answers again.")], f"…the tray shows the new one only ({shown[n0:]})")
+    # ---- watcher_owner=none on Windows ------------------------------------------------
+    def lift(src, names, into):
+        t = ast.parse(src.read_text(encoding="utf-8"))
+        body = [n for n in t.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+                or (isinstance(n, ast.Assign) and any(getattr(x, "id", "") in names for x in n.targets))]
+        exec(compile(ast.Module(body=body, type_ignores=[]), str(src), "exec"), into)
+        missing = names - set(into)
+        assert not missing, f"not found in {src.name}: {missing}"
+    owner = ["none"]
+    V = T / "wv"
+    (V / "run").mkdir(parents=True)
+    TRAY_ENTRY = '"C:\\Users\\me\\AppData\\Local\\aht\\aht-tray.exe"'
+    WATCH_ENTRY = TRAY_ENTRY + " --watch"
+    reg, did, wlog = {"entry": None}, [], []
+    st = {"running": False, "stops": True, "pid": None}
+
+    def stop(wait=6.0):
+        did.append("stop")
+        if st["stops"]:
+            st["running"] = False
+        return st["stops"]
+    wv = {"json": json, "os": os, "sys": sys, "time": time, "ctypes": types.SimpleNamespace(get_last_error=lambda: 0),
+          "argparse": argparse, "print": lambda *a, **k: did.append("print: " + " ".join(map(str, a))),
+          "aht": types.SimpleNamespace(cfg_get=lambda k, d=None: owner[0] if k == "watcher_owner" else d,
+                                       aht_home=lambda: V, warn=did.append, log=lambda m: did.append("log: " + m),
+                                       watch_roots_config=lambda: []),
+          "_run_key_get": lambda: reg["entry"],
+          "_run_key_delete": lambda: (did.append("delete entry"), reg.update(entry=None)),
+          "_run_key_set": lambda v: (did.append("set entry"), reg.update(entry=v)),
+          "watcher_running": lambda: st["running"], "stop_watcher": stop,
+          "_watcher_pid": lambda: st["pid"], "_end_process": lambda pid: (did.append(f"end {pid}"), True)[1],
+          "start_watcher_hidden": lambda: did.append("start"), "_wlog": wlog.append,
+          "_kernel32": types.SimpleNamespace(CreateMutexW=lambda *a: 7, CloseHandle=lambda h: did.append(f"close {h}"),
+                                             CreateEventW=lambda *a: did.append("stop event") or 8),
+          "MUTEX_NAME": "m", "STOP_EVENT_NAME": "e", "ERROR_ALREADY_EXISTS": 183}
+    WLP = ROOT / "windows" / "src" / "winlayer.py"
+    lift(WLP, {"watcher_wanted", "watcher_off", "_reload_watcher", "cmd_watch", "is_tray_entry",
+               "RUN_VALUE", "ENTRY_OFF", "PID_FILE"}, wv)
+    park = V / "run" / wv["ENTRY_OFF"]
+    reg["entry"], st["running"] = WATCH_ENTRY, True
+    done = wv["watcher_off"]()
+    ck(reg["entry"] is None and park.read_text(encoding="utf-8") == WATCH_ENTRY and not st["running"]
+       and len(done) == 2 and "removed" in done[0] and "asked to end" in done[1] and not any(d.startswith("end ") for d in did),
+       f"none: the watcher's logon entry goes (kept aside for agent again), the watcher ends through its stop event ({done})")
+    did.clear()
+    park.unlink()
+    reg["entry"] = TRAY_ENTRY
+    st.update(running=True, stops=False, pid=4242)
+    done = wv["watcher_off"]()
+    ck(reg["entry"] == TRAY_ENTRY and "delete entry" not in did and not park.exists() and "end 4242" in did
+       and done == ["the watcher (pid 4242) did not end when asked, so it was ended"],
+       f"none: the tray's own entry stays; a watcher that does not end is ended by the pid it wrote ({done})")
+    did.clear()
+    st.update(running=True, stops=False, pid=None)
+    done = wv["watcher_off"]()
+    ck(done == ["the watcher was asked to end; it has not ended yet"] and not any(d.startswith("end ") for d in did),
+       "…no pid file (or another program has that pid now): nothing is ended by its name")
+    st.update(running=False, stops=True, pid=None)
+    did.clear()
+    ck(wv["_reload_watcher"]() is False and "start" not in did, "none: Reload starts no watcher")
+    did.clear()
+    ck(wv["cmd_watch"]([]) == 0 and "stop event" not in did and "close 7" in did
+       and wlog[-1] == "watching is off (watcher_owner=none) — exiting" and not (V / "run" / wv["PID_FILE"]).exists(),
+       f"none: a watcher started by a logon entry left from before ends at once ({wlog[-1:]})")
+    # agent again: the entry comes back, the watcher starts
+    owner[0] = "agent"
+    reg["entry"] = None
+    park.write_text(WATCH_ENTRY, encoding="utf-8")
+    did.clear()
+    ck(wv["_reload_watcher"]() is True and reg["entry"] == WATCH_ENTRY and not park.exists() and "start" in did,
+       f"agent again: the logon entry is put back and the watcher starts ({did})")
+    reg["entry"] = TRAY_ENTRY
+    park.write_text(WATCH_ENTRY, encoding="utf-8")
+    did.clear()
+    wv["_reload_watcher"]()
+    ck(reg["entry"] == TRAY_ENTRY and "set entry" not in did and not park.exists(), "…an entry there now (the tray's) stays")
+    wsrc = WLP.read_text(encoding="utf-8")
+    ck("aht.stop_watcher = watcher_off" in wsrc and "if not watcher_wanted():\n            # watcher_owner=none: no logon entry" in wsrc,
+       "aht config --set watcher_owner=none reaches watcher_off on Windows; aht install writes no entry then")
+    # the tray
+    tv = {"winlayer": types.SimpleNamespace(watcher_wanted=lambda: owner[0] != "none", watcher_running=lambda: st["running"],
+                                            start_watcher_hidden=lambda: did.append("start"), stop_watcher=lambda: did.append("stop")),
+          "balloon": lambda t, m: did.append(("balloon", t)), "refresh": lambda force=False: None, "_in_thread": lambda fn: fn()}
+    lift(SRC, {"WATCHING_OFF", "start_watcher_if_wanted", "act_toggle_watch", "act_restart"}, tv)
+    owner[0], st["running"] = "none", False
+    did.clear()
+    tv["start_watcher_if_wanted"]()
+    tv["act_toggle_watch"]()
+    tv["act_restart"]()
+    ck("start" not in did and did.count(("balloon", "Watching is off")) == 2,
+       f"none: the tray starts no watcher (at its start, Resume watching, Restart watcher) and says why ({did})")
+    owner[0] = "agent"
+    did.clear()
+    ck(tv["start_watcher_if_wanted"]() is True and did == ["start"], "agent: the tray keeps a watcher running, as before")
     ck(not warned, f"Windows showed every balloon ({warned})")
 finally:
     shutil.rmtree(T, ignore_errors=True)

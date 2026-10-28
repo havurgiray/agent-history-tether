@@ -189,9 +189,9 @@ folders (`backend_roots`).
 - **`.aht/handover/`**, only when you hand a project over, bring one
   here, switch agents, or pick up work or leave a note across machines:
   - a handover's summary (`<time>-to-<machine>.md`: the session's title
-    and id, the folders on both machines, your task as you wrote it, the
-    exchanges, to-dos, file names, git state and commit subjects, with
-    keys masked, and the files outside the project the session used);
+    and id, the folders on both machines, your task, the exchanges,
+    to-dos, file names, git state and commit subjects, with keys masked,
+    and the files outside the project the session used);
   - for a handover of a Claude Code session, a copy of that session's
     scratch folder (Claude Code's `scratchpad` under `/tmp`), when it holds
     100 MB or less, in `scratch/<session id>/`; the next handover replaces
@@ -265,7 +265,9 @@ folders (`backend_roots`).
   an entry under
   `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
   (Windows); a systemd user unit or an autostart entry in `~/.config`
-  (Linux).
+  (Linux).  With `watcher_owner` set to `none`, aht removes the watcher's
+  LaunchAgent, unit or autostart entry (on a Mac and on Linux) and writes
+  none at `aht install`.
 - **The program:** the `aht` command (macOS and Linux).  On Windows, the
   program in `%LOCALAPPDATA%\Programs\aht` with a Start menu entry and an
   entry under Settings → Apps when the installer put it there, or in
@@ -308,7 +310,7 @@ encrypt it.
 |---|---|---|
 | `config.json` | your settings; for each machine you added, its system, whether you watch it, your home folder's path there, where projects go there (`paths`: `same`, `home`, or pairs of folders), aht's random id there (so a project brought from there goes back to the right machine), whether mosh's traffic gets through (`udp`), and for a Windows PC that answers, what answers there (`runner`: `aht`, `py` or `python`) or why it does not (`answers_why`) | until you delete it, or `aht uninstall --purge` |
 | `machine.json` | a random id of this computer (12 hex digits), its name, and when the file was made.  Made the first time aht has to name this computer to another machine or in a project's record (backups copied, a project synced, handed over, taken back or brought here, a hand-off recorded).  Kept out of `config.json`, so a copied config does not clone it | until you delete it |
-| `install.json` | the version of aht installed here and the protocol number it speaks with your other machines.  Written by aht's own commands here, never by the copy another machine runs here.  A machine that asks this one learns them, to tell whether this one keeps the records Bring Here and Send Back need | rewritten when aht is updated |
+| `install.json` | the version of aht installed here, the protocol number it speaks with your other machines and the names of the operations it answers.  Written by aht's own commands here, never by the copy another machine runs here.  A machine that asks this one learns them, to tell whether this one keeps the records Bring Here and Send Back need | rewritten when aht is updated |
 | `offsite.json` | which backups went to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched (older versions kept this in `run/offsite.json`, which aht removes) | rewritten at each copy and fetch |
 | `registry.json` (and `.bak`) | the projects aht tracks (see [below](#the-registry)) | until you delete it, or `aht uninstall --purge` |
 | `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session ids, your other machines' names (and the Tailscale address aht reached one by), the notices it showed, warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one: about 10 MB at most |
@@ -405,8 +407,8 @@ These files in `run/` are kept longer:
 
 | File | What it holds | How long it is kept |
 |---|---|---|
-| `app-notices.jsonl` (macOS), `tray-notices.jsonl` (Windows) | each notice handed to the Mac app or the Windows tray to show: its title and text, with what a click on it opens (the project's path, a session's id and process, a machine's name, a hand-off's id) and when | until you delete it: aht only adds to it |
-| `stage-<number>.json` (macOS) | the Mac app's view of a job's progress (its stage and percentage) | until you delete them |
+| `app-notices.jsonl` (macOS), `tray-notices.jsonl` (Windows) | each notice handed to the Mac app or the Windows tray to show: its title and text, with what a click on it opens (the project's path, a session's id and process, a machine's name, a hand-off's id) and when | at most 500 lines: the notice after that starts the file over, holding only itself (the app and the tray have shown the older ones by then) |
+| `stage-<number>.json` (macOS) | the Mac app's view of a job's progress (its stage and percentage) | deleted when the job ends (a file left by an earlier version stays until you delete it) |
 | `perm.json` | the permission level aht started an agent in at each hand-off on this computer (Switch, Hand Back, Pick Up → *Open in*, Bring Here): the hand-off's id, the agent, the project's path, the session id when known, the level, whether inside a sandbox, the flags, and when.  aht reads the level a Hand Back continues in only from here, never from the record in the project | the newest 400 |
 | `claude-sandbox.json` | the settings that turn Claude Code's sandbox on (`{"sandbox": {"enabled": true}}`), which aht names with `--settings` when it starts Claude Code in never-ask mode inside its sandbox | rewritten when missing or changed |
 | `board.json` | for each of your other machines, when it last answered and the sessions it had open then: agent, project folder (the path there), process and session ids, state and since when, and the name, title and what it waits for, masked as that machine sent them | rewritten each time one answers; a machine you remove, or add again under the same name, is dropped at once |
@@ -576,7 +578,8 @@ shows that note, and Claude Code's sandbox turned on when the session here
 ran in it); `command.txt`, the line the session runs: the flags of the
 permission level the session here runs in, `handover_claude_args`, the
 name it shows in Remote Control (its iTerm2 tab's title and the machine's
-name, as they are), your task as you wrote it, if you gave one, and git
+name) and your task, if you gave one, both with keys masked here before
+they leave, and git
 settings for its environment (`core.autocrlf=true` when the project comes
 from a PC whose git converts line endings; never in the project's
 `.git/config`); when this attempt's session started, so that aht can tell
@@ -621,17 +624,28 @@ for a moment too.
 #### A PC that answers
 
 Only when you set up an SSH server on a Windows PC and add it on another
-machine.  That machine then hands projects over to it and takes them
-back, watches it and searches it; nothing in aht stops it from also
-keeping a project in sync there or keeping its backups there
-(`offsite_backup`).  It does not bring projects from a PC or send them
-back there, plan night shifts with it, pick up its work or leave notes on
-it, or attach to it.  What goes there and what is read from it are as for
-any machine, with these differences:
+machine.  That machine (a Mac, a Linux machine or another PC) then hands
+projects over to it and takes them back, keeps projects in sync with it,
+keeps its backups there (`offsite_backup`) and fetches them back, sends
+back a project the PC handed over, watches it and searches it.  It does
+not bring projects from a PC, plan night shifts with it, pick up its work
+or leave notes on it, or attach to it.  What goes there and what is read
+from it are as for any machine, with these differences:
 
 - aht's own copy, `~\.aht\remote\aht-<checksum>.py`, is put there only
   when aht is not installed on the PC (or is older), written by the PC's
   Python from what aht sends on the connection.
+- Keep in sync with the PC writes there what a sync writes on any
+  machine: the project and its Claude history, the PC's note that the
+  folder is a copy kept in sync (`~\.aht\remote\copies.json`), and what
+  a sync replaces there set aside in `~\.aht\remote\replaced\`.  Backups
+  kept on the PC go into `~\.aht\offsite\<that computer's id>\` with its
+  name and system (`machine.json`), as on any machine.
+- A Send Back to the PC (of a project the PC handed over) sends the files
+  and history changed on the other machine to the PC, which plans the way
+  back against its own record of the handover and keeps what it replaces
+  in `~\.aht\handover\<project id>\replaced\`, as a Send Back home does
+  anywhere.
 - A project's path never matches there, so its /rewind snapshots do not
   go.  The trust in `~\.claude.json` is kept with forward slashes, as
   Claude Code writes it there.
@@ -641,8 +655,9 @@ any machine, with these differences:
   reached the PC (`~\.aht\remote\run\<window name>\attempt-<id>`), next to
   it the note Continue here's session reads first (`note.txt`) and its
   settings (`settings.json`: a hook that shows that note, with Claude
-  Code's sandbox turned on when the session here ran in it).  The
-  session's title and your task are sent as they are and masked there.
+  Code's sandbox turned on when the session here ran in it).  Your task
+  is masked here before it leaves; the session's title is sent as it is
+  and masked there.
 - A record waits for you, `~\.aht\arrivals\<window name>.json`: the
   project's path on the PC and its folder name, this computer's name and
   random id, the agent (Claude Code), the id of the session handed over
@@ -810,7 +825,7 @@ project's home) keeps the project's record.
   idle), and its latest Claude Code session: its id, its title, masked
   there, and when it was last written.  With it come that machine's name,
   random id, system, home folder path and clock, and whether aht is
-  installed there (its version and protocol number, from
+  installed there (its version, protocol number and operations, from
   `~/.aht/install.json` there).
 - *For the project you pick:* the sessions and other programs running in
   it there (process ids, names, state), its latest Claude Code session's
@@ -915,10 +930,13 @@ meaning a project or session name and a short status such as "input
 needed" (what a session waits for, with keys masked as under
 [Security](#security)), go either through Apple's Messages app as an
 iMessage to the address you give (macOS), or to the ntfy server you name
-(ntfy.sh unless you give your own address).  Anyone who knows an ntfy.sh
-topic's name can read it, so choose a name that is hard to guess, or use
-your own server; a server address that starts with `http://` gets the
-notices unencrypted.
+(ntfy.sh unless you give your own address), always over HTTPS.  Anyone
+who knows an ntfy.sh topic's name can read it, so choose a name that is
+hard to guess, or use your own server.  aht refuses a server address that
+starts with `http://`, which would carry the notices unencrypted, unless
+the server runs on this very computer (`localhost`, `127.0.0.1` or
+`[::1]`), where nothing crosses the network; an `http://` address set
+before aht refused it gets nothing, and the log says why.
 
 Once you have added another machine, every notice names the machine it
 is about: another machine by the name you gave it in aht, this computer
@@ -1007,7 +1025,8 @@ histories of their own for the copies in `~/.aht/opinions/`.
 The session names aht gives Claude Code become part of its history.  An
 agent may sync that history; Claude Code, for example, shows session
 names in the Claude app through Remote Control, and a handed-over session
-is named there after its tab and the machine.  aht starts Antigravity
+is named there after its tab and the machine, with keys in that name
+masked.  aht starts Antigravity
 with its `--remote-control` option while `handover_remote_control` is on;
 what that makes reachable, and through which service, is up to
 Antigravity.
@@ -1065,7 +1084,7 @@ over them.
   | `session_corner`, `chimes` | the Mac app's list of open sessions and its sounds (both off by default) |
   | `backends`, `backend_roots`, `watch_roots` | which agents and folders aht looks at, and where each agent keeps its history |
   | `notifications`, `notify_waiting`, `notify_finished`, `notify_limit` | notices on this computer, and which kinds |
-  | `notify_phone` | notices on your phone: `imessage:<phone or Apple ID>` (macOS) or `ntfy:<topic or server address>` (off by default) |
+  | `notify_phone` | notices on your phone: `imessage:<phone or Apple ID>` (macOS) or `ntfy:<topic or server address>`, an address only with `https://` (or `http://` to a server on this computer) (off by default) |
   | `remotes.<name>.watch` (*Watch*, `aht remote watch`) | whether aht asks a machine for its sessions every 2 minutes (off for every machine) |
   | `handover_carry_trust` | whether a handover marks the folder as trusted in Claude Code on the other machine, and a Bring Here on this computer (on by default) |
   | `handover_remote_control`, `handover_keep_awake` | whether a session handed over can be reached through Claude Code's Remote Control (and Antigravity is started with `--remote-control`), and whether a handover keeps that machine awake (both on by default; the second only with `aht config`) |
@@ -1240,7 +1259,11 @@ changed.
 commands, file paths and web addresses; session titles), handover, switch
 and hand-back summaries (also the commit subjects and file names in
 them), the records of who handed the work to whom (session titles), a
-PC's arrival records (the session's title and your task), the notes aht's
+PC's arrival records (the session's title and your task), the task you
+give a handover and the name a handed-over session shows in Remote
+Control (masked here before they leave: in the summary, the command that
+starts the session there, its first prompt, and the records of the
+handover on both machines), the notes aht's
 hook adds about them, `aht relays --show`, journals, notices (also those
 sent to your phone) and what a session waits for (masked before it leaves
 another machine), the screen lines a handover's start and `aht attach
@@ -1260,11 +1283,9 @@ workspaces.
 they are: in the Mac app's session corner, in the iTerm2 tab titles aht
 sets from a session's name, in `run/tab-names.json` and
 `run/iterm-tabs.json`, in the tab titles of saved workspaces (restoring a
-layout sets them back), and in `aht.log`.  The task you give a handover is
-sent and kept as you wrote it (in the summary, the command that starts
-the session there, and the first prompt), except in a PC's arrival
-record; so is the name a handed-over session shows in Remote Control
-(its tab's title).  Folder paths are never masked.
+layout sets them back), in `aht.log`, and the night shifts you plan
+(`night-shift.json` keeps each task as you wrote it; the handover masks
+it).  Folder paths are never masked.
 
 Backups and checkpoints, though, are exact copies and contain whatever
 the originals contain.  Disk encryption (FileVault, BitLocker, LUKS)

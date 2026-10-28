@@ -15,7 +15,7 @@ Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget inst
 
 - **Five agents:** Switch Agent adds Antigravity and Mistral Vibe, and **Hand Back** returns the work to the session it came from, with a catch-up.
 - **Your other machines:** Hand Over and Take Back now work between Mac, Windows and Linux, at any path.  New: **Bring Here** and **Send Back**, **Pick Up** and **Leave a Note**, **Watch** a machine, **search everywhere**, and another agent on the other machine.
-- **Windows:** a PC asks your Mac and Linux machines without an ssh server of its own, and with OpenSSH Server it can also be handed projects.
+- **Windows:** a PC asks your Mac and Linux machines without an ssh server of its own, and with OpenSSH Server it can also be handed projects, kept in sync with, keep backups and take a Send Back.
 - **Sync safety:** Keep in sync looks before it overwrites; a handover cut off halfway settles itself; **Release** frees a project from a machine that is gone.
 - **File copy:** rsync is now optional; aht copies files itself over ssh.
 - **Permissions:** the agent that continues the work starts in the level of the session it continues, never higher.
@@ -100,6 +100,7 @@ Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget inst
 
 **A Windows PC that answers (optional).**
 - With OpenSSH Server on the PC, a Mac or Linux machine now hands a project over to the PC (`aht handover <path> --to pc`) and takes it back, watches the PC, lists its sessions and searches them.
+- Such a PC also takes Keep in sync (`aht mirror <path> --on --to pc`, with the same pauses before anything is overwritten as any machine, and a name Windows cannot hold such as `aux.md` stops a sync before anything is sent), keeps another computer's backups (`offsite_backup = pc`; *Fetch Backups From…* brings them back), takes a Send Back of a project it handed over (before, only Take Back on the PC returned it), and is handed projects by another PC.
 - No session starts on the PC: its tray says *shop came from mac — Continue here* (once as a notice, then in its menu until the project leaves), and Continue here opens Claude Code in a console there, in the session handed over; nothing runs until you type.
 - On the PC, aht installed there answers (this version or newer); otherwise aht's own copy answers with the PC's Python 3 (`py` or `python`); with neither, *Add* stops with *install aht on pc* and makes nothing there.  aht sends a PC no shell script: one command line that cmd.exe and PowerShell read alike.
 - *Check* has a PC's own rows (*aht answers there*, *Claude Code there*, *aht installed there*, *no session starts there*), and the machine lists say whether a PC answers and why not (`answers`, `answers_why`).  When Claude Code on the PC is another version, the first handover runs `claude install <version>` there.
@@ -167,6 +168,11 @@ Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget inst
 - **Options given twice** now add up: `aht setup --apply --adopt A --adopt B` takes on both, and `aht config --set backup_keep=20 --set notify_finished=false` sets both.  Before, only the last one counted.
 - **Welcome and start at login:** a first setup that turns *start at login* off is now kept as your answer, in the Mac app and in aht's window, so *Getting started* marks the login step optional.
 - **Attach:** `aht attach --print`, `aht attach --window` and the *open it* line after a handover gave an empty command instead of the one that opens the session over there.
+- **Phone notices only encrypted:** `notify_phone` takes an ntfy server only with `https://` (`http://` only for a server on this computer: `localhost`, `127.0.0.1`, `[::1]`); `aht config --set` refuses the rest and says why.  An `http://` address set before gets no notices, and the log and *Send a Test* say why.
+- **No watcher at all:** `watcher_owner=none` now stops a running watcher on a Mac and on Linux and removes its LaunchAgent or unit, and `aht install` then sets none up.  The watcher is what relinks a project's histories as soon as you move or rename its folder; without it only Claude Code's hook relinks, when a session starts there.
+- **Bring Here and Send Back** now ask for aht at protocol 3 on the project's home (the protocol at which every aht has all their operations), and say *update aht on mac first: …* when it is older.
+- **Small files stay small:** the notice queues for the Mac app and the Windows tray start over after 500 notices, and the progress files of a job (`--status-file`, the Mac app's `stage-*.json`) are deleted when it ends.
+- **The window's *Copy the folder when a session starts*** shows what aht really does: `aht status --json` gives `effective.checkpoint_on_start` (off by default on Windows and Linux, where the copies are real copies).
 
 ### Privacy policy
 
@@ -174,7 +180,7 @@ Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget inst
 
 - **New versions:** the update check (off until you say yes; GitHub then sees your computer's address and which version you run).
 - **aht's window on Windows and Linux,** served to your own browser at 127.0.0.1 only, its folder chooser, and the three iTerm2 settings *Getting started* reads.
-- **Masking:** what aht masks and where, that it is best effort and its known limits, where session names and tab titles stay as they are (this computer only), what a shared page removes and leaves, and that the search index is built anew once.
+- **Masking:** what aht masks and where, that it is best effort and its known limits, where session names and tab titles stay as they are (this computer only), what a shared page removes and leaves, and that the search index is built anew once; a handover's task and the name a handed-over session shows in Remote Control are masked before they leave.
 - **aht's own files:** `machine.json` (a random id of this computer), `offsite.json`, `run/autostart.json`, `run/perm.json`, `run/claude-sandbox.json`, `run/board.json`, `run/incoming.jsonl`, `remote/copies.json`, the new handover and Keep in sync data in `registry.json`, the projects you told aht to forget, and how long set-aside files and backups on another machine are kept.
 - **Claude Code's files:** what a handover reads and changes in `~/.claude.json`, and the copies aht keeps of `settings.json`.
 - **Switching agents:** what aht reads of Antigravity's and Mistral Vibe's data folders and what it never reads there, a copy of Codex's `state_5.sqlite` (only to count the sessions aht cannot read), the hand-off records in a project's `.aht/handover/`, the git state a summary reads, and the lines aht's hook adds to a Claude session.
@@ -184,7 +190,8 @@ Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget inst
 - **Keep in sync and aht's own file copy:** the file lists and checksums read from the copy there and kept here, what a paused sync records, and the temporary `.aht-partial` folder.
 - **Bring Here and Send Back:** what aht reads from the project's home and writes there, and the trust it sets here.
 - **Another agent on the other machine:** what aht reads from that agent's tmux window there, and that `--stop` reads its newest messages and types its quit keys.
-- **A Windows PC that answers:** what aht reads and writes on such a PC, including the record that waits for *Continue here* (`~\.aht\arrivals\`).
+- **A Windows PC that answers:** what aht reads and writes on such a PC, including the record that waits for *Continue here* (`~\.aht\arrivals\`), a copy kept in sync there, backups kept there and a Send Back to it.
+- **Notices:** ntfy only over HTTPS, and the notice queues for the Mac app and the Windows tray, which now hold at most 500 notices.
 - **On each system:** where a history you remove with `aht tidy` goes, Linux's emblem images and their icon cache, Windows' new badge file names, the files aht briefly makes to test a folder, and Kimi Code's real folder (`~/.kimi-code`).
 
 ### Unsigned builds

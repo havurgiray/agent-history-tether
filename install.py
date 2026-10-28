@@ -291,16 +291,17 @@ def retarget_tray_autostart():
 ''', encoding="utf-8")
     print("✓ tray autostart now launches the app")
 
-if __name__ == "__main__":
+def main():
     prebuilt = stage_files()
     compile_binaries(prebuilt)
     aht.ensure_config()          # create ~/.aht/config.json with defaults
-    write_plist()
     write_notices_plist()
     install_command()
     install_hook()
     unquarantine()               # before launchd (or anyone) runs the helpers
-    load_agent()
+    # the watcher's LaunchAgent, unless watcher_owner is none (then one left
+    # from before is unloaded and removed)
+    aht.watcher_install(write_plist, load_agent)
     load_notices()
     if FROM_APP:
         stop_other_trays()
@@ -312,3 +313,7 @@ if __name__ == "__main__":
     if ARGS.tray_exe is None:    # from a terminal; the app shows the list itself
         print()
         aht.cmd_getting_started(argparse.Namespace(json=False))
+
+
+if __name__ == "__main__":
+    main()

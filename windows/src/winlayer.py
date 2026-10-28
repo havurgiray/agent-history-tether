@@ -252,9 +252,15 @@ def notify_user(title, message, info=None):
         except OSError:
             tray = False
         if tray:
-            with open(run / "tray-notices.jsonl", "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"title": title, "message": message,
-                                     "info": info or {}, "at": time.time()}) + "\n")
+            # the core's queue_notice keeps the file short (it starts over
+            # past 500 lines); an older core: a plain append
+            record = {"title": title, "message": message, "info": info or {}, "at": time.time()}
+            queue = getattr(aht, "queue_notice", None)
+            if queue:
+                queue(run / "tray-notices.jsonl", record)
+            else:
+                with open(run / "tray-notices.jsonl", "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record) + "\n")
             return
         env = dict(os.environ, AHT_TOAST_TITLE=title, AHT_TOAST_MSG=message)
         # title/message travel via env vars so no quoting can break the script
@@ -359,12 +365,115 @@ def watcher_status() -> dict:
     return st
 
 
+def watcher_wanted() -> bool:
+    """watcher_owner: "agent" (a watcher runs) or "none" (no watcher at all:
+    only the Claude Code hook relinks, when a session starts)."""
+    return aht.cfg_get("watcher_owner", "agent") != "none"
+
+
+# watcher_owner=none: the logon entry that ran the watcher, kept here so
+# that "agent" again puts it back (an install with --no-watcher has none)
+ENTRY_OFF = "watcher-entry-off.txt"
+PID_FILE = "watcher.pid"
+
+
+def _watcher_pid():
+    """The running watcher's pid from run/watcher.pid ({pid, exe}, which the
+    watcher writes), while that process still runs that very program; else
+    None.  A process is never picked by its name."""
+    try:
+        d = json.loads((aht.aht_home() / "run" / PID_FILE).read_text(encoding="utf-8"))
+        pid, exe = int(d["pid"]), str(d["exe"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    k = _kernel32
+    k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k.OpenProcess.restype = wintypes.HANDLE
+    k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                             wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    h = k.OpenProcess(0x1000, False, pid)                     # QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        n = wintypes.DWORD(1024)
+        same = bool(k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n))) \
+            and os.path.normcase(os.path.abspath(buf.value)) == os.path.normcase(os.path.abspath(exe))
+    finally:
+        k.CloseHandle(h)
+    return pid if same else None
+
+
+def _end_process(pid: int) -> bool:
+    k = _kernel32
+    k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    h = k.OpenProcess(0x0001 | SYNCHRONIZE, False, pid)       # TERMINATE
+    if not h:
+        return False
+    try:
+        ok = bool(k.TerminateProcess(h, 1))
+        k.WaitForSingleObject(h, 3000)
+        return ok
+    finally:
+        k.CloseHandle(h)
+
+
+def watcher_off(wait: float = 6.0) -> list:
+    """watcher_owner=none on Windows (the core's stop_watcher leaves Windows
+    to this layer): no logon entry starts the watcher (one that runs the
+    watcher alone is removed; the tray's own entry stays, and the tray then
+    starts no watcher), and a running watcher is asked to end through its
+    own stop event; one that does not end is ended by the pid it wrote
+    (run/watcher.pid), checked against its program.  -> what was done."""
+    done = []
+    try:
+        entry = _run_key_get()
+        if entry and not is_tray_entry(entry):
+            _run_key_delete()
+            try:
+                park = aht.aht_home() / "run" / ENTRY_OFF
+                park.parent.mkdir(parents=True, exist_ok=True)
+                park.write_text(entry, encoding="utf-8")
+            except OSError:
+                pass
+            done.append(f"the logon entry ({RUN_VALUE} in HKCU Run) was removed, so it "
+                        "does not start at sign-in")
+    except Exception as e:
+        aht.warn(f"WATCHER could not remove the logon entry: {e}")
+    if watcher_running():
+        if stop_watcher(wait):
+            done.append("the watcher was asked to end, and it ended")
+        else:
+            pid = _watcher_pid()
+            if pid and _end_process(pid):
+                done.append(f"the watcher (pid {pid}) did not end when asked, so it was ended")
+            else:
+                done.append("the watcher was asked to end; it has not ended yet")
+    if done:
+        aht.log("WATCHER off (watcher_owner=none): " + "; ".join(done))
+    return done
+
+
 def _reload_watcher() -> bool:
     """-> whether the watcher was restarted (the core reports it as
-    setup's "watcher_reloaded")."""
-    if aht.cfg_get("watcher_owner", "agent") == "none":
+    setup's "watcher_reloaded").  After watcher_owner=none, "agent" again
+    puts back the logon entry that was removed then."""
+    if not watcher_wanted():
         print("watching is off (watcher_owner=none) — nothing to reload")
         return False
+    park = aht.aht_home() / "run" / ENTRY_OFF
+    try:
+        entry = park.read_text(encoding="utf-8").strip()
+    except OSError:
+        entry = ""
+    if entry:
+        if _run_key_get() is None:
+            _run_key_set(entry)
+            print("✓ watcher registered to start at logon again (HKCU Run)")
+        try:
+            park.unlink()
+        except OSError:
+            pass
     stop_watcher()
     start_watcher_hidden()
     print("✓ watcher restarted with the current roots")
@@ -562,6 +671,12 @@ def cmd_watch(argv) -> int:
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         _wlog("another watcher is already running — exiting")
         return 0
+    if not watcher_wanted():
+        # a logon entry or a start left from before: watching is off
+        _wlog("watching is off (watcher_owner=none) — exiting")
+        if mutex:
+            _kernel32.CloseHandle(mutex)
+        return 0
     stop_h = _kernel32.CreateEventW(None, True, False, STOP_EVENT_NAME)
 
     roots = [os.path.realpath(r) for r in (args.roots or aht.watch_roots_config())]
@@ -573,6 +688,14 @@ def cmd_watch(argv) -> int:
         _wlog("no existing roots to watch — set them with: aht config "
               "--set watch_roots=C:\\Users\\you\\code")
         return 2
+    # who the watcher is, for watcher_off when the stop event is not enough
+    pid_file = aht.aht_home() / "run" / PID_FILE
+    try:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(json.dumps({"pid": os.getpid(), "exe": sys.executable,
+                                        "started": time.time()}), encoding="utf-8")
+    except OSError:
+        pass
 
     debounce = args.debounce
     if debounce is None:
@@ -594,6 +717,11 @@ def cmd_watch(argv) -> int:
         _wlog("stopped")
         return 0
     finally:
+        try:
+            if json.loads(pid_file.read_text(encoding="utf-8")).get("pid") == os.getpid():
+                pid_file.unlink()
+        except (OSError, ValueError):
+            pass
         if mutex:
             _kernel32.CloseHandle(mutex)
 
@@ -964,20 +1092,27 @@ def cmd_install(argv) -> int:
     install_hook(_hook_cmdline(exe))
     if not args.no_watcher:
         tray = _keep_tray_entry(exe)
-        if not tray:
-            _write_autostart(exe)
-        stop_watcher()
-        if exe:
-            logf = open(watcher_log_path(), "a", encoding="utf-8", errors="replace")
-            subprocess.Popen([exe, "watch"], stdin=subprocess.DEVNULL,
-                             stdout=logf, stderr=logf,
-                             creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
-                             close_fds=True)
+        if not watcher_wanted():
+            # watcher_owner=none: no logon entry for it, and none running
+            done = watcher_off()
+            print("✓ no watcher (watcher_owner=none): moved or renamed project folders are "
+                  "relinked when a Claude Code session starts in them"
+                  + "".join(f"\n  · {d}" for d in done))
         else:
-            start_watcher_hidden()
-        time.sleep(0.5)
-        print(f"✓ watcher {'running' if watcher_running() else 'started'} "
-              f"(log: {watcher_log_path()})")
+            if not tray:
+                _write_autostart(exe)
+            stop_watcher()
+            if exe:
+                logf = open(watcher_log_path(), "a", encoding="utf-8", errors="replace")
+                subprocess.Popen([exe, "watch"], stdin=subprocess.DEVNULL,
+                                 stdout=logf, stderr=logf,
+                                 creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                                 close_fds=True)
+            else:
+                start_watcher_hidden()
+            time.sleep(0.5)
+            print(f"✓ watcher {'running' if watcher_running() else 'started'} "
+                  f"(log: {watcher_log_path()})")
         if tray and not tray_running():
             # an upgrade stopped it (Scoop's, winget's), and nothing else
             # starts it again before the next sign-in
@@ -1091,6 +1226,7 @@ def activate() -> None:
     aht.gui_dialogs_available = gui_dialogs_available
     aht.watcher_status = watcher_status
     aht._reload_watcher = _reload_watcher
+    aht.stop_watcher = watcher_off      # watcher_owner=none (`aht config --set`)
     aht.hook_installed = hook_installed
     aht._default_watch_roots = _default_watch_roots
     try:

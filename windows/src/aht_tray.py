@@ -262,17 +262,25 @@ def act_open_window(project=None, do="show"):
 def brought_here(copies=None):
     """The folders on this PC that Bring Here brought from another machine
     (~/.aht/remote/copies.json, kind "brought"), newest first:
-    [(path, name, from)], at most 10.  Not one whose home is a PC (`system`
-    "Windows"): aht cannot ask a PC, so it goes back from there, not with
-    Send Back here."""
+    [(path, name, from)], at most 10.  One whose home is a PC (`system`
+    "Windows") only while that PC answers (aht.pc_answers); else it goes
+    back from there, not with Send Back here."""
     try:
         copies = aht.read_copies() if copies is None else copies
     except Exception:
         return []
+
+    def answers(c):
+        if c.get("system") != "Windows":
+            return True
+        try:
+            spec = aht.remotes_config().get(c.get("remote") or "")
+            return isinstance(spec, dict) and bool(aht.pc_answers(c["remote"], spec).get("answers"))
+        except Exception:
+            return False
     rows = sorted(((str(c.get("at") or ""), p, str(c.get("from") or "the other machine"))
                    for p, c in copies.items()
-                   if isinstance(c, dict) and c.get("kind") == "brought"
-                   and c.get("system") != "Windows"), reverse=True)
+                   if isinstance(c, dict) and c.get("kind") == "brought" and answers(c)), reverse=True)
     return [(p, p.rstrip("\\/").replace("\\", "/").rsplit("/", 1)[-1] or p, frm)
             for _, p, frm in rows[:10]]
 
@@ -461,14 +469,28 @@ def act_reconcile():
     _in_thread(work)
 
 
+WATCHING_OFF = ("Watching is off", "aht runs no watcher (watcher_owner is none in its "
+                "settings). The SessionStart hook still relinks projects you open.")
+
+
+def start_watcher_if_wanted():
+    """The tray keeps a watcher running, unless watcher_owner is none (then
+    aht runs none at all).  -> whether one was started."""
+    if not winlayer.watcher_wanted() or winlayer.watcher_running():
+        return False
+    winlayer.start_watcher_hidden()
+    return True
+
+
 def act_toggle_watch():
     if winlayer.watcher_running():
         winlayer.stop_watcher()
         balloon("Watcher paused", "Folder moves are not being watched. "
                 "The SessionStart hook still relinks projects you open.")
-    else:
-        winlayer.start_watcher_hidden()
+    elif start_watcher_if_wanted():
         balloon("Watcher", "Watching resumed")
+    else:
+        balloon(*WATCHING_OFF)
     refresh(force=True)
 
 
@@ -517,8 +539,11 @@ def act_editcfg():
 def act_restart():
     def work():
         winlayer.stop_watcher()
-        winlayer.start_watcher_hidden()
-        balloon("Watcher", "Restarted with the current config")
+        if winlayer.watcher_wanted():
+            winlayer.start_watcher_hidden()
+            balloon("Watcher", "Restarted with the current config")
+        else:
+            balloon(*WATCHING_OFF)
         refresh(force=True)
     _in_thread(work)
 
@@ -986,9 +1011,9 @@ def main():
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         return 0
 
-    # the tray's promise is "protection is on while I'm in the tray"
-    if not winlayer.watcher_running():
-        winlayer.start_watcher_hidden()
+    # the tray's promise is "protection is on while I'm in the tray", unless
+    # watcher_owner is none
+    start_watcher_if_wanted()
 
     global HWND, ICONS
     ICONS = {True: make_icon(CORAL), False: make_icon(GRAY)}

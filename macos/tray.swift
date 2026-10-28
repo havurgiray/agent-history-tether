@@ -503,12 +503,12 @@ struct CopyOf: Hashable {
     let at: Date?
     let system: String?             // the home's system ("Windows": a PC)
 
-    /// Its home is a PC: it gets it back from there (Take Back on the PC).
+    /// Its home is a PC.
     var pcHome: Bool { system == "Windows" }
-    /// Send Back cannot return it: its home is a PC, also one that answers
-    /// (the PC keeps the project's record; the core refuses Send Back to
-    /// any PC).  `ms` is kept for the callers; any PC blocks.
-    func pcBlocks(_ ms: [Machine]) -> Bool { pcHome }
+    /// Send Back cannot return it: its home is a PC that does not answer
+    /// (or is not set up here), so it goes back from there (Take Back on the
+    /// PC).  A PC that answers takes Send Back as any machine does.
+    func pcBlocks(_ ms: [Machine]) -> Bool { pcHome && !machineAnswers(remote, ms) }
 
     init?(_ any: Any?) {
         guard let d = any as? [String: Any],
@@ -1141,6 +1141,47 @@ struct Machine: Identifiable, Hashable {
     var cannotAsk: String? { asks ? nil : answersWhy ?? "aht cannot ask a Windows machine yet." }
 }
 
+/// Whether a session's start copies the folder (Undo a whole session), as the
+/// core has it: `status --json` → effective.checkpoint_on_start.  An older
+/// core: the setting, which is on by default on a Mac (the copies are clones
+/// that take no room; on Windows and Linux they are real copies, off until
+/// turned on).
+func checkpointOnStart(_ status: [String: Any], _ config: [String: Any]) -> Bool {
+    (status["effective"] as? [String: Any])?["checkpoint_on_start"] as? Bool
+        ?? config["checkpoints"] as? Bool ?? true
+}
+
+/// Undo a Session with no copy of the folder yet: why, also when the copy at
+/// a session's start is off.
+func undoNoCopyText(_ on: Bool) -> String {
+    on ? "aht has no copy of this folder yet. It makes one each time a Claude Code "
+         + "session starts here, and before another agent takes over."
+       : "aht has no copy of this folder yet: “Copy the folder when a session starts” "
+         + "is off (Settings, Safety nets)."
+}
+
+/// How often the notices ask another machine, as the core's WATCH_EVERY and
+/// HOLDER_EVERY (aht.py), in seconds; sessions on this Mac every 30 seconds
+/// (the notices agent's StartInterval).
+let WATCH_EVERY = 120, HOLDER_EVERY = 55
+func paceText(_ s: Int) -> String {
+    if (45...75).contains(s) { return s == 60 ? "every minute" : "about every minute" }
+    return s % 60 == 0 ? "every \(s / 60) minutes" : "every \(s) seconds"
+}
+let NOTICES_PACE = "Sessions on this Mac are checked every 30 seconds; a watched machine is "
+    + "asked \(paceText(WATCH_EVERY)), and one that holds a project of yours \(paceText(HOLDER_EVERY))."
+
+/// The machines a picker offers (Projects' Machine, for Hand Over and Keep
+/// in sync; Backups on another machine): those aht can ask, a PC only while
+/// it answers; a PC that does not stays out, unless it is the one chosen
+/// now (then it is named so: `pickerLabel`).
+func pickerMachines(_ ms: [Machine], keeping now: String?) -> [Machine] {
+    ms.filter { $0.asks || $0.name == now }
+}
+func pickerLabel(_ mc: Machine) -> String {
+    mc.asks ? mc.name : mc.name + " (aht cannot ask it)"
+}
+
 /// Whether aht can ask the machine set up here under `name` (see Machine.asks);
 /// a machine not set up here cannot be asked.
 func machineAnswers(_ name: String?, _ ms: [Machine]) -> Bool {
@@ -1617,14 +1658,11 @@ func sendBackReady(_ v: SendBackView) -> Bool {
 }
 
 /// Why Send Back cannot ask the project's home from here: it is not set up
-/// here (copy_of.remote is null), or it is a PC (which keeps the record, also
-/// when it answers).
+/// here (copy_of.remote is null), or it is a PC that does not answer.
 func sendBackBlocked(_ p: Project, _ ms: [Machine]) -> String? {
     guard let c = p.copyOf, let to = p.sendBackTo else { return nil }
     if c.pcBlocks(ms) {
-        return machineAnswers(c.remote, ms)
-            ? "\(to) is a Windows PC, which keeps this project's record: take it back on \(to)"
-            : "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)"
+        return "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)"
     }
     guard let r = c.remote, let mc = ms.first(where: { $0.name == r }) else {
         return "\(c.from) is not set up on this Mac: add it under Machines, then send it back"
@@ -3509,6 +3547,17 @@ final class AppModel: ObservableObject {
     }
     func flag(_ key: String, _ fallback: Bool = true) -> Bool {
         return config[key] as? Bool ?? fallback
+    }
+    /// A session's start copies the folder (see checkpointOnStart).
+    var checkpointsOn: Bool { checkpointOnStart(status, config) }
+    /// …switched here: the setting is saved; until the core is read again,
+    /// its answer is taken to follow.
+    func setCheckpoints(_ on: Bool) {
+        if var e = status["effective"] as? [String: Any], e["checkpoint_on_start"] is Bool {
+            e["checkpoint_on_start"] = on
+            status["effective"] = e
+        }
+        set("checkpoints", on ? "true" : "false")
     }
     func text(_ key: String, _ fallback: String) -> String {
         return config[key] as? String ?? fallback
@@ -5630,7 +5679,7 @@ final class AppModel: ObservableObject {
 
     /// A setting the core may refuse (exit 2: agent_permission_flags that ask
     /// for more than their level, say): its words, and the setting as it was.
-    func setChecked(_ key: String, _ text: String, _ value: Any) {
+    func setChecked(_ key: String, _ text: String, _ value: Any, _ done: ((Bool) -> Void)? = nil) {
         let was = config[key]
         config[key] = value
         onChange?()
@@ -5643,6 +5692,7 @@ final class AppModel: ObservableObject {
                     let why = (r.err + r.out).trimmingCharacters(in: .whitespacesAndNewlines)
                     _ = alert("The setting was not saved", why.isEmpty ? "aht refused it." : why)
                 }
+                done?(r.ok)
                 self.refresh()
             }
         }
@@ -5941,13 +5991,15 @@ struct ProjectsView: View {
                 TextField("Search", text: $m.search)
                     .textFieldStyle(.roundedBorder).frame(width: 160)
                 Spacer()
-                if m.machines.count > 1 {
+                let choices = pickerMachines(m.machines, keeping: m.machine)
+                if choices.count > 1 {
                     Picker("Machine", selection: Binding(
                         get: { m.machine ?? "" },
-                        set: { n in m.machines.first { $0.name == n }.map(m.use) })) {
-                        ForEach(m.machines) { Text($0.name).tag($0.name) }
+                        set: { n in choices.first { $0.name == n }.map(m.use) })) {
+                        ForEach(choices) { Text(pickerLabel($0)).tag($0.name) }
                     }
                     .frame(width: 150)
+                    .help(m.machines.first { $0.name == m.machine }?.cannotAsk ?? "")
                 } else if let one = m.machine {
                     Text("Machine: \(one)").foregroundColor(.secondary).lineLimit(1).fixedSize()
                 }
@@ -8480,8 +8532,7 @@ struct UndoSheet: View {
                 }
             }
             Text(u.checkpoints.isEmpty
-                 ? "aht has no copy of this folder yet. It makes one each time a Claude Code "
-                   + "session starts here, and before another agent takes over."
+                 ? undoNoCopyText(m.checkpointsOn)
                  : "How the folder differs from its copy at the start of that session. Putting "
                    + "it back restores every file listed; what is there now is set aside in "
                    + "~/.aht/undo. Rebuilt folders (node_modules, .venv …) and .git are left alone.")
@@ -9159,7 +9210,7 @@ struct MachinesView: View {
                                 Toggle("Watch", isOn: Binding(get: { mc.watch }, set: { m.watch(mc, $0) }))
                                     .toggleStyle(.switch).controlSize(.small)
                                     .disabled(!m.canReach || !mc.asks)
-                                    .help(mc.cannotAsk ?? "aht asks \(mc.name) every 2 minutes and tells you when a "
+                                    .help(mc.cannotAsk ?? "aht asks \(mc.name) \(paceText(WATCH_EVERY)) and tells you when a "
                                           + "session there waits for you or is done")
                                 if let b = m.heard(mc.name) {
                                     // a core without `last_heard`: it answered when the board was read
@@ -10093,6 +10144,7 @@ struct SettingsView: View {
     @State private var wsEvery = ""
     @State private var wsKeep = ""
     @State private var chimeVolume = 70.0
+    @State private var phone = ""
 
     func choice(_ title: String, _ key: String, _ options: [(String, String)]) -> some View {
         HStack {
@@ -10244,15 +10296,18 @@ struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                         HStack {
                             Text("Also send them to my phone:")
-                            TextField("imessage:+43… or ntfy:my-topic",
-                                      text: Binding(get: { m.text("notify_phone", "") },
-                                                    set: { m.config["notify_phone"] = $0 }))
+                            TextField("imessage:+43… or ntfy:my-topic", text: $phone)
                                 .textFieldStyle(.roundedBorder).frame(width: 260)
-                            Button("Save") { m.set("notify_phone", m.text("notify_phone", "")) }
+                            // the core may refuse it (an ntfy server that is not
+                            // https, say): its words, and the saved address back
+                            Button("Save") {
+                                let v = phone.trimmingCharacters(in: .whitespaces)
+                                let saved = m.text("notify_phone", "")
+                                m.setChecked("notify_phone", v, v) { ok in if !ok { phone = saved } }
+                            }
                             Button("Send a Test") { m.testNotice() }
                         }
-                        Text("Sessions here and on your other machines are checked every 30 "
-                             + "seconds. iMessage goes to your own number or Apple ID; ntfy "
+                        Text(NOTICES_PACE + " iMessage goes to your own number or Apple ID; ntfy "
                              + "to a topic you follow in the ntfy app.")
                             .font(.caption).foregroundColor(.secondary)
                     }
@@ -10301,8 +10356,8 @@ struct SettingsView: View {
                 }
                 GroupBox(label: HStack(spacing: 6) { Text("Safety nets (no tokens)"); HelpButton("Undo a whole session") }) {
                     VStack(alignment: .leading, spacing: 8) {
-                        toggle("Copy the folder when a session starts, to undo a whole session",
-                               "checkpoints")
+                        Toggle("Copy the folder when a session starts, to undo a whole session",
+                               isOn: Binding(get: { m.checkpointsOn }, set: { m.setCheckpoints($0) }))
                         toggle("Tell me when Claude stops at its usage limit", "notify_limit")
                         toggle("Show sessions in Spotlight", "spotlight")
                         HStack {
@@ -10328,7 +10383,8 @@ struct SettingsView: View {
                         }
                         Text("The copies are copy-on-write: they take no room until a file "
                              + "changes, and the last \(m.config["checkpoint_keep"] as? Int ?? 10) "
-                             + "per project are kept. Time Machine leaves them out.")
+                             + "per project are kept. Time Machine leaves them out. On Windows and "
+                             + "Linux it makes a real copy of the folder.")
                             .font(.caption).foregroundColor(.secondary)
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
@@ -10438,7 +10494,9 @@ struct SettingsView: View {
                                 get: { m.text("offsite_backup", "") },
                                 set: { m.set("offsite_backup", $0) })) {
                                 Text("no other machine").tag("")
-                                ForEach(m.machines) { Text($0.name).tag($0.name) }
+                                ForEach(pickerMachines(m.machines, keeping: m.text("offsite_backup", ""))) {
+                                    Text(pickerLabel($0)).tag($0.name)
+                                }
                             }
                             .frame(maxWidth: 460)
                             Spacer()
@@ -10447,6 +10505,10 @@ struct SettingsView: View {
                             Button("Fetch Backups From…") { m.openFetchBackups() }
                                 .disabled(m.text("offsite_backup", "").isEmpty || !m.canReach
                                           || m.working != nil)
+                        }
+                        if let why = m.machines.first(where: { $0.name == m.text("offsite_backup", "") })?.cannotAsk {
+                            Text(why).font(.caption).foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         Text("After each daily backup, aht adds the new ones to a folder of this "
                              + "Mac's own there. A backup there goes only after aht removed it "
@@ -10598,6 +10660,7 @@ struct SettingsView: View {
             wsKeep = String(m.config["workspace_keep"] as? Int ?? 40)
             chimeVolume = Double(m.number("chime_volume", 70))
             excludes = ((m.config["checkpoint_excludes"] as? [String]) ?? []).joined(separator: ", ")
+            phone = m.text("notify_phone", "")
         }
     }
 }
@@ -13949,11 +14012,11 @@ if CommandLine.arguments.contains("--selftest") {
                            "copy_of": ["from": "DESKTOP-PC", "kind": "handover", "remote": "pc", "system": "Windows"]])
     let oldCopy9 = Project(["real_path": "/x/oldwork", "exists": true,
                             "copy_of": ["from": "pcold", "kind": "brought", "remote": "pcold", "system": "Windows"]])
-    // fix round: a PC that answers keeps the project's record: no Send Back to it either
-    let send9 = sendBackBlocked(pcCopy9, ms9) == "pc is a Windows PC, which keeps this project's record: take it back on pc"
-        && pcCopy9.copyOf?.pcBlocks(ms9) == true
-        && copyLine(pcCopy9.copyOf!, ms9) == "Handed over from DESKTOP-PC: take it back on pc"
-        && sendBackBlocked(oldCopy9, ms9)?.contains("Windows PC") == true && oldCopy9.copyOf?.pcBlocks(ms9) == true
+    // follow-up round: the core sends back to a PC that answers; not to one that does not
+    let send9 = sendBackBlocked(pcCopy9, ms9) == nil && pcCopy9.copyOf?.pcBlocks(ms9) == false
+        && copyLine(pcCopy9.copyOf!, ms9) == "Handed over from DESKTOP-PC: Take Back there or Send Back here returns it"
+        && sendBackBlocked(oldCopy9, ms9) == "pcold is a Windows PC, which this Mac cannot reach: take it back on pcold"
+        && oldCopy9.copyOf?.pcBlocks(ms9) == true
         && copyLine(oldCopy9.copyOf!, ms9) == "Brought here from pcold: take it back on pcold"
         && sendBackBlocked(pcCopy9, [])?.hasSuffix("take it back on pc") == true
     let okRows9 = [Check(name: "reachable", ok: true, needed: true, detail: "DESKTOP-PC (Windows)", fix: nil, group: "ask"),
@@ -13969,8 +14032,8 @@ if CommandLine.arguments.contains("--selftest") {
     let pc9OK = helper9 && away9 && arrival9 && hand9 && send9 && check9
     print("PC THAT ANSWERS \(pc9OK ? "OK" : "FAIL — helper \(helper9) away \(away9) arrival \(arrival9) hand over \(hand9) send back \(send9) check \(check9)")")
     // fix round: what the core refuses for every PC (Pick Up, Leave a Note,
-    // Bring Here, Send Back, attach) is not offered for one that answers
-    // either; Hand Over, Take Back, Watch, search and Check still are
+    // Bring Here, attach) is not offered for one that answers either; Hand
+    // Over, Take Back, Send Back, Keep in sync, Watch, search and Check are
     let local9 = Project(["real_path": "/x/api", "exists": true])
     let items9 = machineItems(local9, askableMachines(ms9))
     let relay9 = askableMachines(ms9) == ["box"] && !items9.contains { $0.machine == "pc" }
@@ -13987,6 +14050,69 @@ if CommandLine.arguments.contains("--selftest") {
     let gate9OK = relay9 && open9
     print("PC RELAY AND OPEN SESSION NOT OFFERED \(gate9OK ? "OK" : "FAIL — relay \(relay9) open session \(open9) \(items9.map { $0.title })")")
     if !pc9OK { print("   \(awayLine(onPC9, ms9) ?? "-") | \(awayLine(tookPC9, ms9) ?? "-") | \(copyLine(pcCopy9.copyOf!, ms9))") }
+    // Follow-up round.  (1) "Copy the folder when a session starts" shows the
+    // core's effective.checkpoint_on_start; an older core: the setting, on by
+    // default on a Mac
+    let cpFU = !checkpointOnStart(["effective": ["checkpoint_on_start": false]], ["checkpoints": true])
+        && checkpointOnStart(["effective": ["checkpoint_on_start": true]], ["checkpoints": false])
+        && checkpointOnStart([:], [:]) && !checkpointOnStart([:], ["checkpoints": false])
+        && checkpointOnStart(["effective": [:]], ["checkpoints": true])
+        && undoNoCopyText(false) == "aht has no copy of this folder yet: “Copy the folder when a session starts” is off (Settings, Safety nets)."
+        && undoNoCopyText(true).hasPrefix("aht has no copy of this folder yet. It makes one each time")
+    let cpModel = AppModel()
+    cpModel.demo = true
+    cpModel.config = ["checkpoints": true]
+    cpModel.status = ["effective": ["checkpoint_on_start": false]]
+    let cpOff = !cpModel.checkpointsOn
+    cpModel.status = [:]
+    let cpModelOK = cpOff && cpModel.checkpointsOn
+    var cpSample = "no sample yet"
+    var cpSampleOK = true
+    let dir9b = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE9B"] ?? ""
+    if let d = FileManager.default.contents(atPath: dir9b + "/status_effective.json"),
+       let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+       let want = (j["effective"] as? [String: Any])?["checkpoint_on_start"] as? Bool {
+        cpSampleOK = checkpointOnStart(j, ["checkpoints": !want]) == want
+        cpSample = "status_effective.json says \(want)"
+    }
+    print("FOLLOW-UP COPY AT A SESSION'S START FROM THE CORE \(cpFU && cpModelOK && cpSampleOK ? "OK" : "FAIL — helper \(cpFU) model \(cpModelOK) sample \(cpSampleOK)") (\(cpSample))")
+    // (2) how often machines are asked: the core's WATCH_EVERY and HOLDER_EVERY
+    let coreSrc = BUNDLE_RES.map { $0 + "/aht.py" } ?? ahtScript()
+    let coreText = (try? String(contentsOfFile: coreSrc, encoding: .utf8)) ?? ""
+    func coreConst(_ name: String) -> Int? {
+        guard let r = coreText.range(of: "(?m)^" + name + " = (\\d+)", options: .regularExpression) else { return nil }
+        return Int(coreText[r].split(separator: "=").last!.trimmingCharacters(in: .whitespaces))
+    }
+    let paceFU = coreConst("WATCH_EVERY") == WATCH_EVERY && coreConst("HOLDER_EVERY") == HOLDER_EVERY
+        && NOTICES_PACE == "Sessions on this Mac are checked every 30 seconds; a watched machine is asked "
+            + "every 2 minutes, and one that holds a project of yours about every minute."
+        && paceText(60) == "every minute" && paceText(300) == "every 5 minutes" && paceText(30) == "every 30 seconds"
+    print("FOLLOW-UP HOW OFTEN MACHINES ARE ASKED \(paceFU ? "OK" : "FAIL — core \(coreConst("WATCH_EVERY") ?? -1)/\(coreConst("HOLDER_EVERY") ?? -1) in \(coreSrc): \(NOTICES_PACE)")")
+    // (4) a PC may receive more: Send Back to a PC that answers (not to one
+    // that does not, or one not set up here); Keep in sync and backups to it;
+    // Pick Up / Leave a Note / Bring Here still only from Mac and Linux
+    let pcTo = byName9["pc"]!
+    let given9 = Project(["real_path": "/x/given", "exists": true,
+                          "copy_of": ["from": "DESKTOP-PC", "kind": "brought", "remote": "pc", "system": "Windows"]])
+    let pcNew9 = Project(["real_path": "/x/new", "exists": true,
+                          "copy_of": ["from": "pcnew", "kind": "handover", "remote": "pcnew", "system": "Windows"]])
+    let pcGone9 = Project(["real_path": "/x/gone", "exists": true,
+                           "copy_of": ["from": "DESKTOP-9", "kind": "handover", "system": "Windows"]])
+    let sendFU = pcTo.asks && sendBackBlocked(given9, ms9) == nil && given9.sendBackTo == "pc"
+        && copyLine(given9.copyOf!, ms9) == "Brought here from DESKTOP-PC: Send Back returns it"
+        && pcNew9.copyOf?.pcBlocks(ms9) == true && sendBackBlocked(pcNew9, ms9)?.hasSuffix("take it back on pcnew") == true
+        && copyLine(pcNew9.copyOf!, ms9) == "Handed over from pcnew: take it back on pcnew"
+        && pcGone9.copyOf?.pcBlocks(ms9) == true && sendBackBlocked(pcGone9, ms9)?.hasSuffix("take it back on DESKTOP-9") == true
+        && askableMachines(ms9) == ["box"]
+    // (2b) the pickers (Machine, Backups on another machine): a PC only while it
+    // answers; one chosen before stays, named so
+    let pickNames = pickerMachines(ms9, keeping: nil).map { $0.name }
+    let keptOld = pickerMachines(ms9, keeping: "pcold")
+    let pickFU = Set(pickNames) == ["box", "pc"] && Set(keptOld.map { $0.name }) == ["box", "pc", "pcold"]
+        && keptOld.first { $0.name == "pcold" }.map(pickerLabel) == "pcold (aht cannot ask it)"
+        && pickerLabel(byName9["pc"]!) == "pc" && pickerLabel(byName9["box"]!) == "box"
+    print("FOLLOW-UP PICKERS LIST A PC THAT ANSWERS \(pickFU ? "OK" : "FAIL — \(pickNames) | \(keptOld.map(pickerLabel))")")
+    print("FOLLOW-UP SEND BACK TO A PC THAT ANSWERS \(sendFU ? "OK" : "FAIL — \(sendBackBlocked(given9, ms9) ?? "nil") | \(copyLine(given9.copyOf!, ms9)) | \(sendBackBlocked(pcNew9, ms9) ?? "nil")")")
     // … and the core's phase-9 samples: AHT_FIXTURES_PHASE9 (a PC's check,
     // Hand Over to a PC dry and applied, a project on a PC, an arrival)
     let dir9 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE9"] ?? ""

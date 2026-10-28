@@ -358,9 +358,10 @@ const helpBtn = (topic) => h("button", { class: "help icon", text: "?", title: `
 
 // ---- state ----------------------------------------------------------------------
 
-const S = { tab: "projects", status: {}, config: {}, projects: [], selection: null, filter: "",
+const S = { tab: "projects", status: {}, config: {}, explicit: {}, projects: [], selection: null, filter: "",
   board: null, boardAt: null, query: "", hits: null, notes: {}, loaded: false, movers: {} };
 const ON_WINDOWS = () => (S.status.platform || "").startsWith("win");
+const ON_MAC = () => S.status.platform === "darwin";
 const CAN_HAND_OVER = () => !!(S.status.handover || {}).supported;
 // asking other machines (ssh alone); an older core says only "supported"
 const CAN_REACH = () => { const ho = S.status.handover || {}; return "can_reach" in ho ? !!ho.can_reach : !!ho.supported; };
@@ -425,11 +426,11 @@ const pcWhy = (r) => { const t = String((r && r.answers_why) || "").trim(); retu
 /** The guide's section on setting a PC up so that aht can ask it. */
 const PC_SETUP = "A Windows PC that answers";
 const pcSetup = () => h("div", { class: "row small pc-setup" }, h("span", { class: "dim", text: "How to set a PC up so that aht can ask it:" }), helpBtn(PC_SETUP));
-/** …and its home is a PC (`copy_of.system`): it goes back only from there
- * (Take Back on the PC), never with Send Back here, also when the PC
- * answers (the PC keeps the project's record; the core refuses Send Back
- * to any PC). */
+/** …and its home is a PC (`copy_of.system`).  Send Back returns it while
+ * that PC answers; else it goes back only from there (Take Back on the PC). */
 const pcHome = (c) => !!c && c.system === "Windows";
+/** …and that PC does not answer: no Send Back from here. */
+const pcHomeMute = (c) => pcHome(c) && !answers(remoteRow(c.remote));
 /** A project of this machine's that is on another one: {name, system, pc:
  * a Windows PC holds it, there: the holder brought it there
  * (`away.driven_by`), since, agent: the agent working on it there
@@ -449,7 +450,10 @@ function awayOf(p) {
 async function refresh() {
   const [st, cfg, pj] = await Promise.all([J("status", "--json"), J("config", "--json"), J("projects", "--json")]);
   if (st.version) S.status = st;
-  if (cfg.effective) S.config = cfg.effective;
+  if (cfg.effective) {
+    S.config = cfg.effective;
+    S.explicit = cfg.explicit || {};
+  }
   if (pj.projects) {
     S.projects = pj.projects;
     S.limitSwitchTo = pj.limit_switch_to;
@@ -1537,7 +1541,8 @@ async function openUndo(p, checkpoint) {
   }
   s.body.append(h("p", { class: "dim", text: cps.length
     ? "How the folder differs from its copy at the start of that session. Putting it back restores every file listed; what is there now is set aside in ~/.aht/undo first."
-    : "aht has no copy of this folder yet. It makes one each time a Claude Code session starts here, and before another agent takes over." }),
+    : checkpointsOn() ? "aht has no copy of this folder yet. It makes one each time a Claude Code session starts here, and before another agent takes over."
+    : "aht has no copy of this folder yet: “Copy the folder when a session starts” is off (Settings, Safety nets)." }),
     fileDiff(d.files || [], cps.length ? "Nothing changed since then." : ""));
   for (const w of (cps.length ? (d.blockers || []).concat(d.warnings || []) : [])) s.body.append(h("p", { class: "warn small", text: "⚠ " + w }));
   const files = (d.files || []).length;
@@ -2280,11 +2285,11 @@ async function syncAnyway(p, how) {
 function copyLine(c, p) {
   const m = c.from, at = c.since || c.at, since = at ? `, since ${clock(at)}` : "";
   // the project of a PC that aht cannot ask: no Send Back; it goes back there
-  if (sendsBack(c) && pcHome(c)) {
+  // (one that answers takes Send Back as any machine does)
+  if (sendsBack(c) && pcHomeMute(c)) {
     const pc = c.remote || m, r = remoteRow(c.remote);
     return h("div", { class: "row copyof" }, h("span", { class: "badge", text: c.kind === "brought" ? `Brought here from ${m}` : `Handed over from ${m}` }),
-      h("span", { class: "dim small grow", text: answers(r) ? `Take it back on ${pc}: the PC keeps this project's record, so there is no Send Back from here.`
-        : r && r.answers_why ? `Take it back on ${pc}; there is no Send Back from here. ${pcWhy(r)}`
+      h("span", { class: "dim small grow", text: r && r.answers_why ? `Take it back on ${pc}; there is no Send Back from here. ${pcWhy(r)}`
         : `Take it back on ${pc}. aht cannot ask a PC, so there is no Send Back from here.` }),
       helpBtn(PC_SETUP));
   }
@@ -3342,6 +3347,21 @@ function check(label, key, def = true, hint) {
   return h("label", { class: "check" }, h("input", { type: "checkbox", checked: flag(key, def),
     onchange: (e) => setConfig(key, e.target.checked) }), label, hint ? h("span", { class: "dim small", text: hint }) : null);
 }
+/** Whether a session's start copies the folder (Undo a whole session), as
+ * the core has it (`status --json` → effective.checkpoint_on_start).  An
+ * older core: the setting when it is set, else on on macOS only, where the
+ * copy is a clone that takes no room; on Windows and Linux it is a real
+ * copy, so it is off until you turn it on. */
+function checkpointsOn() {
+  const e = (S.status.effective || {}).checkpoint_on_start;
+  if (typeof e === "boolean") return e;
+  return "checkpoints" in S.explicit ? !!S.explicit.checkpoints : ON_MAC();
+}
+function setCheckpoints(on) {
+  if (typeof (S.status.effective || {}).checkpoint_on_start === "boolean") S.status.effective.checkpoint_on_start = on;
+  S.explicit.checkpoints = on;
+  setConfig("checkpoints", on);
+}
 function choice(label, key, options) {
   return h("div", { class: "row" }, h("span", { style: "width:190px", text: label }),
     h("select", { onchange: (e) => setConfig(key, e.target.value) }, options.map(([v, l]) => h("option", { value: v, text: l, selected: S.config[key] === v }))));
@@ -3384,7 +3404,9 @@ function drawSettings(m) {
       h("button", { text: "Send a Test", onclick: async () => { const r = await run(["notices", "--test"]); toast(r.out.trim() || "Sent."); } })),
     h("div", { class: "dim small", text: "ntfy: a topic you follow in the free ntfy app. Anyone who knows an ntfy.sh topic's name can read it, so choose a name that is hard to guess." })));
   m.append(group("Safety nets (no tokens)", "Undo a whole session",
-    check("Copy the folder when a session starts, to undo a whole session", "checkpoints"),
+    h("label", { class: "check checkpoints" }, h("input", { type: "checkbox", checked: checkpointsOn(), onchange: (e) => setCheckpoints(e.target.checked) }),
+      "Copy the folder when a session starts, to undo a whole session",
+      h("span", { class: "dim small", text: "On Windows and Linux it makes a real copy of the folder, which takes room." })),
     check("Tell me when Claude stops at its usage limit", "notify_limit")));
   const tok = (label, key, cost) => h("div", { class: "row" }, h("label", { class: "check" }, h("input", { type: "checkbox", checked: flag(key, false),
     onchange: async (e) => { if (e.target.checked && !(await tokensOK(key, label.toLowerCase()))) e.target.checked = false; else if (!e.target.checked) setConfig(key, false); } }), label),
@@ -3398,18 +3420,23 @@ function drawSettings(m) {
     CAN_HAND_OVER() ? tok("Night shift: hand a project over with a task, on a timer", "night_shift", "the agent works while you are away") : null,
     h("div", { class: "dim small", text: "Each of these makes an agent read or work, which counts against your plan or API bill. aht's own work — watching, search, backups, reports, loose ends — never uses tokens." })));
   m.append(permissionsGroup());
-  // a PC too, with ssh: aht's own copy moves the backups there
+  // a PC too, while it answers (aht's own copy moves the backups there); one
+  // that does not is left out, unless it is the one chosen now
   if (CAN_HAND_OVER() || CAN_REACH()) {
     const off = S.config.offsite_backup || "";
-    const names = Object.keys((st.handover || {}).remotes || {}).sort();
+    const rs = (st.handover || {}).remotes || {};
+    const names = Object.keys(rs).filter((n) => answers(rs[n]) || n === off).sort();
     if (off && !names.includes(off)) names.push(off);
+    const mute = off && rs[off] && !answers(rs[off]) ? rs[off] : null;
     m.append(group("Backups on another machine", "Backups",
       h("div", { class: "row" }, "Keep a copy of the history backups on",
         h("select", { onchange: (e) => setConfig("offsite_backup", e.target.value) },
-          [["", "no other machine"]].concat(names.map((n) => [n, n])).map(([v, l]) => h("option", { value: v, text: l, selected: off === v }))),
+          [["", "no other machine"]].concat(names.map((n) => [n, rs[n] && !answers(rs[n]) ? `${n} (aht cannot ask it)` : n]))
+            .map(([v, l]) => h("option", { value: v, text: l, selected: off === v }))),
         h("span", { class: "grow" }),
         h("button", { text: "Copy Now", disabled: !off, onclick: copyBackupsNow }),
         h("button", { text: "Fetch Backups From…", disabled: !off || !CAN_REACH(), onclick: () => fetchBackups(off) })),
+      mute ? h("div", { class: "row pc-why" }, h("span", { class: "warn small grow", text: pcWhy(mute) }), helpBtn(PC_SETUP)) : null,
       h("div", { class: "dim small", text: names.length
         ? "After each daily backup, aht adds the new ones to a folder of this computer's own there. A backup there goes only after aht removed it here, and at least 3 per project stay. Fetch Backups From… brings back the backups any of your computers left there: it adds what is missing here and replaces nothing."
         : "Add one of your other machines in the Machines tab first." })));
@@ -3820,8 +3847,8 @@ function openOn(go) {
   S.tab = "projects";
   if (p) S.selection = p.real_path;
   drawTop(); draw();
-  // a PC's project goes back from the PC: its line says so
-  if (go.do === "send-back" && !(p && pcHome(copyOf(p)))) sendBack(p || { real_path: go.path, exists: true });
+  // the project of a PC that does not answer goes back from the PC: its line says so
+  if (go.do === "send-back" && !(p && pcHomeMute(copyOf(p)))) sendBack(p || { real_path: go.path, exists: true });
 }
 async function start() {
   $("#guide-btn").addEventListener("click", () => openGuide(null));

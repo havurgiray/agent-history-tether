@@ -288,6 +288,29 @@ def main(argv) -> int:
            and info.get("machine_id") is None,
            f"probe: protocol {info.get('protocol')} on {info.get('system')}, the copy's "
            "ops named, no machine id made")
+        # every op a Mac or Linux machine asks a PC (PC_OPS in aht.py): an
+        # aht.exe that lacks one is not asked.  Keep in sync, backups kept
+        # on the PC and Send Back to it ask the newer ones
+        import re
+        src = (REPO / "aht.py").read_text(encoding="utf-8")
+        m = re.search(r"^PC_OPS = \((.*?)\)\n", src, re.S | re.M)
+        pc_ops = set(re.findall(r'"([a-z-]+)"', m.group(1))) if m else set()
+        lack = sorted(pc_ops - set(info.get("ops") or []))
+        ck(pc_ops and not lack and {"offsite-list", "return-plan", "uncopy"} <= pc_ops,
+           f"probe: every op another machine asks a PC is answered ({len(pc_ops)} ops; "
+           f"lacking: {lack})")
+        mid = "0123456789ab"
+        a, _ = ask(cmd, env, {"op": "offsite-adopt", "id": mid,
+                              "machine": {"name": "mac", "system": "Darwin"}})
+        bk = tmp / "home" / ".aht" / "offsite" / mid / "backups" / "p1"
+        bk.mkdir(parents=True, exist_ok=True)
+        (bk / "20261028-120000.zip").write_bytes(b"PK\x05\x06" + bytes(18))
+        lst, _ = ask(cmd, env, {"op": "offsite-list", "files": [mid]})
+        row = next((f for f in lst.get("folders") or [] if f.get("id") == mid), {})
+        ck(a.get("ok") and row.get("name") == "mac" and row.get("files") == 1
+           and list((lst.get("files") or {}).get(mid) or {}) == ["p1/20261028-120000.zip"],
+           f"offsite-adopt and offsite-list: the far end keeps another computer's backups "
+           f"in a folder of its own ({row})")
 
         # every byte value (CR, LF, Ctrl-Z, NUL), a big file, a name beyond ASCII,
         # an empty file and an empty folder

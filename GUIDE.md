@@ -335,7 +335,9 @@ project from it. While the PC holds a project it brought, the project at
 home says *On pc since 14:10 (brought there from pc). Send it back from
 pc.*, with **Release…** for a PC that is gone. A PC that answers also
 takes Hand Over and Take Back from them, and then a project it brought can
-be taken back at home too (*… or take it back here*).
+be taken back at home too (*… or take it back here*); it also takes Keep
+in sync and their backups, a Send Back of what it handed over, and
+projects handed over from another PC (see *A Windows PC that answers*).
 
 The project usually sits at another path on the PC (`C:\Users\me\code\shop`
 for `/Users/me/code/shop`): see *Across systems and folders*.
@@ -366,9 +368,11 @@ above, with Windows paths, for example:
 ## A Windows PC that answers
 
 Optional. With an ssh server on the PC, your Mac or Linux machine can
-hand a project over to the PC and take it back, watch the PC, list its
-sessions and search them. Without one, the PC still does everything in
-the section above.
+hand a project over to the PC and take it back, keep projects in sync
+with it, keep its backups there, send back a project the PC handed over,
+watch the PC, list its sessions and search them. Another PC can hand
+projects over to it too. Without one, the PC still does everything in the
+section above.
 
 > **Example.** You leave the Mac for the PC in the other room. On the
 > Mac, **Hand Over…** sends shop to pc. No session starts on the PC: its
@@ -392,6 +396,24 @@ the section above.
   comes back, and the PC drops its Continue here. Or, with the Mac added on
   the PC, **Send Back to mac…** there returns it (see *Bring a project
   here, and send it back*).
+- **Keep in sync with the PC**, as with any machine (see *Keep in sync
+  looks first*): aht's own copy moves the files, the PC notes the folder
+  as a copy kept in sync, and the sync pauses when the copy on the PC was
+  changed, when it would remove many files there, or when the folder there
+  holds something else; **Bring Them Here…** takes the PC's changes. A name
+  Windows cannot hold (`aux.md`, `a:b.txt`) stops a sync before anything
+  is sent.
+- **Backups kept on the PC:** pick it under **Settings → Backups on
+  another machine**. Each computer's backups go into a folder of its own
+  in `~\.aht\offsite\` on the PC, and **Fetch Backups From…** brings them
+  back, also on a new computer.
+- **Send Back to the PC:** a project the PC handed over to your Mac (or a
+  Linux machine) goes back with **Send Back** on that machine, as to any
+  machine, once the PC is added there; the PC plans the way back against
+  its record and keeps both versions of a file changed on both sides.
+- **From one PC to another:** a PC hands a project over to another PC that
+  answers, and takes it back, as a Mac does: the files go with aht's own
+  copy, the other PC's tray offers Continue here.
 - **Watch** the PC, see its open sessions in the Sessions tab, and
   **search** its sessions (**Also on my other machines**).
 - **Claude Code** must be installed on the PC. If its version differs from
@@ -402,8 +424,9 @@ the section above.
   Antigravity, Mistral Vibe) and the night shift go to Mac and Linux
   machines only. aht never ends a session on the PC (`--stop` does not),
   so exit it there before you take the project back. **Open Session** has
-  nothing to open. Pick Up, Leave a Note, Bring Here and Send Back with a
-  PC still start on the PC.
+  nothing to open. Pick Up, Leave a Note and Bring Here with a PC still
+  start on the PC; Send Back starts there too, or, for a project the PC
+  handed over, on the machine that has it.
 
 **What answers on the PC:** aht installed there, at least as new as this
 release, or else aht's own copy with the PC's Python 3 (`py`, or
@@ -470,6 +493,12 @@ answers*).
 - `aht handover ~/code/shop --to pc` — show what handing shop over to
   the PC would send, and where it goes there; `--apply` does it.
 - `aht reclaim ~/code/shop --apply` — take it back.
+- `aht mirror ~/code/shop --on --to pc` — keep shop in sync with the PC;
+  `aht mirror ~/code/shop --run` syncs now.
+- `aht config --set offsite_backup=pc` — keep a copy of the backups on the
+  PC; `aht backup --offsite` copies now.
+- `aht send-back ~/code/notes --apply` — return a project the PC handed
+  over to this Mac.
 
 ## New versions
 
@@ -577,6 +606,12 @@ and the agent starts empty there. aht notices and moves the history along.
 - **Settings → When folders change** decides whether aht asks, relinks on
   its own, or leaves things alone. New projects are always taken on as you
   work in them.
+- **The watcher** is what notices a move as it happens: it runs in the
+  background from login and relinks the histories of a folder you moved or
+  renamed at once, for every agent, so your sessions follow the folder.
+  Without it (`watcher_owner` set to `none`), only Claude Code's start
+  hook relinks, when a session starts in the moved folder, and **Find
+  Moved Folders Now** catches up on the rest.
 
 **In the terminal:**
 
@@ -641,7 +676,9 @@ Every day aht zips each project's histories, of all agents, into
   here, and at least 3 per project always stay. The copies aht makes
   before it rewrites a history go there too, and aht never removes those
   there. **Copy Now** copies at once. A Windows PC copies with aht's own
-  copy, so it needs no rsync (see *A Windows PC with your other machines*).
+  copy, so it needs no rsync (see *A Windows PC with your other machines*),
+  and a PC that answers can keep the backups of your Mac and Linux
+  machines too (see *A Windows PC that answers*).
 - **Fetch Backups From…** (in the same group) brings backups back, for
   example on a new computer. It lists every computer's folder of backups on
   that machine, with its name, system, last update, projects, backups and
@@ -827,7 +864,14 @@ holds a project of yours (about once a minute).
 - **Settings → Notices:** choose which notices you want. For the phone,
   enter `imessage:` followed by your own number or Apple ID (it arrives as
   a message to yourself), or `ntfy:` followed by a topic you follow in the
-  free ntfy app. **Send a Test** shows how it looks.
+  free ntfy app (or your own ntfy server's address). **Send a Test** shows
+  how it looks.
+- **Only encrypted:** an ntfy server's address must start with `https://`,
+  since a notice names your projects, sessions and machines. aht refuses
+  `http://` (*… is plain http, so the notices would cross the network
+  unencrypted*), except for a server on this very computer (`localhost`,
+  `127.0.0.1` or `[::1]`). An `http://` address set before aht refused it
+  gets no notices; the log says why, and **Send a Test** too.
 - **Claude's usage limit:** when a session stops because the limit is
   reached, a notice says so, with the time it resets (Settings → Safety
   nets → *Tell me when Claude stops at its usage limit*).
@@ -1599,9 +1643,9 @@ below that machine's home folder (`/Users/me/code/shop` here is
 - **Same Claude Code everywhere:** the other machine gets this computer's
   exact version.
 - **Between systems:** a Mac, a Linux machine or a Windows PC hands
-  projects over to a Mac or Linux machine and takes them back; a Mac or
-  Linux machine also to a PC that answers (see *A Windows PC that
-  answers*). The project may sit at another path there (see *Across
+  projects over to a Mac or Linux machine and takes them back; a Mac, a
+  Linux machine or another PC also to a PC that answers (see *A Windows PC
+  that answers*). The project may sit at another path there (see *Across
   systems and folders*). A machine can also fetch a project itself (see
   *Bring a project here, and send it back*).
 - **It stays awake while the agent works** or waits for you there:
@@ -1704,6 +1748,11 @@ that was only touched does not pause it.
 - **Names the other disk cannot hold apart**, such as `README.md` and
   `readme.md` for a Mac's disk, do not pause a sync. They are listed
   (`aht mirror --run --json` gives them under `names`).
+- **Names the other disk cannot hold at all** (on a Windows PC: `aux.md`,
+  `a:b.txt`, a name ending in a dot or a space, a path too long; links
+  the account there cannot make) stop a sync before anything is sent, as
+  they stop a handover: *1 name pc cannot hold (a name Windows reserves:
+  aux.md) — rename it here, or add it to handover_excludes*.
 
 **A handover cut off halfway.** When the link drops or this computer
 sleeps during a handover, aht asks that machine at its next check, within a
@@ -1752,7 +1801,8 @@ went on.
   in the way; `--to homebox` names the machine, `--apply` does it.
 - `aht handover ~/Desktop/paper --apply --task "run the benchmark"` — hand
   it over and start the session there on that task (`--session <id>`:
-  resume that session instead of the latest).
+  resume that session instead of the latest). A key, token or password in
+  the task is masked before it leaves, as everywhere else.
 - `aht handover ~/Desktop/paper --include ~/notes/paper.md --apply` — take
   a file or folder from outside the project along (remembered; Take Back
   brings it back).
@@ -1808,10 +1858,12 @@ bring a project from your Mac and send it back.
 > puts your work into the Mac's copy.
 
 - **What it needs:** aht installed on the project's home, at this version
-  or newer, since that machine keeps the project's record. Otherwise Bring
-  Here says *install aht on mac first*, or *update aht on mac first (and
-  open it once)*. The home must be a Mac or a Linux machine; a project on
-  a PC goes the other way, with Hand Over on the PC.
+  or newer, since that machine keeps the project's record and answers what
+  Bring Here and Send Back ask it. Otherwise Bring Here says *install aht
+  on mac first*, or *update aht on mac first: Bring Here and Send Back need
+  aht <this version> or newer there …; then open it once*. The home must
+  be a Mac or a Linux machine; a project on a PC goes the other way, with
+  Hand Over on the PC.
 - **What stops it:**
   - a session working or waiting in the project there. An idle one stops
     it too, unless you bring it anyway (**Bring It Anyway**; on a Mac the
@@ -1869,8 +1921,10 @@ bring a project from your Mac and send it back.
   **Release…** is there for a machine that is gone.
 - **A project handed over** to a machine with aht installed (also a PC
   that answers) can go back with Send Back on that machine too, when it
-  can reach the machine that handed it over; not when a PC handed it over
-  (take it back on the PC).
+  can reach the machine that handed it over. That includes a PC that
+  handed it over, once the PC answers (OpenSSH Server, see *A Windows PC
+  that answers*) and is added on that machine; otherwise take it back on
+  the PC.
 - **The hook says so.** A Claude session that starts in the brought folder
   is told where it came from and to send it back when done; one that
   starts in the project on the home is warned that it is worked on
@@ -1991,7 +2045,8 @@ Claude Code only (its tray offers Continue here).
 
 Hand Over, Take Back, Bring Here and Send Back work between a Mac, a Linux
 machine and a Windows PC (a PC starts Bring Here and Send Back itself; a
-PC that answers also takes Hand Over and Take Back), also when the project
+PC that answers also takes Hand Over, Take Back and Send Back, and Keep in
+sync), also when the project
 sits at another path on each machine. This section says what aht does
 about paths, names, line endings, executable marks and git, so nothing is
 lost on the way.
@@ -2558,8 +2613,15 @@ all of them can be set with `aht config --set name=value` and put back with
 - `notifications` (on) — notices about relinks, copies and backups.
 - `watcher_owner` (agent) — `agent`: the watcher runs on its own (a
   LaunchAgent on a Mac, a systemd user service or autostart entry on
-  Linux, a sign-in entry on Windows); `none`: no watcher, only the Claude
-  hook notices moves.
+  Linux, a sign-in entry on Windows). It notices when you move or rename
+  a project folder and relinks its histories right away, for every agent,
+  so your sessions follow the folder. `none`: no watcher. On a Mac and on
+  Linux, setting it stops the watcher that runs (and removes what starts
+  it at login), and `aht install` then sets up none; a moved folder is
+  relinked only when a Claude Code session starts in it (the Claude hook),
+  or when you look with **Find Moved Folders Now** (`aht reconcile`).
+  Back to `agent` (`aht config --set watcher_owner=agent`, or `aht
+  install`) starts it again.
 - `log_level` (info) — how much goes into the log: `debug`, `info`, `warn`,
   `error`.
 
@@ -2612,7 +2674,8 @@ all of them can be set with `aht config --set name=value` and put back with
   else aht's own copy), `rsync` or `aht` (see *What copies the files*
   under *Hand a project over to another machine*).
 - `handover_remote_control` (on) — a handed-over session is reachable from
-  the Claude app; Antigravity, when you switch to it, starts with
+  the Claude app, named after its tab and the machine (a key in that name
+  is masked); Antigravity, when you switch to it, starts with
   `--remote-control` too.
 - `handover_carry_trust` (on) — a folder trusted here is trusted there.
 - `handover_claude_args` (none) — extra options for the session over there,
@@ -2630,7 +2693,8 @@ all of them can be set with `aht config --set name=value` and put back with
   (3) — a session waits for you; a piece of work that took at least that
   many minutes is done.
 - `notify_phone` (none) — `imessage:<your number or Apple ID>` or
-  `ntfy:<topic>`.
+  `ntfy:<topic>` (or `ntfy:https://<your server>/<topic>`; `http://` only
+  for a server on this computer).
 - `notify_limit` (on) — a session stopped at Claude's usage limit.
 - `session_corner` (off) — the app lists the open Claude sessions in the
   screen's top-right corner (*Sessions in the corner*).
@@ -2719,7 +2783,8 @@ and act only with `--apply`; `install`, `uninstall`, `config`, `roots`,
 - `aht encode ~/Desktop/paper` — the folder name Claude Code uses for that
   path.
 - `aht version` — the version of aht.
-- `aht install` — set aht up on this computer: the watcher, the notices,
+- `aht install` — set aht up on this computer: the watcher (none when
+  `watcher_owner` is `none`; one left running then stops), the notices,
   the Claude hooks and the `aht` command; `--src` installs from another
   folder (the app uses this).
 - `aht uninstall` — remove all of that again; histories are never touched.

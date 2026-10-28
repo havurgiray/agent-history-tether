@@ -223,16 +223,21 @@ def check_inotify_budget(roots) -> None:
               "sudo tee /etc/sysctl.d/99-inotify.conf && sudo sysctl --system")
 
 
+def main() -> None:
+    aht.ensure_config()
+    roots = [r for r in aht.watch_roots_config() if Path(r).is_dir()]
+    install_command()
+    install_hook()
+    # the watcher's unit (or autostart entry), unless watcher_owner is none
+    # (then one left from before is stopped and removed)
+    if aht.watcher_install(write_service, load_agent):
+        check_inotify_budget(roots)
+    print(f"\nInstalled at {TOOLS}. Watching roots: {roots or '(none exist yet)'}")
+    print("Reconnect this machine's existing projects with:  aht adopt --apply")
+
+
 if __name__ == "__main__":
     if not sys.platform.startswith("linux"):
         print(f"This installer is for Linux; on {sys.platform} use ../install.sh")
         sys.exit(1)
-    aht.ensure_config()
-    roots = [r for r in aht.watch_roots_config() if Path(r).is_dir()]
-    write_service()
-    install_command()
-    install_hook()
-    load_agent()
-    check_inotify_budget(roots)
-    print(f"\nInstalled at {TOOLS}. Watching roots: {roots or '(none exist yet)'}")
-    print("Reconnect this machine's existing projects with:  aht adopt --apply")
+    main()

@@ -325,6 +325,17 @@ def _coerce(key: str, raw: str):
             raise ValueError(f'{key}: {e} — e.g. {{"codex": {{"never": ["-a", "never", '
                              f'"-s", "workspace-write"]}}}}')
         return perm_flags_table(obj, strict=True)
+    if key == "watcher_owner":
+        v = raw.strip().lower()
+        if v not in ("agent", "none"):
+            raise ValueError("watcher_owner expects agent (a watcher runs) or none (no "
+                             "watcher)")
+        return v
+    if key == "notify_phone":
+        why = phone_refusal(raw)
+        if why:
+            raise ValueError(f"notify_phone was not set: {why}")
+        return raw.strip()
     if key == "limit_switch_to":
         v = raw.strip().lower()
         if v not in SWITCH_TARGETS or v == "claude":
@@ -1177,15 +1188,42 @@ def _app_binary():
             return exe
     return None
 
+NOTICE_QUEUE_MAX = 500      # lines: past this a notice queue starts over
+
+def queue_notice(path, record: dict) -> None:
+    """Hand a notice to the Mac app (run/app-notices.jsonl) or the Windows
+    tray (run/tray-notices.jsonl): one JSON line, which they read from where
+    they stopped.  A queue that holds NOTICE_QUEUE_MAX lines starts over
+    with the new line alone: the file shrinks, so its reader starts again
+    at the top and shows just that notice; the old lines were shown already
+    and carry nothing else.  So the queue never grows past that.  Writers
+    take turns (a lock file beside it, never the queue itself, which its
+    reader opens at any time)."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        line = (json.dumps(record) + "\n").encode("utf-8")
+        with open(str(p) + ".lock", "w") as lk:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+            except OSError:
+                pass
+            with open(p, "ab+") as fh:
+                fh.seek(0)
+                if fh.read().count(b"\n") >= NOTICE_QUEUE_MAX:
+                    fh.truncate(0)
+                fh.write(line)
+    except OSError:
+        pass
+
 def notify_user(title: str, message: str, info: dict = None) -> None:
     try:
         if os.environ.get("AHT_NO_NOTIFY") or not cfg_get("notifications", True):
             return
         if IS_MAC and app_running():            # the app shows it, and handles a click
-            q = aht_home() / "run" / "app-notices.jsonl"
-            with open(q, "a") as fh:
-                fh.write(json.dumps({"title": title, "message": message, "info": info or {},
-                                     "at": time.time()}) + "\n")
+            queue_notice(aht_home() / "run" / "app-notices.jsonl",
+                         {"title": title, "message": message, "info": info or {},
+                          "at": time.time()})
             return
         exe = _app_binary() if IS_MAC else None
         if exe:
@@ -3232,6 +3270,101 @@ def launchagent_loaded() -> bool:
             return True
     return False
 
+def watcher_wanted() -> bool:
+    """watcher_owner: "agent" (a LaunchAgent, a systemd user unit or an
+    autostart entry runs the watcher) or "none" (no watcher at all: only
+    the Claude Code hook relinks, when a session starts)."""
+    return cfg_get("watcher_owner", "agent") != "none"
+
+def _watcher_program() -> Path:
+    """The watcher as the installer puts it: the Mac's program, Linux's
+    script (its Python runs it)."""
+    t = Path.home() / ".aht" / "tools" / "agent-history-tether"
+    return t / ("watcher.py" if IS_LINUX else "watcher")
+
+def _watcher_pids() -> list:
+    """The watcher's processes, by their command line: the installed program
+    itself, or an interpreter (Python, sh) running the installed script, by
+    that very path; a program that merely names the file is not one."""
+    prog = str(_watcher_program())
+    pat = re.compile(r"(?i)(?:\S*/)?(?:python[0-9.]*|sh|bash|dash)(?:\s+-\S+)*\s+"
+                     + re.escape(prog) + r"(?:\s|$)")
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True,
+                           timeout=15)
+    except Exception:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        args = args.strip()
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        if args == prog or args.startswith(prog + " ") or pat.match(args):
+            out.append(int(pid))
+    return out
+
+def stop_watcher() -> list:
+    """watcher_owner=none: the watcher stops cleanly and does not come back
+    (at login, or by launchd's or systemd's keep-alive): its LaunchAgent or
+    unit is unloaded and removed, an autostart entry too, and a watcher
+    still running is asked to end (SIGTERM, to its own pid, found by its
+    command line).  -> what was done, in words."""
+    done = []
+    if os.name == "nt":
+        return done                     # the Windows watcher is the exe's own
+    try:
+        if IS_MAC:
+            plist = Path.home() / "Library" / "LaunchAgents" / f"{MAC_LABEL}.plist"
+            if plist.is_file() or launchagent_loaded():
+                subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{MAC_LABEL}"],
+                               capture_output=True, timeout=30)
+                done.append(f"the watcher's LaunchAgent ({MAC_LABEL}) was unloaded")
+            if plist.is_file():
+                plist.unlink()
+                done.append(f"{plist} was removed, so it does not start at login")
+        elif IS_LINUX:
+            unit = Path.home() / ".config" / "systemd" / "user" / LINUX_UNIT
+            if unit.is_file():
+                if _have("systemctl"):
+                    subprocess.run(["systemctl", "--user", "disable", "--now", LINUX_UNIT],
+                                   capture_output=True, timeout=30)
+                unit.unlink()
+                if _have("systemctl"):
+                    subprocess.run(["systemctl", "--user", "daemon-reload"],
+                                   capture_output=True, timeout=30)
+                done.append(f"the watcher's unit ({LINUX_UNIT}) was stopped and removed")
+            auto = Path.home() / ".config" / "autostart" / "aht-watcher.desktop"
+            if auto.is_file():
+                auto.unlink()
+                done.append(f"{auto} was removed, so it does not start at login")
+    except (OSError, subprocess.SubprocessError) as e:
+        warn(f"WATCHER could not be unregistered: {e}")
+    import signal
+    for pid in _watcher_pids():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            done.append(f"the watcher (pid {pid}) was asked to end")
+        except OSError:
+            pass
+    if done:
+        log("WATCHER off (watcher_owner=none): " + "; ".join(done))
+    return done
+
+def watcher_install(write, load) -> bool:
+    """The installer's watcher steps: write its LaunchAgent or unit, then
+    load it; with watcher_owner=none neither, and a watcher left from
+    before stops (stop_watcher).  -> whether a watcher was set up."""
+    if watcher_wanted():
+        write()
+        load()
+        return True
+    done = stop_watcher()
+    print("✓ no watcher (watcher_owner=none): moved or renamed project folders are "
+          "relinked when a Claude Code session starts in them"
+          + ("".join(f"\n  · {d}" for d in done)))
+    return False
+
 def watcher_status() -> dict:
     st = {"platform": sys.platform, "owner": cfg_get("watcher_owner", "agent"),
           "installed": False, "running": False, "kind": None, "detail": ""}
@@ -3352,6 +3485,9 @@ def cmd_status(args):
         "gui_dialogs": gui_dialogs_available(),
         "policies": {"moves": cfg_get("move_policy"),
                      "copies": cfg_get("copy_policy")},
+        # what the core uses, its default included (a setting the user never
+        # chose differs by system): the front-ends show this, not their own guess
+        "effective": {"checkpoint_on_start": checkpoints_on()},
     }
     if args.json:
         print(json.dumps(st, indent=2))
@@ -3675,6 +3811,17 @@ def cmd_config(args):
     if changed and any(k.startswith("watch_roots") for k in (args.set or [])) \
             and not args.no_reload:
         _reload_quietly(args.json)
+    if changed and any(k.split("=", 1)[0].strip() == "watcher_owner" for k in (args.set or [])):
+        # none: the watcher stops now, cleanly, and stays off; agent again:
+        # it is set up and started (as aht reload does)
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext():
+            if not watcher_wanted():
+                done = stop_watcher()
+                print("watching is off (watcher_owner=none)"
+                      + "".join(f"\n  · {d}" for d in done))
+            elif not args.no_reload:
+                _reload_watcher()
     return 0
 
 def cmd_doctor(args):
@@ -4811,7 +4958,11 @@ AGENT_PROTOCOL = 3      # what the far end speaks; its probe also names its ops
 # speaks an older protocol, or lacks one of them, is not asked
 PC_PROTOCOL = 3
 PC_OPS = ("probe", "manifest", "hash", "prepare", "trust", "install-claude", "start",
-          "stop", "close", "written-by", "board", "search", "prune", "pack", "unpack")
+          "stop", "close", "written-by", "board", "search", "prune", "pack", "unpack",
+          # Keep in sync and backups kept on a PC; Send Back to a PC that handed
+          # a project over
+          "uncopy", "offsite-list", "offsite-adopt", "offsite-prune", "return-plan",
+          "return-apply", "relay-info")
 
 def _core_text() -> bytes:
     """The core's own bytes: what runs on the other machine.  In the Windows
@@ -5579,8 +5730,9 @@ _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 # what a PC still does from its own side (it answers Hand Over, Take Back,
 # the board, Watch and search)
 WINDOWS_FAR = ("A Windows PC does this from its own side: on the PC, use Pick Up or Leave a "
-               "Note. From here, aht hands projects over to it, takes them back, watches it "
-               "and searches it.")
+               "Note. From here, aht hands projects over to it, takes them back, sends back "
+               "what it handed over, keeps projects in sync with it, keeps backups on it, "
+               "watches it and searches it.")
 NO_SH_ON_PC = "aht runs no sh script on a Windows PC"
 
 # ---- a Windows PC that answers ---------------------------------------------- #
@@ -9464,7 +9616,10 @@ def _update_entry(uid: str, **fields) -> None:
 
 class Progress:
     """Where a transfer stands, for a front-end that shows it: the stage in
-    words and the percentage rsync reports, rewritten into one small file."""
+    words and the percentage rsync reports, rewritten into one small file
+    (--status-file: the Mac app's run/stage-*.json, the window's
+    run/window-*.json).  The file goes when the command ends (done())."""
+    written = set()                 # the files this run wrote
     def __init__(self, path=None, talk=False):
         self.path, self.talk = path, talk
         self.stage, self.pct, self.at = "", None, 0.0
@@ -9486,8 +9641,20 @@ class Progress:
             with open(tmp, "w") as fh:
                 json.dump({"stage": self.stage, "percent": self.pct, "at": self.at}, fh)
             os.replace(tmp, self.path)
+            Progress.written.add(str(self.path))
         except OSError:
             pass
+
+    @classmethod
+    def done(cls) -> None:
+        """The command ended: its status files go (nobody reads them now)."""
+        for p in list(cls.written):
+            for f in (p, p + ".new"):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+        cls.written.clear()
 
 class ProjectLock:
     """One transfer per project at a time (a mirror run and a handover)."""
@@ -10033,8 +10200,11 @@ def _sync_check(rem: Remote, uid: str, real: str, info: dict, replace: bool = Fa
     base = read_there(uid, rem.name, rpath)
     there, here = _sync_files(theirs["project"]["files"]), _sync_files(ours["project"]["files"])
     gone = sorted(set(there) - set(here))
+    # the disk there, with its system: a PC cannot hold some names at all
     out = {"ours": ours, "theirs": theirs, "base": bool(base), "pause": None,
-           "names": name_problems(ours["project"], info.get("fs") or {}),
+           "names": name_problems(ours["project"],
+                                  dict(info.get("fs") or {}, system=info.get("system")),
+                                  root=rem._logical(rpath)),
            "changes": _copy_changes(rem, base, ours, theirs, far, near) if base else None,
            "removals": _removals(gone, len(there))}
     owner = info.get("path_owner")
@@ -10187,6 +10357,12 @@ def mirror_project(uid: str, entry: dict, progress: bool = False, replace: bool 
                 if not was or was.get("reason") != p["reason"]:
                     _pause_notice(p, real)
                 return dict(row, status="paused", reason=_pause_text(p), paused=p)
+            # names the disk there cannot hold (on a PC: aux, a:b, a trailing
+            # dot, a path too long; links it cannot make) would stop the copy
+            # halfway: nothing is sent, as a handover sends nothing
+            held = [p for p in chk["names"] if p["kind"] not in ("case", "unicode")]
+            if held:
+                raise HandoverError(names_blocker(held, rem.name, "here"))
             r = push_project(rem, uid, entry, progress=progress, sync=True)
             # both lists as they are now: the next sync compares with these
             theirs = rem.agent("manifest", timeout=900,
@@ -10725,6 +10901,10 @@ def cmd_handover(args):
            "agent": agent, "start_line": None, "tokens": None, "first_prompt": None,
            "relay": None}
     lines = []
+    if getattr(args, "task", None):
+        # the task leaves this machine (the summary, the first prompt, the
+        # records there and the one here): masked, as everything else is
+        args.task = redact(str(args.task))
     if not handover_supported():
         out["blockers"].append("handover needs rsync and ssh; it is not available "
                                "in this build")
@@ -11168,13 +11348,8 @@ def cmd_handover(args):
                     got = rem.agent("install-claude", timeout=1000, version=install)
                     info["claude"] = got["claude"]
                 if not args.no_start:
-                    trusted = False
-                    try:
-                        cj = json.loads(_claude_json().read_text())
-                        trusted = bool((cj.get("projects") or {}).get(real, {})
-                                       .get("hasTrustDialogAccepted"))
-                    except Exception:
-                        pass
+                    # keyed as Claude Code keys it here (on a PC: C:/Users/…)
+                    trusted = is_trusted(real)
                     if trusted and cfg_get("handover_carry_trust", True) and agent == "claude":
                         out["trust"] = rem.agent("trust", path=rem.there(real)).get("trust")
                     say(f"starting {AGENT_NAMES[agent]} on {rem.name} …")
@@ -11278,6 +11453,7 @@ def cmd_handover(args):
         warn(f"HANDOVER {real}: {e}")
     code = _emit(args, out, lines)
     if out.get("applied") and args.attach and not args.json and out.get("attach"):
+        Progress.done()
         os.execvp(out["attach"][0], out["attach"])
     return code
 
@@ -12178,22 +12354,41 @@ def cmd_reclaim(args):
 # Bring Here (at the holder-to-be) fetches a project from its home, and Send
 # Back (at the holder) pushes it home again.  Home keeps the record, as for a
 # Hand Over: the holder asks it through the ops mark-handing, mark-away,
-# unmark, return-plan and return-apply (aht's own copy of aht answers there,
-# at protocol 2 or newer).  So a PC, without being asked anything, brings
-# projects from Mac and Linux machines and sends them back.
+# unmark, return-plan and return-apply (aht's own copy answers there, or a
+# PC's aht.exe; the aht installed there, at HOME_PROTOCOL or newer, keeps
+# the record).  So a PC, without being asked anything, brings projects from
+# Mac and Linux machines and sends them back; and a PC that answers takes a
+# Send Back of a project it handed over.
 
-HOME_PROTOCOL = 2
+# The ops Bring Here and Send Back ask the home for, and the records they
+# leave there for the aht installed at home to keep (its checks and its
+# window read `away` with driven_by "there", `returned`, copies.json).  The
+# lowest protocol at which every aht has all of them is 3: an aht at
+# protocol 2 may come from before Bring Here, when protocol 2 already was.
+HOME_OPS = ("probe", "manifest", "pack", "mark-handing", "mark-away", "unmark",
+            "return-plan", "return-apply", "uncopy", "relay-info")
+HOME_PROTOCOL = 3
 
 def _aht_home_blocker(info: dict, name: str):
     """Bring Here and Send Back need aht installed at the project's home,
-    which keeps the project's record."""
+    which keeps the project's record: at HOME_PROTOCOL or newer, and, when
+    it names its ops, with every op of HOME_OPS."""
     t = info.get("aht_there") or {}
     if not t.get("installed"):
         return (f"install aht on {name} first: Bring Here and Send Back need it there, "
                 "where the project's record is kept")
-    if int(t.get("protocol") or 0) < HOME_PROTOCOL:
-        return (f"update aht on {name} first (and open it once): Bring Here and Send Back "
-                "need a newer aht there, where the project's record is kept")
+    try:
+        proto = int(t.get("protocol") or 0)
+    except (TypeError, ValueError):
+        proto = 0
+    lack = sorted(set(HOME_OPS) - set(t["ops"])) if isinstance(t.get("ops"), list) else []
+    if proto < HOME_PROTOCOL or lack:
+        return (f"update aht on {name} first: Bring Here and Send Back need aht {VERSION} or "
+                f"newer there, where the project's record is kept (the aht there is "
+                f"{t.get('version') or 'older'}"
+                + (f", at protocol {proto}" if proto < HOME_PROTOCOL else
+                   f", without {', '.join(lack)}")
+                + "); then open it once")
     return None
 
 def _far_arg(rem: Remote, p: str) -> str:
@@ -12820,18 +13015,18 @@ def cmd_send_back(args):
         if read_marker(real) != uid:
             out["blockers"].append("this folder holds another project now (its id changed)")
             return _emit(args, out, lines)
-        if c.get("system") == "Windows":
-            # handed over by a PC, which keeps the record: it takes it back
-            frm = c.get("from") or "the PC it came from"
-            out["blockers"].append(f"{frm} is a Windows PC, which keeps this project's "
-                                   f"record: take it back on {frm}")
-            return _emit(args, out, lines)
+        # a project a PC handed over goes back as any other, when that PC
+        # answers (its OpenSSH Server) and is set up here; else it is taken
+        # back on the PC
         name = args.to or (c.get("remote") if c.get("remote") in remotes_config() else
                            _remote_for(c.get("from"), c.get("from_id")))
         if not name:
-            out["blockers"].append(f"{c.get('from')} is not set up on this machine: add it "
-                                   f"(aht remote add {c.get('from')} <user@host>), then send "
-                                   "it back")
+            out["blockers"].append(
+                f"{c.get('from')} is not set up on this machine: add it "
+                f"(aht remote add {c.get('from')} <user@host>), then send it back"
+                + (f" — a PC needs OpenSSH Server for that (see “A Windows PC that "
+                   f"answers”); or take it back on {c.get('from')}"
+                   if c.get("system") == "Windows" else ""))
             return _emit(args, out, lines)
         rem = get_remote(name)
         rem.on_percent = prog.percent
@@ -19457,7 +19652,10 @@ def _aht_there() -> dict:
     return {"installed": installed,
             "version": (mark.get("version") or st.get("version")) if installed else None,
             "protocol": mark.get("protocol") if installed else None,
-            "phone_here": bool(installed and fresh and cfg_get("notify_phone"))}
+            "ops": mark.get("ops") if installed and isinstance(mark.get("ops"), list)
+            else None,
+            "phone_here": bool(installed and fresh and cfg_get("notify_phone")
+                               and not phone_refusal(cfg_get("notify_phone")))}
 
 def install_mark_path() -> Path:
     return aht_home() / "install.json"
@@ -19468,7 +19666,8 @@ def _mark_install() -> None:
     here), so that machine can tell whether this one keeps records it
     understands (Bring Here, Send Back)."""
     p = install_mark_path()
-    want = {"version": VERSION, "protocol": AGENT_PROTOCOL}
+    want = {"version": VERSION, "protocol": AGENT_PROTOCOL,
+            "ops": sorted(set(AGENT_OPS) | set(STREAM_OPS))}
     try:
         if json.loads(p.read_text()) == want:
             return
@@ -19481,10 +19680,46 @@ def _mark_install() -> None:
     except OSError:
         pass
 
+# a server on this very machine: plain http to it never crosses the network
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+def phone_refusal(target) -> str | None:
+    """Why notify_phone would send notices in the clear: ntfy over plain http
+    to another machine (a notice names projects, sessions and machines).
+    None for https, a topic on ntfy.sh, http to a server on this machine
+    (localhost, 127.0.0.1, [::1]), or anything else."""
+    t = str(target or "").strip()
+    if not t.lower().startswith("ntfy:"):
+        return None
+    url = t.split(":", 1)[1].strip()
+    if not url.lower().startswith("http://"):
+        return None
+    import urllib.parse
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host in _LOCAL_HOSTS:
+        return None
+    return (f"{url} is plain http, so the notices would cross the network unencrypted — "
+            "use https://, or http:// only for a server on this computer (localhost, "
+            "127.0.0.1 or [::1])")
+
 def send_to_phone(title: str, message: str, target: str = None) -> str:
     """Pass a notice on to the phone, if the user set that up:
-    notify_phone = "imessage:<phone or Apple ID>" or "ntfy:<topic or URL>"."""
+    notify_phone = "imessage:<phone or Apple ID>" or "ntfy:<topic or URL>".
+    Never in the clear: an http:// server on another machine (a value set
+    before aht refused it, or written into config.json by hand) gets
+    nothing, and the log says why."""
     target = str(cfg_get("notify_phone") or "") if target is None else target
+    why = phone_refusal(target)
+    if why:
+        warn(f"NOTICE not sent to the phone: {why}")
+        if os.environ.get("AHT_NOTIFY_LOG"):             # tests: note that nothing went
+            with open(os.environ["AHT_NOTIFY_LOG"], "a") as fh:
+                fh.write(json.dumps({"title": title, "message": message, "phone": "",
+                                     "refused": why}) + "\n")
+        return "refused: " + why
     if os.environ.get("AHT_NOTIFY_LOG"):                 # tests: note it, send nothing
         with open(os.environ["AHT_NOTIFY_LOG"], "a") as fh:
             fh.write(json.dumps({"title": title, "message": message, "phone": target}) + "\n")
@@ -19958,8 +20193,11 @@ def cmd_update(args):
 def cmd_notices(args):
     if args.test:
         _notify("aht", "This is how a notice from aht looks.")
-        print(("sent to this Mac" if IS_MAC else "sent to this computer") + ("" if not cfg_get("notify_phone")
-                                    else f" and to {cfg_get('notify_phone')}"))
+        why = phone_refusal(cfg_get("notify_phone"))
+        print(("sent to this Mac" if IS_MAC else "sent to this computer")
+              + ("" if not cfg_get("notify_phone") else
+                 f"; not to {cfg_get('notify_phone')}: {why}" if why else
+                 f" and to {cfg_get('notify_phone')}"))
         return 0
     got = check_notices()
     if args.json:
@@ -23380,8 +23618,9 @@ def handover_session_name(sid, real: str, machine: str) -> str:
     entry = state.get(str(sid or "")) or {}
     names = entry.get("names") or []
     if not names:
-        return os.path.basename(real)
-    name = f"{entry.get('tab') or names[-1]} @ {machine}"
+        return redact(os.path.basename(real))
+    # it leaves this machine (the Claude app shows it): masked, as the title is
+    name = redact(f"{entry.get('tab') or names[-1]} @ {machine}")
     if sid:                         # aht's name: renamed after the tab once it is back
         state[str(sid)] = dict(entry, names=(names + [name])[-10:], at=time.time())
         _write_json(tab_names_path(), state)
@@ -25442,6 +25681,8 @@ def main(argv=None):
         import traceback
         error("UNCAUGHT " + traceback.format_exc())
         raise
+    finally:
+        Progress.done()                 # a --status-file outlives no command
 
 if __name__ == "__main__":
     sys.exit(main())

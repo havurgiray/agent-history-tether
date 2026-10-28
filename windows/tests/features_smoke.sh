@@ -2,7 +2,8 @@
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
 # journal, report, share, secrets, rules, loose ends, undo, tidy, switch
 # (Summary Only, and the permission level a switch carries) and relays,
-# limits, sessions, workspace, asking other
+# limits, sessions, workspace, phone notices over https only, the effective
+# copy-at-start setting, asking other
 # machines over Windows' own ssh (status, remote add, pickup), Bring Here's
 # list and dry run from a test-mode machine (also into Codex), what a PC that
 # answers does (start queues Continue here: _arrival); and the hidden ones
@@ -54,6 +55,14 @@ WANT=$(sum256 "$REPO/aht.py" | cut -c1-12)
 GOT=$(W _core --id)
 [ "$GOT" = "$WANT" ] || fail "_core --id is '$GOT', this checkout's aht.py is $WANT"
 has "$(printf '%s' '{"op": "probe"}' | W _agent)" '^@@AHT@@\{.*"ok": true' "_agent did not answer the probe"
+
+echo "== phone notices only over https (or to a server on this computer) =="
+RC=0; OUT=$($RUN "$EXE" config --set notify_phone=ntfy:http://ntfy.example.org/aht 2>&1) || RC=$?
+[ "$RC" = 2 ] || fail "config --set took ntfy over plain http (exit $RC): $OUT"
+has "$OUT" "plain http" "the refusal of ntfy over plain http does not say why"
+W config --set notify_phone=ntfy:http://localhost:2586/aht >/dev/null \
+  || fail "config --set refused ntfy on this computer"
+W config --unset notify_phone >/dev/null
 
 echo "== other machines: a PC asks them over its own ssh =="
 # a PC can ask other machines (can_reach) and hand projects over (supported:
@@ -117,7 +126,15 @@ has "$(W rules "$PAPER" --json)" "CLAUDE.md" "rules did not see CLAUDE.md"
 has "$(W loose-ends --json)" "release notes" "loose ends missed the open question"
 
 echo "== undo a session (a real copy off macOS) =="
+# the window ticks "Copy the folder when a session starts" from what the core
+# uses: off by default off macOS (the copies are real copies), on once set
+if [ -z "${AHT_SMOKE_POSIX:-}" ]; then
+  has "$(W status --json)" '"checkpoint_on_start": false' \
+    "status: the copy at a session's start is not off by default on Windows"
+fi
 W config --set checkpoints=true >/dev/null
+has "$(W status --json)" '"checkpoint_on_start": true' \
+  "status: the copy at a session's start is not on once set"
 has "$(W checkpoint "$PAPER" --json)" '"method": "(copy|clone)"' "no copy was made"
 echo "x = 2" > "$T/roots/paper/a.py"
 echo "new" > "$T/roots/paper/made.txt"

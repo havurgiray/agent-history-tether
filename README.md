@@ -128,7 +128,12 @@ aht doctor            # check every piece
 ### Pause or uninstall
 
 Every tray has *Pause Watching*; while paused, the Claude Code hook still
-relinks a project you open.  Uninstalling removes the watcher, the hook,
+relinks a project you open.  To run with no watcher at all, `aht config
+--set watcher_owner=none` stops it on a Mac or Linux and keeps it off, also
+through `aht install`.  What you give up: the watcher notices when you move
+or rename a project folder and relinks its histories at once, so your
+sessions follow the folder; without it only the hook relinks, when a
+Claude Code session starts there.  Uninstalling removes the watcher, the hook,
 the tray autostart and the `aht` command, and never touches any agent's
 history:
 
@@ -330,13 +335,16 @@ back, and keeps its backups on one of them.
 
 **A Windows PC that answers (optional).**  With OpenSSH Server on the PC,
 a Mac or Linux machine also hands a project over to the PC and takes it
-back, watches it and searches it.  No session starts on the PC: its tray
+back, keeps projects in sync with it (the same pauses before anything is
+overwritten), keeps its backups there and fetches them back, sends back a
+project the PC handed over, watches it and searches it; another PC hands
+projects over to it too.  No session starts on the PC: its tray
 offers *Continue here*, which opens Claude Code in the session handed
 over, in the permission level the handover named.  aht installed on the
 PC answers; without it, a copy of aht's core runs with the PC's Python 3.
 `--agent`, a handover's task and the night shift go only to Mac and Linux
-machines, and Pick Up, Leave a Note, Bring Here and Send Back with a PC
-still start on the PC.  The guide's *A Windows PC with your other
+machines, and Pick Up, Leave a Note and Bring Here with a PC still start
+on the PC.  The guide's *A Windows PC with your other
 machines* and *A Windows PC that answers* show how to set up the keys and
 the PC safely.
 
@@ -385,7 +393,7 @@ The guide's *The permission level follows the work* has the details.
 | feature | command | what it does |
 |---|---|---|
 | Undo a whole session | `aht undo <folder> [--apply]` | a copy of the project when a session starts, and the folder put back from it, including what the session's commands changed (macOS: copy-on-write clones that cost no room; Linux and Windows: real copies up to 100 MB, off until `checkpoints=true`) |
-| Notices | `aht notices` | a session here or on another machine waits for you or finished a long piece of work; also on the phone (`notify_phone`: iMessage or ntfy).  On a Mac also the session corner and chimes |
+| Notices | `aht notices` | a session here or on another machine waits for you or finished a long piece of work; also on the phone (`notify_phone`: iMessage, or ntfy over HTTPS).  On a Mac also the session corner and chimes |
 | The usage limit | `aht limits` | spots a session that stopped at Claude's limit and says when it resets; `limit_switch` offers to go on in another agent |
 | Informed sessions | `informed_sessions = true` | a new Claude Code session learns in a few lines where the last one in its folder stopped, whichever agent ran it |
 | Loose ends | `aht loose-ends` | projects of the last 30 days with work not committed, open to-dos, or a last session that ended on a question |
@@ -410,10 +418,11 @@ macOS-first: new features are built and tested there first.
 | Switch Agent and Hand Back, second opinion, informed sessions | ✓ | ✓ | ✓, not yet tried on Windows |
 | Ask other machines: add and check them, Watch, their sessions and notices, search everywhere | ✓ | ✓ | ✓ (Mac and Linux machines, over Windows' own ssh) |
 | Pick Up and Leave a Note | ✓ | ✓ | ✓ (the PC starts every exchange) |
-| Hand Over and Take Back, Keep in Sync, night shift, backups on another machine | ✓ | ✓ | ✓ (with Mac and Linux machines) |
+| Hand Over and Take Back, Keep in Sync, night shift, backups on another machine | ✓ | ✓ | ✓ (with Mac and Linux machines; Hand Over and Take Back also with a PC that answers) |
 | Bring Here and Send Back | ✓ | ✓ | ✓ (from Mac and Linux machines) |
 | Hand Over or Bring Here into Codex, Kimi Code, Antigravity or Mistral Vibe | ✓ | ✓ | ✓ (Hand Over to Mac and Linux machines; Bring Here into an agent on the PC), not yet tried on Windows |
 | Be handed a project, watched and searched by your other machines | ✓ | ✓ | optional, with OpenSSH Server (a PC that answers); a project handed over waits for *Continue here*, in Claude Code |
+| Be kept in sync with, keep another machine's backups, take a Send Back of what it handed over | ✓ | ✓ | optional, a PC that answers |
 | Projects at other paths; names, line endings, executable marks and git across systems | ✓ | ✓ | ✓ |
 | The other machine stays awake while a handed-over agent works | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or GNOME's own inhibitor) | — |
 | Notices | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |

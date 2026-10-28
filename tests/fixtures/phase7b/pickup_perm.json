@@ -1,0 +1,75 @@
+{
+  "command": "pickup",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "error": null,
+  "project": "/Users/me/code/paper",
+  "machine": "box",
+  "match": {
+    "path": "/home/me/code/paper",
+    "how": "id",
+    "candidates": [
+      {
+        "path": "/home/me/code/paper",
+        "how": "id"
+      }
+    ]
+  },
+  "sessions": [
+    {
+      "agent": "claude",
+      "id": "b1",
+      "title": "add the search page",
+      "updated": 1793162146.481758,
+      "open": false,
+      "working": false,
+      "state": "closed"
+    }
+  ],
+  "source": {
+    "agent": "claude",
+    "session": "b1",
+    "title": "add the search page",
+    "updated": 1793162146.481758,
+    "last_t": 1793161846.481615,
+    "path": "/home/me/code/paper",
+    "perm": {
+      "level": "never",
+      "sandbox": false,
+      "from": "transcript"
+    },
+    "machine": "box"
+  },
+  "git": {
+    "here": null,
+    "there": null,
+    "warning": null
+  },
+  "brief": "# Pick up: paper\n\n- From **Claude Code** on box (macOS) to **Codex** on mac (macOS), 2026-10-28 05:35\n- Folder on box: `/home/me/code/paper`; on mac: `/Users/me/code/paper`\n- Session it continues: add the search page — `b1`\n- To go back to it on box: `cd /home/me/code/paper && /opt/homebrew/bin/claude --resume b1`; to hand the work back from mac: `aht leave-note /Users/me/code/paper --on box`\n\n## The latest exchanges\n\n**You (05:30):** add the search page\n",
+  "brief_kind": "full",
+  "mode": "new",
+  "back_of": null,
+  "note_for": null,
+  "target": "codex",
+  "session": null,
+  "relay": null,
+  "left": [],
+  "opened": null,
+  "start_line": "/opt/homebrew/bin/codex --dangerously-bypass-approvals-and-sandbox 'You are taking over this project from Claude Code on box. Read .aht/handover/relay-20261028-053546-784a.md first: it records where the work stood, the latest exchanges and the open items. Then tell me in two or three lines what you understood, and wait for my next instruction.'",
+  "command_line": null,
+  "fallback": null,
+  "perm": {
+    "agent": "codex",
+    "level": "never",
+    "sandbox": false,
+    "flags": [
+      "--dangerously-bypass-approvals-and-sandbox"
+    ],
+    "from": "transcript",
+    "read": "never",
+    "text": "Codex starts in never-ask mode, like the Claude Code session on box"
+  },
+  "kimi_reads": null,
+  "first_prompt": null
+}

@@ -9,7 +9,10 @@ works the way the summaries read it: a patch (apply_patch), a plan
 agent said is there twice (an `item_completed` event, and a `response_item`
 message for the model), among Codex's own instructions and the environment
 (developer and environment messages) that aht must not read, and so is
-encrypted reasoning.  Every call is appended to $AHT_FAKE_CODEX_LOG;
+encrypted reasoning.  Each turn starts with a `turn_context` that holds
+the approval policy and sandbox the command line asked for (Codex's own
+default: on request, in the workspace sandbox), which aht reads for the
+permission level.  Every call is appended to $AHT_FAKE_CODEX_LOG;
 $AHT_FAKE_CODEX_PATCH names the file the patch changes (default
 src/app.py)."""
 import json, os, sys, time, uuid
@@ -20,6 +23,23 @@ args = sys.argv[1:]
 with open(os.environ["AHT_FAKE_CODEX_LOG"], "a") as fh:
     fh.write(json.dumps({"cwd": os.getcwd(), "args": args}) + "\n")
 root = Path(os.environ["AHT_ROOT_CODEX"])
+# Codex's own options come before its subcommand or first prompt
+flags, i = [], 0
+while i < len(args) and args[i].startswith("-") and args[i] != "-":
+    takes = args[i] in ("-a", "--ask-for-approval", "-s", "--sandbox", "-c", "--config",
+                        "-m", "--model")
+    flags += args[i:i + 2] if takes else args[i:i + 1]
+    i += 2 if takes else 1
+args = args[i:]
+approval, sandbox = "on-request", "workspace-write"
+for j, f in enumerate(flags):
+    val = flags[j + 1] if j + 1 < len(flags) else ""
+    if f in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+        approval, sandbox = "never", "danger-full-access"
+    elif f in ("-a", "--ask-for-approval"):
+        approval = val
+    elif f in ("-s", "--sandbox"):
+        sandbox = val
 
 def iso(t):
     return datetime.fromtimestamp(t, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -43,6 +63,9 @@ def turn(sid, prompt, t):
         return rec(dt, "response_item", {"type": "message", "role": role,
                                          "content": [{"type": kind, "text": text}]})
     return [rec(0, "event_msg", {"type": "task_started", "turn_id": tid}),
+            rec(0, "turn_context", {"cwd": os.getcwd(), "approval_policy": approval,
+                                    "sandbox_policy": {"type": sandbox},
+                                    "model": "gpt-5-codex", "summary": "auto"}),
             message(0, "developer", "input_text",
                     "<permissions instructions>\nNEVER-READ-INSTRUCTIONS\n</permissions instructions>"),
             message(0, "user", "input_text",

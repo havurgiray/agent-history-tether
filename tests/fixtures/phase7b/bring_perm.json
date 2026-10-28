@@ -1,0 +1,90 @@
+{
+  "command": "bring",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "remote": "box",
+  "there_path": "/home/code/shop",
+  "mode": "bring",
+  "agent": "claude",
+  "allow_idle": false,
+  "there": {
+    "host": "mac",
+    "system": "Darwin",
+    "claude_version": "9.9.9",
+    "sessions": [],
+    "processes": [],
+    "aht": {
+      "installed": true,
+      "version": "0.13.0",
+      "protocol": 2,
+      "phone_here": false
+    }
+  },
+  "uuid": "72c0937b81254d0fa59c4b1a159a4590",
+  "session": {
+    "id": "s1",
+    "title": "refactor the checkout",
+    "perm": {
+      "level": "edits",
+      "sandbox": false,
+      "from": "transcript"
+    },
+    "open": null
+  },
+  "perm": {
+    "agent": "claude",
+    "level": "edits",
+    "sandbox": false,
+    "flags": [
+      "--permission-mode",
+      "acceptEdits"
+    ],
+    "from": "transcript",
+    "read": "edits",
+    "text": "Claude Code starts in edits mode, like the session on box"
+  },
+  "sessions": 1,
+  "other_histories": [],
+  "project": "/Users/me/code/shop",
+  "here_path": "/Users/me/code/shop",
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "here": {
+    "sessions": [],
+    "processes": [],
+    "system": "Darwin"
+  },
+  "names": [],
+  "plan": {
+    "files": 2,
+    "bytes": 42,
+    "history_files": 1,
+    "history_bytes": 386,
+    "replaces": 0,
+    "set_aside": 0,
+    "plans": 0,
+    "file_history": false,
+    "free_bytes": 34190249984
+  },
+  "modes_lost": [],
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9"
+  },
+  "git": {
+    "is_git": false,
+    "gitattributes": false,
+    "suggest": [],
+    "env": {},
+    "how": null
+  },
+  "eol_only": [],
+  "unsafe_names": []
+}

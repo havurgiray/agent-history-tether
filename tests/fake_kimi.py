@@ -6,7 +6,8 @@ folder, keeps the prompt as its first message and prints the session id the
 way the real CLI's stream-json output carries it.  `kimi -S ID -p PROMPT …`
 adds the prompt as a turn of that session instead (unless
 $AHT_FAKE_KIMI_NO_RESUME is set: then it answers without keeping the turn,
-which aht must notice).  Every call is appended to $AHT_FAKE_KIMI_LOG."""
+which aht must notice).  Like the real CLI it refuses --auto and --yolo
+together with -p.  Every call is appended to $AHT_FAKE_KIMI_LOG."""
 import json, os, sys, time, uuid
 from pathlib import Path
 
@@ -16,6 +17,10 @@ import aht  # noqa: E402  the core's own key function for the store bucket
 args = sys.argv[1:]
 with open(os.environ["AHT_FAKE_KIMI_LOG"], "a") as fh:
     fh.write(json.dumps({"cwd": os.getcwd(), "args": args}) + "\n")
+if "-p" in args and any(a in args for a in ("--auto", "--yolo", "-y")):
+    # as the real CLI: its print mode never asks and takes no level flag
+    print("Cannot combine --prompt with --auto", file=sys.stderr)
+    sys.exit(1)
 if "-p" in args:
     prompt = args[args.index("-p") + 1]
     real = os.path.realpath(os.getcwd())

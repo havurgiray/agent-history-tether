@@ -5,7 +5,7 @@ notes file) and answers the way the real CLI's print mode does."""
 import json, sys
 
 who, args = sys.argv[1], sys.argv[2:]
-if who == "kimi" and ("-y" in args or "--yolo" in args):
+if who == "kimi" and ("-y" in args or "--yolo" in args or "--auto" in args):
     sys.exit("error: Cannot combine --prompt with --yolo.")     # as Kimi Code 2 says
 task = args[args.index("-p") + 1]
 with open("a.py", "a") as fh:

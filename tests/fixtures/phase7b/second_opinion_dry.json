@@ -1,0 +1,29 @@
+{
+  "project": "/Users/me/code/paper",
+  "applied": false,
+  "blockers": [],
+  "warnings": [
+    "Kimi Code is left out: its unattended run never asks, and here it may go no further than ask mode (the project's latest session (Claude Code) runs in ask mode)"
+  ],
+  "dry_run": true,
+  "perms": {
+    "claude": {
+      "agent": "claude",
+      "level": "edits",
+      "sandbox": false,
+      "flags": [
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "from": "transcript",
+      "read": "ask",
+      "text": "Claude Code edits its copy (edits mode); its commands follow the project's latest session (Claude Code), which runs in ask mode"
+    }
+  },
+  "agents": [
+    "claude"
+  ],
+  "left_out": {
+    "kimi": "Kimi Code is left out: its unattended run never asks, and here it may go no further than ask mode (the project's latest session (Claude Code) runs in ask mode)"
+  }
+}

@@ -206,3 +206,19 @@ details.eol ul.files li { overflow-wrap: anywhere; }
 .paths { margin-top: 4px; }
 .pairs .row { padding: 3px 0; border-bottom: 1px solid var(--line); }
 .pairs .mono { overflow-wrap: anywhere; }
+/* the level the next agent starts in (Switch, Hand Back, Pick Up, Bring Here,
+   Hand Over, the night shift); never-ask with a caution, not a stop */
+.perm { border-left: 3px solid var(--line); padding: 2px 0 2px 10px; }
+.perm > * + * { margin-top: 2px; }
+.perm .flags code { overflow-wrap: anywhere; }
+.perm.never {
+  border: 1px solid var(--warn); border-left-width: 4px; border-radius: 8px; padding: 6px 10px;
+  background: var(--panel); background: color-mix(in srgb, var(--warn) 10%, var(--panel));
+}
+.perm.never .lead { font-weight: 600; }
+.perm .caution { color: var(--warn); }
+#sheet > .body > .perm { margin-top: 10px; }
+/* the second opinion's levels beside Start, from its dry run */
+.opinion-levels:empty { display: none; }
+/* Kimi below never-ask: the first message to paste */
+.first-prompt pre { user-select: all; }

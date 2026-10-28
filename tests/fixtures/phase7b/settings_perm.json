@@ -1,0 +1,33 @@
+{
+  "path": "/Users/me/.aht/config.json",
+  "effective": {
+    "agent_permissions": "follow",
+    "agent_permission_flags": {
+      "codex": {
+        "never": [
+          "-a",
+          "never",
+          "-s",
+          "workspace-write"
+        ]
+      }
+    }
+  },
+  "explicit": {
+    "agent_permissions": "follow",
+    "agent_permission_flags": {
+      "codex": {
+        "never": [
+          "-a",
+          "never",
+          "-s",
+          "workspace-write"
+        ]
+      }
+    }
+  },
+  "defaults": {
+    "agent_permissions": "follow",
+    "agent_permission_flags": {}
+  }
+}

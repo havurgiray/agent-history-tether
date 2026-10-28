@@ -583,6 +583,91 @@ all of this is in the app's window; the commands behave the same.
 - **Finder and a shortcut** — right-click a project folder for aht's
   Quick Actions; ⌃⌥⌘A (`hotkey`) opens the search from anywhere.
 
+### The permission level follows the work
+
+When you start a session in a mode that does not ask (Claude Code's
+`--dangerously-skip-permissions`, Codex's full bypass) or asks less, the
+agent that continues the work starts in its own equivalent: Switch, Hand
+Back, Pick Up → Open in, Bring Here, Hand Over and the night shift, on this
+machine and across machines.  **aht never raises the level on its own; it
+carries the level you chose to the next agent, on this machine and across
+machines; restarts keep a session's own flags.**  The next agent never gets
+more power than the session it continues: where it has no exact match, it
+starts in the next stricter level, and every dialog, dry run and text
+output says which (*Codex starts in never-ask mode, like the Claude Code
+session you are leaving*).  `--json` of `switch`, `pickup`, `bring` and
+`handover`, dry runs included, carries `perm: {level, from, flags, read,
+sandbox, agent, text}`; `switch` and `pickup` also carry `kimi_reads` and
+`first_prompt` (Kimi Code, below).  *Continue Here* (`aht resume-here`)
+reopens a Claude Code session in its level too.  **Only levels you set
+yourself raise what the next agent gets** (your own command line, your
+user or managed Claude Code settings, aht's own settings, or a level aht
+recorded on this machine); anything from a repository or another machine
+is not trusted for that.
+
+| level | Claude Code | Codex | Kimi Code | Antigravity | Mistral Vibe |
+|---|---|---|---|---|---|
+| `ask` (each agent's default) | — | — | — | — | — |
+| `edits` (edits run, commands ask) | `--permission-mode acceptEdits` | `-a on-request -s workspace-write` | — (it asks) | `--mode accept-edits` | `--agent accept-edits` |
+| `auto` (routine runs, risky asks) | `--permission-mode auto` | `-a on-request` | `--yolo` | `--mode auto` | `--smart-approve` |
+| `never` (never asks) | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--auto` | `--dangerously-skip-permissions` | `--auto-approve` |
+
+- **How aht tells the level** of the session the work comes from: an open
+  session's command line (its options up to the first prompt, whose words
+  are no flags), no higher than what the session itself noted, and for
+  Codex with what the command line leaves out filled from its newest
+  `turn_context`; else what the session itself noted (Codex's
+  `turn_context`: its approval policy and sandbox; Claude Code's
+  `permissionMode` on its prompts); else the level aht started it in, kept
+  on this machine in `~/.aht/run/perm.json` (so Hand Back keeps it; the
+  relay record's `perm` in the project is only shown, never believed);
+  else Claude Code's `permissions.defaultMode` in its settings: your user
+  settings, the managed settings and a `--settings` on the session's
+  command line.  The project's `.claude/settings.json` and
+  `settings.local.json` count only for `acceptEdits`, `plan` or `default`
+  (Claude Code itself takes bypass mode only from the user's, managed or
+  command-line settings).  Unknown means `ask`.  Codex asking on request
+  in its workspace sandbox is also what it does on its own in a trusted
+  folder, so that reads as `ask` unless its command line or aht's record
+  says more.  Claude Code's `dontAsk` refuses what was not allowed in
+  advance, so it counts as `ask`.
+- **By what the agent can actually do.** Claude Code's skip-permissions
+  goes on as Codex's full bypass.  A never-ask Claude session inside Claude
+  Code's own sandbox (`sandbox.enabled`) goes on as Codex's never-ask that
+  keeps its sandbox (`-a never -s workspace-write`); that Codex session goes
+  on in Claude Code as skip-permissions together with Claude's sandbox
+  (`--settings ~/.aht/run/claude-sandbox.json`, a file aht writes, so a
+  restart keeps it) where the sandbox works (macOS; Linux with
+  bubblewrap), else in `auto`.  Kimi Code, Antigravity
+  and Mistral Vibe have no such sandbox, so they go on in `auto` then.  At
+  `ask` aht adds no flag, so an agent starts as its own settings say.
+- **Kimi Code reads its summary in a run of its own (`-p`) only in
+  never-ask mode:** Kimi takes no level flag together with `--prompt`, and
+  that run never asks.  Below never-ask, Switch, Hand Back and Pick Up →
+  Open in Kimi open Kimi's own session with the level's flag and no such
+  run: the text output prints the one line to paste as your first message
+  (`--json`: `kimi_reads: false` and `first_prompt`).
+- **A second opinion** works in a throwaway copy of the project, so Claude
+  Code may edit that copy at any level (`--permission-mode acceptEdits` at
+  `ask`); its commands follow the level, never above it.  Kimi Code takes
+  part only in never-ask mode (its unattended run never asks); below it,
+  Kimi is left out with a warning that says why.  `aht second-opinion
+  <folder> --task "…" --dry-run --json` shows each agent's `perms`,
+  `agents` and `left_out` without starting anything.
+- **Settings** (in the window and the Mac app: Settings → Permissions):
+  `agent_permissions` is `follow` (the default), a fixed
+  level (`ask` … `never`: your own choice for every next agent), or a cap
+  (`max:auto`).  `agent_permission_flags` replaces aht's own flags per
+  agent and level, e.g. Codex's never-ask that keeps its sandbox:
+  `aht config --set 'agent_permission_flags={"codex": {"never": ["-a",
+  "never", "-s", "workspace-write"]}}'`.  aht refuses flags there that
+  could ask for more than their level (read the most permissive way:
+  `-anever`, `-c approval_policy=never` and the like), flags it does not
+  know as permission or harmless flags (such as Codex's `--profile`), a
+  Claude Code `--settings` that holds permissions or a sandbox, and two
+  permission flags that ask for different levels.  `handover_claude_args`
+  is still added after the level's flags.
+
 ## Before and after a session
 
 - **Undo a whole session** — when a Claude Code session starts (and before
@@ -615,8 +700,10 @@ all of this is in the app's window; the commands behave the same.
 - **Second opinion** — `aht second-opinion <folder> --task "…"` runs Claude
   Code and Kimi Code on the same task, each in its own copy; `--show <id>`
   compares answers and changes, `--take <id> --from kimi --apply` brings one
-  into the project (refused for files changed there meanwhile).  Needs
-  `second_opinion = true`.
+  into the project (refused for files changed there meanwhile); `--dry-run`
+  says the level each would work in and starts nothing.  Claude edits its
+  copy at any level, its commands follow the level; Kimi takes part only in
+  never-ask mode.  Needs `second_opinion = true`.
 - **Night shift** — `aht night-shift <folder> --task "…" --start 22:00
   --back 07:00 --apply`: a handover with a task at the start time, taken
   back when the session is done after the end time (the notices agent keeps
@@ -697,6 +784,8 @@ for handover: `remotes` / `default_remote` (managed by `aht remote`),
 `mirror_interval_minutes`, `handover_excludes`, `handover_compress`,
 `handover_transfer`, `handover_remote_control`, `handover_carry_trust`,
 `handover_claude_args`, `handover_mosh`, `handover_keep_awake`, `rsync_path`, `terminal_app`;
+the permission level the next agent starts in (see *The permission level
+follows the work*): `agent_permissions`, `agent_permission_flags`;
 notices and reports:
 `notify_waiting`, `notify_finished`, `notify_finished_minutes`,
 `notify_phone`, `notify_limit`, `session_corner`, `chimes` /
@@ -738,6 +827,10 @@ click: a row is selected first, a button pressed second.
 6. **Nothing spends an agent's tokens unless you turned it on or asked for
    it**, and nothing that starts an agent or changes files runs from a link
    or a notice without a question first.
+7. **aht never raises an agent's permission level on its own**: the agent
+   that continues the work starts in the level of the session it continues,
+   or a stricter one, unless you set a fixed `agent_permissions` level (see
+   *The permission level follows the work*).
 
 ## Commands
 

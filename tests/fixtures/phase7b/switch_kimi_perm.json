@@ -1,0 +1,34 @@
+{
+  "command": "switch",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/paper",
+  "source": {
+    "agent": "claude",
+    "session": "7e200000-1111-4222-8333-444455556666",
+    "title": "make the parser faster"
+  },
+  "target": "kimi",
+  "brief": "/Users/me/code/paper/.aht/handover/relay-20261028-064248-feb4.md",
+  "session": null,
+  "command_line": "cd /Users/me/code/paper && /opt/homebrew/bin/kimi --yolo",
+  "error": null,
+  "relay": "20261028-064248-feb4",
+  "mode": "new",
+  "start_line": "/opt/homebrew/bin/kimi --yolo",
+  "fallback": null,
+  "perm": {
+    "agent": "kimi",
+    "level": "auto",
+    "sandbox": false,
+    "flags": [
+      "--yolo"
+    ],
+    "from": "relay",
+    "read": "auto",
+    "text": "Kimi Code starts in auto mode, like the Claude Code session you are leaving"
+  },
+  "kimi_reads": false,
+  "first_prompt": "You are taking over this project from Claude Code. Read .aht/handover/relay-20261028-064248-feb4.md first: it records where the work stood, the latest exchanges and the open items. Then tell me in two or three lines what you understood, and wait for my next instruction."
+}

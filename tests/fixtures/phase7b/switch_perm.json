@@ -1,0 +1,34 @@
+{
+  "command": "switch",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/paper",
+  "source": {
+    "agent": "claude",
+    "session": "7e100000-1111-4222-8333-444455556666",
+    "title": "fix the login redirect"
+  },
+  "target": "codex",
+  "brief": null,
+  "session": null,
+  "command_line": null,
+  "error": null,
+  "relay": null,
+  "mode": "new",
+  "start_line": "/opt/homebrew/bin/codex --dangerously-bypass-approvals-and-sandbox 'You are taking over this project from Claude Code. Read .aht/handover/relay-20261028-053537-19e4.md first: it records where the work stood, the latest exchanges and the open items. Then tell me in two or three lines what you understood, and wait for my next instruction.'",
+  "fallback": null,
+  "perm": {
+    "agent": "codex",
+    "level": "never",
+    "sandbox": false,
+    "flags": [
+      "--dangerously-bypass-approvals-and-sandbox"
+    ],
+    "from": "transcript",
+    "read": "never",
+    "text": "Codex starts in never-ask mode, like the Claude Code session you are leaving"
+  },
+  "kimi_reads": null,
+  "first_prompt": null
+}

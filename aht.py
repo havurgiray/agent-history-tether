@@ -190,6 +190,12 @@ CONFIG_DEFAULTS = {
     "handover_remote_control": True, # reachable from the Claude app
     "handover_carry_trust": True,    # a folder trusted here is trusted there
     "handover_claude_args": [],      # extra arguments for the resumed session
+    # the permission level follows the work: the next agent starts in its
+    # own equivalent of the level of the session it continues
+    "agent_permissions": "follow",   # follow | ask | edits | auto | never |
+                                     #   max:<level> (a cap)
+    "agent_permission_flags": {},    # {agent: {level: [flags]}}: replaces aht's
+                                     #   own flags for that agent and level
     "handover_mosh":    True,        # attach with mosh when both sides have it
     "handover_keep_awake": True,     # the other machine does not sleep while the
                                      #   agent works there (a closed lid still does)
@@ -277,6 +283,20 @@ def _coerce(key: str, raw: str):
         if v not in TRANSFERS:
             raise ValueError(f"handover_transfer expects one of {list(TRANSFERS)}")
         return v
+    if key == "agent_permissions":
+        v = raw.strip().lower()
+        if v != "follow" and v not in PERM_LEVELS and not (
+                v.startswith("max:") and v[4:] in PERM_LEVELS):
+            raise ValueError("agent_permissions expects follow, a level (ask, edits, auto, "
+                             "never) or a cap such as max:auto")
+        return v
+    if key == "agent_permission_flags":
+        try:
+            obj = json.loads(raw) if raw.strip() else {}
+        except ValueError as e:
+            raise ValueError(f'{key}: {e} — e.g. {{"codex": {{"never": ["-a", "never", '
+                             f'"-s", "workspace-write"]}}}}')
+        return perm_flags_table(obj, strict=True)
     if key == "limit_switch_to":
         v = raw.strip().lower()
         if v not in SWITCH_TARGETS or v == "claude":
@@ -5667,7 +5687,7 @@ class Remote:
         e = {k: v for k, v in os.environ.items()
              if not k.startswith("AHT_") or k in ("AHT_CLAUDE", "AHT_ITERM_TABS",
                                                    "AHT_AWAKE_EVERY", "AHT_SESSION_BUS",
-                                                   "AHT_CASELESS")}
+                                                   "AHT_CASELESS", "AHT_CLAUDE_SANDBOX")}
         e.update(_sandbox_env(self.root + "/home"))
         if os.name == "nt":
             e["USERPROFILE"] = e["HOME"]        # Windows' Path.home()
@@ -7035,6 +7055,7 @@ def _agent_probe(req: dict) -> dict:
             "core_id": _quiet_value(core_id),
             "machine_id": machine_id(create=False),
             "aht_there": _aht_there(),
+            "claude_sandbox": claude_can_sandbox(),
             "keep_awake": _awake_tool()[0]}
     if req.get("test_awake") and info["keep_awake"]:
         # `remote check`: does it work for this account, over ssh?  (polkit
@@ -7266,9 +7287,12 @@ def _agent_start(req: dict) -> dict:
     run = aht_home() / "remote" / "run" / name
     run.mkdir(parents=True, exist_ok=True)
     (run / "note.txt").write_text(req.get("note") or "")
-    (run / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [
+    settings = {"hooks": {"SessionStart": [
         {"hooks": [{"type": "command", "timeout": 5,
-                    "command": "cat " + shlex.quote(str(run / "note.txt"))}]}]}}))
+                    "command": "cat " + shlex.quote(str(run / "note.txt"))}]}]}}
+    if req.get("claude_sandbox"):       # never-ask inside Claude Code's own sandbox
+        settings.update(CLAUDE_SANDBOX)
+    (run / "settings.json").write_text(json.dumps(settings))
     argv = [req["claude"]]
     if req.get("session"):
         argv += ["--resume", req["session"]]
@@ -7768,7 +7792,9 @@ def _agent_mark_handing(req: dict) -> dict:
     store = _store_of(real)
     sid = latest_session(store)
     exe = find_claude()
-    out.update(session={"id": sid, "title": redact(session_title(store, sid))},
+    out.update(session={"id": sid, "title": redact(session_title(store, sid)),
+                        # the level it runs (or ran) in: the session here follows it
+                        "perm": session_level(real, "claude", sid)},
                sessions_count=len(_sessions_of(store)), store=str(store) if store else None,
                sids=_sessions_of(store), plans=_plans_of(store) if store else [],
                claude_version=claude_version(exe) if exe else None,
@@ -8599,7 +8625,7 @@ def attach_command(rem: Remote, mux: str, name: str) -> list:
     alias = rem.route()[1]
     return [_ssh(), "-t"] + (["-o", f"HostKeyAlias={alias}"] if alias else []) + [rem.dest] + inner
 
-def _cmdline(argv: list) -> str:
+def _argv_line(argv: list) -> str:
     """A command as one line this system's shell reads: cmd.exe's quoting on
     Windows (no mosh there: ssh -t in a console of its own), sh's elsewhere."""
     if os.name == "nt":
@@ -9887,6 +9913,10 @@ def cmd_handover(args):
             out["blockers"].append(f"no session {args.session} in this project")
         out["session"] = sid
         out["sessions"] = len(sids)
+        # the level the session runs in here: the one there starts in it
+        perm = out["perm"] = perm_for("claude", session_level(real, "claude", sid),
+                                      "the session here", bool(info.get("claude_sandbox")),
+                                      f"Claude Code on {rem.name}")
         dig = session_digest(Path(store) / f"{sid}.jsonl", real) if sid else \
             session_digest(os.devnull, real)
         out["title"] = dig.get("title")
@@ -9952,6 +9982,7 @@ def cmd_handover(args):
                       f"({_human(out['plan']['bytes'])}), history "
                       f"{_human(out['plan']['history_bytes'])}",
                       f"   session        {dig.get('title') or sid or 'none yet'}",
+                      f"   level          {perm['text']}",
                       f"   Claude Code    {here_ver or '?'} here, "
                       f"{info.get('claude_version') or 'none'} there"
                       + (f" → {install} gets installed" if install else "")]
@@ -10084,7 +10115,10 @@ def cmd_handover(args):
                                    env=git_env_vars(gset),
                                    name=away["window"], attempt=attempt,
                                    claude=info["claude"], note=note,
-                                   args=list(cfg_get("handover_claude_args") or []),
+                                   # the level's flags; handover_claude_args after them
+                                   args=_without_settings(perm["flags"])
+                                   + list(cfg_get("handover_claude_args") or []),
+                                   claude_sandbox=bool(perm["sandbox"]),
                                    task=args.task,
                                    keep_awake=bool(cfg_get("handover_keep_awake", True)),
                                    remote_control=handover_session_name(sid, real, rem.name)
@@ -10131,8 +10165,9 @@ def cmd_handover(args):
                   f"{_human(out['sent']['history_bytes'])}  "
                   f"({_human(out['sent']['wire_bytes'])} on the wire)",
                   f"   session   {dig.get('title') or sid or 'a new one'}",
+                  f"   level     {perm['text']}",
                   f"   summary   {brief}",
-                  "   open it   " + _cmdline(out["attach"]),
+                  "   open it   " + _argv_line(out["attach"]),
                   "   back      aht reclaim " + shlex.quote(real) + " --apply"]
         if out.get("ends_pause"):
             lines.append(f"   Keep in sync with {rem.name} goes on again once you take it back "
@@ -11074,6 +11109,9 @@ def cmd_bring(args):
         out["session"] = dict(chk.get("session") or {"id": None, "title": ""},
                               open=next((s.get("status") for s in chk.get("sessions") or []),
                                         None))
+        # the level of the session there, read there: it goes on here in it
+        perm = out["perm"] = perm_for("claude", (chk.get("session") or {}).get("perm"),
+                                      f"the session on {rem.name}")
         out["sessions"] = chk.get("sessions_count", 0)
         out["other_histories"] = chk.get("other_histories") or []
         # where it goes here
@@ -11139,7 +11177,7 @@ def cmd_bring(args):
                                 {"agent": "claude", "session": sid, "mode": "resume"},
                                 _bring_brief(here, shown_far, rem.name, info.get("system"),
                                              sid, dig),
-                                rid=rid)
+                                rid=rid, perm=perm)
                 except OSError as e:
                     out["warnings"].append(f"the summary could not be written ({e})")
             out["relay"] = rid
@@ -11157,6 +11195,7 @@ def cmd_bring(args):
                     shutil.rmtree(aside, ignore_errors=True)
                 prune_set_asides(aside.parent)
             line = ("" if os.name == "nt" else "exec ") + shell_quote(find_claude() or "claude") \
+                + "".join(" " + shell_quote(f) for f in perm["flags"]) \
                 + (" --resume " + shell_quote(sid) if sid else "")
             env = git_env_vars(gset)
             out["command_line"] = env_prefix(env) + cd_then(here) + line
@@ -11175,6 +11214,7 @@ def cmd_bring(args):
                           f"history {_human(out['fetched']['history_bytes'])}",
                           f"   session   {dig.get('title') or sid or 'a new one'}"
                           + (" — opened in a new window" if out["opened"] else ""),
+                          f"   level     {perm['text']}",
                           "   continue  " + out["command_line"],
                           f"   back      aht send-back {_arg(here)} --apply"])
             return _emit(args, out, lines)
@@ -11292,7 +11332,8 @@ def cmd_bring(args):
                       f"({_human(out['plan']['bytes'])}); Claude history "
                       f"{_human(out['plan']['history_bytes'])}",
                       f"   session     {out['session'].get('title') or sid or 'none yet'}"
-                      + (" — opens here; nothing runs until you type" if sid else "")]
+                      + (" — opens here; nothing runs until you type" if sid else ""),
+                      f"   level       {perm['text']}"]
             if out["plan"]["set_aside"]:
                 lines.append(f"   here        {_n(out['plan']['set_aside'], 'file')} in the "
                              "folder here are set aside first")
@@ -12194,12 +12235,12 @@ def cmd_attach(args):
         return 1
     cmd = attach_command(rem, away.get("mux"), away.get("window"))
     if args.print:
-        print(_cmdline(cmd))
+        print(_argv_line(cmd))
         return 0
     if args.window or os.name == "nt":
         # a PC opens it in a console of its own (Windows Terminal when that is
         # the default): ssh -t <machine> tmux attach -t <window>
-        return open_terminal(_cmdline(cmd), f"attach-{away.get('window')}")
+        return open_terminal(_argv_line(cmd), f"attach-{away.get('window')}")
     os.execvp(cmd[0], cmd)
 
 TERMINALS = ("iTerm", "Terminal")         # apps that run a .command file they open
@@ -12299,8 +12340,10 @@ def cmd_resume_here(args):
         return 2
     if other:
         line = resume_command(args.agent, sid)
-    else:
+    else:           # in the level the session runs in, as Bring Here does
+        perm = perm_for("claude", session_level(real, "claude", sid), "the session")
         line = ("" if os.name == "nt" else "exec ") + shell_quote(find_claude() or "claude") \
+            + "".join(" " + shell_quote(f) for f in perm["flags"]) \
             + (" --resume " + shell_quote(sid) if sid else "")
     env = _copy_git_env(real)
     if args.print:
@@ -14779,9 +14822,11 @@ def _relay_here(end: dict) -> bool:
     return (end or {}).get("machine") == _here()
 
 def write_relay(real: str, kind: str, frm: dict, to: dict, text: str, rid: str = None,
-                back_of: str = None, note_for: str = None) -> dict:
+                back_of: str = None, note_for: str = None, perm: dict = None) -> dict:
     """Write a relay and its summary into the project -> the record.  The
-    summary goes first, so a record never names a file that is not there."""
+    summary goes first, so a record never names a file that is not there.
+    `perm`: the level aht started the receiving agent in (perm_for), so a
+    Hand Back keeps it."""
     d = relay_dir(real)
     d.mkdir(parents=True, exist_ok=True)
     # excerpts of a conversation must never end up in the project's repository
@@ -14795,10 +14840,14 @@ def write_relay(real: str, kind: str, frm: dict, to: dict, text: str, rid: str =
            # an end on another machine says which (pickup, note): it overrides
            "from": {**_here_end(), "machine_id": mid, "path": real, **frm},
            "to": {**_here_end(), "machine_id": mid, "path": real, **to},
-           "brief": f"relay-{rid}.md", "back_of": back_of, "note_for": note_for}
+           "brief": f"relay-{rid}.md", "back_of": back_of, "note_for": note_for,
+           "perm": perm_record(perm)}
     (d / rec["brief"]).write_text(text, encoding="utf-8")
     with open(d / f"relay-{rid}.json", "x", encoding="utf-8") as fh:
         json.dump(rec, fh, indent=1)
+    if perm and _relay_here(rec["to"]):     # the one place its level is read from
+        remember_perm(rid, real, rec["to"].get("agent"), rec["to"].get("session"), perm,
+                      rec["at"])
     prune_relays(d)
     log(f"RELAY {real}: {kind} {rid} {frm.get('agent')} -> {to.get('agent')}")
     return rec
@@ -14920,7 +14969,13 @@ def _relay_safe(rec, rid: str):
             x["mode"] = word("mode", lambda v: v in ("new", "resume", "brief-only"))
         ends[side] = x
     pid, back, note = rec.get("project_id"), rec.get("back_of"), rec.get("note_for")
-    return {"v": 1, "id": rid, "kind": rec["kind"], "at": _number(rec["at"]),
+    p = rec.get("perm")
+    fl = _flag_list(p.get("flags")) if isinstance(p, dict) and isinstance(p.get("flags"), list) \
+        else None
+    perm = {"level": p["level"], "sandbox": p.get("sandbox") is True and p["level"] == "never",
+            "flags": fl} if isinstance(p, dict) and p.get("level") in PERM_LEVELS \
+        and fl is not None else None
+    return {"v": 1, "id": rid, "kind": rec["kind"], "at": _number(rec["at"]), "perm": perm,
             "project_id": pid if isinstance(pid, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", pid)
             else None, **ends, "brief": f"relay-{rid}.md",
             "back_of": back if isinstance(back, str) and _RELAY_ID.fullmatch(back) else None,
@@ -14968,6 +15023,21 @@ def _session_after(real: str, agent: str, since: float):
                 break
     return None
 
+def _first_session_after(real: str, agent: str, since: float):
+    """The first session of `agent` in the folder `real` that began after
+    `since`: the one a start at `since` opened (a later one, started by
+    hand, is another)."""
+    first = None
+    for s in list_sessions(real, agents=[agent]):
+        if (s["updated"] or 0) < since - 1:
+            break
+        for _end, ev in session_events(s["agent"], s["file"]):
+            if ev.get("t"):
+                if ev["t"] >= since - 1 and (first is None or ev["t"] < first[0]):
+                    first = (ev["t"], s["id"])
+                break
+    return first and first[1]
+
 def _went_on(real: str, r: dict) -> bool:
     """Whether someone typed into the session a relay left, after the relay
     (here, resumed by hand).  Only what the user typed counts: the session
@@ -15012,7 +15082,7 @@ def relay_row(r: dict, real: str) -> dict:
     closed = r.get("closed")
     return {"id": r["id"], "kind": r.get("kind"), "at": r.get("at"),
             "from": r.get("from"), "to": r.get("to"), "side": r.get("side"),
-            "back_of": r.get("back_of"),
+            "back_of": r.get("back_of"), "perm": r.get("perm"),
             "open": closed is None and not _opens_nothing(r),
             "closed_by": (closed or {}).get("by") if closed is not None else None,
             "brief": str(relay_dir(real) / f"relay-{r['id']}.md")}
@@ -15321,20 +15391,956 @@ def codex_unreadable(real: str) -> int:
             n += 1
     return n
 
+# ---- the permission level follows the work ---------------------------------- #
+# A session started in a mode that asks less (Claude Code's
+# --dangerously-skip-permissions, Codex's full bypass, Kimi's --auto …) is
+# continued in the next agent's own equivalent: Switch, Hand Back, Pick Up →
+# Open in, Bring Here, Hand Over and the night shift, on this machine and
+# across machines.  aht never raises the level on its own: it reads the level
+# of the session the work comes from and starts the next agent in the same
+# level, or in the next stricter one that agent has.  At `ask` it adds no
+# flag, so an agent starts as its own settings say.
+
+PERM_LEVELS = ("ask", "edits", "auto", "never")
+PERM_WORDS = {"ask": "ask mode", "edits": "edits mode", "auto": "auto mode",
+              "never": "never-ask mode"}
+PERM_FROM = ("command_line", "rollout", "transcript", "settings", "relay", "unknown")
+# each agent's own flags for a level; `ask` is each agent's default (no flag)
+PERM_FLAGS = {
+    "claude": {"edits": ["--permission-mode", "acceptEdits"],
+               "auto": ["--permission-mode", "auto"],
+               "never": ["--dangerously-skip-permissions"]},
+    "codex": {"edits": ["-a", "on-request", "-s", "workspace-write"],
+              "auto": ["-a", "on-request"],
+              "never": ["--dangerously-bypass-approvals-and-sandbox"]},
+    "kimi": {"auto": ["--yolo"], "never": ["--auto"]},        # no edits-only mode
+    "agy": {"edits": ["--mode", "accept-edits"], "auto": ["--mode", "auto"],
+            "never": ["--dangerously-skip-permissions"]},
+    "vibe": {"edits": ["--agent", "accept-edits"], "auto": ["--smart-approve"],
+             "never": ["--auto-approve"]},
+}
+# never-ask that keeps Codex's sandbox (agent_permission_flags offers it for
+# every never-ask Codex start); a session in a sandbox continues in this one
+CODEX_NEVER_SANDBOXED = ["-a", "never", "-s", "workspace-write"]
+CLAUDE_SANDBOX = {"sandbox": {"enabled": True}}
+CLAUDE_MODES = {"bypassPermissions": "never", "auto": "auto", "acceptEdits": "edits",
+                # dontAsk never asks but refuses what was not allowed in
+                # advance: less power than ask, never more
+                "dontAsk": "ask", "default": "ask", "plan": "ask", "manual": "ask"}
+
+def _perm_rank(level: str, sandbox: bool = False) -> tuple:
+    """How much an agent may do on its own: a level, and never-ask inside a
+    sandbox below never-ask without one."""
+    return (PERM_LEVELS.index(level), 0 if sandbox or level != "never" else 1)
+
+def _lowest(levels: list) -> dict:
+    return min(levels, key=lambda x: _perm_rank(x["level"], x.get("sandbox")))
+
+def _opt(argv: list, i: int, names) -> tuple:
+    """(value, next index) when argv[i] is one of `names` (`--x v`, `--x=v`,
+    and for a short one `-xv`), else (None, i + 1)."""
+    t = argv[i]
+    key, eq, val = t.partition("=")
+    if key not in names:
+        for n in names:         # a short option's value written onto it: -anever
+            if len(n) == 2 and n[1] != "-" and len(t) > 2 and t.startswith(n) \
+                    and not t.startswith("--"):
+                return t[2:], i + 1
+        return None, i + 1
+    if eq:
+        return val, i + 1
+    return (argv[i + 1] if i + 1 < len(argv) else ""), i + 2
+
+# what each agent's program is called (a script runs as `node …/codex`)
+_PROG_NAMES = {"claude": ("claude",), "codex": ("codex",), "kimi": ("kimi", "kimi-cli", "kimi-code"),
+               "agy": ("agy", "antigravity"), "vibe": ("vibe", "vibe-rs")}
+# the options that take a value, so that a value is not taken for the first
+# prompt; the ones that take several (Claude Code's --add-dir a b …) take
+# words up to the next option
+_VALUE_OPTS = {
+    "claude": ("--permission-mode", "--settings", "--model", "--effort", "--agent", "--resume", "-r",
+               "--session-id", "--fallback-model", "--output-format", "--input-format",
+               "--append-system-prompt", "--system-prompt", "--setting-sources",
+               "--permission-prompt-tool", "--max-turns", "--name", "-n", "--agents",
+               "--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools",
+               "--disallowed-tools", "--mcp-config", "--betas", "--plugin-dir"),
+    "codex": ("-a", "--ask-for-approval", "-s", "--sandbox", "-c", "--config", "-m", "--model",
+              "-p", "--profile", "-C", "--cd", "-i", "--image", "--add-dir", "--local-provider"),
+    "kimi": ("-S", "--session", "-m", "--model", "-w", "--work-dir", "-p", "--prompt",
+             "--output-format", "--input-format", "--agent-file", "--mcp-config-file"),
+    "agy": ("--mode", "--conversation", "-i", "--model"),
+    "vibe": ("--agent", "--resume", "-r", "--model", "-p", "--prompt"),
+}
+_MANY_OPTS = ("--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools",
+              "--disallowed-tools", "--mcp-config", "--betas", "--plugin-dir")
+_MAYBE_VALUE = ("--resume", "-r")       # Claude Code's --resume alone opens its picker
+
+def _flag_words(agent: str, argv: list) -> list:
+    """The options of a command line: after the program, up to `--` or the
+    first word that is neither an option nor an option's value.  That word
+    starts the first prompt, whose words can look like flags on a command
+    line read from ps.  Codex's `resume <id>` is a subcommand, not a prompt."""
+    names = _PROG_NAMES.get(agent, (agent,))
+    start = 0
+    for k, w in enumerate(argv[:3]):
+        b = re.sub(r"\.(exe|cmd|bat|js|mjs|cjs|py)$", "", re.split(r"[\\/]", w)[-1].lower())
+        if b in names:
+            start = k + 1
+            break
+    else:
+        if argv and not argv[0].startswith("-"):
+            start = 1                   # some program: its options follow
+    vals = _VALUE_OPTS.get(agent, ())
+    out, i, sub = [], start, False
+    while i < len(argv):
+        t = argv[i]
+        if t == "--":
+            break
+        if not t.startswith("-") or t == "-":
+            if agent == "codex" and not sub and t == "resume":
+                sub = True              # `codex … resume [<id>|--last] [prompt]`
+                i += 1
+                if i < len(argv) and not argv[i].startswith("-"):
+                    i += 1              # the session it resumes
+                continue
+            break                       # the first prompt
+        key = t.partition("=")[0]
+        if key in vals and "=" not in t:
+            if key in _MAYBE_VALUE and (i + 1 >= len(argv) or argv[i + 1].startswith("-")):
+                out.append(t)
+                i += 1
+                continue
+            out += argv[i:i + 2]
+            i += 2
+            if key in _MANY_OPTS:
+                while i < len(argv) and not argv[i].startswith("-"):
+                    out.append(argv[i])
+                    i += 1
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+def _codex_policy(argv: list) -> tuple:
+    """(approval, sandbox) a Codex command line asks for; None for what it
+    does not say."""
+    approval = sandbox = None
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t == "--":
+            break
+        if t in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+            return "never", "danger-full-access"
+        if t == "--full-auto":
+            approval, sandbox = approval or "on-request", sandbox or "workspace-write"
+            i += 1
+            continue
+        v, j = _opt(argv, i, ("-a", "--ask-for-approval"))
+        if v is not None:
+            approval, i = v, j
+            continue
+        v, j = _opt(argv, i, ("-s", "--sandbox"))
+        if v is not None:
+            sandbox, i = v, j
+            continue
+        v, j = _opt(argv, i, ("-c", "--config"))
+        if v is not None:
+            k, _eq, val = v.partition("=")
+            val = val.strip().strip("'\"")
+            if k.strip() == "approval_policy":
+                approval = val
+            elif k.strip() == "sandbox_mode":
+                sandbox = val
+            i = j
+            continue
+        i += 1
+    return approval, sandbox
+
+def _codex_policies(argv: list) -> tuple:
+    """Every approval policy and sandbox a Codex command line names, in any
+    of its forms -> (approvals, sandboxes, bypass)."""
+    aps, sbs, bypass = set(), set(), False
+    i = 0
+    while i < len(argv):
+        t = argv[i]
+        if t in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+            bypass = True
+        elif t == "--full-auto":
+            aps.add("on-request")
+            sbs.add("workspace-write")
+        for names, into in ((("-a", "--ask-for-approval"), aps), (("-s", "--sandbox"), sbs)):
+            v, j = _opt(argv, i, names)
+            if v is not None:
+                into.add(v.strip().strip("'\""))
+                i = j - 1
+                break
+        else:
+            v, j = _opt(argv, i, ("-c", "--config"))
+            if v is not None:
+                k, _eq, val = v.partition("=")
+                val = val.strip().strip("'\"")
+                if k.strip() == "approval_policy":
+                    aps.add(val)
+                elif k.strip() == "sandbox_mode":
+                    sbs.add(val)
+                i = j - 1
+        i += 1
+    return aps, sbs, bypass
+
+def _codex_level(approval, sandbox, explicit: bool = True):
+    """The level of a Codex approval policy and sandbox.  On request in the
+    workspace sandbox is also what Codex does on its own in a trusted
+    folder: only a command line that asks for it reads as `edits`."""
+    if approval is None and sandbox is None:
+        return None
+    if approval == "never":
+        if sandbox == "danger-full-access":
+            return {"level": "never", "sandbox": False}
+        if sandbox == "read-only":
+            return {"level": "ask", "sandbox": False}
+        return {"level": "never", "sandbox": True}
+    if approval in (None, "on-request", "on-failure"):
+        if sandbox == "danger-full-access":
+            return {"level": "auto", "sandbox": False}
+        if sandbox == "workspace-write" and explicit:
+            return {"level": "edits", "sandbox": False}
+    return {"level": "ask", "sandbox": False}
+
+def _claude_settings_arg(argv: list):
+    """What a Claude Code command line's --settings holds: a JSON text or a
+    file's path."""
+    for_words = _flag_words("claude", argv)
+    i = 0
+    while i < len(for_words):
+        v, i = _opt(for_words, i, ("--settings",))
+        if v is not None:
+            return v
+    return None
+
+def flag_level(agent: str, argv: list, most: bool = False):
+    """{level, sandbox} that a command line's flags ask for, or None when it
+    has no permission flag.  Reading a session's command line (the program
+    first): its options only, up to the first prompt; two that disagree, the
+    stricter.  `most` (flags someone wants aht to use): every word, and the
+    most permissive reading of them (a Codex policy the command line leaves
+    open as config.toml could fill it)."""
+    argv = [str(a) for a in argv or []]
+    words = argv if most else _flag_words(agent, argv)
+    seen = []
+    if agent == "codex":
+        if not most:
+            return _codex_level(*_codex_policy(words))
+        aps, sbs, bypass = _codex_policies(words)
+        if bypass:
+            return {"level": "never", "sandbox": False}
+        if not aps and not sbs:
+            return None
+        got = [_codex_level(a, s) for a in (aps or {"never"})
+               for s in (sbs or {"danger-full-access"})]
+        return max(got, key=lambda x: _perm_rank(x["level"], x["sandbox"]))
+    i = 0
+    while i < len(words):
+        t = words[i]
+        if t == "--" and not most:
+            break
+        if agent == "claude":
+            if t == "--dangerously-skip-permissions" or (
+                    most and t == "--allow-dangerously-skip-permissions"):
+                seen.append("never")
+            v, j = _opt(words, i, ("--permission-mode",))
+            if v is not None:
+                seen.append(CLAUDE_MODES.get(v, "never" if most else "ask"))
+                i = j
+                continue
+            if most:
+                v, j = _opt(words, i, ("--settings",))
+                if v is not None:
+                    m = ((_settings_text(v).get("permissions") or {}).get("defaultMode"))
+                    if m is not None:
+                        seen.append(CLAUDE_MODES.get(m, "never"))
+                    i = j
+                    continue
+        elif agent == "kimi":
+            if t == "--auto":
+                seen.append("never")
+            elif t in ("-y", "--yolo"):
+                seen.append("auto")
+        elif agent == "agy":
+            if t == "--dangerously-skip-permissions":
+                seen.append("never")
+            v, j = _opt(words, i, ("--mode",))
+            if v is not None:
+                seen.append({"accept-edits": "edits", "auto": "auto", "plan": "ask",
+                             "default": "ask"}.get(v, "never" if most else "ask"))
+                i = j
+                continue
+        elif agent == "vibe":
+            if t in ("--auto-approve", "--yolo"):
+                seen.append("never")
+            elif t == "--smart-approve":
+                seen.append("auto")
+            v, j = _opt(words, i, ("--agent",))
+            if v is not None:
+                lv = {"ask": "ask", "accept-edits": "edits", "smart-approve": "auto",
+                      "auto-approve": "never", "plan": "ask"}.get(v)
+                if lv or most:
+                    seen.append(lv or "never")
+                i = j
+                continue
+        i += 1
+    if not seen:
+        return None
+    pick = max if most else min
+    return {"level": pick(seen, key=PERM_LEVELS.index), "sandbox": False}
+
+# the flags agent_permission_flags may hold, per agent: the permission flags
+# aht reads (1: takes a value) and a few that change nothing about them
+PERM_OPTS = {
+    "claude": {"--dangerously-skip-permissions": 0, "--allow-dangerously-skip-permissions": 0,
+               "--permission-mode": 1, "--settings": 1},
+    "codex": {"--dangerously-bypass-approvals-and-sandbox": 0, "--yolo": 0, "--full-auto": 0,
+              "-a": 1, "--ask-for-approval": 1, "-s": 1, "--sandbox": 1, "-c": 1, "--config": 1},
+    "kimi": {"--auto": 0, "-y": 0, "--yolo": 0},
+    "agy": {"--dangerously-skip-permissions": 0, "--mode": 1},
+    "vibe": {"--auto-approve": 0, "--yolo": 0, "--smart-approve": 0, "--agent": 1},
+}
+HARMLESS_OPTS = {
+    "claude": {"--model": 1, "--effort": 1, "--verbose": 0, "--disallowedTools": 1,
+               "--disallowed-tools": 1},
+    "codex": {"-m": 1, "--model": 1},
+    "kimi": {"-m": 1, "--model": 1},
+    "agy": {"--model": 1},
+    "vibe": {},
+}
+_PERM_VALUES = {
+    ("claude", "--permission-mode"): set(CLAUDE_MODES),
+    ("codex", "-a"): {"untrusted", "on-failure", "on-request", "never"},
+    ("codex", "--ask-for-approval"): {"untrusted", "on-failure", "on-request", "never"},
+    ("codex", "-s"): {"read-only", "workspace-write", "danger-full-access"},
+    ("codex", "--sandbox"): {"read-only", "workspace-write", "danger-full-access"},
+    ("agy", "--mode"): {"accept-edits", "auto", "plan", "default"},
+    ("vibe", "--agent"): {"ask", "accept-edits", "smart-approve", "auto-approve", "plan"},
+}
+
+def _settings_text(v) -> dict:
+    """A --settings value given as JSON text, as a dict ({} for a path or
+    anything else)."""
+    try:
+        d = json.loads(v) if isinstance(v, str) and v.strip().startswith("{") else {}
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+def perm_flags_why(agent: str, flags: list):
+    """Why flags someone wants aht to start `agent` with cannot be taken as
+    they are (None: they can): a flag aht does not know as a permission flag
+    or a harmless one (a word it cannot read could ask for anything), a
+    value it does not know, a Claude Code --settings that holds permissions
+    or a sandbox, or two permission flags that ask for different levels."""
+    known = dict(PERM_OPTS.get(agent, {}), **HARMLESS_OPTS.get(agent, {}))
+    levels, i = [], 0
+    while i < len(flags):
+        t = flags[i]
+        key = t.partition("=")[0]
+        name = key if key in known else next(
+            (n for n in known if len(n) == 2 and n[1] != "-" and known[n]
+             and len(t) > 2 and t.startswith(n) and not t.startswith("--")), None)
+        if name is None:
+            return f"{t} is not a flag aht knows for {AGENT_NAMES.get(agent, agent)}"
+        if not known[name]:
+            if name in PERM_OPTS.get(agent, {}):
+                levels.append((flag_level(agent, [t], most=True) or {"level": "ask"})["level"])
+            i += 1
+            continue
+        val, i = _opt(flags, i, (name,))
+        if not val:
+            return f"{name} needs a value"
+        allowed = _PERM_VALUES.get((agent, name))
+        if allowed is not None and val not in allowed:
+            return f"{name} {val}: aht does not know that value"
+        if agent == "codex" and name in ("-c", "--config"):
+            k = val.partition("=")[0].strip()
+            if k not in ("approval_policy", "sandbox_mode"):
+                return f"{name} {val}: only approval_policy and sandbox_mode may be set here"
+            v = val.partition("=")[2].strip().strip("'\"")
+            if v not in (_PERM_VALUES[("codex", "-a" if k == "approval_policy" else "-s")]):
+                return f"{name} {val}: aht does not know that value"
+        if agent == "claude" and name == "--settings":
+            d = _settings_text(val)
+            if not d:
+                return "--settings: only a JSON text aht can read, not a file"
+            if "permissions" in d or "sandbox" in d:
+                return "--settings may not hold permissions or a sandbox here"
+        if name in PERM_OPTS.get(agent, {}) and agent != "codex" \
+                and not (agent == "claude" and name == "--settings"):
+            levels.append((flag_level(agent, [name, val], most=True) or {"level": "ask"})["level"])
+    if len(set(levels)) > 1:
+        return f"{' '.join(flags)} mixes levels ({', '.join(sorted(set(levels), key=PERM_LEVELS.index))})"
+    return None
+
+def _settings_json(path) -> dict:
+    try:
+        v = json.loads(Path(path).read_text(encoding="utf-8"))
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def claude_managed_settings() -> Path:
+    """Where Claude Code's managed (policy) settings live on this system."""
+    if os.environ.get("AHT_CLAUDE_MANAGED_SETTINGS"):           # tests
+        return Path(os.environ["AHT_CLAUDE_MANAGED_SETTINGS"])
+    if IS_MAC:
+        return Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+    if os.name == "nt":
+        return Path(os.environ.get("ProgramFiles", r"C:\Program Files"), "ClaudeCode",
+                    "managed-settings.json")
+    return Path("/etc/claude-code/managed-settings.json")
+
+# a project's own settings (in its repository) may lower the level, never
+# raise it: Claude Code itself takes bypassPermissions only from the user's,
+# managed or command-line settings
+PROJECT_MODES = ("acceptEdits", "plan", "default", "dontAsk")
+
+def claude_settings(real: str = None, extra=None) -> dict:
+    """{mode, sandbox}: Claude Code's permissions.defaultMode and
+    sandbox.enabled, from the user's settings, the project's
+    (.claude/settings.json, then settings.local.json), `extra` (what a
+    command line's --settings gave) and the managed settings, the later
+    winning; None where none says.  The project's two count only for a
+    mode of edits or less, and only to turn the sandbox on: a repository
+    never raises the level."""
+    layers = [(_settings_json(claude_home() / "settings.json"), True)]
+    if real:
+        layers += [(_settings_json(Path(real) / ".claude" / "settings.json"), False),
+                   (_settings_json(Path(real) / ".claude" / "settings.local.json"), False)]
+    if isinstance(extra, str) and extra.strip():
+        x = extra.strip()
+        if x.startswith("{"):
+            layers.append((_settings_text(x), True))
+        else:
+            layers.append((_settings_json(Path(real, x) if real else Path(x)), True))
+    layers.append((_settings_json(claude_managed_settings()), True))
+    mode = sandbox = None
+    for d, trusted in layers:
+        p, sb = d.get("permissions"), d.get("sandbox")
+        if isinstance(p, dict) and isinstance(p.get("defaultMode"), str) and (
+                trusted or p["defaultMode"] in PROJECT_MODES):
+            mode = p["defaultMode"]
+        if isinstance(sb, dict) and isinstance(sb.get("enabled"), bool) and (
+                trusted or sb["enabled"]):
+            sandbox = sb["enabled"]
+    return {"mode": mode, "sandbox": sandbox}
+
+def claude_sandbox_file() -> str:
+    """The settings file that turns Claude Code's sandbox on (`--settings`
+    names it), written when missing or changed."""
+    f = aht_home() / "run" / "claude-sandbox.json"
+    want = json.dumps(CLAUDE_SANDBOX, indent=1) + "\n"
+    try:
+        if not f.is_file() or f.read_text(encoding="utf-8") != want:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_name(f.name + ".new")
+            tmp.write_text(want, encoding="utf-8")
+            os.replace(tmp, f)
+    except OSError as e:
+        warn(f"PERM sandbox settings: {e}")
+    return str(f)
+
+def claude_can_sandbox() -> bool:
+    """Whether Claude Code's own sandbox works on this machine: on macOS; on
+    Linux with bubblewrap; not on Windows."""
+    if os.environ.get("AHT_CLAUDE_SANDBOX") in ("0", "1"):        # tests
+        return os.environ["AHT_CLAUDE_SANDBOX"] == "1"
+    if IS_MAC:
+        return True
+    return bool(IS_LINUX and shutil.which("bwrap"))
+
+def _last_record_with(path, marker: bytes, want, size: int = 1 << 20, most: int = 16 << 20):
+    """The last JSON line of `path` that holds `marker` and that `want`
+    takes (a text in a message may name the key too), read from its end
+    (the last MB, then up to 16 MB)."""
+    try:
+        with open(path, "rb") as fh:
+            end = fh.seek(0, 2)
+            while True:
+                fh.seek(max(0, end - size))
+                data = fh.read(size)
+                lines = data.split(b"\n")
+                if end > size:
+                    lines = lines[1:]           # the first may be cut
+                for raw in reversed(lines):
+                    if marker in raw:
+                        try:
+                            e = json.loads(raw)
+                        except ValueError:
+                            continue
+                        if isinstance(e, dict) and want(e):
+                            return e
+                if end <= size or size >= most:
+                    return None
+                size *= 4
+    except OSError:
+        return None
+
+def codex_rollout_level(real: str, sid: str):
+    """{level, sandbox, approval, sandbox_mode} from the newest turn_context
+    of a Codex session's rollout, or None."""
+    f = session_file(real, "codex", sid) if sid else None
+    e = _last_record_with(f, b'"turn_context"', lambda x: x.get("type") == "turn_context") \
+        if f else None
+    p = (e or {}).get("payload")
+    if not isinstance(p, dict):
+        return None
+    sp = p.get("sandbox_policy")
+    mode = sp if isinstance(sp, str) else (sp.get("type") or sp.get("mode")) \
+        if isinstance(sp, dict) else None
+    ap = p.get("approval_policy") if isinstance(p.get("approval_policy"), str) else None
+    got = _codex_level(ap, mode if isinstance(mode, str) else None, explicit=False)
+    return dict(got, approval=ap, sandbox_mode=mode) if got else None
+
+def claude_transcript_level(real: str, sid: str):
+    """{level} from the permissionMode Claude Code notes on a session's
+    newest prompt, or None."""
+    f = session_file(real, "claude", sid) if sid else None
+    e = _last_record_with(f, b'"permissionMode"',
+                          lambda x: isinstance(x.get("permissionMode"), str)) if f else None
+    m = (e or {}).get("permissionMode")
+    return {"level": CLAUDE_MODES.get(m, "ask"), "sandbox": False} if isinstance(m, str) \
+        else None
+
+def _agent_proc_rows() -> list:
+    """[{pid, agent, argv, cwd}] of the agent CLIs other than Claude Code that
+    run now: ps, and lsof or /proc for the folder (tests: AHT_AGENT_PROCS, a
+    list of {pid, args, cwd}).  aht's own runs with a prompt (-p) and the
+    agents' daemons and tools are left out."""
+    fake = os.environ.get("AHT_AGENT_PROCS")
+    if fake:
+        listed = [(int(r.get("pid") or 0), str(r.get("args") or ""), r.get("cwd"))
+                  for r in json.loads(fake)]
+    elif os.name == "nt":
+        return []
+    else:
+        try:
+            r = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True,
+                               timeout=15, cwd="/")
+        except Exception:
+            return []
+        listed = []
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                listed.append((int(parts[0]), parts[1], None))
+    pids = {}
+    for pid, args, cwd in listed:
+        words = args.split()
+        m = _AGENT_PROC.search(" ".join(words[:2]))
+        if not m or any(f" {f} " in f" {args} " for f in ("-p", "--prompt", "--print")):
+            continue
+        if m.group(1) in NOT_SESSIONS:
+            at = next((i for i, w in enumerate(words[:2])
+                       if re.search(rf"(?:^|/){m.group(1)}$", w)), 0)
+            if (words[at + 1:at + 2] or [""])[0] in NOT_SESSIONS[m.group(1)]:
+                continue
+        pids[pid] = ("vibe" if m.group(1) == "vibe-rs" else m.group(1), args, cwd)
+    if not pids:
+        return []
+    cwd = {pid: c for pid, (_a, _l, c) in pids.items() if c}
+    argv = {}
+    if fake:
+        pass
+    elif IS_LINUX:
+        for pid in pids:
+            try:
+                cwd[pid] = os.readlink(f"/proc/{pid}/cwd")
+                raw = Path(f"/proc/{pid}/cmdline").read_bytes()     # the words exactly
+                argv[pid] = [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
+            except OSError:
+                pass
+    else:
+        lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
+        try:
+            r = subprocess.run([lsof, "-a", "-p", ",".join(map(str, pids)), "-d", "cwd", "-Fpn"],
+                               capture_output=True, text=True, timeout=30, cwd="/")
+            pid = None
+            for line in r.stdout.splitlines():
+                if line.startswith("p"):
+                    pid = int(line[1:])
+                elif line.startswith("n") and pid:
+                    cwd[pid] = line[1:]
+        except Exception:
+            pass
+    return [{"pid": pid, "agent": agent, "cwd": cwd[pid],
+             "argv": argv.get(pid) or _split_args(args)}
+            for pid, (agent, args, _c) in pids.items() if pid in cwd]
+
+def _argv_of(pid: int) -> list:
+    """A process's words: exactly, from /proc on Linux; else its command line
+    from ps, split as a shell would (a word with a space in it comes apart)."""
+    if IS_LINUX and not os.environ.get("AHT_CMDLINES"):
+        try:
+            raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+            return [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
+        except (OSError, ValueError):
+            pass
+    line = _cmdline(pid)
+    return _split_args(line) if line else []
+
+def _split_args(line: str) -> list:
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+RESUME_FLAGS = {"codex": ("resume",), "kimi": ("-S", "--session"), "agy": ("--conversation",),
+                "vibe": ("--resume", "-r")}
+
+def _live_argvs(real: str, agent: str, sid: str) -> list:
+    """The command lines of the running process(es) of the session `sid` of
+    `agent` in the folder `real`; [] when none runs (or none can be told)."""
+    if agent == "claude":
+        out = []
+        for s in running_sessions(inside=real):
+            if sid and s.get("session") == sid:
+                words = _argv_of(s["pid"])
+                if words:
+                    out.append(words)
+        return out
+    named, unnamed = [], []
+    for r in _agent_proc_rows():
+        if r["agent"] != agent or not _same_dir(r["cwd"], real):
+            continue
+        words = r["argv"]
+        if sid and sid in words:
+            named.append(words)
+        elif not any(w in RESUME_FLAGS.get(agent, ()) for w in words):
+            unnamed.append(words)           # a new session: the newest one, then
+    if named:
+        return named
+    if unnamed and sid:
+        newest = next(iter(list_sessions(real, agents=[agent])), None)
+        if newest and newest["id"] == sid:
+            return unnamed
+    return []
+
+# the level aht started an agent in, kept on this machine only (a relay record
+# in the project can be written by anyone who can write the repository, so its
+# `perm` is shown, never believed)
+PERM_KEEP = 400
+
+def perm_store() -> Path:
+    return aht_home() / "run" / "perm.json"
+
+def _perm_records() -> dict:
+    try:
+        v = json.loads(perm_store().read_text(encoding="utf-8"))
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def remember_perm(rid: str, real: str, agent: str, session, perm, at: float = None) -> None:
+    """Note that aht started `agent` in the folder `real` (its session, when
+    known) in the level `perm`, for the relay `rid`."""
+    if not perm or not rid:
+        return
+    try:
+        recs = _perm_records()
+        recs[rid] = {"agent": agent, "project": os.path.realpath(real), "session": session,
+                     "level": perm["level"], "sandbox": bool(perm.get("sandbox")),
+                     "flags": list(perm.get("flags") or []), "at": at or time.time()}
+        if len(recs) > PERM_KEEP:
+            for k in sorted(recs, key=lambda k: float((recs[k] or {}).get("at") or 0))[
+                    :len(recs) - PERM_KEEP]:
+                del recs[k]
+        _write_json(perm_store(), recs)
+    except (OSError, TypeError, ValueError) as e:
+        warn(f"PERM record {rid}: {e}")
+
+def relay_level(real: str, agent: str, sid: str, relay: dict = None):
+    """{level, sandbox, flags} that aht started the session `sid` of `agent`
+    in, as this machine recorded it for the relay that started it here (or
+    `relay`), or None.  The relay names the record; the level, the agent, the
+    folder and the session come from the record."""
+    real = os.path.realpath(real)
+    mine = _perm_records()
+    if not mine:
+        return None
+    for r in [relay] if relay else read_relays(real):
+        to = r.get("to") or {}
+        p = mine.get(r.get("id"))
+        if not isinstance(p, dict) or to.get("agent") != agent or p.get("agent") != agent \
+                or p.get("level") not in PERM_LEVELS \
+                or os.path.realpath(str(p.get("project") or "/nonexistent")) != real:
+            continue
+        if not relay:
+            if p.get("session"):
+                if p["session"] != sid:
+                    continue
+            elif not (sid and _first_session_after(real, agent, float(p.get("at") or 0)) == sid):
+                continue
+        return {"level": p["level"], "sandbox": p.get("sandbox") is True and p["level"] == "never",
+                "flags": [str(f) for f in p.get("flags") or []]}
+    return None
+
+def _codex_live(argv: list, rec):
+    """The level of an open Codex session: its command line, with what that
+    leaves out filled from the session's newest turn_context; the lower of
+    the two where they disagree.  None: the command line names no policy."""
+    ap, sb = _codex_policy(_flag_words("codex", argv))
+    if ap is None and sb is None:
+        return None
+    explicit = sb is not None
+    if rec:
+        ap = rec.get("approval") if ap is None else ap
+        sb = rec.get("sandbox_mode") if sb is None else sb
+    lv = _codex_level(ap, sb, explicit) or {"level": "ask", "sandbox": False}
+    if rec and (ap, sb) != (rec.get("approval"), rec.get("sandbox_mode")):
+        lv = _lowest([lv, rec])
+    return {"level": lv["level"], "sandbox": bool(lv.get("sandbox"))}
+
+def session_level(real: str, agent: str, sid: str, relay: dict = None) -> dict:
+    """{level, sandbox, from}: the level a session runs (or ran) in.  A
+    running session's command line, no higher than what the session itself
+    records; else what the session recorded (Codex's turn_context, Claude
+    Code's permissionMode); else the level aht started it in (this machine's
+    record of it); else, for Claude Code, its settings' defaultMode.
+    Unknown: ask."""
+    real = os.path.realpath(real)
+    out = None
+    try:
+        rec = codex_rollout_level(real, sid) if agent == "codex" else \
+            claude_transcript_level(real, sid) if agent == "claude" else None
+        lives = _live_argvs(real, agent, sid) if agent in SWITCH_TARGETS else []
+        if lives:
+            got = []
+            for argv in lives:
+                lv = _codex_live(argv, rec) if agent == "codex" else flag_level(agent, argv)
+                if lv:
+                    lv = dict(lv, **{"from": "command_line"})
+                elif agent == "claude":         # as its settings say
+                    st = claude_settings(real, _claude_settings_arg(argv))
+                    lv = {"level": CLAUDE_MODES.get(st["mode"] or "default", "ask"),
+                          "sandbox": False,
+                          "from": "settings" if st["mode"] else "command_line"}
+                elif agent == "codex" and rec:
+                    lv = dict(rec, **{"from": "rollout"})
+                else:
+                    lv = {"level": "ask", "sandbox": False, "from": "command_line"}
+                if agent == "claude" and lv["level"] == "never":
+                    lv["sandbox"] = bool(claude_settings(real, _claude_settings_arg(argv))[
+                        "sandbox"]) or bool((relay_level(real, agent, sid, relay) or {}).get(
+                            "sandbox"))
+                if agent == "claude" and rec and _perm_rank(rec["level"]) \
+                        < _perm_rank(lv["level"], lv["sandbox"]):
+                    lv = dict(rec, **{"from": "transcript"})    # it says less
+                got.append(lv)
+            out = _lowest(got)
+        if out is None:
+            rel = relay_level(real, agent, sid, relay)
+            if rec and rel and (rec["level"] == rel["level"] or (
+                    agent == "codex" and _codex_agrees(rel, rec))):
+                out = {"level": rel["level"], "sandbox": rel["sandbox"] or rec["sandbox"],
+                       "from": "relay"}
+            elif rec:
+                out = dict(rec, **{"from": "rollout" if agent == "codex" else "transcript"})
+            elif rel:
+                out = {"level": rel["level"], "sandbox": rel["sandbox"], "from": "relay"}
+            elif agent == "claude":
+                st = claude_settings(real)
+                if st["mode"]:
+                    out = {"level": CLAUDE_MODES.get(st["mode"], "ask"), "sandbox": False,
+                           "from": "settings"}
+            if out and agent == "claude" and out["level"] == "never" and not out["sandbox"]:
+                out["sandbox"] = bool(claude_settings(real)["sandbox"])
+    except Exception as e:                  # never in the way of the work itself
+        warn(f"PERM {real}: {agent} {sid}: {e}")
+        out = None
+    out = out or {"level": "ask", "sandbox": False, "from": "unknown"}
+    return {"level": out["level"], "sandbox": bool(out["sandbox"]) and out["level"] == "never",
+            "from": out["from"]}
+
+def _codex_agrees(rel: dict, rec: dict) -> bool:
+    """Whether a Codex session's turn_context is what the flags aht started
+    it with ask for (Codex notes no difference between its own default and
+    on-request asked for), and those flags are the level aht recorded."""
+    flags = list(rel.get("flags") or [])
+    got = flag_level("codex", flags, most=True)
+    if not got or got["level"] != rel.get("level"):
+        return False
+    ap, sb = _codex_policy(flags)
+    return ap is not None and ap == rec.get("approval") and (sb is None
+                                                             or sb == rec.get("sandbox_mode"))
+
+def level_clean(v) -> dict:
+    """A level that came from another machine or a record, as aht uses it."""
+    v = v if isinstance(v, dict) else {}
+    lv = v.get("level") if v.get("level") in PERM_LEVELS else "ask"
+    return {"level": lv, "sandbox": v.get("sandbox") is True and lv == "never",
+            "from": v.get("from") if v.get("from") in PERM_FROM else "unknown"}
+
+def _flag_list(v):
+    """A list of flags from a setting: a list of words or one line."""
+    if isinstance(v, str):
+        v = _split_args(v)
+    if not isinstance(v, list) or len(v) > 12 or not all(
+            isinstance(w, str) and len(w) <= 300 and not _CONTROL.search(w) for w in v):
+        return None
+    return list(v)
+
+def perm_flags_table(obj, strict: bool = False) -> dict:
+    """agent_permission_flags as aht uses it: per agent, per level, a list of
+    flags that replaces aht's own.  An entry whose flags ask for more than
+    its level is refused (strict) or left out: the setting can choose a
+    stricter way, never more power."""
+    if not isinstance(obj, dict):
+        if strict:
+            raise ValueError("agent_permission_flags expects a JSON object")
+        return {}
+    out = {}
+    for agent, levels in obj.items():
+        if agent not in SWITCH_TARGETS or not isinstance(levels, dict):
+            if strict:
+                raise ValueError(f"agent_permission_flags: {agent!r} is not one of "
+                                 f"{', '.join(SWITCH_TARGETS)}, each with an object of levels")
+            continue
+        for level, flags in levels.items():
+            fl = _flag_list(flags)
+            why = None
+            if level not in PERM_LEVELS:
+                why = f"{level!r} is not a level ({', '.join(PERM_LEVELS)})"
+            elif fl is None:
+                why = f"{agent}.{level} expects a list of flags"
+            elif perm_flags_why(agent, fl):
+                why = f"{agent}.{level}: {perm_flags_why(agent, fl)}"
+            else:           # read as the most they could ask for
+                got = flag_level(agent, fl, most=True) or {"level": "ask"}
+                if PERM_LEVELS.index(got["level"]) > PERM_LEVELS.index(level):
+                    why = (f"{agent}.{level}: {' '.join(fl)} asks for {got['level']}, more "
+                           f"than {level}")
+            if why:
+                if strict:
+                    raise ValueError(f"agent_permission_flags: {why}")
+                continue
+            out.setdefault(agent, {})[level] = fl
+    return out
+
+def _perm_flags(agent: str, level: str):
+    """The flags that start `agent` in `level`: the setting's, else aht's
+    own; None when the agent has no such level ([] at ask)."""
+    mine = perm_flags_table(cfg_get("agent_permission_flags") or {}).get(agent, {})
+    if level in mine:
+        return list(mine[level])
+    if level == "ask":
+        return []
+    own = PERM_FLAGS.get(agent, {}).get(level)
+    return list(own) if own else None
+
+def _perm_setting() -> tuple:
+    v = str(cfg_get("agent_permissions", "follow") or "follow").strip().lower()
+    if v in PERM_LEVELS:
+        return "fixed", v
+    if v.startswith("max:") and v[4:] in PERM_LEVELS:
+        return "max", v[4:]
+    return "follow", None
+
+def perm_for(target: str, src: dict, who: str, sandbox_ok: bool = None,
+             name: str = None) -> dict:
+    """The level the next agent `target` starts in, continuing a session of
+    the level `src` (session_level's answer): the same level in the agent's
+    own flags, or the next stricter one it has.  `who` names that session
+    for the text ("the Claude Code session you are leaving"); `sandbox_ok`:
+    whether Claude Code's sandbox works where the agent starts (default:
+    here).  -> {agent, level, sandbox, flags, from, read, text}."""
+    src = level_clean(src)
+    read, sbx = src["level"], src["sandbox"]
+    kind, cap = _perm_setting()
+    want = read
+    if kind == "fixed":
+        want, sbx = cap, sbx and cap == read
+    elif kind == "max" and _perm_rank(read) > _perm_rank(cap):
+        want, sbx = cap, False
+    tname = name or AGENT_NAMES.get(target, target)
+    flags, sandbox, note = None, False, None
+    if want == "never" and sbx:
+        if target == "codex":
+            own = _perm_flags("codex", "never")
+            got = flag_level("codex", own or [], most=True) or {"level": "ask"}
+            flags = own if _perm_rank(got["level"], got.get("sandbox")) \
+                <= _perm_rank("never", True) else list(CODEX_NEVER_SANDBOXED)
+            sandbox = bool((flag_level("codex", flags, most=True) or {}).get("sandbox"))
+        elif target == "claude" and (claude_can_sandbox() if sandbox_ok is None
+                                     else sandbox_ok):
+            # a file, not a JSON text: a command line read back from ps (a
+            # restart, the level of an open session) keeps a path whole
+            flags = (_perm_flags("claude", "never") or []) + ["--settings", claude_sandbox_file()]
+            sandbox = True
+        else:
+            note = ("its sandbox does not work " + ("there" if name else "on this machine")
+                    if target == "claude" else "it has no sandbox")
+            want = "auto"
+    level = want
+    if flags is None:
+        for lv in reversed(PERM_LEVELS[:PERM_LEVELS.index(want) + 1]):
+            flags = _perm_flags(target, lv)
+            if flags is not None:
+                level = lv
+                break
+        if level != want and not note:
+            note = f"it has no {PERM_WORDS[want]}"
+        if level == "never" and not sandbox:    # the setting's own may keep a sandbox
+            sandbox = bool((flag_level(target, flags or [], most=True) or {}).get("sandbox"))
+    words = PERM_WORDS[level] + (" inside its sandbox" if sandbox else "")
+    was = PERM_WORDS[read] + (" inside a sandbox" if src["sandbox"] else "")
+    why = f"; {note}" if note else ""
+    if kind == "fixed":
+        text = f"{tname} starts in {words}, as agent_permissions says{why} ({who} runs in {was})"
+    elif kind == "max" and _perm_rank(read) > _perm_rank(cap):
+        text = (f"{tname} starts in {words}: agent_permissions caps it there{why} "
+                f"({who} runs in {was})")
+    elif note:
+        text = f"{tname} starts in {words}, the next stricter level: {note} ({who} runs in {was})"
+    elif src["from"] == "unknown":
+        text = f"{tname} starts in {words}: aht could not tell the level of {who}"
+    else:
+        text = f"{tname} starts in {words}, like {who}"
+    return {"agent": target, "level": level, "sandbox": sandbox, "flags": list(flags or []),
+            "from": src["from"], "read": read, "text": text}
+
+def perm_record(perm) -> dict:
+    """What a relay keeps of the level it started an agent in."""
+    return {"level": perm["level"], "sandbox": bool(perm.get("sandbox")),
+            "flags": list(perm.get("flags") or [])} if perm else None
+
+def _without_settings(flags: list) -> list:
+    """Flags without a --settings pair (the far start puts that into its own
+    settings file)."""
+    out, i = [], 0
+    while i < len(flags):
+        if flags[i] == "--settings":
+            i += 2
+            continue
+        if not flags[i].startswith("--settings="):
+            out.append(flags[i])
+        i += 1
+    return out
+
 # ---- switch agent, and hand back ------------------------------------------- #
 
-def agent_start_line(agent: str, mode: str, sid=None, ask: str = None) -> str:
+def agent_start_line(agent: str, mode: str, sid=None, ask: str = None,
+                     flags: list = None, reads: bool = True) -> str:
     """The line that opens `agent` in a terminal: a new session that reads
     the summary first (mode "new"), or its own session `sid`, which reads
     the catch-up (mode "resume").  Claude's own session hears of the
     catch-up from aht's SessionStart hook, so it costs nothing before you
     type.  Kimi reads its summary in a run of its own first (switch does
-    that), so its line only opens the session."""
+    that), so its line only opens the session; without that run (`reads`
+    False, below never-ask) it opens Kimi, and you paste the first prompt.
+    `flags`: the permission level's (perm_for), right after the program."""
     q = shell_quote
-    exe = q(agent_cli(agent) or agent)
+    exe = q(agent_cli(agent) or agent) + "".join(" " + q(f) for f in flags or [])
     resume = mode == "resume" and sid
     if agent == "kimi":
-        return f"{exe} -S {q(sid)}" if sid else f"{exe} -S <the new session>"
+        return f"{exe} -S {q(sid)}" if sid else f"{exe} -S <the new session>" if reads else exe
     if agent == "claude":
         if resume:
             return f"{exe} --resume {q(sid)}" + ("" if hook_installed() or not ask
@@ -15361,11 +16367,27 @@ def _ask(frm: str, rel: str, catchup: bool) -> str:
             "where the work stood, the latest exchanges and the open items. Then tell me "
             "in two or three lines what you understood, and wait for my next instruction.")
 
+def kimi_reads_ok(perm) -> bool:
+    """Whether Kimi may read its summary in a run of its own (`-p`): Kimi
+    takes no level flag together with --prompt, and that run never asks, so
+    only when the level is never-ask.  Below it, Kimi opens and you paste
+    the first prompt."""
+    return bool(perm) and perm.get("level") == "never"
+
+def _kimi_paste(out: dict, lines: list, ask: str, perm: dict) -> None:
+    """Kimi opens without reading the summary: the line to paste."""
+    out["kimi_reads"], out["first_prompt"] = False, ask
+    lines += [f"   paste  Kimi reads the summary when you send it this (its run of its own "
+              f"never asks, more than {PERM_WORDS[perm['level']]}):",
+              f"          {ask}"]
+
 def _kimi_reads(exe: str, real: str, prompt: str, sid: str = None) -> tuple:
     """Kimi reads `prompt` in a run of its own, in its session `sid` or in a
     new one -> (session, None), or (None, why not; "" when the run went
     fine but the turn is not in that session).  Kimi takes no first prompt
-    in its interactive mode: this is how it gets one."""
+    in its interactive mode: this is how it gets one.  That run never asks
+    and takes no level flag (Kimi refuses --auto and --yolo with --prompt):
+    only for a session that goes on in never-ask mode (kimi_reads_ok)."""
     started = time.time()
     own = session_file(real, "kimi", sid) if sid else None
     size = (_stat(own).st_size if own and _stat(own) else 0)
@@ -15460,7 +16482,8 @@ def cmd_switch(args):
     out = {"command": "switch", "applied": False, "blockers": [], "warnings": [],
            "project": None, "source": None, "target": None, "brief": None, "session": None,
            "command_line": None, "error": None,
-           "relay": None, "mode": None, "start_line": None, "fallback": None}
+           "relay": None, "mode": None, "start_line": None, "fallback": None, "perm": None,
+           "kimi_reads": None, "first_prompt": None}
     lines = []
     real = os.path.realpath(args.path)
     out["project"] = real
@@ -15511,8 +16534,16 @@ def cmd_switch(args):
     sid = own["id"] if mode == "resume" else None
     out["session"] = sid                # the session that goes on, when it is known
     ask = _ask(frm, rel, mode == "resume")
+    # the level the session it continues runs in, in the next agent's flags
+    perm = None if mode == "brief-only" else perm_for(
+        target, session_level(real, src["agent"], src["id"]), f"the {frm} session you are leaving")
+    out["perm"] = perm
+    pflags = (perm or {}).get("flags")
+    kimi_p = kimi_reads_ok(perm)            # Kimi's run of its own never asks
+    if target == "kimi" and mode != "brief-only":
+        out["kimi_reads"] = kimi_p
     if mode != "brief-only":
-        out["start_line"] = agent_start_line(target, mode, sid, ask)
+        out["start_line"] = agent_start_line(target, mode, sid, ask, pflags, kimi_p)
     lines += [f"{'switching' if args.apply else 'would switch'}:  {real}",
               f"   from   {frm} — {dig.get('title') or src['id']} ({_clock(src['updated'])})"]
     if mode == "brief-only":
@@ -15521,7 +16552,7 @@ def cmd_switch(args):
         lines += [f"   to     {AGENT_NAMES[target]} — its own session "
                   f"“{_session_title(own) or own['id']}” ({_clock(own['updated'])})",
                   f"          it reads only what happened since (uses tokens)"]
-        if target == "kimi":
+        if target == "kimi" and kimi_p:
             lines.append("          if Kimi does not take it into that session, a new one "
                          "reads the full summary")
     else:
@@ -15531,6 +16562,10 @@ def cmd_switch(args):
             lines += [f"   {AGENT_NAMES[target]} has its own earlier session here "
                       f"(“{_session_title(own) or own['id']}”, {_clock(own['updated'])}):",
                       "   continue that one with --resume (it reads only what happened since)"]
+    if perm:
+        lines.append(f"   level  {perm['text']}")
+    if target == "kimi" and perm and not kimi_p:
+        _kimi_paste(out, lines, ask, perm)
     if out["fallback"]:
         lines.append(f"   {out['fallback']}")
     if not args.apply:
@@ -15544,7 +16579,7 @@ def cmd_switch(args):
     since = own["updated"] if mode == "resume" else None
     text = relay_brief(real, "catchup", own, since, head) if mode == "resume" \
         else relay_brief(real, "full", src, relay=head, dig=dig)
-    if target == "kimi" and mode != "brief-only":
+    if target == "kimi" and mode != "brief-only" and kimi_p:
         # Kimi reads it in a run of its own, before the relay is written: which
         # session took it is known then
         sid, why = _kimi_reads(exe, real, _kimi_prompt(text, frm, mode == "resume"), sid)
@@ -15564,7 +16599,8 @@ def cmd_switch(args):
                       {"agent": src["agent"], "session": src["id"], "title": dig.get("title"),
                        "last_t": dig.get("last_t") or src["updated"], "git": _git_mark(real)},
                       {"agent": target, "session": sid, "mode": mode}, text, rid=rid,
-                      note_for=sid if target == "claude" and mode == "resume" else None)
+                      note_for=sid if target == "claude" and mode == "resume" else None,
+                      perm=perm)
     out["relay"] = rec["id"]
     out["brief"] = str(relay_dir(real) / rec["brief"])
     lines.append(f"   summary {out['brief']}")
@@ -15576,8 +16612,11 @@ def cmd_switch(args):
         take_checkpoint(real, None, target)
     out["session"] = sid
     rel = os.path.join(".aht", "handover", rec["brief"])
+    if target == "kimi" and not kimi_p:     # the summary's file is named now
+        out["first_prompt"] = _ask(frm, rel, mode == "resume")
     return _start(args, out, lines, real, target,
-                  agent_start_line(target, mode, sid, _ask(frm, rel, mode == "resume")))
+                  agent_start_line(target, mode, sid, _ask(frm, rel, mode == "resume"), pflags,
+                                   kimi_p))
 
 def _switch_back(args, out: dict, lines: list, real: str) -> int:
     """Hand the work back: the newest open relay (or the newest that came
@@ -15665,9 +16704,24 @@ def _switch_back(args, out: dict, lines: list, real: str) -> int:
     rid = new_relay_id()
     rel = os.path.join(".aht", "handover", f"relay-{rid}.md")
     frm = AGENT_NAMES.get(now.get("agent"), now.get("agent") or "?")
+    # the level of the session it comes back from: the one aht started it in
+    # (that relay's perm) unless the session itself says otherwise
+    perm = None if mode == "brief-only" else perm_for(
+        target, session_level(real, now.get("agent"), now_sid, relay=rels[0]),
+        f"the {frm} session you are leaving")
+    out["perm"] = perm
+    pflags = (perm or {}).get("flags")
+    kimi_p = kimi_reads_ok(perm)
+    if perm:
+        lines.append(f"   level  {perm['text']}")
     if mode != "brief-only":
         out["start_line"] = agent_start_line(target, "new" if gone else "resume",
-                                             None if gone else sid, _ask(frm, rel, not gone))
+                                             None if gone else sid, _ask(frm, rel, not gone),
+                                             pflags, kimi_p)
+        if target == "kimi":
+            out["kimi_reads"] = kimi_p
+            if not kimi_p:
+                _kimi_paste(out, lines, _ask(frm, rel, not gone), perm)
     if not args.apply:
         lines.append("(dry run — pass --apply to do it)")
         return _emit(args, out, lines)
@@ -15682,7 +16736,7 @@ def _switch_back(args, out: dict, lines: list, real: str) -> int:
         return _clip_to(full + ("\n---\n\n" if full else "") + text, BRIEF_MAX)
     text = with_full(catchup) if gone else catchup
     took = None if gone else sid
-    if target == "kimi" and mode != "brief-only":
+    if target == "kimi" and mode != "brief-only" and kimi_p:
         took, why = _kimi_reads(exe, real, _kimi_prompt(text, frm, not gone), took)
         if took is None and why == "":
             out["fallback"] = ("Kimi did not take the summary into its own session, so a "
@@ -15698,7 +16752,7 @@ def _switch_back(args, out: dict, lines: list, real: str) -> int:
                        "git": _git_mark(real)},
                       {"agent": target, "session": took, "mode": "new" if gone else "resume"},
                       text, rid=rid, back_of=r["id"],
-                      note_for=sid if target == "claude" and not gone else None)
+                      note_for=sid if target == "claude" and not gone else None, perm=perm)
     for x in [r] + later:
         close_relay(real, x["id"], rec["id"])
     out["relay"] = rec["id"]
@@ -15712,9 +16766,11 @@ def _switch_back(args, out: dict, lines: list, real: str) -> int:
     if checkpoints_on():
         take_checkpoint(real, None, target)
     rel = os.path.join(".aht", "handover", rec["brief"])
+    if target == "kimi" and not kimi_p:
+        out["first_prompt"] = _ask(frm, rel, not gone)
     return _start(args, out, lines, real, target,
                   agent_start_line(target, "new" if gone else "resume", took,
-                                   _ask(frm, rel, not gone)))
+                                   _ask(frm, rel, not gone), pflags, kimi_p))
 
 def cmd_relays(args):
     real = os.path.realpath(args.path)
@@ -16131,7 +17187,9 @@ def _agent_relay_info(req: dict) -> dict:
         out["source"] = {"agent": src["agent"], "session": src["id"],
                          "title": _line(dig.get("title") or _session_title(src)),
                          "updated": src["updated"], "last_t": dig.get("last_t") or src["updated"],
-                         "path": folder}
+                         "path": folder,
+                         # the level it runs (or ran) in: the next agent's follows it
+                         "perm": session_level(folder, src["agent"], src["id"])}
         out["brief"] = relay_brief(folder, "full", src, relay=dict(head, back_of=None),
                                    dig=dig)
     if back:
@@ -16339,7 +17397,8 @@ def cmd_pickup(args):
            "source": None, "git": None, "brief": None, "brief_kind": None, "mode": None,
            "back_of": None, "note_for": None, "target": None, "session": None, "relay": None,
            "left": [], "opened": None,
-           "start_line": None, "command_line": None, "fallback": None}
+           "start_line": None, "command_line": None, "fallback": None, "perm": None,
+           "kimi_reads": None, "first_prompt": None}
     lines = []
     if not os.path.isdir(real):
         out["blockers"].append(f"not a folder: {real}")
@@ -16419,9 +17478,20 @@ def cmd_pickup(args):
     rid = new_relay_id()
     rel = os.path.join(".aht", "handover", f"relay-{rid}.md")
     frm_name = f"{AGENT_NAMES.get((src or {}).get('agent'), 'an agent')} on {rem.name}"
+    # the level of the session there (read there), in the flags of the agent
+    # opened here
+    perm = perm_for(target, (src or {}).get("perm"),
+                    f"the {AGENT_NAMES.get((src or {}).get('agent'), 'agent')} session on "
+                    f"{rem.name}") if args.open else None
+    out["perm"] = perm
+    pflags = (perm or {}).get("flags")
+    kimi_p = kimi_reads_ok(perm)
     if args.open:
         out["start_line"] = agent_start_line(target, how, sid, _ask(frm_name, rel,
-                                                                    how == "resume"))
+                                                                    how == "resume"), pflags,
+                                             kimi_p)
+        if target == "kimi":
+            out["kimi_reads"] = kimi_p
     lines += [f"{'picking up' if args.apply else 'would pick up'}:  {real}",
               f"   from   {rem.name}: {there} ({RELAY_HOW.get(out['match']['how'], '?')})"]
     if src:
@@ -16435,13 +17505,17 @@ def cmd_pickup(args):
                         if how == "resume" else ""))
     lines.append(f"   then   {AGENT_NAMES[target]} opens with it (uses tokens)" if args.open
                  else "   then   nothing opens (--open X starts an agent with it: uses tokens)")
+    if perm:
+        lines.append(f"   level  {perm['text']}")
+    if args.open and target == "kimi" and not kimi_p:
+        _kimi_paste(out, lines, _ask(frm_name, rel, how == "resume"), perm)
     if out["fallback"]:
         lines.append(f"   {out['fallback']}")
     if out["blockers"] or not args.apply:
         if not out["blockers"]:
             lines.append("(dry run — pass --apply to do it)")
         return _emit(args, out, lines)
-    if args.open and target == "kimi":      # Kimi reads it in a run of its own first
+    if args.open and target == "kimi" and kimi_p:   # Kimi reads it in a run of its own first
         sid, why = _kimi_reads(exe, real, _kimi_prompt(text, frm_name, how == "resume"), sid)
         if sid is None and why == "":
             out["fallback"] = ("Kimi did not take the summary into its own session, so a new "
@@ -16463,7 +17537,7 @@ def cmd_pickup(args):
                        "last_t": worker.get("last_t"), "git": gm},
                       {"agent": target, "session": sid, "mode": how if args.open else None},
                       text, rid=rid, back_of=back["id"] if back else None,
-                      note_for=sid if back and how == "resume" else None)
+                      note_for=sid if back and how == "resume" else None, perm=perm)
     out.update(applied=True, relay=rec["id"], session=sid)
     out["brief"] = str(relay_dir(real) / rec["brief"])      # the file, once it is written
     lines.append(f"   summary {out['brief']}")
@@ -16491,7 +17565,10 @@ def cmd_pickup(args):
     if checkpoints_on():
         take_checkpoint(real, None, target)
     rel = os.path.join(".aht", "handover", rec["brief"])
-    line = agent_start_line(target, how, sid, _ask(frm_name, rel, how == "resume"))
+    line = agent_start_line(target, how, sid, _ask(frm_name, rel, how == "resume"), pflags,
+                            kimi_p)
+    if target == "kimi" and not kimi_p:
+        out["first_prompt"] = _ask(frm_name, rel, how == "resume")
     out["start_line"] = line
     out["command_line"] = cd_then(real) + line
     if args.no_window:
@@ -16651,54 +17728,12 @@ NOT_SESSIONS = {"agy": AGY_NOT_SESSIONS, "codex": CODEX_NOT_SESSIONS, "vibe": VI
 def agent_processes() -> list:
     """Agent CLIs other than Claude Code that run right now, with their folder
     (Claude Code sessions have records of their own)."""
-    try:
-        r = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True,
-                           timeout=15, cwd="/")
-    except Exception:
-        return []
-    pids = {}
-    for line in r.stdout.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2 or not parts[0].isdigit():
-            continue
-        words = parts[1].split()
-        m = _AGENT_PROC.search(" ".join(words[:2]))
-        if not m or any(f" {f} " in f" {parts[1]} " for f in ("-p", "--prompt", "--print")):
-            continue
-        if m.group(1) in NOT_SESSIONS:
-            at = next((i for i, w in enumerate(words[:2])
-                       if re.search(rf"(?:^|/){m.group(1)}$", w)), 0)
-            if (words[at + 1:at + 2] or [""])[0] in NOT_SESSIONS[m.group(1)]:
-                continue
-        pids[int(parts[0])] = "vibe" if m.group(1) == "vibe-rs" else m.group(1)
-    if not pids:
-        return []
-    cwd = {}
-    if IS_LINUX:
-        for pid in pids:
-            try:
-                cwd[pid] = os.readlink(f"/proc/{pid}/cwd")
-            except OSError:
-                pass
-    else:
-        lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
-        try:
-            r = subprocess.run([lsof, "-a", "-p", ",".join(map(str, pids)), "-d", "cwd", "-Fpn"],
-                               capture_output=True, text=True, timeout=30, cwd="/")
-            pid = None
-            for line in r.stdout.splitlines():
-                if line.startswith("p"):
-                    pid = int(line[1:])
-                elif line.startswith("n") and pid:
-                    cwd[pid] = line[1:]
-        except Exception:
-            pass
     # one row per agent and folder: a CLI often runs as several processes
     rows = {}
-    for pid, agent in pids.items():
-        if pid in cwd and cwd[pid] != "/":
-            rows.setdefault((agent, cwd[pid]), {"agent": agent, "project": cwd[pid],
-                                                "pid": pid, "status": "running"})
+    for r in _agent_proc_rows():
+        if r["cwd"] and r["cwd"] != "/":
+            rows.setdefault((r["agent"], r["cwd"]), {"agent": r["agent"], "project": r["cwd"],
+                                                     "pid": r["pid"], "status": "running"})
     return list(rows.values())
 
 _STATUS_WORDS = {"busy": "working", "shell": "working (a command runs)",
@@ -19461,18 +20496,60 @@ OPINION_NOTE = ("\n\n(You work in a copy of the project, made to compare two age
 def opinions_root() -> Path:
     return aht_home() / "opinions"
 
-def _opinion_cmd(agent: str, exe: str, task: str) -> list:
-    if agent == "claude":       # edits yes, commands no
-        return [exe, "-p", task + OPINION_NOTE, "--permission-mode", "acceptEdits",
-                "--output-format", "json"]
-    return [exe, "-p", task + OPINION_NOTE, "--output-format", "text"]   # -p decides itself
+def _opinion_cmd(agent: str, exe: str, task: str, flags=()) -> list:
+    """An agent's unattended run on the task in its copy (`flags`,
+    opinion_perms').  Kimi's takes no level flag: Kimi refuses them with
+    --prompt, and that run never asks (it runs only at never-ask)."""
+    if agent == "claude":
+        return [exe, "-p", task + OPINION_NOTE] + list(flags) + ["--output-format", "json"]
+    return [exe, "-p", task + OPINION_NOTE, "--output-format", "text"]
+
+def opinion_perms(real: str, agents) -> dict:
+    """The level each agent of a second opinion works in, from the project's
+    latest session -> {perms, agents (those that run), left_out {agent: why},
+    warnings}.  Each works in a throwaway copy, so Claude Code may edit that
+    copy at any level (edits mode at ask); its commands follow the level.
+    Kimi's unattended run never asks, so Kimi takes part only at never-ask."""
+    src = next((x for x in list_sessions(real)
+                if not (x["agent"] == "claude" and _is_scripted(x["file"]))), None) \
+        if os.path.isdir(real) else None
+    lv = session_level(real, src["agent"], src["id"]) if src else None
+    who = (f"the project's latest session ({AGENT_NAMES.get(src['agent'], src['agent'])})"
+           if src else "the project's latest session")
+    perms, run, out, warns = {}, [], {}, []
+    for a in agents:
+        pm = perm_for(a, lv, who)
+        if a == "kimi" and not kimi_reads_ok(pm):
+            out[a] = (f"Kimi Code is left out: its unattended run never asks, and here it "
+                      f"may go no further than {PERM_WORDS[pm['level']]} ({who} runs in "
+                      f"{PERM_WORDS[pm['read']]})")
+            warns.append(out[a])
+            continue
+        if a == "kimi":                 # its run takes no flag: it never asks
+            pm = dict(pm, flags=[])
+        if a == "claude" and pm["level"] == "ask":
+            ed = _perm_flags("claude", "edits") or PERM_FLAGS["claude"]["edits"]
+            pm = dict(pm, level="edits", flags=list(ed),
+                      text=(f"Claude Code edits its copy (edits mode); its commands follow "
+                            f"{who}, which runs in {PERM_WORDS[pm['read']]}"
+                            if pm["read"] == "ask" else
+                            f"Claude Code edits its copy (edits mode); its commands follow "
+                            f"ask mode ({pm['text']})"))
+        perms[a] = pm
+        run.append(a)
+    return {"perms": perms, "agents": run, "left_out": out, "warnings": warns}
 
 def _opinion_meta(rid: str) -> dict:
     return json.loads((opinions_root() / rid / "meta.json").read_text())
 
-def start_second_opinion(project: str, task: str, agents=OPINION_AGENTS) -> dict:
+def start_second_opinion(project: str, task: str, agents=OPINION_AGENTS,
+                         dry_run: bool = False) -> dict:
+    """`dry_run`: the level each would work in, and who would take part,
+    without copying or starting anything."""
     real = os.path.realpath(project)
     res = {"project": real, "applied": False, "blockers": [], "warnings": []}
+    if dry_run:
+        res.update(dry_run=True, perms={}, agents=[], left_out={})
     agents = list(dict.fromkeys(agents))
     if not cfg_get("second_opinion", False):
         res["blockers"].append("a second opinion uses the tokens of both agents, so it is "
@@ -19490,7 +20567,15 @@ def start_second_opinion(project: str, task: str, agents=OPINION_AGENTS) -> dict
                                    f"{' and '.join(AGENT_NAMES[x] for x in OPINION_AGENTS)}")
         elif not agent_cli(a):
             res["blockers"].append(f"{AGENT_NAMES[a]} is not installed on this machine")
-    if res["blockers"]:
+    # they run unattended in the level of the project's latest session
+    if os.path.isdir(real) and all(a in OPINION_AGENTS for a in agents):
+        op = opinion_perms(real, agents)
+        res["warnings"] += op["warnings"]
+        res.update(perms=op["perms"], left_out=op["left_out"], agents=op["agents"])
+        if not op["agents"]:
+            res["blockers"].append("no agent can work on it at this level")
+        agents = op["agents"]
+    if res["blockers"] or dry_run:
         return res
     rid = _stamp()
     keep_out_of_time_machine(opinions_root())
@@ -19507,6 +20592,7 @@ def start_second_opinion(project: str, task: str, agents=OPINION_AGENTS) -> dict
         return res
     _write_json(base / "meta.json", {
         "id": rid, "project": real, "task": task.strip(), "agents": agents,
+        "perms": {a: perm_record(p) for a, p in res["perms"].items()},
         "started": time.time(), "state": {a: {"state": "starting"} for a in agents}})
     _spawn_aht(["second-opinion", "--run", rid])
     res.update(applied=True, id=rid)
@@ -19543,7 +20629,8 @@ def run_second_opinion(rid: str) -> None:
     for a in meta["agents"]:
         with open(base / f"{a}.out", "wb") as out, open(base / f"{a}.err", "wb") as err:
             try:
-                p = subprocess.Popen(_opinion_cmd(a, agent_cli(a), meta["task"]),
+                p = subprocess.Popen(_opinion_cmd(a, agent_cli(a), meta["task"], (
+                    (meta.get("perms") or {}).get(a) or {}).get("flags") or []),
                                      cwd=str(base / a / name), stdin=subprocess.DEVNULL,
                                      stdout=out, stderr=err, env=env)
             except OSError as e:
@@ -19706,12 +20793,17 @@ def cmd_second_opinion(args):
         print("name a project folder, or use --list / --show / --take", file=sys.stderr)
         return 2
     agents = [a.strip() for a in (args.agents or ",".join(OPINION_AGENTS)).split(",")]
-    res = start_second_opinion(args.path, args.task or "", agents)
+    res = start_second_opinion(args.path, args.task or "", agents, dry_run=args.dry_run)
     lines = []
-    if res["applied"]:
-        lines += [f"started {res['id']}: {' and '.join(AGENT_NAMES[a] for a in agents)} "
-                  "work on the task, each in its own copy",
-                  f"   see how it goes:  aht second-opinion --show {res['id']}"]
+    if res["applied"] or (args.dry_run and not res["blockers"]):
+        names = " and ".join(AGENT_NAMES[a] for a in res["agents"])
+        lines += [f"started {res['id']}: {names} work on the task, each in its own copy"
+                  if res["applied"] else
+                  f"would start: {names} on the task, each in its own copy"]
+        lines += [f"   level  {p['text']}" for p in res["perms"].values()]
+        lines += [f"   left out  {w}" for w in res["left_out"].values()]
+        lines += [f"   see how it goes:  aht second-opinion --show {res['id']}"
+                  if res["applied"] else "(dry run — nothing was copied or started)"]
     return _emit(args, res, lines)
 
 # ---- the night shift (USES TOKENS: off unless turned on) ------------------- #
@@ -19768,6 +20860,12 @@ def plan_night_shift(project: str, task: str, start: str, back: str,
     job = {"id": _stamp(), "project": real, "task": (task or "").strip(), "remote": rem,
            "start_at": t0, "back_at": t1, "state": "planned", "log": []}
     res["job"] = job
+    if os.path.isdir(real):     # as of now: the handover reads it again when it starts
+        store = _store_of(real)
+        res["perm"] = perm_for("claude", session_level(real, "claude", latest_session(store)
+                                                       if store else None),
+                               "the project's latest session here", None,
+                               f"Claude Code on {rem or 'the other machine'}")
     if not apply or res["blockers"]:
         return res
     with Lock(timeout=10):
@@ -19922,8 +21020,10 @@ def cmd_night_shift(args):
         fmt = lambda t: time.strftime("%a %H:%M", time.localtime(t))
         lines += [f"{'planned' if res['applied'] else 'would plan'}: {j['project']}",
                   f"   {fmt(j['start_at'])}  hand over to {j['remote']} with the task",
-                  f"   {fmt(j['back_at'])}  take it back (once the session is done)",
-                  f"   {_here()} has to be awake then; the agent there uses its tokens"]
+                  f"   {fmt(j['back_at'])}  take it back (once the session is done)"]
+        if res.get("perm"):
+            lines.append(f"   level  {res['perm']['text']} (read again when it starts)")
+        lines.append(f"   {_here()} has to be awake then; the agent there uses its tokens")
         if not res["applied"] and not res["blockers"]:
             lines.append("(dry run — pass --apply to plan it)")
     return _emit(args, res, lines)
@@ -21018,7 +22118,7 @@ def cmd_goto(args):
 # ---- sessions that need a look: duplicates, stuck ones, outside the app ----- #
 
 KEEP_FLAGS = {"--dangerously-skip-permissions": 0, "--allow-dangerously-skip-permissions": 0,
-              "--permission-mode": 1, "--model": 1, "--effort": 1, "--add-dir": 1,
+              "--permission-mode": 1, "--settings": 1, "--model": 1, "--effort": 1, "--add-dir": 1,
               "--agent": 1, "--chrome": 0, "--no-chrome": 0, "--verbose": 0}
 
 def _claude_flags(cmdline: str) -> list:
@@ -22634,6 +23734,8 @@ def build_parser():
     s.add_argument("--from", dest="agent", choices=OPINION_AGENTS)
     s.add_argument("--discard", metavar="ID", help="remove the copies")
     s.add_argument("--run", metavar="ID", help=argparse.SUPPRESS)
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="the level each agent would work in; nothing starts")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_second_opinion)

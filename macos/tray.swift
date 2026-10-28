@@ -2002,16 +2002,20 @@ func switchText(_ d: [String: Any], mode: String, hook: Bool, machine: String? =
             + "happened since: the work of the latest \(from) session\(on)\(title), the files "
             + "changed and the commits made."
     default:
+        // Kimi below never-ask reads it once the first message is pasted
+        let reads = target == "kimi" && !kimiReads(d) ? "reads it once you paste the first message" : "reads it first"
         body = machine == nil
             ? "\(label) continues the work of the latest \(from) session\(title) in a new "
               + "session. aht writes a summary of where things stood into the project, and "
-              + "\(label) reads it first."
+              + "\(label) \(reads)."
             : "\(label) continues the work of the \(from) session\(on)\(title) in a new "
               + "session here. aht writes a summary of where things stood into the project, "
-              + "and \(label) reads it first."
+              + "and \(label) \(reads)."
     }
     body += " The \(from) session\(on) stays as it is."
-    if target == "kimi" {
+    if target == "kimi" && !kimiReads(d) {
+        body += "\n\n" + KIMI_OPENS
+    } else if target == "kimi" {
         body += "\n\nKimi reads it in a first run of its own; this takes a moment before "
             + "the window opens."
     } else if target == "claude" && mode != "new" && hook {
@@ -2049,9 +2053,172 @@ func switchDoneText(_ d: [String: Any], project: String) -> String {
     default:
         said = "\(label) took over; its window is open. The summary it read: \(file)"
     }
+    // Kimi below never-ask: its window opened without reading; the line to
+    // paste is shown under this, with a Copy button (FirstPromptBox)
+    if kimiFirst(d) != nil && d["mode"] as? String != "brief-only" {
+        said = "\(label)'s window is open. The summary is in the project: \(file)"
+    }
     if let f = fell { said = f + "\n\n" + said }
     for w in (d["warnings"] as? [String]) ?? [] { said += "\n⚠ " + w }
     return said
+}
+
+// ---- Kimi below never-ask ----------------------------------------------------
+// Kimi's run of its own that reads the summary first (`-p`) always runs in
+// never-ask, so the core uses it only at never-ask (`kimi_reads: true`). Below
+// it, Switch, Hand Back and Pick Up → Open in Kimi open Kimi's own session
+// without that run (`kimi_reads: false`) and give `first_prompt`: the one line
+// that asks it to read the summary, for the user to paste.
+
+let KIMI_OPENS = "Kimi opens without reading the summary: its run that reads it first works only in "
+    + "never-ask mode, so you paste the first message aht shows you."
+let KIMI_PASTE = "Kimi opens without reading the summary. Paste this as your first message:"
+
+/// Whether Kimi reads the summary in a run of its own first: the core's
+/// `kimi_reads` (when the answer speaks of Kimi), else Kimi's level from the
+/// dry run (never-ask: it does); an older core that says neither: it does.
+func kimiReads(_ d: [String: Any]) -> Bool {
+    let own = firstText((d["perm"] as? [String: Any])?["agent"], d["target"])
+    if let b = d["kimi_reads"] as? Bool, own == nil || own == "kimi" { return b }
+    return permInfo(d, agent: "kimi").map { $0.level == "never" } ?? true
+}
+
+/// An answer that opened (or starts) Kimi without its reading run: the line
+/// to paste as its first message; nil otherwise.
+func kimiFirst(_ d: [String: Any]) -> String? {
+    guard d["kimi_reads"] as? Bool == false,
+          let t = (d["first_prompt"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !t.isEmpty else { return nil }
+    return t
+}
+
+// ---- the permission level the next agent starts in --------------------------
+// Switch, Hand Back, Pick Up, Bring Here, Hand Over and the night shift (and
+// their dry runs) carry `perm`: {agent, level, sandbox, flags, from, read,
+// text}. Levels in aht's words: ask (each agent's default), edits (edits
+// run, commands ask), auto (routine runs, risky asks), never (never asks).
+// `read`: the level of the session the work comes from; `from`: how aht read
+// it (command_line, rollout, transcript, settings, relay, unknown). The next
+// agent starts in its own equivalent of it, or in the next stricter level it
+// has (`agent_permissions`: "follow", a fixed level, or "max:<level>"); aht
+// never raises it by itself. Never-ask is shown with a caution, not stopped:
+// the user chose it.
+
+let PERM_LEVELS = ["ask", "edits", "auto", "never"]
+let PERM_NAME = ["ask": "ask mode", "edits": "edits mode", "auto": "auto mode", "never": "never-ask mode"]
+let PERM_SAYS = ["ask": "It asks before it acts, as it does by default.",
+                 "edits": "Edits run without asking; commands ask first.",
+                 "auto": "Routine steps run without asking; risky ones ask first.",
+                 "never": "It never asks: every edit and command runs."]
+/// Codex's never-ask flags that keep its sandbox (Settings ▸ Permissions).
+let CODEX_SANDBOXED = ["-a", "never", "-s", "workspace-write"]
+/// Settings ▸ Permissions: what the next agent starts in.
+let PERM_CHOICES = [("follow", "Follow the session"), ("ask", "Always: ask mode"),
+                    ("edits", "Always: edits mode"), ("auto", "Always: auto mode"),
+                    ("never", "Always: never-ask mode"), ("max:edits", "At most: edits mode"),
+                    ("max:auto", "At most: auto mode")]
+
+func permRank(_ level: String?) -> Int { level.flatMap { PERM_LEVELS.firstIndex(of: $0) } ?? -1 }
+
+/// The Permissions setting: "follow", a level, or "max:<level>".
+func permSetting(_ config: [String: Any]) -> String {
+    let v = config["agent_permissions"] as? String ?? "follow"
+    return PERM_NAME[v] != nil || (v.hasPrefix("max:") && PERM_NAME[String(v.dropFirst(4))] != nil) ? v : "follow"
+}
+
+/// A level in words: "never-ask mode inside its sandbox".
+func permName(_ level: String, sandbox: Bool = false) -> String {
+    (PERM_NAME[level] ?? level) + (sandbox && level == "never" ? " inside its sandbox" : "")
+}
+
+/// The level an agent starts in, from a dry run. `text`: the core's
+/// sentence, shown as given; `was`: the level of the session the work comes
+/// from; `fell`: no exact match, so a stricter level; `other`: the core named
+/// no level for this agent (Pick Up without --open), only the level of the
+/// session there (`source.perm`), so its flags are its own (nil).
+struct PermInfo: Equatable {
+    let level: String
+    let sandbox: Bool
+    let flags: [String]?
+    let text: String?
+    let was: String
+    let fell: Bool
+    let other: Bool
+}
+
+/// nil: no level known (an older core, or nothing starts: Summary Only).
+func permInfo(_ d: [String: Any], agent: String?, setting: String = "follow") -> PermInfo? {
+    let own = agent.flatMap { (d["perms"] as? [String: Any])?[$0] as? [String: Any] }
+    var p = own ?? (d["perm"] as? [String: Any])
+    if let q = p, own == nil, let a = agent, let planned = firstText(q["agent"], d["target"]), planned != a { p = nil }
+    var other = false
+    if p == nil, let src = (d["source"] as? [String: Any])?["perm"] as? [String: Any],
+       let lv = src["level"] as? String, PERM_NAME[lv] != nil {
+        p = ["level": lv, "sandbox": src["sandbox"] as? Bool ?? false, "read": lv, "from": src["from"] ?? "unknown"]
+        other = true
+    }
+    guard let p = p, let level = p["level"] as? String, PERM_NAME[level] != nil else { return nil }
+    let text = other ? nil : (p["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let said = (text?.isEmpty ?? true) ? nil : text
+    let was = (p["read"] as? String).flatMap { PERM_NAME[$0] != nil ? $0 : nil } ?? level
+    let cap = setting.hasPrefix("max:") ? String(setting.dropFirst(4)) : nil
+    let meant = PERM_NAME[setting] != nil ? setting : cap.map { permRank(was) > permRank($0) ? $0 : was } ?? was
+    let fell = !other && (said.map { $0.contains("the next stricter level") } ?? (permRank(level) < permRank(meant)))
+    var flags: [String]? = nil
+    if !other { flags = ((p["flags"] as? [Any]) ?? []).map { "\($0)" } }
+    return PermInfo(level: level, sandbox: p["sandbox"] as? Bool == true && level == "never", flags: flags,
+                    text: said, was: was, fell: fell, other: other)
+}
+
+/// A flag as a shell would need it written.
+func shellWord(_ w: String) -> String {
+    w.range(of: "^[A-Za-z0-9_@%+=:,./-]+$", options: .regularExpression) != nil ? w
+        : "'" + w.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// The line (the core's text as given; words of our own where it gave
+/// none), the no-exact-match note, and the flags in words. `source`: the
+/// agent of the session the work comes from, which `leaving` names (its
+/// label, or nil); `on`: the machine the next agent starts on.
+func permWords(_ p: PermInfo, agent: String, source: String? = nil, on: String? = nil,
+               leaving: (String?) -> String) -> (line: String, fell: String?, flags: String) {
+    let label = AGENT_LABEL[agent] ?? agent
+    let who = label + (on.map { " on \($0)" } ?? "")
+    let them = leaving(source.map { AGENT_LABEL[$0] ?? $0 })
+    let line: String
+    if let t = p.text {
+        line = t
+    } else if p.other {
+        line = them.prefix(1).uppercased() + them.dropFirst() + " runs in " + permName(p.was, sandbox: p.sandbox)
+            + ": \(who) starts in its own equivalent, or the next stricter level it has."
+    } else if p.fell {
+        line = "\(who) starts in \(permName(p.level, sandbox: p.sandbox)), the next stricter level it has "
+            + "(\(them) runs in \(PERM_NAME[p.was] ?? p.was))."
+    } else {
+        line = "\(who) starts in \(permName(p.level, sandbox: p.sandbox)), like \(them)."
+    }
+    let fell = p.fell ? "No exact match: \(label) starts in the next stricter level it has." : nil
+    let flags = p.flags.map { $0.isEmpty ? "No flags: \(label)'s own default." : "Flags: " + $0.map(shellWord).joined(separator: " ") }
+        ?? "\(label) gets its own flags for it."
+    return (line, fell, (PERM_SAYS[p.level] ?? "") + " " + flags)
+}
+
+/// Codex's never-ask flags as set (`agent_permission_flags`.codex.never):
+/// "full" (the built-in full bypass), "sandbox", or "own" (other flags).
+func codexNever(_ config: [String: Any]) -> String {
+    let f = (((config["agent_permission_flags"] as? [String: Any])?["codex"] as? [String: Any])?["never"] as? [Any])?
+        .map { "\($0)" } ?? []
+    return f.isEmpty ? "full" : f == CODEX_SANDBOXED ? "sandbox" : "own"
+}
+
+/// `agent_permission_flags` with Codex's never-ask choice made; every other
+/// agent's and level's flags as they were.
+func withCodexNever(_ config: [String: Any], sandbox: Bool) -> [String: Any] {
+    var all = (config["agent_permission_flags"] as? [String: Any]) ?? [:]
+    var codex = (all["codex"] as? [String: Any]) ?? [:]
+    if sandbox { codex["never"] = CODEX_SANDBOXED } else { codex.removeValue(forKey: "never") }  // the built-in full bypass
+    if codex.isEmpty { all.removeValue(forKey: "codex") } else { all["codex"] = codex }
+    return all
 }
 
 // ---- Pick Up and Leave a Note: work across machines -------------------------
@@ -2264,6 +2431,7 @@ func pickupAgent(_ d: [String: Any], installed: [String]) -> String? {
 /// Open in …: the switch dialog's words for the agent picked.
 func pickupOpenText(_ d: [String: Any], agent: String, machine: String, hook: Bool) -> String {
     var x = d
+    if firstText(d["target"]) != agent { x["kimi_reads"] = nil }   // it spoke of the agent planned
     x["target"] = agent
     x["warnings"] = []                  // the sheet shows them once, above
     return switchText(x, mode: pickupIsBack(d) ? "back" : "new", hook: hook, machine: machine)
@@ -2271,10 +2439,14 @@ func pickupOpenText(_ d: [String: Any], agent: String, machine: String, hook: Bo
 
 /// What opening costs: one turn of the agent; nil for a Claude session that
 /// hears through aht's hook (the switch dialog's words say so already).
-func openCost(_ agent: String, back: Bool, hook: Bool, machine: String? = nil) -> String? {
+func openCost(_ agent: String, back: Bool, hook: Bool, machine: String? = nil, kimiReads: Bool = true) -> String? {
     let label = AGENT_LABEL[agent] ?? agent
     let copy = "Copy the Start Line writes the summary here and a copy of it on \(machine ?? "the other machine"), "
         + "and puts the line that starts \(label) with it on the clipboard"
+    if agent == "kimi" && !kimiReads {
+        return "Reading it is Kimi's first turn, which uses tokens. " + copy + "; nothing runs until you "
+            + "paste it, and then you paste the first message aht shows you into Kimi."
+    }
     if agent == "kimi" {
         return "Kimi reads the summary in a run of its own first, for Open in and for Copy the Start "
             + "Line alike: that turn uses tokens. " + copy + "; nothing else runs until you paste it."
@@ -2348,7 +2520,11 @@ func pickupDoneText(_ d: [String: Any], machine: String, project: String, copied
     let opened = (d["opened"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         ?? (d["opened"] as? Bool == true ? pickupTarget(d) ?? "" : nil)
     var said: String
-    if let o = opened {
+    if let o = opened, kimiFirst(d) != nil {
+        // Kimi below never-ask: open, not having read it (FirstPromptBox)
+        said = "Picked up from \(machine): \(AGENT_LABEL[o] ?? "Kimi Code") is open here. The summary is here"
+            + (file.map { ": \($0)." } ?? ".")
+    } else if let o = opened {
         let label = AGENT_LABEL[o] ?? (o.isEmpty ? "The agent" : o)
         said = pickupIsBack(d)
             ? "Picked up from \(machine): \(label)'s own session is open again and reads what "
@@ -2570,6 +2746,7 @@ struct OpinionResult: Identifiable {
     let seconds: Int?
     let cost: Double?
     let files: [ChangedFile]
+    var perm: [String: Any]? = nil  // the level it runs in ({level, sandbox, flags}), unattended
 }
 
 struct OpinionView: Identifiable {
@@ -2582,6 +2759,31 @@ struct OpinionView: Identifiable {
     var changedMeanwhile: [String] = []
     var taken: String?
     var finished = true
+    var started: [String: Any] = [:]    // what starting it answered: each agent's level (`perms`)
+}
+
+/// The second opinion's dry run (`second-opinion <path> --task … --dry-run
+/// --json`: {perms: {agent: perm}, warnings, blockers}) for the task typed:
+/// the level each agent works in, before anything starts.
+struct OpinionDry {
+    let path: String
+    let task: String
+    let d: [String: Any]
+}
+
+/// What the dialog shows beside Start, from a dry run or from what starting
+/// it answered: the agents with a level (their perm.text through PermLine),
+/// the warnings (Kimi left out below never-ask, say), and what stops the task.
+/// `typed`: a task is typed; with none, the core's "say what both should do
+/// (--task)" is no news.
+func opinionDryArgs(_ path: String, task: String) -> [String] {
+    ["second-opinion", path, "--task=" + task.trimmingCharacters(in: .whitespacesAndNewlines), "--dry-run", "--json"]
+}
+
+func opinionLevels(_ d: [String: Any], typed: Bool) -> (agents: [String], warnings: [String], blockers: [String]) {
+    let agents = ((d["perms"] as? [String: Any]) ?? [:]).filter { $0.value is [String: Any] }.map { $0.key }.sorted()
+    let stops = nameList(d["blockers"]).filter { typed || !$0.contains("--task") }
+    return (agents, nameList(d["warnings"]), stops)
 }
 
 struct NightJob: Identifiable {
@@ -2598,6 +2800,7 @@ struct NightShiftView: Identifiable {
     let id = UUID()
     let project: Project
     let jobs: [NightJob]
+    var dry: [String: Any] = [:]    // a dry run: the level the session there starts in (`perm`)
 }
 
 /// One session of a project (`aht sessions <project>`): a branch has the time it
@@ -2709,6 +2912,10 @@ final class AppModel: ObservableObject {
     @Published var percent: Double?
     @Published var notes: [String: String] = [:]    // per project: how the last action went
     @Published var summaries: [String: String] = [:] // … and the summary a switch wrote
+    @Published var firstPrompts: [String: String] = [:] // … and Kimi's first message to paste (below never-ask)
+    @Published var opinionDry: OpinionDry?           // the second opinion's dry run for the task typed
+    private var opinionAsked = 0
+    private var opinionWait: DispatchWorkItem?
     @Published var checks: [String: [Check]] = [:]  // per machine
     @Published var movers: [String: Mover] = [:]    // what each machine's check said copies files
     @Published var checkError: [String: String] = [:]
@@ -2981,6 +3188,7 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.async {
             self.notes[path] = text
             self.summaries[path] = nil          // it belonged to the note before
+            self.firstPrompts[path] = nil
         }
     }
 
@@ -3894,7 +4102,8 @@ final class AppModel: ObservableObject {
                 + (briefOnly ? ["--brief-only"] : s.mode == "resume" ? ["--resume"] : [])
         }
         let what = briefOnly ? "writing the summary…"
-            : s.target == "kimi" ? "\(label) is reading the summary…" : "opening \(label)…"
+            : s.target == "kimi" && kimiReads(s.plans[s.mode] ?? [:]) ? "\(label) is reading the summary…"
+            : "opening \(label)…"
         busy(what) {
             let d = ahtJSON(args + ["--apply", "--json"]) ?? [:]
             if let why = self.problems(d) {
@@ -3906,6 +4115,10 @@ final class AppModel: ObservableObject {
             if let b = d["brief"] as? String, !b.isEmpty {
                 let f = summaryFile(b, in: p.path)
                 DispatchQueue.main.async { self.summaries[p.path] = f }
+            }
+            // Kimi below never-ask: the first message to paste, with a Copy button
+            if let first = kimiFirst(d) {
+                DispatchQueue.main.async { self.firstPrompts[p.path] = first }
             }
         }
     }
@@ -4478,14 +4691,38 @@ final class AppModel: ObservableObject {
 
     func openOpinion(_ p: Project) {
         guard tokensOK("second_opinion", "second opinions") else { return }
+        opinionDry = nil
         loadOpinion(p, run: nil)
     }
 
-    func loadOpinion(_ p: Project, run: String?) {
+    /// The second opinion's dry run for the task typed: the level each agent
+    /// works in and the warnings, before Start; nothing starts. Asked as the
+    /// dialog opens (`wait` 0) and a moment after typing stops; an answer for
+    /// text typed over since is dropped.
+    func opinionDryRun(_ p: Project, task: String, wait: Double = 0.5) {
+        opinionWait?.cancel()
+        opinionAsked += 1
+        let n = opinionAsked, t = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !demo else { return }
+        let w = DispatchWorkItem {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let d = ahtJSON(opinionDryArgs(p.path, task: t)) ?? [:]
+                DispatchQueue.main.async {
+                    guard n == self.opinionAsked, self.opinion?.project.path == p.path else { return }
+                    self.opinionDry = OpinionDry(path: p.path, task: t, d: d)
+                }
+            }
+        }
+        opinionWait = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: w)
+    }
+
+    func loadOpinion(_ p: Project, run: String?, started: [String: Any] = [:]) {
         DispatchQueue.global(qos: .userInitiated).async {
             let all = (ahtJSON(["second-opinion", "--list", "--json"])?["opinions"]
                        as? [[String: Any]]) ?? []
             var v = OpinionView(project: p)
+            v.started = started
             let f = DateFormatter()
             f.dateStyle = .short
             f.timeStyle = .short
@@ -4507,7 +4744,8 @@ final class AppModel: ObservableObject {
                                          answer: r["answer"] as? String ?? "",
                                          seconds: r["seconds"] as? Int,
                                          cost: (r["cost_usd"] as? NSNumber)?.doubleValue,
-                                         files: ((r["files"] as? [[String: Any]]) ?? []).map { changedFile($0) })
+                                         files: ((r["files"] as? [[String: Any]]) ?? []).map { changedFile($0) },
+                                         perm: (d["perms"] as? [String: Any])?[a] as? [String: Any])
                 }
                 v.finished = !v.results.contains { ["working", "starting"].contains($0.state) }
             }
@@ -4523,7 +4761,7 @@ final class AppModel: ObservableObject {
                     _ = alert("Not started", why)
                     return
                 }
-                self.loadOpinion(p, run: d["id"] as? String)
+                self.loadOpinion(p, run: d["id"] as? String, started: d)
             }
         }
     }
@@ -4578,7 +4816,10 @@ final class AppModel: ObservableObject {
     }
 
     func loadNight(_ p: Project) {
+        let to = machine.map { ["--to=" + $0] } ?? []
         DispatchQueue.global(qos: .userInitiated).async {
+            // a dry run, for the level the session there starts in
+            let dry = ahtJSON(["night-shift", p.path, "--start", "now", "--back", "07:00", "--json"] + to) ?? [:]
             let jobs = ((ahtJSON(["night-shift", "--list", "--json"])?["jobs"] as? [[String: Any]]) ?? [])
                 .filter { ($0["project"] as? String) == p.path }
                 .map { j in
@@ -4588,7 +4829,7 @@ final class AppModel: ObservableObject {
                              remote: j["remote"] as? String ?? "", task: j["task"] as? String ?? "",
                              log: (j["log"] as? [String]) ?? [])
                 }
-            DispatchQueue.main.async { self.night = NightShiftView(project: p, jobs: jobs.reversed()) }
+            DispatchQueue.main.async { self.night = NightShiftView(project: p, jobs: jobs.reversed(), dry: dry) }
         }
     }
 
@@ -4908,6 +5149,33 @@ final class AppModel: ObservableObject {
                                                              : value as Any
         background { aht(["config", "--set", "\(key)=\(value)", "--no-reload"]) }
         onChange?()
+    }
+
+    /// A setting that is a table or a list (`agent_permission_flags`), as JSON.
+    func setJSON(_ key: String, _ value: Any) {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else { return }
+        setChecked(key, text, value)
+    }
+
+    /// A setting the core may refuse (exit 2: agent_permission_flags that ask
+    /// for more than their level, say): its words, and the setting as it was.
+    func setChecked(_ key: String, _ text: String, _ value: Any) {
+        let was = config[key]
+        config[key] = value
+        onChange?()
+        guard !demo else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript(), "config", "--set", "\(key)=\(text)", "--no-reload"])
+            DispatchQueue.main.async {
+                if !r.ok {
+                    self.config[key] = was
+                    let why = (r.err + r.out).trimmingCharacters(in: .whitespacesAndNewlines)
+                    _ = alert("The setting was not saved", why.isEmpty ? "aht refused it." : why)
+                }
+                self.refresh()
+            }
+        }
     }
 
     /// A chime picked in Settings plays at once, at the volume set.
@@ -5914,6 +6182,9 @@ struct HandoverSheet: View {
             Text(plan.body).frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+            PermLine(d: plan.dry, agent: firstText(plan.dry["agent"]) ?? "claude",
+                     source: firstText(plan.dry["agent"]) ?? "claude", on: plan.remote,
+                     leaving: { "the \($0.map { $0 + " " } ?? "")session here" })
             CrossingNotes(d: plan.dry, receiver: plan.remote, keeper: plan.remote)
             Text("A task to start on over there (optional)").padding(.top, 6)
             TextEditor(text: $plan.task)
@@ -6133,6 +6404,13 @@ struct BringSheet: View {
                     } else {
                         Text(bringText(v.dry, machine: v.machine)).fixedSize(horizontal: false, vertical: true)
                             .textSelection(.enabled)
+                        // the level its session opens in here, like it ran there
+                        let ses = (v.dry["session"] as? [String: Any]) ?? [:]
+                        if pickupProblems(v.dry) == nil, firstText(ses["id"]) != nil {
+                            let a = firstText(ses["agent"], v.dry["agent"]) ?? "claude"
+                            PermLine(d: v.dry, agent: a, source: a,
+                                     leaving: { "the \($0.map { $0 + " " } ?? "")session on \(v.machine)" })
+                        }
                         CrossingNotes(d: v.dry, receiver: "this Mac", keeper: "this Mac")
                         BlockerList(d: v.dry)
                         if idleBlock(v.dry) || v.allowIdle { idle(v) }
@@ -6356,6 +6634,7 @@ struct DetailNotes: View {
                     }
                 }
             }
+            if let first = m.firstPrompts[p.path] { FirstPromptBox(line: first) }
         }
     }
 }
@@ -6490,6 +6769,79 @@ struct BringMenu: View {
 
 /// Switch Agent and Hand Back: what the dry run found for the way picked
 /// (a new session or the agent's own one), then Switch, or Summary Only.
+/// The level the next agent starts in, from a dry run's `perm`: the line,
+/// the no-exact-match note, and the flags in small text; a never-ask level
+/// in a caution box (no blocker: the user chose it). Nothing from an older
+/// core that sends no `perm`.
+struct PermLine: View {
+    @EnvironmentObject var m: AppModel
+    let d: [String: Any]
+    let agent: String
+    var source: String? = nil
+    var on: String? = nil
+    var later: String? = nil
+    let leaving: (String?) -> String
+
+    var body: some View {
+        if let p = permInfo(d, agent: agent, setting: permSetting(m.config)) {
+            let w = permWords(p, agent: agent, source: source, on: on, leaving: leaving)
+            let never = p.level == "never"
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: never ? "exclamationmark.triangle.fill" : "hand.raised")
+                    .foregroundColor(never ? .orange : .secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(w.line).fontWeight(never ? .semibold : .regular)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let f = w.fell {
+                        Text(f).font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(w.flags).font(.caption).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    if let l = later {
+                        Text(l).font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(never ? 8 : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(never ? Color.orange.opacity(0.12) : Color.clear))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(never ? Color.orange.opacity(0.7) : Color.clear))
+            .help(never ? "Not a stop: you chose this level. Settings ▸ Permissions sets what the next agent starts in."
+                        : "Settings ▸ Permissions sets what the next agent starts in.")
+        }
+    }
+}
+
+/// Kimi below never-ask: it opened (or starts) without reading the summary;
+/// the line to paste as its first message, with a Copy button.
+struct FirstPromptBox: View {
+    let line: String
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(KIMI_PASTE).font(.callout.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .top, spacing: 8) {
+                Text(line).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button(copied ? "Copied" : "Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(line, forType: .string)
+                    copied = true
+                }
+                .controlSize(.small)
+                .help("Put the first message on the clipboard, to paste into Kimi")
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.accentColor.opacity(0.35)))
+    }
+}
+
 struct SwitchSheet: View {
     @EnvironmentObject var m: AppModel
     @State var plan: SwitchPlan
@@ -6516,6 +6868,13 @@ struct SwitchSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+            if blocked == nil {
+                // Hand Back leaves the agent that has the work now
+                PermLine(d: d, agent: firstText(d["target"]) ?? plan.target,
+                         source: plan.back ? plan.project.handBack?.to
+                                           : firstText((d["source"] as? [String: Any])?["agent"]),
+                         leaving: { "the \($0.map { $0 + " " } ?? "")session you are leaving" })
+            }
             if blocked == nil, let line = d["start_line"] as? String, !line.isEmpty {
                 Text(line).font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
                     .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
@@ -6734,9 +7093,11 @@ struct PickupSheet: View {
         if !agent.isEmpty {
             Text(pickupOpenText(v.dry, agent: agent, machine: v.machine, hook: m.hookOn))
                 .font(.callout).fixedSize(horizontal: false, vertical: true)
-            if let cost = openCost(agent, back: back, hook: m.hookOn, machine: v.machine) {
+            if let cost = openCost(agent, back: back, hook: m.hookOn, machine: v.machine, kimiReads: kimiReads(v.dry)) {
                 Text(cost).font(.caption).foregroundColor(.secondary)
             }
+            PermLine(d: v.dry, agent: agent, source: firstText((v.dry["source"] as? [String: Any])?["agent"]),
+                     leaving: { "the \($0.map { $0 + " " } ?? "")session on \(v.machine)" })
         }
     }
 
@@ -6750,6 +7111,8 @@ struct PickupSheet: View {
                 .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
                 .help("The line that starts the agent here with the summary")
         }
+        // Kimi below never-ask: it starts without reading the summary
+        if v.kind == "pickup", pickupProblems(d) == nil, let first = kimiFirst(d) { FirstPromptBox(line: first) }
     }
 
     @ViewBuilder func footer(_ v: PickupView) -> some View {
@@ -6778,7 +7141,8 @@ struct PickupSheet: View {
                         .disabled(!ready || agent == nil || !(m.agentCLIs.contains(agent ?? "") || back))
                         .help("Write the summary here and a copy of it on \(v.machine), and put the line "
                               + "that starts \(label) with it on the clipboard; nothing opens"
-                              + (agent == "kimi" ? " (Kimi reads it in a run of its own first: tokens)" : ""))
+                              + (agent == "kimi" ? (kimiReads(v.dry) ? " (Kimi reads it in a run of its own first: tokens)"
+                                                                     : " (then paste the first message aht shows you into Kimi)") : ""))
                     Button(back ? "Open \(label)'s Session" : "Open in \(label)") {
                         m.applyPickup(open: agent)
                     }
@@ -7699,6 +8063,13 @@ struct OpinionSheet: View {
                     .frame(width: 360)
                 }
             }
+            let typed = task.trimmingCharacters(in: .whitespacesAndNewlines)
+            // beside Start: what starting it answered until another task is
+            // typed, else the dry run (the latest; its blockers only for this text)
+            let dry = m.opinionDry.flatMap { $0.path == v.project.path ? $0 : nil }
+            let shown = typed.isEmpty && !v.started.isEmpty ? v.started : (dry?.d ?? [:])
+            let now = dry.map { $0.task == typed } ?? false
+            let lv = opinionLevels(shown, typed: !typed.isEmpty && now)
             HStack(alignment: .top) {
                 TextField("A task for both, e.g. make the parser accept empty lines",
                           text: $task, axis: .vertical)
@@ -7707,13 +8078,26 @@ struct OpinionSheet: View {
                     m.startOpinion(v.project, task: task)
                     task = ""
                 }
-                .disabled(task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(typed.isEmpty || (now && !lv.blockers.isEmpty))
             }
-            Text("Claude Code and Kimi Code each get a copy of the project and the same task; "
-                 + "the project itself stays untouched until you pick one. This uses both "
-                 + "agents' tokens. Claude may edit files but not run commands; Kimi's "
-                 + "non-interactive mode may also run commands it decides on.")
+            Text("Two agents each get a throwaway copy of the project and the same task; the project "
+                 + "itself stays untouched until you pick one. This uses both agents' tokens. Claude Code "
+                 + "may edit files in its copy at any level; the commands it runs follow the level of the "
+                 + "project's latest session, never higher. Kimi Code's run on its own never asks, so Kimi "
+                 + "takes part only when that session runs in never-ask mode.")
                 .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            // the level each agent works in, in the core's words, and the warnings
+            ForEach(lv.agents, id: \.self) { a in
+                PermLine(d: shown, agent: a, leaving: { _ in "the project's latest session" })
+            }
+            ForEach(lv.warnings, id: \.self) { w in
+                Text("⚠ " + w).font(.callout).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if !lv.blockers.isEmpty {
+                Text("Not possible now:\n\n" + lv.blockers.map { "• " + $0 }.joined(separator: "\n\n"))
+                    .font(.callout).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
             if v.current != nil {
                 Text("Task: " + v.task).font(.callout).lineLimit(2)
                 HStack(alignment: .top, spacing: 12) {
@@ -7739,6 +8123,15 @@ struct OpinionSheet: View {
         .onReceive(tick) { _ in
             if !v.finished, let r = v.current { m.loadOpinion(v.project, run: r) }
         }
+        .onAppear {
+            // the dry run as the dialog opens, unless one for this project is in hand
+            if v.started.isEmpty && m.opinionDry?.path != v.project.path { m.opinionDryRun(v.project, task: task, wait: 0) }
+        }
+        .onChange(of: task) { t in
+            if !(t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !v.started.isEmpty) {
+                m.opinionDryRun(v.project, task: t)
+            }
+        }
     }
 
     func column(_ r: OpinionResult) -> some View {
@@ -7752,6 +8145,12 @@ struct OpinionSheet: View {
             HStack {
                 Text(label).bold()
                 Text(state).font(.caption).foregroundColor(.secondary)
+                if let lv = r.perm?["level"] as? String, PERM_NAME[lv] != nil {
+                    let flags = ((r.perm?["flags"] as? [Any]) ?? []).map { shellWord("\($0)") }.joined(separator: " ")
+                    Text(permName(lv, sandbox: r.perm?["sandbox"] as? Bool == true)).font(.caption)
+                        .foregroundColor(lv == "never" ? .orange : .secondary)
+                        .help(flags.isEmpty ? "No flags" : "Flags: " + flags)
+                }
                 Spacer()
                 if v.taken == r.id {
                     Text("taken").font(.caption).foregroundColor(.green)
@@ -7816,6 +8215,11 @@ struct NightShiftSheet: View {
                 .disabled(task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                           || m.machine == nil)
             }
+            PermLine(d: v.dry, agent: firstText(v.dry["agent"]) ?? "claude",
+                     source: firstText(v.dry["agent"]) ?? "claude",
+                     on: firstText((v.dry["job"] as? [String: Any])?["remote"]) ?? m.machine,
+                     later: "aht reads the level again when the shift starts.",
+                     leaving: { "the \($0.map { $0 + " " } ?? "")session here" })
             Divider()
             Text("Planned and past").font(.subheadline.bold())
             if v.jobs.isEmpty {
@@ -8969,6 +9373,58 @@ struct WelcomeView: View {
     }
 }
 
+/// Settings ▸ Permissions: the level the next agent starts in (`agent_permissions`:
+/// follow, a fixed level, or at most one), and Codex's never-ask flags
+/// (`agent_permission_flags`.codex.never: the built-in full bypass, or
+/// never asking inside Codex's sandbox).
+struct PermissionsSettings: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let now = m.config["agent_permissions"] as? String ?? "follow"
+        var levels = PERM_CHOICES
+        if !levels.contains(where: { $0.0 == now }) { levels.append((now, now)) }
+        let cx = codexNever(m.config)
+        let own = (((m.config["agent_permission_flags"] as? [String: Any])?["codex"] as? [String: Any])?["never"] as? [Any])?
+            .map { shellWord("\($0)") }.joined(separator: " ") ?? ""
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("The agent that continues the work starts in its own equivalent of the session's "
+                 + "permission level; aht never raises it by itself.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Text("The next agent starts in").frame(width: 170, alignment: .leading)
+                Picker("", selection: Binding(get: { now }, set: { m.setChecked("agent_permissions", $0, $0) })) {
+                    ForEach(levels, id: \.0) { Text($0.1).tag($0.0) }
+                }
+                .labelsHidden().fixedSize()
+                Spacer()
+            }
+            if now == "never" {
+                Label("Every agent aht starts or continues then never asks, also after a session that asked.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Text("Codex's never-ask mode").frame(width: 170, alignment: .leading)
+                Picker("", selection: Binding(get: { cx }, set: { v in
+                    if v != "own" { m.setJSON("agent_permission_flags", withCodexNever(m.config, sandbox: v == "sandbox")) }
+                })) {
+                    Text("Full bypass (default)").tag("full")
+                    Text("Never ask, keep Codex's sandbox").tag("sandbox")
+                    if cx == "own" { Text("Your own flags: " + own).tag("own") }
+                }
+                .labelsHidden().fixedSize()
+                Spacer()
+            }
+            Text("Full bypass: --dangerously-bypass-approvals-and-sandbox, the closest to Claude Code's "
+                 + "skip-permissions. Keeping the sandbox: " + CODEX_SANDBOXED.joined(separator: " ")
+                 + ": Codex never asks, but writes only inside the project.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var m: AppModel
     @State private var maxFiles = ""
@@ -9310,6 +9766,9 @@ struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                GroupBox(label: HStack(spacing: 6) { Text("Permissions"); HelpButton("The permission level follows the work") }) {
+                    PermissionsSettings().padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 GroupBox(label: HStack(spacing: 6) { Text("Backups on another machine"); HelpButton("Backups") }) {
                     VStack(alignment: .leading, spacing: 8) {
@@ -12395,6 +12854,212 @@ if CommandLine.arguments.contains("--selftest") {
         print("PHASE 7 SAMPLES not checked (" + (dir7.isEmpty ? "AHT_FIXTURES_PHASE7 names no folder"
                                                        : "no samples in \(dir7) yet") + ")")
     }
+    // Phase 7b: the permission level follows the work. The core's `perm`
+    // ({agent, level, sandbox, flags, from, read, text}) through the app's
+    // reader and words: its text as given, the no-exact-match note, the
+    // flags; Pick Up's level of the session there; Settings' Codex never-ask
+    // choice as agent_permission_flags
+    let leaving7b = { (a: String?) in "the \(a.map { $0 + " " } ?? "")session you are leaving" }
+    func words7b(_ perm: Any?, _ agent: String, _ extra: [String: Any] = [:], source: String? = "claude",
+                 setting: String = "follow") -> (line: String, fell: String?, flags: String)? {
+        var d = extra
+        d["perm"] = perm
+        return permInfo(d, agent: agent, setting: setting).map { permWords($0, agent: agent, source: source, leaving: leaving7b) }
+    }
+    func perm7(_ agent: String, _ level: String, _ read: String, _ flags: [Any], _ text: String? = nil,
+               _ extra: [String: Any] = [:]) -> [String: Any] {
+        var d: [String: Any] = ["agent": agent, "level": level, "sandbox": false, "flags": flags, "from": "command_line",
+                                "read": read]
+        if let t = text { d["text"] = t }
+        return d.merging(extra) { $1 }
+    }
+    let neverP = perm7("codex", "never", "never", ["--dangerously-bypass-approvals-and-sandbox"],
+                       "Codex starts in never-ask mode, like the Claude Code session you are leaving")
+    let kimiT = "Kimi Code starts in ask mode, the next stricter level: it has no edits mode (the Claude Code session you "
+        + "are leaving runs in edits mode)"
+    let capT = "Codex starts in auto mode: agent_permissions caps it there (the Claude Code session you are leaving runs "
+        + "in never-ask mode)"
+    let sbxT = "Claude Code on box starts in never-ask mode inside its sandbox, like the session here"
+    let w7b = [
+        words7b(neverP, "codex"),
+        words7b(perm7("kimi", "ask", "edits", [], kimiT), "kimi"),
+        words7b(perm7("codex", "auto", "never", ["-a", "on-request"], capT), "codex", setting: "max:auto"),
+        words7b(perm7("claude", "never", "never", ["--dangerously-skip-permissions", "--settings", "{\"sandbox\":{\"enabled\":true}}"],
+                      sbxT, ["sandbox": true]), "claude"),
+        words7b(perm7("kimi", "auto", "never", ["--yolo"]), "kimi"),
+        words7b(perm7("codex", "never", "never", CODEX_SANDBOXED, nil, ["sandbox": true]), "codex"),
+        words7b(perm7("claude", "never", "never", ["x"], "x"), "codex"),
+        words7b(nil, "codex", ["source": ["agent": "claude", "perm": ["level": "never", "sandbox": false, "from": "command_line"]]],
+                source: "claude"),
+        words7b(neverP, "kimi", ["perms": ["kimi": perm7("kimi", "never", "never", ["--auto"], "Kimi Code starts in never-ask mode, "
+                                                                                              + "like the Claude Code session on box")]])]
+    let want7b: [(String, String?, String)?] = [
+        ("Codex starts in never-ask mode, like the Claude Code session you are leaving", nil,
+         "It never asks: every edit and command runs. Flags: --dangerously-bypass-approvals-and-sandbox"),
+        (kimiT, "No exact match: Kimi Code starts in the next stricter level it has.",
+         "It asks before it acts, as it does by default. No flags: Kimi Code's own default."),
+        (capT, nil, "Routine steps run without asking; risky ones ask first. Flags: -a on-request"),
+        (sbxT, nil, "It never asks: every edit and command runs. Flags: --dangerously-skip-permissions --settings "
+            + "'{\"sandbox\":{\"enabled\":true}}'"),
+        ("Kimi Code starts in auto mode, the next stricter level it has (the Claude Code session you are leaving runs in "
+            + "never-ask mode).", "No exact match: Kimi Code starts in the next stricter level it has.",
+         "Routine steps run without asking; risky ones ask first. Flags: --yolo"),
+        ("Codex starts in never-ask mode inside its sandbox, like the Claude Code session you are leaving.", nil,
+         "It never asks: every edit and command runs. Flags: -a never -s workspace-write"),
+        nil,
+        ("The Claude Code session you are leaving runs in never-ask mode: Codex starts in its own equivalent, or the next "
+            + "stricter level it has.", nil, "It never asks: every edit and command runs. Codex gets its own flags for it."),
+        ("Kimi Code starts in never-ask mode, like the Claude Code session on box", nil,
+         "It never asks: every edit and command runs. Flags: --auto")]
+    var bad7b: [String] = []
+    for (i, w) in w7b.enumerated() {
+        let want = want7b[i]
+        if (w == nil) != (want == nil) || (w != nil && (w!.line != want!.0 || w!.fell != want!.1 || w!.flags != want!.2)) {
+            bad7b.append("\(i): \(w.map { "\($0.line) | \($0.fell ?? "-") | \($0.flags)" } ?? "nil")")
+        }
+    }
+    let none7bOK = words7b(nil, "codex") == nil && words7b(["level": "bogus"], "codex") == nil
+        && words7b("never", "codex") == nil && permInfo(["perm": neverP], agent: nil)?.flags == neverP["flags"] as? [String]
+    let on7b = permInfo(["perm": perm7("claude", "never", "never", ["--dangerously-skip-permissions"])], agent: "claude")
+        .map { permWords($0, agent: "claude", source: "claude", on: "box",
+                         leaving: { "the \($0.map { $0 + " " } ?? "")session here" }).line }
+    let set7bOK = permSetting([:]) == "follow" && permSetting(["agent_permissions": "max:auto"]) == "max:auto"
+        && permSetting(["agent_permissions": "never"]) == "never" && permSetting(["agent_permissions": "max:x"]) == "follow"
+        && codexNever([:]) == "full"
+        && codexNever(["agent_permission_flags": ["codex": ["never": CODEX_SANDBOXED]]]) == "sandbox"
+        && codexNever(["agent_permission_flags": ["codex": ["never": ["--sandbox", "read-only"]]]]) == "own"
+    let on7 = withCodexNever(["agent_permission_flags": ["kimi": ["never": ["--auto"]]]], sandbox: true)
+    let off7 = withCodexNever(["agent_permission_flags": ["codex": ["never": CODEX_SANDBOXED, "auto": ["-a", "on-request"]],
+                                                         "kimi": ["never": ["--auto"]]]], sandbox: false)
+    let gone7 = withCodexNever(["agent_permission_flags": ["codex": ["never": CODEX_SANDBOXED]]], sandbox: false)
+    let flags7bOK = ((on7["codex"] as? [String: Any])?["never"] as? [String]) == CODEX_SANDBOXED
+        && ((on7["kimi"] as? [String: Any])?["never"] as? [String]) == ["--auto"]
+        && (off7["codex"] as? [String: Any])?.keys.sorted() == ["auto"] && off7["kimi"] != nil && gone7.isEmpty
+        && shellWord("{\"sandbox\":{\"enabled\":true}}") == "'{\"sandbox\":{\"enabled\":true}}'" && shellWord("--x=1") == "--x=1"
+    let perm7bOK = bad7b.isEmpty && none7bOK && set7bOK && flags7bOK
+        && on7b == "Claude Code on box starts in never-ask mode, like the Claude Code session here."
+    print("PERMISSION LEVEL \(perm7bOK ? "OK" : "FAIL — words \(bad7b) none \(none7bOK) settings \(set7bOK) flags \(flags7bOK) \(on7b ?? "-")")")
+    // … and the core's phase-7b samples: AHT_FIXTURES_PHASE7B (every answer
+    // with `perm`, through the reader and the words; a config with
+    // agent_permission_flags through Settings' reader)
+    var phase7bOK = true
+    let dir7b = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE7B"] ?? ""
+    let files7b = ((try? FileManager.default.contentsOfDirectory(atPath: dir7b)) ?? []).filter { $0.hasSuffix(".json") }.sorted()
+    if !dir7b.isEmpty && !files7b.isEmpty {
+        var miss: [String] = [], seen: [String] = []
+        for n in files7b {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir7b).appendingPathComponent(n))
+            guard let d = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] else {
+                miss.append(n + " (not JSON)")
+                continue
+            }
+            if let cfg = (d["effective"] as? [String: Any]) ?? (d["agent_permission_flags"] != nil ? d : nil) {
+                seen.append("\(n): settings \(permSetting(cfg)), Codex \(codexNever(cfg))")
+                continue
+            }
+            // a dry run's level: `perm` (null for Summary Only), `perms`, or Pick
+            // Up's `source.perm` (the session there) without --open
+            guard d["perm"] is [String: Any] || d["perms"] is [String: Any]
+                    || (d["source"] as? [String: Any])?["perm"] is [String: Any] else { continue }
+            let agent = firstText((d["perm"] as? [String: Any])?["agent"], d["target"], d["agent"]) ?? "claude"
+            guard let p = permInfo(d, agent: agent, setting: "follow") else {
+                miss.append(n + " (perm unread)")
+                continue
+            }
+            let w = permWords(p, agent: agent, source: firstText((d["source"] as? [String: Any])?["agent"]),
+                              leaving: leaving7b)
+            let all = w.line + (w.fell ?? "") + w.flags
+            if all.contains("Optional(") || all.contains("<null>") || (p.flags == nil && !p.other)
+                || ((d["perm"] as? [String: Any]).map { ($0["text"] as? String ?? "").isEmpty } ?? false) { miss.append(n) }
+            seen.append("\(n): \(AGENT_LABEL[agent] ?? agent) \(p.level)" + (p.fell ? " (no exact match)" : "")
+                        + (p.flags.map { $0.isEmpty ? "" : " " + $0.joined(separator: " ") } ?? ""))
+        }
+        phase7bOK = miss.isEmpty && !seen.isEmpty
+        print("PHASE 7B SAMPLES \(phase7bOK ? "OK" : "FAIL \(miss)") — \(dir7b) [" + seen.joined(separator: "; ") + "]")
+    } else {
+        print("PHASE 7B SAMPLES not checked (" + (dir7b.isEmpty ? "AHT_FIXTURES_PHASE7B names no folder"
+                                                         : "no samples in \(dir7b) yet") + ")")
+    }
+    // Phase 7b fix round, item 1: Kimi's reading run (-p) is never-ask only,
+    // so below it Switch, Hand Back and Pick Up → Open in Kimi open Kimi
+    // without it (kimi_reads false) and give the first message to paste
+    // (first_prompt); at never-ask Kimi still reads it first
+    let kAsk: [String: Any] = ["agent": "kimi", "level": "ask", "sandbox": false, "flags": [Any](), "read": "edits",
+                               "from": "transcript", "text": "Kimi Code starts in ask mode, the next stricter level it has"]
+    let kNever: [String: Any] = ["agent": "kimi", "level": "never", "sandbox": false, "flags": ["--yolo"], "read": "never",
+                                 "from": "transcript", "text": "Kimi Code starts in never-ask mode, like the Claude Code session"]
+    let cAuto: [String: Any] = ["agent": "claude", "level": "auto", "sandbox": false, "flags": ["--permission-mode", "auto"],
+                                "read": "auto", "from": "transcript", "text": "Claude Code starts in auto mode"]
+    let swK: [String: Any] = ["target": "kimi", "mode": "new", "source": ["agent": "claude", "title": "fix the login redirect"],
+                              "perm": kAsk, "kimi_reads": false]
+    let swKdone = swK.merging(["applied": true, "brief": "/x/paper/.aht/handover/relay-1.md",
+                               "first_prompt": "  Read .aht/handover/relay-1.md first.  "]) { $1 }
+    let swKnever = swK.merging(["perm": kNever, "kimi_reads": true]) { $1 }
+    let puK: [String: Any] = ["target": "claude", "mode": "new", "perm": cAuto, "perms": ["kimi": kAsk],
+                              "source": ["agent": "claude", "title": "add the search page",
+                                         "perm": ["level": "auto", "sandbox": false, "from": "transcript"]],
+                              "match": ["path": "/home/me/code/paper", "how": "id"], "kimi_reads": true]
+    let reads1 = !kimiReads(swK) && !kimiReads(["target": "kimi", "perm": kAsk]) && kimiReads(swKnever)
+        && kimiReads(["target": "kimi", "perm": kNever]) && kimiReads([:]) && kimiReads(["target": "kimi", "kimi_reads": true])
+        && kimiReads(["target": "codex", "kimi_reads": false, "perm": cAuto.merging(["agent": "codex"]) { $1 }])
+        && !kimiReads(puK)          // its kimi_reads speaks of Claude Code, the agent planned: Kimi's own level tells
+    let first1 = kimiFirst(swKdone) == "Read .aht/handover/relay-1.md first." && kimiFirst(swK) == nil
+        && kimiFirst(["kimi_reads": true, "first_prompt": "x"]) == nil && kimiFirst(["kimi_reads": false, "first_prompt": " "]) == nil
+    let swT = switchText(swK, mode: "new", hook: true), swTn = switchText(swKnever, mode: "new", hook: true)
+    let backT = switchText(swK.merging(["mode": "back"]) { $1 }, mode: "back", hook: true)
+    let doneK = switchDoneText(swKdone, project: "/x/paper")
+    let doneN = switchDoneText(swKnever.merging(["applied": true, "brief": "/x/paper/.aht/handover/relay-1.md"]) { $1 }, project: "/x/paper")
+    let puT = pickupOpenText(puK, agent: "kimi", machine: "box", hook: true)
+    let puC = pickupOpenText(puK, agent: "claude", machine: "box", hook: true)
+    let costK = openCost("kimi", back: false, hook: true, machine: "box", kimiReads: false) ?? ""
+    let puDone = pickupDoneText(["applied": true, "opened": "kimi", "kimi_reads": false, "first_prompt": "Read it first.",
+                                 "brief": "/x/paper/.aht/handover/relay-2.md", "blockers": [Any](), "warnings": [Any]()],
+                                machine: "box", project: "/x/paper", copied: false)
+    let texts1 = swT.contains(KIMI_OPENS) && !swT.contains("first run of its own") && swTn.contains("first run of its own")
+        && !swTn.contains(KIMI_OPENS) && backT.contains(KIMI_OPENS)
+        && doneK == "Kimi Code's window is open. The summary is in the project: /x/paper/.aht/handover/relay-1.md"
+        && doneN.hasPrefix("Kimi Code took over; its window is open. The summary it read:")
+        && puT.contains(KIMI_OPENS) && !puC.contains(KIMI_OPENS)
+        && costK.contains("paste the first message aht shows you into Kimi") && !costK.contains("run of its own")
+        && (openCost("kimi", back: false, hook: true, machine: "box") ?? "").contains("run of its own")
+        && puDone == "Picked up from box: Kimi Code is open here. The summary is here: /x/paper/.aht/handover/relay-2.md."
+    // … and the core's samples that say kimi_reads (AHT_FIXTURES_PHASE7B)
+    var kimiSeen: [String] = [], kimiBad: [String] = []
+    for n in files7b {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: dir7b).appendingPathComponent(n)),
+              let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], let r = d["kimi_reads"] as? Bool else { continue }
+        let ok = r ? kimiFirst(d) == nil : kimiFirst(d) != nil && !switchDoneText(d, project: "/x/p").contains("it read")
+        kimiSeen.append("\(n): kimi_reads \(r)" + (kimiFirst(d) != nil ? ", first_prompt" : ""))
+        if !ok || kimiReads(d) != r { kimiBad.append(n) }
+    }
+    let kimi7bOK = reads1 && first1 && texts1 && kimiBad.isEmpty
+    print("KIMI BELOW NEVER-ASK \(kimi7bOK ? "OK" : "FAIL — reads \(reads1) first \(first1) texts \(texts1) samples \(kimiBad)")"
+          + (kimiSeen.isEmpty ? " (no sample says kimi_reads yet)" : " [" + kimiSeen.joined(separator: "; ") + "]"))
+    if !texts1 { print("   \(swT.suffix(160)) | \(doneK) | \(puT.suffix(160)) | \(costK) | \(puDone)") }
+    // item 2: the second opinion's level before Start, from its dry run
+    let dryO: [String: Any] = ["project": "/x/paper", "applied": false, "blockers": ["say what both should do (--task)"],
+        "warnings": ["Kimi Code is left out: its run on its own works only in never-ask mode"],
+        "perms": ["codex": ["agent": "codex", "level": "ask", "sandbox": false, "flags": [Any](), "read": "ask", "from": "transcript",
+                            "text": "Codex works in ask mode, like the project's latest session (Claude Code)"],
+                  "claude": cAuto.merging(["text": "Claude Code works in auto mode, like the project's latest session (Claude Code)"]) { $1 }]]
+    let l0 = opinionLevels(dryO, typed: false), l1 = opinionLevels(dryO, typed: true)
+    let leaving2 = { (_: String?) in "the project's latest session" }
+    let said2 = l0.agents.compactMap { a in permInfo(dryO, agent: a).map { permWords($0, agent: a, leaving: leaving2).line } }
+    var opDryOK = l0.agents == ["claude", "codex"] && l0.blockers.isEmpty && l1.blockers == ["say what both should do (--task)"]
+        && l0.warnings == ["Kimi Code is left out: its run on its own works only in never-ask mode"]
+        && said2 == ["Claude Code works in auto mode, like the project's latest session (Claude Code)",
+                     "Codex works in ask mode, like the project's latest session (Claude Code)"]
+        && opinionLevels([:], typed: true).agents.isEmpty && opinionLevels(["perms": ["claude": "x"]], typed: true).agents.isEmpty
+        && opinionDryArgs("/x/paper", task: " make it so ") == ["second-opinion", "/x/paper", "--task=make it so", "--dry-run", "--json"]
+    var opSeen = "no second_opinion_dry.json yet"
+    if let data = try? Data(contentsOf: URL(fileURLWithPath: dir7b).appendingPathComponent("second_opinion_dry.json")),
+       let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+        let l = opinionLevels(d, typed: true)
+        let lines = l.agents.compactMap { a in permInfo(d, agent: a).flatMap { $0.text } }
+        opDryOK = opDryOK && !l.agents.isEmpty && lines.count == l.agents.count && d["applied"] as? Bool != true
+        opSeen = "second_opinion_dry.json: " + l.agents.joined(separator: ", ") + (l.warnings.isEmpty ? "" : ", \(l.warnings.count) warning(s)")
+    }
+    print("SECOND OPINION LEVEL BEFORE START \(opDryOK ? "OK" : "FAIL \(l0) \(said2)") [\(opSeen)]")
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -12432,7 +13097,8 @@ if CommandLine.arguments.contains("--selftest") {
          && releaseOK && pauseOK && backOnOK && offsiteOK && fetchPartialOK && relayOK && dialogOK && samplesOK
          && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
          && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK
-         && pause5OK && phase5OK && transferOK && phase6OK && bringOK && phase7OK && fix7OK ? 0 : 1)
+         && pause5OK && phase5OK && transferOK && phase6OK && bringOK && phase7OK && fix7OK
+         && perm7bOK && phase7bOK && kimi7bOK && opDryOK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -12780,6 +13446,166 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
                 snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
                          dir + "/detail-sync-sample-\(k + 1).png", NSSize(width: 900, height: 176))
             }
+        }
+        exit(0)
+    }
+    if args.contains("--perm-only") {
+        // The level the next agent starts in: the switch dialog (never-ask
+        // from Claude Code; Kimi Code with no exact match), Hand Back, Pick
+        // Up, Bring Here, Hand Over and the night shift, and Settings ▸
+        // Permissions; made-up answers in the shape of the core's `perm`, then
+        // the core's own samples (AHT_FIXTURES_PHASE7B) when there are some.
+        // Nothing asks the core or another machine.
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 7b", "tracked": 3, "hook_installed": true,
+                       "agent_clis": ["claude": "claude", "codex": "codex", "kimi": "kimi"],
+                       "handover": ["supported": true, "can_reach": true, "default_remote": "box", "remotes": [
+                           "box": ["ssh": "me@box", "system": "Linux", "paths": "same"]]]]
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+        let paper = Project(["real_path": home + "/code/paper", "exists": true, "sessions": 3, "agents": ["claude", "codex"],
+                             "relay": ["id": "r1", "from_agent": "claude", "to_agent": "codex", "open": true]])
+        let never: [String: Any] = ["agent": "codex", "level": "never", "sandbox": false, "from": "command_line", "read": "never",
+                                    "flags": ["--dangerously-bypass-approvals-and-sandbox"],
+                                    "text": "Codex starts in never-ask mode, like the Claude Code session you are leaving"]
+        let sw: [String: Any] = ["command": "switch", "applied": false, "blockers": [], "warnings": [], "target": "codex",
+                                 "mode": "new", "source": ["agent": "claude", "title": "fix the login redirect"],
+                                 "start_line": "codex --dangerously-bypass-approvals-and-sandbox 'Read .aht/handover/relay-1.md first'",
+                                 "perm": never]
+        snapshot(SwitchSheet(plan: SwitchPlan(project: paper, target: "codex", back: false, backTo: nil,
+                                              plans: ["new": sw, "resume": sw], mode: "new")).environmentObject(demo),
+                 dir + "/perm-switch-never.png", NSSize(width: 520, height: 470))
+        let kimi = sw.merging(["target": "kimi", "start_line": "kimi",
+                               "perm": ["agent": "kimi", "level": "ask", "sandbox": false, "from": "command_line", "read": "edits",
+                                        "flags": [Any](), "text": "Kimi Code starts in ask mode, the next stricter level: it has "
+                                            + "no edits mode (the Claude Code session you are leaving runs in edits mode)"]]) { $1 }
+        snapshot(SwitchSheet(plan: SwitchPlan(project: paper, target: "kimi", back: false, backTo: nil,
+                                              plans: ["new": kimi, "resume": kimi], mode: "new")).environmentObject(demo),
+                 dir + "/perm-switch-kimi.png", NSSize(width: 520, height: 500))
+        let back = sw.merging(["target": "claude", "mode": "back", "start_line": "claude --resume s1 --permission-mode auto",
+                               "perm": ["agent": "claude", "level": "auto", "sandbox": false, "from": "relay", "read": "auto",
+                                        "flags": ["--permission-mode", "auto"],
+                                        "text": "Claude Code starts in auto mode, like the Codex session you are leaving"]]) { $1 }
+        snapshot(SwitchSheet(plan: SwitchPlan(project: paper, target: "claude", back: true, backTo: nil,
+                                              plans: ["back": back], mode: "back")).environmentObject(demo),
+                 dir + "/perm-hand-back.png", NSSize(width: 520, height: 400))
+        var pv = PickupView(project: paper, machine: "box", kind: "pickup")
+        pv.loading = false
+        pv.dry = ["command": "pickup", "applied": false, "blockers": [], "warnings": [], "target": "claude", "mode": "new",
+                  "match": ["path": "/home/me/code/paper", "how": "id"],
+                  "source": ["agent": "claude", "title": "fix the login redirect",
+                             "perm": ["level": "never", "sandbox": false, "from": "command_line"]],
+                  "brief": "# Pick up: paper\n\n## Where things stood\n\nThe redirect after login goes to /home.\n",
+                  "perm": NSNull()]
+        demo.pickup = pv
+        snapshot(PickupSheet().environmentObject(demo), dir + "/perm-pickup.png", NSSize(width: 660, height: 640))
+        pv.open = "codex"
+        demo.pickup = pv
+        snapshot(PickupSheet().environmentObject(demo), dir + "/perm-pickup-codex.png", NSSize(width: 660, height: 640))
+        var bv = BringView(machine: "box")
+        (bv.listing, bv.picked) = (false, home + "/code/shop")
+        bv.list = ["remote": "box", "projects": [["path": home + "/code/shop", "here_path": home + "/code/shop",
+                                                  "title": "Checkout flow refactor", "sessions": 3]]]
+        bv.dry = ["command": "bring", "applied": false, "blockers": [], "warnings": [], "remote": "box", "agent": "claude",
+                  "here_path": home + "/code/shop", "there_path": home + "/code/shop",
+                  "session": ["id": "0f3a9c2e", "title": "Checkout flow refactor"],
+                  "plan": ["files": 1204, "bytes": 40_055_603, "history_bytes": 4_299_161, "file_history": true],
+                  "perm": ["agent": "claude", "level": "edits", "sandbox": false, "from": "relay", "read": "edits",
+                           "flags": ["--permission-mode", "acceptEdits"],
+                           "text": "Claude Code starts in edits mode, like the session on box"]]
+        demo.bring = bv
+        snapshot(BringSheet().environmentObject(demo), dir + "/perm-bring.png", NSSize(width: 660, height: 640))
+        let ho: [String: Any] = ["command": "handover", "remote": "box", "there_path": home + "/code/paper",
+                                 "perm": ["agent": "claude", "level": "never", "sandbox": true, "from": "command_line", "read": "never",
+                                          "flags": ["--dangerously-skip-permissions", "--settings", "{\"sandbox\":{\"enabled\":true}}"],
+                                          "text": "Claude Code on box starts in never-ask mode inside its sandbox, like the session here"]]
+        snapshot(HandoverSheet(plan: HandoverPlan(project: paper, remote: "box",
+                                                  body: "812 file(s) to send (5.1 MB), history 879 KB.\nSession: add rate limits\n\n"
+                                                    + "The session is resumed there and this folder is marked as away until you take it back.",
+                                                  dry: ho)).environmentObject(demo),
+                 dir + "/perm-handover.png", NSSize(width: 520, height: 560))
+        let ns: [String: Any] = ["project": paper.path, "applied": false, "blockers": ["say what the agent should work on (--task)"],
+                                 "job": ["remote": "box"],
+                                 "perm": ["agent": "claude", "level": "auto", "sandbox": false, "from": "transcript", "read": "auto",
+                                          "flags": ["--permission-mode", "auto"],
+                                          "text": "Claude Code on box starts in auto mode, like the project's latest session here"]]
+        snapshot(NightShiftSheet(v: NightShiftView(project: paper, jobs: [], dry: ns)).environmentObject(demo),
+                 dir + "/perm-night.png", NSSize(width: 660, height: 540))
+        var ov = OpinionView(project: paper)
+        (ov.current, ov.task, ov.finished) = ("r1", "make the parser accept empty lines", true)
+        ov.started = ["perms": [
+            "claude": ["agent": "claude", "level": "never", "sandbox": false, "read": "never", "from": "command_line",
+                       "flags": ["--dangerously-skip-permissions"],
+                       "text": "Claude Code starts in never-ask mode, like the project's latest session (Claude Code)"],
+            "kimi": ["agent": "kimi", "level": "never", "sandbox": false, "read": "never", "from": "command_line",
+                     "flags": ["--auto"], "text": "Kimi Code starts in never-ask mode, like the project's latest session (Claude Code)"]]]
+        ov.results = [OpinionResult(id: "claude", state: "done", answer: "Done.", seconds: 95, cost: nil, files: [],
+                                    perm: ["level": "never", "sandbox": false, "flags": ["--dangerously-skip-permissions"]]),
+                      OpinionResult(id: "kimi", state: "working", answer: "", seconds: nil, cost: nil, files: [],
+                                    perm: ["level": "never", "sandbox": false, "flags": ["--auto"]])]
+        snapshot(OpinionSheet(v: ov).environmentObject(demo), dir + "/perm-opinion.png", NSSize(width: 960, height: 660))
+        // the fix round: the second opinion's level before Start (its dry run),
+        // Kimi below never-ask in the switch dialog, and the first message to
+        // paste after Pick Up → Open in Kimi
+        var od = OpinionView(project: paper)
+        od.finished = true
+        demo.opinion = od
+        demo.opinionDry = OpinionDry(path: paper.path, task: "", d: [
+            "applied": false, "blockers": ["say what both should do (--task)"],
+            "warnings": ["Kimi Code is left out: its run on its own works only in never-ask mode, and the project's latest "
+                         + "session runs in auto mode"],
+            "perms": ["claude": ["agent": "claude", "level": "auto", "sandbox": false, "read": "auto", "from": "transcript",
+                                 "flags": ["--permission-mode", "auto"],
+                                 "text": "Claude Code works in auto mode, like the project's latest session (Claude Code)"],
+                      "codex": ["agent": "codex", "level": "auto", "sandbox": false, "read": "auto", "from": "transcript",
+                                "flags": ["-a", "on-request"],
+                                "text": "Codex works in auto mode, like the project's latest session (Claude Code)"]]])
+        snapshot(OpinionSheet(v: od).environmentObject(demo), dir + "/perm-opinion-dry.png", NSSize(width: 960, height: 420))
+        (demo.opinion, demo.opinionDry) = (nil, nil)
+        let kimiAsk = sw.merging(["target": "kimi", "start_line": "kimi", "kimi_reads": false,
+                                  "perm": ["agent": "kimi", "level": "ask", "sandbox": false, "from": "transcript", "read": "auto",
+                                           "flags": [Any](), "text": "Kimi Code starts in ask mode, the next stricter level it has "
+                                               + "(the Claude Code session you are leaving runs in auto mode)"]]) { $1 }
+        snapshot(SwitchSheet(plan: SwitchPlan(project: paper, target: "kimi", back: false, backTo: nil,
+                                              plans: ["new": kimiAsk, "resume": kimiAsk], mode: "new")).environmentObject(demo),
+                 dir + "/kimi-switch-below-never.png", NSSize(width: 520, height: 520))
+        var pk = PickupView(project: paper, machine: "box", kind: "pickup")
+        (pk.loading, pk.open) = (false, "kimi")
+        pk.dry = ["command": "pickup", "applied": false, "blockers": [], "warnings": [], "target": "claude", "mode": "new",
+                  "match": ["path": "/home/me/code/paper", "how": "id"],
+                  "source": ["agent": "claude", "title": "fix the login redirect",
+                             "perm": ["level": "auto", "sandbox": false, "from": "transcript"]],
+                  "brief": "# Pick up: paper\n\n## Where things stood\n\nThe redirect after login goes to /home.\n"]
+        pk.done = ["applied": true, "blockers": [], "warnings": [], "opened": "kimi", "kimi_reads": false,
+                   "brief": paper.path + "/.aht/handover/relay-20261028-100000-k1.md", "start_line": "kimi",
+                   "first_prompt": "You are taking over this project from Claude Code on box. Read "
+                       + ".aht/handover/relay-20261028-100000-k1.md first: it records where the work stood, the latest "
+                       + "exchanges and the open items. Then tell me in two or three lines what you understood, and wait "
+                       + "for my next instruction."]
+        demo.pickup = pk
+        snapshot(PickupSheet().environmentObject(demo), dir + "/kimi-pickup-first-prompt.png", NSSize(width: 660, height: 640))
+        demo.pickup = nil
+        demo.config = ["agent_permissions": "never",
+                       "agent_permission_flags": ["codex": ["never": CODEX_SANDBOXED]]]
+        snapshot(PermissionsSettings().padding(12).frame(width: 700).environmentObject(demo),
+                 dir + "/perm-settings.png", NSSize(width: 700, height: 220))
+        demo.config = ["agent_permission_flags": ["codex": ["never": ["--sandbox", "read-only", "-a", "never"]]]]
+        snapshot(PermissionsSettings().padding(12).frame(width: 700).environmentObject(demo),
+                 dir + "/perm-settings-own.png", NSSize(width: 700, height: 200))
+        // the core's samples, when it has written them: each answer with a perm
+        let dir7b = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE7B"] ?? ""
+        let files7b = ((try? FileManager.default.contentsOfDirectory(atPath: dir7b)) ?? []).filter { $0.hasSuffix(".json") }.sorted()
+        demo.config = [:]
+        for n in files7b {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir7b).appendingPathComponent(n))
+            guard let d = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any],
+                  d["perm"] != nil else { continue }
+            let agent = firstText(d["target"], d["agent"]) ?? "claude"
+            let src = firstText((d["source"] as? [String: Any])?["agent"])
+            snapshot(PermLine(d: d, agent: agent, source: src, leaving: { "the \($0.map { $0 + " " } ?? "")session you are leaving" })
+                        .padding(12).frame(width: 520).environmentObject(demo),
+                     dir + "/perm-sample-" + (n as NSString).deletingPathExtension + ".png", NSSize(width: 520, height: 120))
         }
         exit(0)
     }

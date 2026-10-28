@@ -1,7 +1,8 @@
 #!/bin/sh
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
 # journal, report, share, secrets, rules, loose ends, undo, tidy, switch
-# (Summary Only) and relays, limits, sessions, workspace, asking other
+# (Summary Only, and the permission level a switch carries) and relays,
+# limits, sessions, workspace, asking other
 # machines over Windows' own ssh (status, remote add, pickup), Bring Here's
 # list and dry run from a test-mode machine; and the hidden ones
 # another aht uses: `_core --id`
@@ -163,6 +164,7 @@ export AHT_ROOT_CODEX="$(P tools/codex)"
 CXID="c0dec0de-0000-4000-8000-000000000001"
 cat > "$T/tools/codex/2026/10/27/rollout-2026-10-27T10-00-00-$CXID.jsonl" <<EOF
 {"type":"session_meta","timestamp":"$NOW","payload":{"id":"$CXID","cwd":"$(J "$PAPER")"}}
+{"type":"turn_context","timestamp":"$NOW","payload":{"cwd":"$(J "$PAPER")","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"}}}
 {"type":"event_msg","timestamp":"$NOW","payload":{"type":"user_message","message":"tidy the pelican module"}}
 {"type":"event_msg","timestamp":"$NOW","payload":{"type":"agent_message","message":"The pelican module is tidy."}}
 EOF
@@ -176,6 +178,20 @@ grep -q "pelican module" "$T/roots/paper/.aht/handover/relay-$RID.md" \
 OUT=$(W relays "$PAPER" --json)
 has "$OUT" "\"id\": \"$RID\"" "relays does not list the hand-off"
 has "$OUT" '"open": false' "a Summary Only hand-off counts as open"
+has "$OUT" '"perm": null' "a Summary Only hand-off names a permission level"
+
+echo "== the permission level follows the work: Codex never asked, Claude Code would not either =="
+# the dry run only names the program, so a stand-in name is enough
+export AHT_CLI_CLAUDE=claude
+OUT=$(W switch "$PAPER" --to claude --session "$CXID" --json)
+unset AHT_CLI_CLAUDE
+printf '%s' "$OUT" | grep -q Traceback && fail "switch crashed: $OUT"
+has "$OUT" '"level": "never"' "the switch dry run does not carry Codex's never-ask level"
+has "$OUT" '"from": "rollout"' "the level was not read from Codex's turn_context"
+# on a PC every word of the line is quoted for cmd.exe ("claude" "--dangerously-…")
+has "$OUT" 'claude(\.exe)?(\\")? (\\")?--dangerously-skip-permissions' "Claude Code would not start with --dangerously-skip-permissions"
+has "$OUT" 'Claude Code starts in never-ask mode, like the Codex session you are leaving' \
+  "the dry run does not say the level in words"
 
 echo "== Bring Here from a test-mode machine: its list and a dry run =="
 # a folder stands in for the other machine (remotes.<name>.root): the exe runs
@@ -206,6 +222,8 @@ has "$OUT" '"applied": false' "bring without --apply did something"
 has "$OUT" '"blockers": \[\]' "the bring dry run is blocked"
 has "$OUT" '"there_path": "[\\/]+home[\\/]+code[\\/]+shop"' "the bring dry run names another folder there"
 has "$OUT" '"files": 3' "the bring dry run does not count the project's three files (its id too)"
+has "$OUT" '"perm": \{' "the bring dry run names no permission level"
+has "$OUT" 'Claude Code starts in ask mode' "the bring dry run does not say the level the session here starts in"
 printf '%s' "$OUT" | grep -q Traceback && fail "bring crashed: $OUT"
 [ ! -e "$T/landing/shop" ] || fail "the bring dry run made the folder here"
 rm -f "$T/home/.aht/config.json"

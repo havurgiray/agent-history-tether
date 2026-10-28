@@ -1091,8 +1091,10 @@ and hand it back later. Claude Code, Codex, Kimi Code, Antigravity (the
 - **What it costs.** Writing a summary or a catch-up costs nothing: aht
   reads the histories itself. A new session reads the summary as its first
   turn; Codex, Kimi Code, Antigravity and Mistral Vibe read the catch-up in
-  their own session the same way: one turn of that agent. Kimi reads it in
-  a run of its own before its window opens, so the dialog waits a moment;
+  their own session the same way: one turn of that agent. In never-ask
+  mode Kimi reads it in a run of its own before its window opens, so the
+  dialog waits a moment (below never-ask Kimi opens, and you paste the line
+  aht shows);
   when Kimi does not take the catch-up into its own session, a new Kimi
   session reads the full summary instead, and aht says so. **Hand Back to
   Claude Code, or Claude Code's own session, costs nothing until you
@@ -1178,6 +1180,111 @@ and hand it back later. Claude Code, Codex, Kimi Code, Antigravity (the
   whom and when, newest first, and which hand-off is still open.
 - `aht relays ~/Desktop/paper --show <id>` — print that hand-off's summary.
 
+## The permission level follows the work
+
+If you started a session in a mode that does not ask for permission
+(Claude Code's `--dangerously-skip-permissions`, Codex's full bypass), or
+asks less, the agent that continues the work starts in its own equivalent.
+That holds for Switch Agent, Hand Back, Pick Up → Open in, Bring Here, Hand
+Over and the night shift, on this computer and across machines.
+
+**aht never raises the level on its own: it carries the level you chose to
+the next agent, on this machine and across machines. Restarts keep a
+session's own flags.** The next agent never gets more power than the
+session it continues, and only levels you set yourself raise what it gets:
+your own command line, your user or managed Claude Code settings, aht's own
+settings, or a level aht recorded on this computer. Nothing in a project's
+repository or from another machine does.
+
+> **Example.** You run Claude Code with `--dangerously-skip-permissions`
+> and it stops at its usage limit. You press **Continue in Codex…**; the
+> dialog says *Codex starts in never-ask mode, like the Claude Code session
+> you are leaving*, and Codex opens with
+> `--dangerously-bypass-approvals-and-sandbox`. Later **Hand Back** opens
+> your Claude session again with `--dangerously-skip-permissions`.
+
+**The levels**, in aht's words, and each agent's flags for them:
+
+| level | Claude Code | Codex | Kimi Code | Antigravity | Mistral Vibe |
+|---|---|---|---|---|---|
+| ask (each agent's default) | — | — | — | — | — |
+| edits (edits run, commands ask) | `--permission-mode acceptEdits` | `-a on-request -s workspace-write` | — (it asks) | `--mode accept-edits` | `--agent accept-edits` |
+| auto (routine runs, risky asks) | `--permission-mode auto` | `-a on-request` | `--yolo` | `--mode auto` | `--smart-approve` |
+| never (never asks) | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--auto` | `--dangerously-skip-permissions` | `--auto-approve` |
+
+- **How aht knows the level.** For a session that is open: its command
+  line, up to its first prompt (words in a prompt are not flags), and never
+  higher than what the session itself notes; what a Codex command line
+  leaves out comes from Codex's own record. For one that ended: what the
+  session noted itself (Codex's approval policy and sandbox, its
+  `turn_context`; the permission mode Claude Code notes on each prompt);
+  else the level aht started it in, which aht keeps on this computer
+  (`~/.aht/run/perm.json`), so Hand Back keeps it; the record in the
+  project shows it but is not believed, since anyone who can write the
+  repository can write it. Else, for Claude Code, the default mode in its
+  settings (`permissions.defaultMode`): your own settings, the managed
+  settings and a `--settings` on its command line. The project's
+  `.claude/settings.json` and `settings.local.json` count only for
+  `acceptEdits`, `plan` or `default`, as in Claude Code itself, which takes
+  bypass mode only from those. When nothing tells, the next agent asks,
+  and the dialog says that aht could not tell. For Pick Up and Bring Here,
+  the other machine reads the level of its session there.
+- **No exact match: the next stricter level.** Kimi Code has no edits-only
+  mode, so after an edits-mode session it asks; the dialog names the level
+  and why: *Kimi Code starts in ask mode, the next stricter level: it has
+  no edits mode*.
+- **By what an agent can actually do.** Claude Code's skip-permissions is
+  closest to Codex's full bypass, so one goes on as the other. A never-ask
+  Claude session inside Claude Code's own sandbox (`sandbox.enabled` in its
+  settings) goes on as Codex's never-ask that keeps Codex's sandbox (`-a
+  never -s workspace-write`). Such a Codex session goes on in Claude Code
+  as skip-permissions together with Claude's sandbox, on macOS and on Linux
+  with bubblewrap; elsewhere in auto. Kimi Code, Antigravity and Mistral
+  Vibe have no such sandbox, so they go on in auto then. aht turns
+  Claude's sandbox on with a settings file of its own
+  (`~/.aht/run/claude-sandbox.json`), so a restart keeps it.
+- **Codex's never-ask.** By default a never-ask session goes on in Codex
+  with its full bypass. Settings → Permissions → *Codex's never-ask mode*
+  offers **Never ask, keep Codex's sandbox** instead (`-a never -s
+  workspace-write`): Codex then never asks, but writes only inside the
+  project. In the terminal: `aht config --set
+  'agent_permission_flags={"codex": {"never": ["-a", "never", "-s",
+  "workspace-write"]}}'`.
+- **Your own level.** Settings → Permissions → *The next agent starts in*:
+  **Follow the session** (the default, `agent_permissions = follow`), a
+  fixed level (**Always: ask mode** … **Always: never-ask mode**: your
+  choice, even above the session's level), or a cap (**At most: auto
+  mode**, `max:auto`). `agent_permission_flags` replaces aht's flags for
+  one agent and level; aht refuses flags that could ask for more than their
+  level (read the most permissive way, `-anever` and `-c
+  approval_policy=never` too), flags it does not know as permission or
+  harmless flags, a Claude Code `--settings` that holds permissions or a
+  sandbox, and permission flags that ask for different levels.
+- **At ask, aht adds no flag**, so an agent starts as its own settings say.
+- **Hand Over** starts the session there with the level's flags, then
+  `handover_claude_args`; inside Claude's sandbox, its settings file there
+  turns the sandbox on.
+- **Kimi Code** reads its summary in a run of its own only in never-ask
+  mode: Kimi takes no level flag in that run, and it never asks. Below
+  never-ask, Switch, Hand Back and Pick Up → Open in Kimi open Kimi's own
+  session in its level without that run, and aht shows the one line to
+  paste as your first message (`--json`: `kimi_reads: false` and
+  `first_prompt`).
+- **A second opinion** works in a throwaway copy, so Claude Code may edit
+  that copy at any level; its commands follow the level, never above it.
+  Kimi Code takes part only in never-ask mode; below it, aht leaves Kimi
+  out and says why.
+- **Continue Here** reopens a Claude Code session in its level too.
+
+**In the terminal:** `aht switch ~/Desktop/paper --to codex` (a dry run)
+says the level in its `level` line; `--json` adds `perm` with `level`,
+`from` (`command_line`, `rollout`, `transcript`, `settings`, `relay` or
+`unknown`), `read` (the session's own level), `flags`, `sandbox` and
+`text`. So do `aht pickup … --open`, `aht bring`, `aht handover` and the
+night shift's plan. `aht second-opinion … --dry-run --json` gives each
+agent's level (`perms`), who takes part (`agents`) and who is left out and
+why (`left_out`), and starts nothing.
+
 ## A second opinion (uses tokens, off by default)
 
 Give Claude Code and Kimi Code the same task, each in its own copy of the
@@ -1193,10 +1300,13 @@ project, and compare what they did before you keep one.
   The first time you open it, aht asks.
 - The project is not touched until you pick a version. If a file changed in
   the project meanwhile, aht does not overwrite it.
-- Claude may edit files in its copy but not run commands. Kimi's
-  non-interactive mode also runs commands it decides on (for example, it
-  runs the code to check its change), so give it only tasks you would let
-  it do in the project itself.
+- Claude may edit files in its copy at any level; its commands follow the
+  level of the project's latest session, never above it (at ask it cannot
+  run them, since nobody is there to say yes). Kimi's non-interactive mode
+  never asks and runs commands it decides on (for example, it runs the
+  code to check its change), so Kimi takes part only when that session
+  runs in never-ask mode; otherwise aht leaves Kimi out, says why, and
+  Claude works alone.
 - **Remove the Copies…** clears a finished comparison.
 
 **In the terminal:**
@@ -1212,6 +1322,8 @@ project, and compare what they did before you keep one.
 - `aht second-opinion --discard <id>` — remove the two copies.
 - `--agents claude,kimi` names the two agents; these two are the ones that
   work today, and they are the default.
+- `--dry-run` (with `--json`) shows the level each agent would work in and
+  whether Kimi takes part, without copying or starting anything.
 
 ## One set of project rules
 
@@ -2238,8 +2350,9 @@ same repository for example, and the copies may sit at different paths.
   Windows machine yet. On the PC, use Pick Up or Leave a Note.*
 - **What it costs.** Writing the summary costs nothing: aht reads the
   histories itself. **Open in** makes the agent read the summary as its
-  first turn, which uses tokens (Kimi reads it in a run of its own before
-  its window opens). When the work comes back to Claude Code's own session,
+  first turn, which uses tokens (in never-ask mode Kimi reads it in a run
+  of its own before its window opens; below it you paste the line aht
+  shows). When the work comes back to Claude Code's own session,
   aht's hook gives it the catch-up as it opens, and nothing runs until you
   type. The summary alone (Copy the Start Line, or `--apply` without
   `--open`) and Leave a Note spend nothing.
@@ -2609,6 +2722,16 @@ all of them can be set with `aht config --set name=value` and put back with
   not find it itself (`aht backends --set-root`, or Settings → Where each
   agent keeps its history).
 
+**The permission level** (see *The permission level follows the work*)
+
+- `agent_permissions` (follow) — the level the next agent starts in:
+  `follow` (the level of the session it continues), a fixed level (`ask`,
+  `edits`, `auto`, `never`), or a cap (`max:auto`).
+- `agent_permission_flags` (none) — per agent and level, the flags that
+  replace aht's own, as `{"codex": {"never": ["-a", "never", "-s",
+  "workspace-write"]}}` (Codex's never-ask that keeps its sandbox); flags
+  that ask for more than their level are refused.
+
 **Folder badges**
 
 - `icons_enabled` (on), `icons_agent` (on), `icons_git` (on) — badges at
@@ -2645,7 +2768,8 @@ all of them can be set with `aht config --set name=value` and put back with
   the Claude app; Antigravity, when you switch to it, starts with
   `--remote-control` too.
 - `handover_carry_trust` (on) — a folder trusted here is trusted there.
-- `handover_claude_args` (none) — extra options for the session over there.
+- `handover_claude_args` (none) — extra options for the session over there,
+  after the flags of its permission level.
 - `handover_mosh` (on) — open a handed-over session with mosh when it gets
   through.
 - `handover_keep_awake` (on) — the other machine does not sleep while the

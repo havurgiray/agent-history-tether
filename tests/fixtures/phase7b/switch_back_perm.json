@@ -1,0 +1,34 @@
+{
+  "command": "switch",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/paper",
+  "source": {
+    "agent": "codex",
+    "session": "94c42250-e022-4e74-816a-3a61dd2b5bad",
+    "title": null
+  },
+  "target": "claude",
+  "brief": null,
+  "session": "7e100000-1111-4222-8333-444455556666",
+  "command_line": null,
+  "error": null,
+  "relay": null,
+  "mode": "back",
+  "start_line": "/opt/homebrew/bin/claude --dangerously-skip-permissions --resume 7e100000-1111-4222-8333-444455556666",
+  "fallback": null,
+  "perm": {
+    "agent": "claude",
+    "level": "never",
+    "sandbox": false,
+    "flags": [
+      "--dangerously-skip-permissions"
+    ],
+    "from": "relay",
+    "read": "never",
+    "text": "Claude Code starts in never-ask mode, like the Codex session you are leaving"
+  },
+  "kimi_reads": null,
+  "first_prompt": null
+}

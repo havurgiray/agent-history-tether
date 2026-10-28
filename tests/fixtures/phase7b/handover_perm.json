@@ -1,0 +1,75 @@
+{
+  "command": "handover",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "project": "/Users/me/code/hand",
+  "remote": "box",
+  "here": {
+    "sessions": [],
+    "processes": []
+  },
+  "here_path": "/Users/me/code/hand",
+  "there_path": "/home/code/hand",
+  "there": {
+    "host": "mac",
+    "system": "Darwin",
+    "home": "/home/me",
+    "claude": "/opt/homebrew/bin/claude",
+    "claude_version": "9.9.9",
+    "path_exists": false,
+    "path_writable": true,
+    "free_bytes": 34189996032,
+    "sessions": [],
+    "processes": [],
+    "path": "/home/code/hand"
+  },
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "names": [],
+  "git": {
+    "is_git": false,
+    "gitattributes": null,
+    "suggest": [],
+    "env": {},
+    "how": null
+  },
+  "transfer": "rsync",
+  "claude": {
+    "here": "9.9.9",
+    "there": "9.9.9"
+  },
+  "session": "h1",
+  "sessions": 1,
+  "perm": {
+    "agent": "claude",
+    "level": "never",
+    "sandbox": true,
+    "flags": [
+      "--dangerously-skip-permissions",
+      "--settings",
+      "/Users/me/.aht/run/claude-sandbox.json"
+    ],
+    "from": "transcript",
+    "read": "never",
+    "text": "Claude Code on box starts in never-ask mode inside its sandbox, like the session here"
+  },
+  "title": null,
+  "outside_not_carried": [],
+  "task": null,
+  "plan": {
+    "files": 2,
+    "bytes": 35,
+    "history_bytes": 278,
+    "extras": [],
+    "install_claude": null,
+    "free_bytes": 34189996032
+  },
+  "other_histories": []
+}

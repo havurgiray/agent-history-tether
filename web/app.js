@@ -450,7 +450,15 @@ function guessHome() {
 async function setConfig(key, value, reload) {
   S.config[key] = value;
   const v = typeof value === "string" ? value : JSON.stringify(value);
-  await run(["config", "--set", `${key}=${v}`].concat(reload ? [] : ["--no-reload"]));
+  const r = await run(["config", "--set", `${key}=${v}`].concat(reload ? [] : ["--no-reload"]));
+  // a value the core refuses (exit 2: agent_permission_flags that ask for
+  // more than their level, say): its words, and the setting as it was
+  const said = ((r.err || "") + (r.out || "")).trim();
+  if (!r.ok && r.code > 0) {
+    await refresh();
+    draw();
+    return tell("The setting was not saved", said || "aht refused it.");
+  }
   refresh();
 }
 
@@ -664,6 +672,90 @@ async function dryRun(args) {
   return a.json || { error: ((a.err || "") + (a.out || "")).trim() || "aht gave no answer." };
 }
 
+// ---- the permission level the next agent starts in ----------------------------------
+// Switch, Hand Back, Pick Up → Open in, Bring Here, Hand Over and the night
+// shift (and their dry runs) carry `perm`: {agent, level, sandbox, flags,
+// from, read, text}; null when nothing starts.  Levels in aht's words: ask
+// (each agent's default), edits (edits run, commands ask), auto (routine
+// runs, risky asks), never (never asks).  `read`: the level of the session
+// the work comes from; `text`: the core's sentence, shown as given.  The next
+// agent starts in its own equivalent, or in the next stricter level it has
+// (`agent_permissions`: "follow", a fixed level, or "max:<level>"); aht never
+// raises it by itself.  Never-ask is shown with a caution, not stopped: the
+// user chose it.
+const PERM_LEVELS = ["ask", "edits", "auto", "never"];
+const PERM_NAME = { ask: "ask mode", edits: "edits mode", auto: "auto mode", never: "never-ask mode" };
+const PERM_SAYS = { ask: "It asks before it acts, as it does by default.", edits: "Edits run without asking; commands ask first.",
+  auto: "Routine steps run without asking; risky ones ask first.", never: "It never asks: every edit and command runs." };
+const permRank = (l) => PERM_LEVELS.indexOf(l);
+/** The Permissions setting: "follow", a level, or "max:<level>". */
+function permSetting() {
+  const v = String(S.config.agent_permissions || "follow");
+  return PERM_NAME[v] || (v.startsWith("max:") && PERM_NAME[v.slice(4)]) ? v : "follow";
+}
+/** A level in words: "never-ask mode inside its sandbox". */
+const permName = (level, sandbox) => PERM_NAME[level] + (sandbox && level === "never" ? " inside its sandbox" : "");
+/** The level `agent` starts in, from a dry run: {level, sandbox, flags,
+ * text (the core's), was (the level of the session the work comes from),
+ * fell (no exact match: a stricter level), other}.  `other`: the core named
+ * no level for this agent (Pick Up without --open, or another agent than
+ * the one planned), only the level of the session there (`source.perm`):
+ * the flags are the agent's own (null).  null: no level known (an older
+ * core, or nothing starts). */
+function permOf(d, agent) {
+  if (!d || typeof d !== "object") return null;
+  const by = d.perms && typeof d.perms === "object" ? d.perms : {};
+  const own = agent && by[agent] && typeof by[agent] === "object" ? by[agent] : null;
+  let p = own || (d.perm && typeof d.perm === "object" ? d.perm : null);
+  if (p && agent && !own && (p.agent || d.target) && (p.agent || d.target) !== agent) p = null;
+  let other = false;
+  const src = d.source && typeof d.source === "object" && d.source.perm && typeof d.source.perm === "object" ? d.source.perm : null;
+  if (!p && src && PERM_NAME[src.level]) {
+    p = { level: src.level, sandbox: src.sandbox, read: src.level, from: src.from };
+    other = true;
+  }
+  if (!p || !PERM_NAME[p.level]) return null;
+  const text = !other && typeof p.text === "string" && p.text.trim() ? p.text.trim() : null;
+  const was = PERM_NAME[p.read] ? p.read : p.level;
+  const set = permSetting();
+  const meant = PERM_NAME[set] ? set : set.startsWith("max:") && permRank(was) > permRank(set.slice(4)) ? set.slice(4) : was;
+  const fell = !other && ((text && /the next stricter level/.test(text)) || (!text && permRank(p.level) < permRank(meant)));
+  const flags = other ? null : Array.isArray(p.flags) ? p.flags.map(String) : [];
+  return { level: p.level, sandbox: !!p.sandbox && p.level === "never", flags, text, was, meant, fell, other };
+}
+/** The line and the no-exact-match note.  The core's text as given; where
+ * it gave none, words of our own.  `ctx`: {agent: the session's agent,
+ * leaving: (its label) => the words for that session, on: the machine the
+ * next agent starts on}. */
+function permWords(x, agent, ctx = {}) {
+  const label = AGENTS[agent] || agent || "The agent";
+  const who = label + (ctx.on ? ` on ${ctx.on}` : "");
+  const leaving = ctx.leaving ? ctx.leaving(ctx.agent ? AGENTS[ctx.agent] || ctx.agent : null) : "the session it continues";
+  let line;
+  if (x.text) line = x.text;
+  else if (x.other) line = `${leaving[0].toUpperCase() + leaving.slice(1)} runs in ${permName(x.was, x.sandbox)}: ${who} starts in its own equivalent, or the next stricter level it has.`;
+  else if (x.fell) line = `${who} starts in ${permName(x.level, x.sandbox)}, the next stricter level it has (${leaving} runs in ${PERM_NAME[x.was]}).`;
+  else line = `${who} starts in ${permName(x.level, x.sandbox)}, like ${leaving}.`;
+  return { line, fell: x.fell ? `No exact match: ${label} starts in the next stricter level it has.` : null };
+}
+/** A flag as a shell would need it written. */
+const shellWord = (w) => (/^[\w@%+=:,./-]+$/.test(w) ? w : "'" + w.replace(/'/g, "'\\''") + "'");
+/** The line, the no-exact-match note and the flags in small text; a
+ * never-ask level in a caution box. */
+function permPart(d, agent, ctx) {
+  const x = agent ? permOf(d, agent) : null;
+  if (!x) return null;
+  const { line, fell } = permWords(x, agent, ctx);
+  const label = AGENTS[agent] || agent;
+  return h("div", { class: "perm " + x.level, "data-level": x.level },
+    h("div", { class: "lead" }, x.level === "never" ? h("span", { class: "caution", text: "⚠ " }) : null, h("span", { class: "said", text: line })),
+    fell ? h("div", { class: "warn small fell", text: fell }) : null,
+    h("div", { class: "dim small flags" }, PERM_SAYS[x.level] + " ",
+      x.flags === null ? `${label} gets its own flags for it.`
+        : x.flags.length ? ["Flags: ", h("code", { text: x.flags.map(shellWord).join(" ") })] : `No flags: ${label}'s own default.`),
+    ctx && ctx.later ? h("div", { class: "dim small", text: ctx.later }) : null);
+}
+
 /** Switch Agent: the dry run, then a dialog that asks how the agent goes
  * on: in a new session that reads the whole summary, or in its own latest
  * session here, which reads only what changed since it last worked here
@@ -686,13 +778,15 @@ async function switchAgent(p, target) {
   let mode = "new";
   const s = sheet(`Continue “${name}” in ${label}`, "Continue in another agent", 600);
   const said = h("div", { class: "stack" });
-  const go = h("button", { class: "primary", text: "Switch", onclick: () => { closeSheet(); startSwitch(p, target, mode); } });
+  const go = h("button", { class: "primary", text: "Switch", onclick: () => { closeSheet(); startSwitch(p, target, mode, target !== "kimi" || kimiReads(plans[mode])); } });
   // what the chosen way would do: what stops it, what aht does instead
   // (fallback), and its warnings
   const pick = (m) => {
     mode = m;
     const x = plans[m], stop = problems(x);
-    clear(said).append(stop ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: "Not possible this way:\n\n" + stop }) : null,
+    clear(said).append(stop ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: "Not possible this way:\n\n" + stop })
+      : permPart(x, x.target || target, { agent: (x.source || src).agent, leaving: (a) => `the ${a ? a + " " : ""}session you are leaving` }),
+      !stop && (x.target || target) === "kimi" && !kimiReads(x) ? h("p", { class: "small kimi-opens", text: KIMI_OPENS }) : null,
       x.fallback ? h("p", { class: "warn small", text: x.fallback }) : null,
       (x.warnings || []).map((w) => h("p", { class: "warn small", text: "⚠ " + w })),
       x.start_line ? h("details", {}, h("summary", { class: "dim small", text: "What aht runs" }),
@@ -714,9 +808,9 @@ async function switchAgent(p, target) {
     h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), go);
   pick(mode);
 }
-async function startSwitch(p, target, mode) {
+async function startSwitch(p, target, mode, reads = true) {
   const label = AGENTS[target] || target, resume = mode === "resume";
-  const a = await busy(resume ? `${label} is catching up…` : `${label} is reading the summary…`,
+  const a = await busy(!reads ? `opening ${label}…` : resume ? `${label} is catching up…` : `${label} is reading the summary…`,
     () => job(["switch", p.real_path, "--to", target, ...(resume ? ["--resume"] : []), "--apply", "--json"]));
   // fallback: its own session could not take the catch-up, so a new one did
   switched(p, a, label, (d) => (resume && !d.fallback ? `${label} went on in its own session; its window is open. What it read: ${d.brief || ""}`
@@ -728,9 +822,14 @@ function switched(p, a, label, done, notDone) {
   const d = a.json || {};
   // what aht printed holds the line to run by hand when no terminal opened
   const failed = problems(d) || (a.ok && d.applied ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
+  // Kimi below never-ask: its window opened without reading the summary;
+  // the line to paste as its first message, with a Copy button
+  const first = kimiFirst(d);
+  const parts = first ? [firstPromptPart(first)] : undefined;
   // the summary is written before the terminal opens: only that step is left
   if (!(d.blockers || []).length && d.brief && /^No terminal window opened/.test(d.error || ""))
-    note(p, `aht wrote the summary for ${label} (${d.brief}), but no terminal window opened. ${d.error.replace(/^No terminal window opened\.\s*/, "")}`);
+    note(p, `aht wrote the summary for ${label} (${d.brief}), but no terminal window opened. ${d.error.replace(/^No terminal window opened\.\s*/, "")}`, undefined, parts);
+  else if (!failed && first) note(p, `${d.fallback ? d.fallback + "\n\n" : ""}${label}'s window is open. The summary is in the project: ${d.brief || ""}`, d.brief || undefined, parts);
   else note(p, failed ? `${notDone}:\n\n${failed}` : done(d));
   refresh();
 }
@@ -772,8 +871,10 @@ async function handBack(p) {
   const title = (rec.from || {}).title;
   let body = (x.fallback || `${back}'s own session${title ? ` (“${title}”)` : ""} goes on where it stopped, and reads only what ${now} did${r.since ? " since " + clock(r.since) : ""}.`)
     + ` The ${now} session stays as it is.`;
+  if ((x.target || r.from_agent) === "kimi" && !kimiReads(x)) body += "\n\n" + KIMI_OPENS;
   for (const w of x.warnings || []) body += "\n\n⚠ " + w;
-  if (!(await confirmIt(`Hand “${name}” back to ${back}?`, body, "Hand Back"))) return;
+  const level = permPart(x, x.target || r.from_agent, { agent: r.to_agent, leaving: (a) => `the ${a ? a + " " : ""}session you are leaving` });
+  if (!(await confirmIt(`Hand “${name}” back to ${back}?`, body, "Hand Back", level))) return;
   const a = await busy(`handing ${name} back to ${back}…`, () => job(["switch", p.real_path, "--back", "--apply", "--json"]));
   switched(p, a, back, (d) => (d.fallback ? `${d.fallback}\n\n${back}'s window is open. The summary it read: ${d.brief || ""}`
     : `${back} is back in its own session; its window is open. What ${now} did meanwhile: ${d.brief || ""}`), "Handing back did not go through");
@@ -1018,11 +1119,38 @@ function tokenLine(agent, d) {
   if (own && agent === "claude" && S.status.hook_installed !== false) {
     return "Claude Code's own session goes on: aht's hook tells it what happened meanwhile, so nothing runs until you type.";
   }
+  if (agent === "kimi" && !kimiReads(d)) return KIMI_OPENS + " Reading it is Kimi's first turn: it uses tokens.";
   if (agent === "kimi") return "Kimi reads the summary in a first run of its own, before its window opens or its line is copied: that turn uses tokens.";
   if (own) return `${label}'s own session reads what happened meanwhile as its next turn: it uses tokens.`;
   return `Reading the summary is ${label}'s first turn: it uses tokens.`;
 }
 const copyText = (t) => navigator.clipboard.writeText(t).then(() => toast("Copied."), () => toast("It could not be copied: select the line and copy it."));
+
+// ---- Kimi below never-ask ---------------------------------------------------------------
+// Kimi's run of its own that reads the summary first (`-p`) always runs in
+// never-ask, so the core uses it only at never-ask (`kimi_reads: true`).
+// Below it, Switch, Hand Back and Pick Up → Open in Kimi open Kimi's own
+// session without that run (`kimi_reads: false`) and give `first_prompt`:
+// the one line that asks it to read the summary, for the user to paste.
+const KIMI_OPENS = "Kimi opens without reading the summary: its run that reads it first works only in never-ask mode, so you paste the first message aht shows you.";
+/** Whether Kimi reads the summary in a run of its own first: the core's
+ * `kimi_reads` (when it speaks of Kimi), else Kimi's level from the dry run
+ * (never-ask: it does); an older core that says neither: it does. */
+function kimiReads(d) {
+  if (!d || typeof d !== "object") return true;
+  const own = d.perm && typeof d.perm === "object" ? d.perm.agent || d.target : d.target;
+  if (typeof d.kimi_reads === "boolean" && (!own || own === "kimi")) return d.kimi_reads;
+  const x = permOf(d, "kimi");
+  return x ? x.level === "never" : true;
+}
+/** An answer that opened (or would open) Kimi without its reading run, and
+ * the line to paste as its first message; null otherwise. */
+const kimiFirst = (d) => (d && d.kimi_reads === false && typeof d.first_prompt === "string" && d.first_prompt.trim() ? d.first_prompt.trim() : null);
+/** The first message to paste, with its Copy button. */
+const firstPromptPart = (line) => h("div", { class: "callout info first-prompt" },
+  h("strong", { text: "Kimi opens without reading the summary. Paste this as your first message:" }),
+  h("div", { class: "row top" }, h("pre", { class: "grow", style: "white-space:pre-wrap;margin:4px 0", text: line }),
+    h("button", { class: "small", text: "Copy", onclick: () => copyText(line) })));
 
 /** Pick Up from M: what was last done in this project on M, as a summary
  * made and masked there (`pickup --json`, a dry run): the folder there and
@@ -1056,7 +1184,7 @@ async function pickUp(p, machine, o = {}) {
   const copyLine = async () => {
     if (st.done) return copyText(st.done.line);
     const label = AGENTS[st.agent] || st.agent;
-    st.working = st.agent === "kimi" ? "Kimi is reading the summary…" : "writing the summary…"; st.failed = null; paint();
+    st.working = st.agent === "kimi" && kimiReads(st.d) ? "Kimi is reading the summary…" : "writing the summary…"; st.failed = null; paint();
     // --open X with --no-window: the summary here and its copy there, the
     // line that starts X with it, and no terminal (Kimi reads it first, in a
     // run of its own); --agent would pick the session there, not X
@@ -1069,8 +1197,11 @@ async function pickUp(p, machine, o = {}) {
       return s.body.isConnected ? paint() : note(p, "The summary was not written:\n\n" + failed);
     }
     const line = d.command_line || d.start_line || "";
-    st.done = { line, file: briefOf(d).file, copied: false };
-    note(p, `Picked up from ${machine}; nothing was opened.` + (line ? ` Start ${label} in a terminal with:\n\n${line}` : ""), st.done.file);
+    // Kimi below never-ask: it starts without reading the summary; the line
+    // to paste as its first message
+    st.done = { line, file: briefOf(d).file, copied: false, first: kimiFirst(d) };
+    note(p, `Picked up from ${machine}; nothing was opened.` + (line ? ` Start ${label} in a terminal with:\n\n${line}` : ""), st.done.file,
+      st.done.first ? [firstPromptPart(st.done.first)] : undefined);
     refresh();
     if (!s.body.isConnected) return;
     if (line) st.done.copied = await navigator.clipboard.writeText(line).then(() => true, () => false);
@@ -1081,7 +1212,7 @@ async function pickUp(p, machine, o = {}) {
     const agent = st.agent, label = AGENTS[agent] || agent, back = backMode(st.d) && agent === planned() && !!st.d.session;
     const extra = opts(true);
     closeSheet();
-    const a = await busy(agent === "kimi" ? "Kimi is reading the summary…" : `opening ${label}…`,
+    const a = await busy(agent === "kimi" && kimiReads(st.d) ? "Kimi is reading the summary…" : `opening ${label}…`,
       () => job(["pickup", p.real_path, "--from", machine, ...extra, "--open", agent, "--apply", "--json"]));
     const d = a.json || {};
     switched(p, Object.assign({}, a, { json: Object.assign({}, d, { brief: briefOf(d).file }) }), label, (x) => (back
@@ -1106,7 +1237,8 @@ async function pickUp(p, machine, o = {}) {
         st.done.line ? [h("div", { class: "small", text: st.done.copied ? `The line that starts ${label()} with it is copied: paste it into a terminal.`
           : `To start ${label()} with it, run this line in a terminal:` }),
         h("div", { class: "row top" }, h("pre", { class: "grow", style: "white-space:pre-wrap;margin:4px 0", text: st.done.line }),
-          h("button", { class: "small", text: "Copy", onclick: () => copyText(st.done.line) }))] : null));
+          h("button", { class: "small", text: "Copy", onclick: () => copyText(st.done.line) }))] : null),
+      st.done.first ? firstPromptPart(st.done.first) : null);
     }
     if (st.failed) wrap.append(h("p", { class: "warn small", style: "white-space:pre-wrap", text: "The summary was not written:\n\n" + st.failed }));
     wrap.append(matchPart(d, machine, p, { choose: (x) => { st.there = x; look(); }, retry: look, change: o.change }));
@@ -1128,6 +1260,8 @@ async function pickUp(p, machine, o = {}) {
       h("div", { class: "brief" }, md(bf.text, true))));
     }
     const tok = h("span", { class: "dim small" });
+    // the level the agent chosen starts in, like the session there
+    const level = h("div");
     // what Copy the Start Line does for the agent chosen
     const cp = st.done ? null : h("div", { class: "dim small" });
     const go = h("button", { class: "primary", disabled: !ok || !st.agent || !!st.done || !!st.working, onclick: openIn });
@@ -1135,16 +1269,19 @@ async function pickUp(p, machine, o = {}) {
     const said = () => {
       go.textContent = st.agent ? `Open in ${label()}` : "Open in …";
       tok.textContent = st.agent ? tokenLine(st.agent, d) : "";
+      clear(level).append(permPart(d, st.agent, { agent: (d.source || {}).agent, leaving: (a) => `the ${a ? a + " " : ""}session on ${machine}` }));
+      level.hidden = !level.firstChild;
       if (cp) cp.textContent = `Copy the Start Line writes the summary here and a copy of it on ${machine}, and copies the line that starts ${label()} with it: `
-        + (st.agent === "kimi" ? "Kimi reads the summary in a run of its own first (that turn uses tokens), then nothing runs until you paste the line into a terminal."
-          : "nothing runs until you paste it into a terminal.") + " Done closes this and writes nothing.";
+        + (st.agent === "kimi" && kimiReads(st.d) ? "Kimi reads the summary in a run of its own first (that turn uses tokens), then nothing runs until you paste the line into a terminal."
+          : st.agent === "kimi" ? "nothing runs until you paste it into a terminal; then paste the first message aht shows you into Kimi."
+            : "nothing runs until you paste it into a terminal.") + " Done closes this and writes nothing.";
       if (runs) runs.hidden = st.agent !== planned();
     };
     if (ok && agents.length) {
       wrap.append(h("div", { class: "openin" }, h("div", { class: "row" }, h("strong", { text: "Open in" }),
         h("select", { disabled: !!st.done, onchange: (e) => { st.agent = e.target.value; said(); } },
           agents.map((a) => h("option", { value: a, text: AGENTS[a] || a, selected: a === st.agent }))), tok),
-      cp, runs));
+      level, cp, runs));
     } else if (ok) wrap.append(h("p", { class: "dim small", text: "No agent CLI is installed on this computer to open it in." }));
     said();
     f.append(h("button", { text: "Copy the Start Line", disabled: !st.done && (!ok || !st.agent || !!st.working), onclick: copyLine }),
@@ -1438,7 +1575,22 @@ async function tokensOK(key, what) {
   if (ok) await setConfig(key, true);
   return ok;
 }
-async function openOpinion(p, runId) {
+/** The level each agent of a second opinion works in, beside Start: from
+ * `second-opinion <path> --task … --dry-run --json` ({perms: {agent: perm},
+ * warnings, blockers}), which starts nothing; or what starting it answered.
+ * `typed`: a task is typed (with none, the core's "say what both should do"
+ * is no news). */
+function opinionLevels(d, typed) {
+  const by = d && d.perms && typeof d.perms === "object" ? d.perms : {};
+  const stops = arr(d && d.blockers).filter((b) => typed || !/--task\b/.test(b));
+  return [Object.keys(by).map((a) => permPart(d, a, { leaving: () => "the project's latest session" })),
+    arr(d && d.warnings).map((w) => h("p", { class: "warn small", text: "⚠ " + w })),
+    stops.length ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: "Not possible now:\n\n" + stops.map((b) => "• " + b).join("\n\n") }) : null];
+}
+/** `started`: what starting it answered: the level each agent runs in
+ * (`perms`, the core's words) and its warnings, shown beside Start until
+ * another task is typed. */
+async function openOpinion(p, runId, started) {
   if (!(await tokensOK("second_opinion", "second opinions"))) return;
   const all = ((await J("second-opinion", "--list", "--json")).opinions || []).filter((o) => o.project === p.real_path);
   const cur = runId || (all[0] || {}).id;
@@ -1449,14 +1601,32 @@ async function openOpinion(p, runId) {
       all.map((o) => h("option", { value: o.id, selected: o.id === cur, text: `${when(o.started)} — ${String(o.task || "").slice(0, 40)}` }))));
   }
   const task = h("textarea", { rows: 2, style: "width:100%", placeholder: "A task for two agents, e.g. “make the parser accept empty lines”" });
-  s.body.append(h("p", { class: "dim", text: "Two agents work on the same task, each in its own copy of the project; you compare and take one result. Both use tokens." }),
-    h("div", { class: "row" }, task, h("button", { class: "primary", text: "Start", onclick: async () => {
-      const t = task.value.trim();
-      if (!t) return;
-      const r = await busy("copying the project twice…", () => J("second-opinion", p.real_path, "--task=" + t, "--json"));
-      if (problems(r)) return tell("Not started", problems(r));
-      openOpinion(p, r.id);
-    } })));
+  // beside Start: the level each agent works in, from a dry run of the task
+  // typed (asked as the dialog opens, and again a moment after typing stops)
+  const levels = h("div", { class: "stack opinion-levels", style: "margin-top:8px" });
+  const start = h("button", { class: "primary", text: "Start", onclick: async () => {
+    const t = task.value.trim();
+    if (!t) return;
+    const r = await busy("copying the project twice…", () => J("second-opinion", p.real_path, "--task=" + t, "--json"));
+    if (problems(r)) return tell("Not started", problems(r));
+    openOpinion(p, r.id, r);
+  } });
+  let asked = 0, wait = null;
+  const look = async () => {
+    const t = task.value.trim(), n = ++asked;
+    // as it started, until another task is typed
+    if (!t && started) return clear(levels).append(opinionLevels(started, false));
+    const r = await J("second-opinion", p.real_path, "--task=" + t, "--dry-run", "--json");
+    if (n !== asked || !levels.isConnected) return;          // typed again, or closed
+    clear(levels).append(opinionLevels(r, !!t));
+    // what stops this task stops Start too
+    start.disabled = !!t && arr(r.blockers).length > 0;
+  };
+  task.addEventListener("input", () => { clearTimeout(wait); start.disabled = false; wait = setTimeout(look, 400); });
+  s.body.append(h("p", { class: "dim", text: "Two agents work on the same task, each in a throwaway copy of the project; you compare and take one result. Both use tokens." }),
+    h("p", { class: "dim small", text: "Claude Code may edit files in its throwaway copy at any level, since the project itself stays untouched; the commands it runs follow the level of the project's latest session, never higher. Kimi Code's run on its own never asks, so Kimi takes part only when that session runs in never-ask mode." }),
+    h("div", { class: "row" }, task, start), levels);
+  look();
   if (cur) {
     if (d.task) s.body.append(h("h3", { text: d.task }));
     if ((d.project_changed || []).length) s.body.append(h("p", { class: "warn small", text: "Changed in the project meanwhile: " + d.project_changed.join(", ") }));
@@ -1465,8 +1635,11 @@ async function openOpinion(p, runId) {
     for (const a of d.agents || []) {
       const r = res[a] || {};
       const busyNow = ["working", "starting"].includes(r.state);
+      const lv = (d.perms || {})[a];
+      const level = lv && PERM_NAME[lv.level] ? h("span", { class: "badge" + (lv.level === "never" ? " waiting" : ""), text: permName(lv.level, lv.sandbox),
+        title: arr(lv.flags).length ? "Flags: " + lv.flags.map(shellWord).join(" ") : "No flags" }) : null;
       cols.append(h("div", { class: "box grow", style: "min-width:280px" },
-        h("div", { class: "row" }, h("strong", { text: AGENTS[a] || a }), h("span", { class: "badge", text: r.state || "?" }),
+        h("div", { class: "row" }, h("strong", { text: AGENTS[a] || a }), h("span", { class: "badge", text: r.state || "?" }), level,
           r.seconds ? h("span", { class: "dim small", text: `${Math.round(r.seconds / 60)} min` }) : null,
           r.cost_usd ? h("span", { class: "dim small", text: `$${Number(r.cost_usd).toFixed(2)}` }) : null, h("span", { class: "grow" }),
           h("button", { class: "small", text: "Use These Changes…", disabled: busyNow || !!d.taken || !(r.files || []).length, onclick: async () => {
@@ -1491,14 +1664,22 @@ async function openOpinion(p, runId) {
   h("span", { class: "spacer" }), h("button", { class: "primary", text: "Close", onclick: closeSheet }));
 }
 async function openNightShift(p) {
-  const jobs = ((await J("night-shift", "--list", "--json")).jobs || []).filter((j) => j.project === p.real_path);
+  const remote = (S.status.handover || {}).default_remote;
+  // the jobs, and a dry run for the level the session there starts in
+  const [list, dry] = await Promise.all([J("night-shift", "--list", "--json"),
+    J(...["night-shift", p.real_path, "--start", "now", "--back", "07:00", "--json"].concat(remote ? ["--to=" + remote] : []))]);
+  const jobs = (list.jobs || []).filter((j) => j.project === p.real_path);
   const s = sheet(`Night shift: ${base(p.real_path)}`, "The night shift", 700);
   const task = h("textarea", { rows: 3, style: "width:100%", placeholder: "What the agent should do while you are away" });
   const startAt = h("input", { type: "time", value: "22:00" });
   const backAt = h("input", { type: "time", value: "07:00" });
   const now = h("input", { type: "checkbox" });
+  const there = (dry.job || {}).remote || remote;
+  const agent = dry.agent || "claude";
   s.body.append(task, h("div", { class: "row", style: "margin-top:6px" }, "Hand it over at", startAt,
-    h("label", { class: "check" }, now, "now"), "and take it back from", backAt));
+    h("label", { class: "check" }, now, "now"), "and take it back from", backAt),
+  permPart(dry, agent, { on: there, agent, leaving: (a) => `the ${a ? a + " " : ""}session here`,
+    later: "aht reads the level again when the shift starts." }));
   for (const j of jobs.slice().reverse()) {
     s.body.append(h("div", { class: "row small", style: "padding:4px 0;border-bottom:1px solid var(--line)" },
       h("span", { class: "grow", text: `${when(j.start_at)} → ${when(j.back_at)}: ${j.task || ""}` }), h("span", { class: "badge", text: j.state || "" }),
@@ -1508,7 +1689,6 @@ async function openNightShift(p) {
     h("button", { class: "primary", text: "Plan It", onclick: async () => {
       const t = task.value.trim();
       if (!t || !(await tokensOK("night_shift", "the night shift"))) return;
-      const remote = (S.status.handover || {}).default_remote;
       const r = await busy("planning the night shift…", () => J(...["night-shift", p.real_path, "--task=" + t, "--back", backAt.value,
         "--start", now.checked ? "now" : startAt.value, "--apply", "--json"].concat(remote ? ["--to=" + remote] : [])));
       if (problems(r)) return tell("Not planned", problems(r));
@@ -1590,7 +1770,8 @@ async function handOver(p, replacing) {
   for (const w of plan.warnings || []) if (!(replacing && /aside there$/.test(w))) body += "\n\n⚠ " + w;
   for (const t of arr(plan.notes)) body += "\n\n" + sentence(t).trim();
   body += "\n\nThe session is resumed there and this folder is marked as away until you take it back.";
-  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over", gitattrPart(plan)))) return;
+  const level = permPart(plan, plan.agent || "claude", { on: remote, agent: plan.agent || "claude", leaving: (a) => `the ${a ? a + " " : ""}session here` });
+  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over", [level, gitattrPart(plan)]))) return;
   S.moving = p.real_path;             // its own record of it is no unfinished handover
   const d = await busy(`handing ${name} over…`, () =>
     job(["handover", p.real_path, "--apply", "--json", "--to", remote, ...past], "handing over", true).then((a) => a.json || {}))
@@ -2260,6 +2441,8 @@ async function bringHere(machine, there, o = {}) {
       wrap.append(factsGrid([...planFacts(plan, `on ${machine}`, "here"),
         plan.set_aside ? ["Here", `${plural(plan.set_aside, "file")} in the folder here ${plan.set_aside === 1 ? "is" : "are"} set aside first`] : null,
         ["Session", sess.id ? `${sess.title ? `“${sess.title}” — ` : ""}opens here in a new terminal; nothing runs until you type` : "none yet"]].filter(Boolean)));
+      // the level its session opens in here, like it ran there
+      if (sess.id) wrap.append(permPart(d, sess.agent || d.agent || "claude", { agent: sess.agent || d.agent || "claude", leaving: (a) => `the ${a ? a + " " : ""}session on ${machine}` }));
       if (st.idle) wrap.append(h("p", { class: "small", text: `The idle session on ${machine} stays as it is. If anyone types into it later, Send Back keeps both versions.` }));
       wrap.append(h("p", { class: "small", text: `On ${machine} the project is marked as being here; its own copy stays as it is. Send Back returns your work when you are done.` }));
     }
@@ -2878,6 +3061,7 @@ function drawSettings(m) {
     tok("Second opinion: one task, two agents, compared", "second_opinion", "both agents work"),
     CAN_HAND_OVER() ? tok("Night shift: hand a project over with a task, on a timer", "night_shift", "the agent works while you are away") : null,
     h("div", { class: "dim small", text: "Each of these makes an agent read or work, which counts against your plan or API bill. aht's own work — watching, search, backups, reports, loose ends — never uses tokens." })));
+  m.append(permissionsGroup());
   // a PC too, with ssh: aht's own copy moves the backups there
   if (CAN_HAND_OVER() || CAN_REACH()) {
     const off = S.config.offsite_backup || "";
@@ -2954,6 +3138,49 @@ function drawSettings(m) {
       h("button", { text: "Open Log", onclick: () => post("/api/reveal", { path: st.log && st.log.path }) }),
       h("button", { text: "Open Data Folder", onclick: () => post("/api/reveal", { path: st.aht_home }) })),
     h("div", { class: "dim small", text: "aht keeps every AI coding agent's per-project history connected to its folder. History is never deleted or overwritten. Data: " + tilde(st.aht_home || "") })));
+}
+/** Settings ▸ Permissions: the level the next agent starts in
+ * (`agent_permissions`), and Codex's never-ask flags
+ * (`agent_permission_flags`.codex.never: the built-in full bypass, or
+ * never asking inside Codex's sandbox). */
+const PERM_CHOICES = [["follow", "Follow the session"], ["ask", "Always: ask mode"], ["edits", "Always: edits mode"],
+  ["auto", "Always: auto mode"], ["never", "Always: never-ask mode"], ["max:edits", "At most: edits mode"], ["max:auto", "At most: auto mode"]];
+const CODEX_SANDBOXED = ["-a", "never", "-s", "workspace-write"];
+/** Codex's never-ask flags as set: "sandbox" (never asks, keeps its
+ * sandbox), "full" (the built-in full bypass), or "own" (other flags). */
+function codexNever() {
+  const f = ((S.config.agent_permission_flags || {}).codex || {}).never;
+  if (!Array.isArray(f) || !f.length) return "full";
+  return JSON.stringify(f) === JSON.stringify(CODEX_SANDBOXED) ? "sandbox" : "own";
+}
+function setCodexNever(how) {
+  const all = JSON.parse(JSON.stringify(S.config.agent_permission_flags || {}));
+  const codex = Object.assign({}, all.codex || {});
+  if (how === "sandbox") codex.never = CODEX_SANDBOXED.slice();
+  else delete codex.never;                // the built-in: --dangerously-bypass-approvals-and-sandbox
+  if (Object.keys(codex).length) all.codex = codex; else delete all.codex;
+  return setConfig("agent_permission_flags", all);
+}
+function permissionsGroup() {
+  const now = String(S.config.agent_permissions || "follow");
+  const choices = PERM_CHOICES.some(([v]) => v === now) ? PERM_CHOICES : PERM_CHOICES.concat([[now, now]]);
+  const cx = codexNever();
+  const own = cx === "own" ? ((S.config.agent_permission_flags || {}).codex || {}).never.map(shellWord).join(" ") : null;
+  const caution = h("div", { class: "warn small", id: "perm-never", text: "Every agent aht starts or continues then never asks, also after a session that asked." });
+  caution.hidden = now !== "never";
+  return group("Permissions", "The permission level follows the work",
+    h("div", { class: "dim small", text: "The agent that continues the work starts in its own equivalent of the session's permission level; aht never raises it by itself." }),
+    h("div", { class: "row" }, h("span", { style: "width:190px", text: "The next agent starts in" }),
+      h("select", { id: "agent-permissions", onchange: (e) => { caution.hidden = e.target.value !== "never"; setConfig("agent_permissions", e.target.value); } },
+        choices.map(([v, l]) => h("option", { value: v, text: l, selected: v === now })))),
+    caution,
+    h("div", { class: "row" }, h("span", { style: "width:190px", text: "Codex's never-ask mode" }),
+      h("select", { id: "codex-never", onchange: (e) => setCodexNever(e.target.value) },
+        [["full", "Full bypass (default)"], ["sandbox", "Never ask, keep Codex's sandbox"]].concat(own ? [["own", `Your own flags: ${own}`]] : [])
+          .map(([v, l]) => h("option", { value: v, text: l, selected: v === cx, disabled: v === "own" })))),
+    h("div", { class: "dim small" }, "Full bypass: ", h("code", { text: "--dangerously-bypass-approvals-and-sandbox" }),
+      ", the closest to Claude Code's skip-permissions. Keeping the sandbox: ", h("code", { text: CODEX_SANDBOXED.join(" ") }),
+      ": Codex never asks, but writes only inside the project."));
 }
 async function copyBackupsNow() {
   const a = await busy("copying the backups…", () => job(["backup", "--offsite", "--json"], "copying the backups"));

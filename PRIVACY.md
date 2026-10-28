@@ -78,6 +78,20 @@ switch agents off (`backends`) or point aht at other folders
 - Claude Code's settings file `~/.claude/settings.json`, to add and remove
   aht's hooks, and to show whether Remote Control and going on after the
   usage limit are on;
+- to learn the permission level a session runs in, so that the agent that
+  continues its work starts in the same (a switch, Hand Back, Pick Up,
+  Bring Here, a handover, the night shift and a second opinion): the
+  command line of that session's own process (Claude Code's from `ps`,
+  the other agents' from the list above), of which aht uses only the
+  permission flags; Codex's `turn_context` records in that session's
+  rollout, of which it uses only the approval policy and the sandbox; the
+  `permissionMode` Claude Code notes on that session's prompts; and from
+  Claude Code's settings (`~/.claude/settings.json`, the project's
+  `.claude/settings.json` and `.claude/settings.local.json`, Claude Code's
+  managed settings file, and a file or text a session's `--settings`
+  names) only `permissions.defaultMode` and `sandbox.enabled`.  Nothing of
+  these is kept, other than the level in a hand-off's record (below) and
+  in `~/.aht/run/perm.json`;
 - during a handover or a Bring Here: whether Claude Code trusts the
   project folder, from its `~/.claude.json` on the machine the project
   leaves;
@@ -158,7 +172,9 @@ switch agents off (`backends`) or point aht at other folders
   project's path and identifier; the two
   agents, their session ids and the session's title, masked; when; and the
   git branch, the latest commit, and how many files were not committed and
-  commits not pushed), its summary `relay-<id>.md`
+  commits not pushed; and the permission level aht started the receiving
+  agent in, `perm`: `ask`, `edits`, `auto` or `never`, whether inside a
+  sandbox, and the flags), its summary `relay-<id>.md`
   (exchanges, to-dos, file names, git state and commit subjects, with keys
   masked), and later small markers: `relay-<id>.closed` (what answered it,
   and when) and `relay-<id>.told` (the session told of it, and when).
@@ -265,6 +281,8 @@ encrypt it.
 | `remote/copies.json` | the folders on this computer that are copies of another machine's projects, each with the kind of copy, the project's identifier, the machine it came from (its name and its aht's random id), the project's path and system there, whether git converts line endings there (`autocrlf`), which attempt it came with, and since when.  aht writes a note when you bring a project here (`brought`, then `returned` once you send it back), and when another machine keeps a project in sync here or hands one over to this computer (see [What can leave your device](#what-can-leave-your-device)) | until you delete the file; a later copy into the same folder replaces that folder's note |
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
 | `run/` | short-lived state: notices already shown (with when each of your other machines was last asked for them, and since when one that holds a project of yours has not answered), open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
+| `run/perm.json` | the permission level aht started an agent in at each hand-off on this computer (Switch, Hand Back, Pick Up → Open in, Bring Here): the hand-off's identifier, the agent, the project's path, the session id when known, the level, whether inside a sandbox, the flags, and when.  aht reads the level a Hand Back continues in only from here, never from the record in the project | the newest 400 |
+| `run/claude-sandbox.json` | the settings that turn Claude Code's sandbox on (`{"sandbox": {"enabled": true}}`), which aht names with `--settings` when it starts Claude Code in never-ask mode inside its sandbox | rewritten when missing or changed |
 | `run/board.json` | for each of your other machines, when it last answered and the sessions it had open then: for each session its agent, project folder (the path there), process and session ids, state and since when, and its name, title and what it waits for, masked as that machine sent them | rewritten each time one of those machines answers; a machine you remove, or add again under the same name, is dropped at once |
 | `run/incoming.jsonl` | what your other machines left in this computer's projects through Pick Up and Leave a Note, one line each: when, the record's identifier and kind, whether the work left from here or came here and whether it came back, the project's path and folder name, the other machine's name (as it names itself), the agent that worked and its session's title (masked), and when that work began and ended.  This computer's notices tell of each new line once, and its hook and window use the file to tell that aht itself put a record there | the newest 300 lines |
 | `run/autostart.json` | that you answered whether aht's tray starts at login: the answer (on or off) and when.  Written only when your answer took effect, that is when the tray then starts at login, or not, as you chose: by `aht autostart on` or `off` (on a Mac the command itself changes nothing, since the app has the switch), the Windows installer's first install, the start-at-login switches in aht's window, the Mac app and the trays, and the welcome, when setting up changes whether aht starts at login or you changed its switch: so a first setup's no counts even when the tray did not start at login anyway (on a Mac too, where *Getting started* then marks the login step optional); the welcome then keeps that answer | rewritten at your next answer |
@@ -403,8 +421,10 @@ features below send data, and only after you set them up.
    own, or neither.  To start the
    session there, aht writes a few small files in
    `~/.aht/remote/run/aht-<project name>-<6 characters of its id>/` there:
-   the note the session reads first, its settings, the command it runs
-   (with your task, if you gave one), and when this handover's session was
+   the note the session reads first, its settings (with Claude Code's
+   sandbox turned on when the session here ran in it), the command it runs
+   (with the flags of the permission level the session here runs in, and
+   your task, if you gave one), and when this handover's session was
    started (so that aht can tell later, should the link drop, whether it
    started), and git settings for the session in that command
    (`core.autocrlf=true` when the project comes from a PC whose git
@@ -485,7 +505,10 @@ features below send data, and only after you set them up.
      commit and its subject, up to 30 names of files not committed, and
      how many are untracked); and its records of who handed the work to
      whom (identifiers, kinds, times and machine names).  For Pick Up it
-     also sends a summary of the chosen session there, or, when the work
+     also sends the permission level the chosen session runs in (the
+     level, whether inside a sandbox, and where that machine read it: as
+     under [What aht reads](#what-aht-reads)), a summary of the chosen
+     session there, or, when the work
      comes back, a catch-up of what happened there since, made there from
      the agents' histories the way aht makes one here.  Titles, commit
      subjects, file names and summaries are masked there (as under
@@ -536,8 +559,9 @@ features below send data, and only after you set them up.
      protocol number, from `~/.aht/install.json` there).
    - *For the project you pick:* the sessions and other programs running
      in it there (process ids, names, state), its latest Claude Code
-     session's id and title (the title masked there), how many sessions it
-     has and their ids, the path of its Claude Code history there and the
+     session's id and title (the title masked there) and the permission
+     level it runs in (as for Pick Up), how many sessions it has and their
+     ids, the path of its Claude Code history there and the
      names of its sessions' plans, Claude Code's version there, whether
      Claude Code trusts the folder there, which other agents keep a history
      of it, whether git converts line endings in it there (only when that

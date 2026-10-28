@@ -2,7 +2,8 @@
 # Smoke test of the commands added since 0.11 in the built aht.exe: search,
 # journal, report, share, secrets, rules, loose ends, undo, tidy, switch
 # (Summary Only) and relays, limits, sessions, workspace, asking other
-# machines over Windows' own ssh (status, remote add, pickup); and the hidden ones
+# machines over Windows' own ssh (status, remote add, pickup), Bring Here's
+# list and dry run from a test-mode machine; and the hidden ones
 # another aht uses: `_core --id`
 # (the core inside the exe is this checkout's aht.py, byte for byte) and
 # `_agent`.  Runs natively on Windows from Git Bash with
@@ -53,15 +54,13 @@ GOT=$(W _core --id)
 has "$(printf '%s' '{"op": "probe"}' | W _agent)" '^@@AHT@@\{.*"ok": true' "_agent did not answer the probe"
 
 echo "== other machines: a PC asks them over its own ssh =="
-# a PC can ask other machines (can_reach) and cannot hand projects over yet
-# (supported); adding a machine that does not answer fails with ssh's own
+# a PC can ask other machines (can_reach) and hand projects over (supported:
+# aht's own copy moves the files); adding a machine that does not answer fails with ssh's own
 # "cannot reach", never "getsockname" (Windows' ssh stops on the Control
 # options).  Only natively: wine has no ssh, and on macOS or Linux the add
 # would ask this machine's real ssh server
 HO=$(W status --json | sed -n '/"handover": {/,/"remotes"/p')
-if [ -z "${AHT_SMOKE_POSIX:-}" ]; then
-  has "$HO" '"supported": false' "status: the exe does not hand projects over yet"
-fi
+has "$HO" '"supported": true' "status: the exe does not hand projects over"
 if [ -n "${AHT_SMOKE_NATIVE:-}" ]; then
   has "$HO" '"can_reach": true' "status: Windows' own ssh is there, yet other machines cannot be asked"
   OUT=$(W remote add x nobody@127.0.0.1 2>&1)
@@ -177,6 +176,54 @@ grep -q "pelican module" "$T/roots/paper/.aht/handover/relay-$RID.md" \
 OUT=$(W relays "$PAPER" --json)
 has "$OUT" "\"id\": \"$RID\"" "relays does not list the hand-off"
 has "$OUT" '"open": false' "a Summary Only hand-off counts as open"
+
+echo "== Bring Here from a test-mode machine: its list and a dry run =="
+# a folder stands in for the other machine (remotes.<name>.root): the exe runs
+# itself there as `_agent`, with that folder's home.  Its project is
+# registered by the exe run with that home; nothing is brought (no --apply)
+mkdir -p "$T/mac/home/code/shop/bin" "$T/mac/home/.aht" "$T/mac/home/.claude/projects" "$T/landing"
+printf 'print(1)\n' > "$T/mac/home/code/shop/app.py"
+printf '#!/bin/sh\necho run\n' > "$T/mac/home/code/shop/bin/run.sh"
+chmod 755 "$T/mac/home/code/shop/bin/run.sh"
+SHOP="$(P mac/home/code/shop)"
+( export HOME="$(P mac/home)" USERPROFILE="$(P mac/home)" AHT_HOME="$(P mac/home/.aht)" \
+         AHT_ROOT_CLAUDE="$(P mac/home/.claude/projects)"
+  SENC=$(W encode "$SHOP")
+  mkdir -p "$T/mac/home/.claude/projects/$SENC"
+  printf '%s\n' "{\"type\":\"user\",\"cwd\":\"$(J "$SHOP")\",\"message\":{\"role\":\"user\",\"content\":\"tidy the heron module\"}}" \
+    > "$T/mac/home/.claude/projects/$SENC/s1.jsonl"
+  W tag "$SHOP" --apply >/dev/null ) || fail "the project on the test machine could not be registered"
+printf '{"remotes": {"mac": {"root": "%s", "paths": "home"}}}' "$(J "$(P mac)")" > "$T/home/.aht/config.json"
+# the test machine is this PC, so its paths are spelt the Windows way
+# (\home\code\shop); a Mac or Linux machine there would say /home/code/shop
+OUT=$(W bring --from mac --list --json)
+has "$OUT" '"path": "[\\/]+home[\\/]+code[\\/]+shop"' "bring --list does not list the project on the test machine"
+has "$OUT" '"can_bring": true' "bring --list says the project cannot be brought"
+THERE=$(printf '%s\n' "$OUT" | sed -n 's/.*"path": "\([^"]*shop\)".*/\1/p' | head -n 1 | sed 's/\\\\/\\/g')
+LAND="$(P landing/shop)"
+OUT=$(W bring "$THERE" --from mac --here "$LAND" --json)
+has "$OUT" '"applied": false' "bring without --apply did something"
+has "$OUT" '"blockers": \[\]' "the bring dry run is blocked"
+has "$OUT" '"there_path": "[\\/]+home[\\/]+code[\\/]+shop"' "the bring dry run names another folder there"
+has "$OUT" '"files": 3' "the bring dry run does not count the project's three files (its id too)"
+printf '%s' "$OUT" | grep -q Traceback && fail "bring crashed: $OUT"
+[ ! -e "$T/landing/shop" ] || fail "the bring dry run made the folder here"
+rm -f "$T/home/.aht/config.json"
+
+echo "== the line to continue a brought project, as cmd.exe runs it =="
+# a folder noted as brought here from a Mac: its session gets git's
+# core.filemode=false, and the line to type sets it with cmd.exe's own set
+# (sh's VAR=x and export do not run there)
+mkdir -p "$T/home/.aht/remote"
+printf '{"%s": {"uuid": "0123456789abcdef0123456789abcdef", "from": "mac", "kind": "brought", "system": "Darwin", "at": "2026-10-28T10:00:00"}}' \
+  "$(J "$PAPER")" > "$T/home/.aht/remote/copies.json"
+OUT=$(W resume-here "$PAPER" --print)
+if [ -z "${AHT_SMOKE_POSIX:-}" ]; then
+  has "$OUT" '^set "GIT_CONFIG_COUNT=1" && set "GIT_CONFIG_KEY_0=core.filemode" && set "GIT_CONFIG_VALUE_0=false" && cd /d ' \
+    "resume-here --print on a PC does not set git's settings as cmd.exe does"
+  printf '%s' "$OUT" | grep -q 'export ' && fail "resume-here --print on a PC uses sh's export: $OUT"
+fi
+rm -f "$T/home/.aht/remote/copies.json"
 
 echo "== limits / sessions / tab names / workspace / checkup =="
 has "$(W limits --json)" '"limits": \[\]' "limits failed"

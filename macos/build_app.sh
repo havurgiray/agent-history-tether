@@ -208,6 +208,7 @@ if [ "$TEST_AFTER" = "1" ]; then
   AHT_FIXTURES_PHASE4="${AHT_FIXTURES_PHASE4:-$REPO/tests/fixtures/phase4}" \
   AHT_FIXTURES_PHASE5="${AHT_FIXTURES_PHASE5:-$REPO/tests/fixtures/phase5}" \
   AHT_FIXTURES_PHASE6="${AHT_FIXTURES_PHASE6:-$REPO/tests/fixtures/phase6}" \
+  AHT_FIXTURES_PHASE7="${AHT_FIXTURES_PHASE7:-$REPO/tests/fixtures/phase7}" \
     "$APP/Contents/MacOS/$EXEC_NAME" --selftest
   "$RES/bin/aht" version
   "$RES/badge_icon" preview "$OUT/badge-preview.png" git agent:claude agent:kimi >/dev/null \

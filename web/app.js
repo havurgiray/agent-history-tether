@@ -78,6 +78,15 @@ function bytes(n) {
 
 // ---- talking to aht -----------------------------------------------------------
 
+// What the window opens on, when the tray opened it for one project
+// (Projects brought here ▸ Send Back…): p=<its path>&do=show|send-back
+// after #, read before the address is cleaned below.
+const GO = (() => {
+  try {
+    const q = new URLSearchParams(location.hash.slice(1));
+    return q.get("p") ? { path: q.get("p"), do: q.get("do") || "show" } : null;
+  } catch (e) { return null; }
+})();
 // The key that lets this page use aht's API. aht puts it after # in the
 // address it opens, a part no server sees; it is kept for a reload, then
 // taken out of the address.
@@ -187,15 +196,17 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-/** A small question above everything: resolves to the label pressed, or null. */
-function ask(title, body, buttons = ["Cancel", "OK"]) {
+/** A small question above everything: resolves to the label pressed, or
+ * null.  `extra`: more under the text (a box with a Copy button, say). */
+function ask(title, body, buttons = ["Cancel", "OK"], extra) {
   return new Promise((resolve) => {
     if (LOST) return resolve(null);   // the window says why nothing works
     const back = h("div", { class: "dialog-back", style: "position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:70;display:flex;align-items:center;justify-content:center;padding:20px" });
     const done = (v) => { back.remove(); resolve(v); };
-    const box = h("div", { class: "box", style: "max-width:520px;width:100%;box-shadow:var(--shadow)" },
+    const box = h("div", { class: "box", style: "max-width:520px;width:100%;max-height:100%;overflow:auto;box-shadow:var(--shadow)" },
       h("h2", { text: title, style: "margin-top:0" }),
       body ? h("p", { text: body, style: "white-space:pre-wrap" }) : null,
+      extra && [].concat(extra).some(Boolean) ? h("div", { class: "stack" }, extra) : null,
       h("div", { class: "row", style: "justify-content:flex-end;margin-top:10px" },
         buttons.map((b, i) => h("button", { text: b, class: i === buttons.length - 1 ? "primary" : "",
           onclick: () => done(i === 0 && buttons.length > 1 ? null : b) }))));
@@ -204,7 +215,7 @@ function ask(title, body, buttons = ["Cancel", "OK"]) {
     box.querySelector("button.primary")?.focus();
   });
 }
-const confirmIt = async (title, body, ok) => (await ask(title, body, ["Cancel", ok])) === ok;
+const confirmIt = async (title, body, ok, extra) => (await ask(title, body, ["Cancel", ok], extra)) === ok;
 const tell = (title, body) => ask(title, body, ["OK"]);
 
 /** A button with a menu under it. */
@@ -354,11 +365,12 @@ const CAN_HAND_OVER = () => !!(S.status.handover || {}).supported;
 // asking other machines (ssh alone); an older core says only "supported"
 const CAN_REACH = () => { const ho = S.status.handover || {}; return "can_reach" in ho ? !!ho.can_reach : !!ho.supported; };
 // what a PC does with a project and the other machines, said where Hand Over
-// would be: with a Mac or Linux machine to ask, and without one
-const FROM_WINDOWS = "With Machines ▾, Pick Up brings this project's latest work on another machine here as a summary, and Leave a Note leaves a summary of your work here on that machine before you go. Git moves the files. Handing projects over from Windows comes in a later version.";
-const FROM_WINDOWS_NONE = "Add your Mac or Linux machines in the Machines tab: then you can pick up a project's work from them here, and leave a note on them before you go. Handing projects over from Windows comes in a later version.";
+// would be when this aht cannot hand projects over: with a Mac or Linux
+// machine to ask, and without one
+const FROM_WINDOWS = "With Machines ▾, Pick Up brings this project's latest work on another machine here as a summary, and Leave a Note leaves a summary of your work here on that machine before you go. Git moves the files.";
+const FROM_WINDOWS_NONE = "Add your Mac or Linux machines in the Machines tab: then you can pick up a project's work from them here, and leave a note on them before you go.";
 // …and at the top of the Machines tab
-const PC_MACHINES = "From this PC you can see, search and watch your other machines, pick up a project's work from them and leave a note on them. Handing projects over from Windows comes in a later version.";
+const PC_MACHINES = "From this PC you can see, search and watch your other machines, pick up a project's work from them and leave a note on them.";
 const flag = (k, d = true) => (k in S.config ? !!S.config[k] : d);
 /** What copies files to and from another machine (`handover_transfer`):
  * "auto" picks rsync where both machines have it and neither is Windows,
@@ -394,6 +406,27 @@ const syncPaused = (p) => (p.mirror && p.mirror_paused ? p.mirror_paused : null)
  * kind}, from this machine's ~/.aht/remote/copies.json; `from`: that
  * machine's own name), or null. */
 const copyOf = (p) => (p.copy_of && typeof p.copy_of === "object" && p.copy_of.from ? p.copy_of : null);
+/** A copy here that goes back with Send Back: brought here (Bring Here), or
+ * handed over here from another machine. */
+const sendsBack = (c) => !!c && (c.kind === "brought" || c.kind === "handover");
+/** …and this machine has no name for its home (`copy_of.remote` null):
+ * Send Back needs that machine added first. */
+const noName = (c) => !!c && "remote" in c && !c.remote;
+/** …and its home is a PC (`copy_of.system`): aht cannot ask a PC, so it goes
+ * back only from there (Take Back on the PC), never with Send Back here. */
+const pcHome = (c) => !!c && c.system === "Windows";
+/** A project of this machine's that is on another one: {name, system,
+ * there: the holder brought it there (`away.driven_by`), since, take: Take
+ * Back can fetch it}.  A PC cannot be reached, so what a PC holds goes back
+ * only with Send Back there, or Release here; so does what a machine this
+ * one has no name for brought there (`away_remote` null). */
+function awayOf(p) {
+  if (!p.away) return null;
+  const r = ((S.status.handover || {}).remotes || {})[p.away_remote] || {};
+  const there = p.away_driven_by === "there", system = p.away_system || r.system || null;
+  return { name: p.away_remote || p.away_holder || p.away, system, there, since: p.away_since,
+    take: CAN_HAND_OVER() && system !== "Windows" && !(there && !p.away_remote) };
+}
 
 async function refresh() {
   const [st, cfg, pj] = await Promise.all([J("status", "--json"), J("config", "--json"), J("projects", "--json")]);
@@ -464,7 +497,7 @@ function draw() {
 
 function projState(p) {
   if (p.handing) return ["handover unfinished", "waiting"];
-  if (p.away) return [`handed over to ${p.away}`, "working"];
+  if (p.away) return [awayOf(p).there ? `on ${awayOf(p).name}` : `handed over to ${p.away}`, "working"];
   if (!p.exists) return ["folder gone", "waiting"];
   if (p.open === "waiting") return ["waiting for you", "waiting"];
   if (p.open === "working") return ["working", "working"];
@@ -475,7 +508,7 @@ function projState(p) {
   // a pause that asks something (the copy there was changed, say) waits for you
   if (syncPaused(p)) return ["sync paused", asksForSync(p) ? "waiting" : ""];
   const c = copyOf(p);
-  if (c) return [`copy from ${c.from}`, ""];
+  if (c) return [{ brought: `brought from ${c.from}`, handover: `handed over from ${c.from}` }[c.kind] || `copy from ${c.from}`, ""];
   return ["", ""];
 }
 
@@ -499,8 +532,11 @@ function drawProjects(m) {
   const table = h("table", { class: "list" }, h("thead", {}, h("tr", {},
     h("th", { text: "Project" }), h("th", { text: "State" }), h("th", { text: "Last used" }), h("th", { text: "Agents" }))), tbody);
   const look = menu("Look Back", [["Loose Ends…", openLooseEnds], ["Report…", openReport]], { right: true });
+  // a project of another machine's, brought here to work on (Bring Here)
+  const from = askable();
+  const bring = from.length ? menu("Bring Here", from.map((n) => [`From ${n}…`, () => bringList(n)]), { right: true }) : null;
   const top = h("div", { class: "row" }, filter, h("span", { class: "grow" }),
-    (S.status.missing || S.status.orphan_claude_stores) ? h("button", { text: "Tidy Up…", onclick: openTidy }) : null, look);
+    (S.status.missing || S.status.orphan_claude_stores) ? h("button", { text: "Tidy Up…", onclick: openTidy }) : null, bring, look);
   m.append(h("div", { class: "split" }, top,
     h("div", { class: "listpane" }, list.length ? table : h("p", { class: "dim", style: "padding:12px",
       text: S.projects.length ? "No project matches." : "No project tracked yet: aht takes them on as you work, or use Settings → Run Setup Again." })),
@@ -511,16 +547,19 @@ function detail() {
   const p = S.projects.find((x) => x.real_path === S.selection);
   const d = h("div", { class: "detail stack" });
   if (!p) { d.append(h("p", { class: "dim", text: "Select a project to continue a session, see what changed, or look back." })); return d; }
+  const aw = awayOf(p);
   const st = p.handing ? `handover to ${handing(p).to} unfinished`
-    : p.away ? `handed over to ${p.away}${p.away_since ? ", " + ago(p.away_since) : ""}`
+    : p.away ? `${aw.there ? "on " + aw.name : "handed over to " + p.away}${p.away_since ? ", " + ago(p.away_since) : ""}`
     : !p.exists ? "the folder is gone; its histories are safe"
     : `${plural(p.sessions || 0, "session")}, ${bytes(p.bytes)} of history`;
   d.append(h("div", { class: "row" }, h("strong", { text: base(p.real_path) }), h("span", { class: "dim", text: st })),
     h("div", { class: "dim small mono", text: tilde(p.real_path) }));
   if (p.handing) d.append(handingBanner(p));
   else if (!p.away && p.exists && syncPaused(p)) d.append(pausedBanner(p));
+  // brought to another machine, or held by a PC: it comes back from there
+  if (aw && !p.handing && (aw.there || !aw.take)) d.append(awayLine(p, aw));
   const copy = p.exists && !p.away ? copyOf(p) : null;
-  if (copy) d.append(copyLine(copy));
+  if (copy) d.append(copyLine(copy, p));
   const relay = openRelay(p);
   if (relay) d.append(relayLine(p, relay));
   const across = crossing(p), line = across && crossingLine(p, across);
@@ -530,11 +569,12 @@ function detail() {
   const row = h("div", { class: "row" });
   const handover = CAN_HAND_OVER() && (S.status.handover || {}).default_remote;
   if (p.away) {
-    if (CAN_HAND_OVER()) row.append(h("button", { class: "primary", text: "Take Back…", onclick: () => takeBack(p) }));
+    if (aw.take) row.append(h("button", { class: "primary", text: "Take Back…", onclick: () => takeBack(p) }));
   } else if (p.exists) {
     // while a handover is unfinished, nobody knows yet where the work goes on
     const held = !!p.handing;
-    if (CAN_HAND_OVER()) {
+    // a copy of another machine's project goes back there (Send Back), not on
+    if (CAN_HAND_OVER() && !sendsBack(copy)) {
       row.append(h("button", { text: handover ? `Hand Over to ${handover}…` : "Hand Over…", disabled: !handover || !!p.open || held,
         onclick: () => handOver(p) }));
       row.append(h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!p.mirror, disabled: !handover || held,
@@ -586,15 +626,20 @@ function detail() {
   }
   const n = S.notes[p.real_path];
   if (n) {
-    d.append(h("pre", { text: n.text || n, style: "white-space:pre-wrap" }));
+    const text = typeof n === "string" ? n : n.text;
+    if (text) d.append(h("pre", { text, style: "white-space:pre-wrap" }));
     if (n.file) d.append(h("button", { class: "small", text: ON_WINDOWS() ? "Show in Explorer" : "Show in Files",
       onclick: () => post("/api/reveal", { path: parent(n.file) }) }));
+    if (n.parts) d.append(h("div", { class: "stack" }, n.parts));
   }
   return d;
 }
 /** A note under the project; `file`: one it names, with a button that shows
- * its folder. */
-const note = (p, text, file) => { S.notes[p.real_path || p] = text && file ? { text, file } : text; draw(); };
+ * its folder; `parts`: more to show under it (names that cannot cross, say). */
+const note = (p, text, file, parts) => {
+  S.notes[p.real_path || p] = file || parts ? { text, file, parts } : text;
+  draw();
+};
 /** Whether "Start aht's tray at login" can be turned on here: the core knows
  * how, and (on Linux) the tray can run. */
 const loginWorks = () => { const a = S.status.autostart || {}; return !!a.supported && a.runs !== false; };
@@ -1521,9 +1566,19 @@ async function handOver(p, replacing) {
   const plan = await busy(`checking ${name}…`, () => J("handover", p.real_path, "--json", "--to", remote, ...past));
   const ch = changedThere(plan);
   if (ch && !replacing) return changedCopyBlock(p, plan, ch, remote);
+  // names that cannot exist there, or a folder there that is another
+  // project's: said in parts, with the way past
+  if (problems(plan) && (arr(plan.names).length || arr(plan.blockers).some((x) => WHERE.test(x) || /`/.test(x)))) {
+    const why = blockedPart(plan, remote, null, "Cannot be handed over now"), sys = farSystem(plan);
+    return note(p, why ? "" : "Cannot be handed over now:", null, [why,
+      namesPart(plan, `${remote}${sys ? ` (${SYSTEMS[sys] || sys})` : ""}`, () => handOver(p, replacing))]);
+  }
   if (problems(plan)) return note(p, "Cannot be handed over now:\n\n" + problems(plan));
   const n = plan.plan || {};
+  // the folder there, when it is not at the same path (path mapping)
+  const far = plan.there_path || plan.remote_path;
   let body = `${n.files || 0} file(s) to send (${bytes(n.bytes)}), history ${bytes(n.history_bytes)}.\nSession: ${plan.title || "the one used last"}`;
+  if (far && !sameDir(far, p.real_path)) body += `\nOn ${remote} it goes to ${far}.`;
   if (n.install_claude) body += `\nClaude Code ${n.install_claude} gets installed on ${remote}.`;
   const stay = plan.outside_not_carried || [];
   if (stay.length) body += "\n\nFiles outside the project that stay here:\n" + stay.slice(0, 6).map((x) => "• " + x).join("\n");
@@ -1533,8 +1588,9 @@ async function handOver(p, replacing) {
   }
   // …which the core says too, as a warning: once is enough
   for (const w of plan.warnings || []) if (!(replacing && /aside there$/.test(w))) body += "\n\n⚠ " + w;
+  for (const t of arr(plan.notes)) body += "\n\n" + sentence(t).trim();
   body += "\n\nThe session is resumed there and this folder is marked as away until you take it back.";
-  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over"))) return;
+  if (!(await confirmIt(`Hand “${name}” over to ${remote}?`, body, replacing ? "Replace and Hand Over" : "Hand Over", gitattrPart(plan)))) return;
   S.moving = p.real_path;             // its own record of it is no unfinished handover
   const d = await busy(`handing ${name} over…`, () =>
     job(["handover", p.real_path, "--apply", "--json", "--to", remote, ...past], "handing over", true).then((a) => a.json || {}))
@@ -1575,14 +1631,16 @@ async function takeBack(p, copy) {
   if (plan.would_stop) body += `\n\nThe idle session on ${remote} is ended first.`;
   const both = Object.values(plan.conflicts || {}).flat();
   const title = copy ? `Bring the changes on ${remote} here?` : `Take “${name}” back from ${remote}?`;
+  // across systems: line endings, names this machine cannot hold, .gitattributes
+  const across = crossNotes(plan, "here");
   let extra = [];
   if (both.length) {
     body += "\n\nChanged on BOTH machines:\n" + both.slice(0, 6).map((x) => "• " + x).join("\n") +
       `\n\nKeep Both leaves your version in place and puts the one from ${remote} next to it.`;
-    const pick = await ask(title, body, ["Cancel", `Use the Versions from ${remote}`, "Keep Both"]);
+    const pick = await ask(title, body, ["Cancel", `Use the Versions from ${remote}`, "Keep Both"], across);
     if (!pick) return;
     if (pick.startsWith("Use")) extra = ["--prefer", "there"];
-  } else if (!(await confirmIt(title, body, copy ? "Bring Them Here" : "Take Back"))) return;
+  } else if (!(await confirmIt(title, body, copy ? "Bring Them Here" : "Take Back", across))) return;
   const d = await busy(copy ? `bringing the changes on ${remote} here…` : `taking ${name} back…`, () =>
     job(["reclaim", p.real_path, ...stop, "--apply", "--json", ...extra, ...allow], copy ? "bringing them here" : "taking back", true).then((a) => a.json || {}));
   const kept = d.set_aside ? "\nReplaced files are kept in: " + d.set_aside : "";
@@ -1761,18 +1819,26 @@ async function syncAnyway(p, how) {
 /** On the other machine: "Copy kept in sync from mac".  Work done in it
  * here is not overwritten: mac's next sync pauses and asks there.  Keep in
  * sync from here back to mac is refused for it (the core says so). */
-function copyLine(c) {
+function copyLine(c, p) {
   const m = c.from, at = c.since || c.at, since = at ? `, since ${clock(at)}` : "";
-  // `kind`: "sync" (Keep in sync on that machine); from a later aht also
-  // "handover", "brought" and "returned"
+  // a PC's project: no Send Back (the PC cannot be asked); it goes back there
+  if (sendsBack(c) && pcHome(c)) {
+    const pc = c.remote || m;
+    return h("div", { class: "row copyof" }, h("span", { class: "badge", text: c.kind === "brought" ? `Brought here from ${m}` : `Handed over from ${m}` }),
+      h("span", { class: "dim small grow", text: `Take it back on ${pc}. aht cannot ask a PC, so there is no Send Back from here.` }));
+  }
+  // `kind`: "sync" (Keep in sync on that machine), "handover" (handed over
+  // here), "brought" (Bring Here) or "returned" (it went back)
   const [label, more] = {
     sync: [`Copy kept in sync from ${m}`, `${m} sends its changes here${since}. Work done in it here is not overwritten: ${m}'s next sync pauses and asks there.`],
-    handover: [`Handed over from ${m}`, `It goes back when ${m} takes it back.`],
-    brought: [`Brought here from ${m}`, null],
+    handover: [`Handed over from ${m}`, `It goes back when you send it back, or when ${m} takes it back.`],
+    brought: [`Brought here from ${m}`, `It is marked on ${m} as being here${since}. Send Back returns your work to ${m}.`],
     returned: [`A copy of a project that went back to ${m}`, null],
   }[c.kind || "sync"] || [`Copy from ${m}`, null];
   return h("div", { class: "row copyof" }, h("span", { class: "badge", text: label }),
-    more ? h("span", { class: "dim small grow", text: more }) : null);
+    more ? h("span", { class: "dim small grow", text: more }) : null,
+    p && sendsBack(c) && noName(c) ? h("span", { class: "warn small", text: `Send Back needs ${m} in the Machines tab: add it there first.` }) : null,
+    p && sendsBack(c) ? h("button", { class: "small", text: `Send Back to ${c.remote || m}…`, disabled: !!p.handing || noName(c), onclick: () => sendBack(p) }) : null);
 }
 /** Stop Syncing: Keep in sync goes off; the copy there stays as it is. */
 async function stopSyncing(p) {
@@ -1791,8 +1857,17 @@ async function stopSyncing(p) {
 // "checking" or "unreachable"; `release`: an hour went by without an answer.
 function handing(p) {
   const g = p.handing && typeof p.handing === "object" ? p.handing : {};
-  return { to: g.remote || g.host || "the other machine", state: g.state || "checking", error: g.error || "",
-    silent: g.unreachable_since, release: !!g.release };
+  return { to: g.remote || g.holder || g.host || "the other machine", state: g.state || "checking", error: g.error || "",
+    silent: g.unreachable_since, release: !!g.release, there: g.driven_by === "there" || p.away_driven_by === "there", since: g.since };
+}
+/** The machine that brings a project there drives it (mark-away, or unmark
+ * when it fails); aht here never asks it (a PC cannot be asked).  The
+ * notices check offers Release an hour after it began (the core's
+ * HANDING_RELEASE_AFTER): "aht waits for pc; Release is offered after an
+ * hour (at 15:10)." */
+function waitsFor(g) {
+  const t = typeof g.since === "number" ? g.since * 1000 : Date.parse(g.since || "");
+  return `aht waits for ${g.to}; Release is offered after an hour${isNaN(t) ? "" : ` (at ${clock((t + 3600e3) / 1000)})`}.`;
 }
 const sentence = (t) => { t = String(t || "").trim(); return t ? t[0].toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? " " : ". ") : ""; };
 function handingBanner(p) {
@@ -1803,6 +1878,16 @@ function handingBanner(p) {
       h("div", { class: "small", text: "This note goes when it is done." })));
   }
   const gone = g.state === "unreachable";
+  // the other machine began bringing it there (Bring Here at that machine)
+  if (g.there) {
+    return h("div", { class: "callout row" },
+      h("div", { class: "grow" }, h("strong", { text: `${g.to} began bringing this project there${g.since ? " at " + clock(g.since) : ""}` }),
+        h("div", { class: "small", text: `${sentence(g.error)}When ${g.to} finishes, the project shows as on ${g.to}. `
+          + (g.release ? `If it does not, Release lets the project go on here; what was copied to ${g.to} stays there.` : waitsFor(g)) })),
+      // no Check Now: there is nobody here to ask
+      h("button", { class: g.release ? "small primary" : "small", text: "Release…", onclick: () => release(p) }),
+      helpBtn("Hand a project over"));
+  }
   return h("div", { class: "callout row" },
     h("div", { class: "grow" },
       h("strong", { text: gone ? `Handover to ${g.to} did not finish` : `Handover to ${g.to} unfinished: checking…` }),
@@ -1826,6 +1911,7 @@ async function checkHanding(p) {
   if (q.handing) {
     const g = handing(q);
     return note(p, g.state === "running" ? `The handover to ${to} is under way right now.`
+      : g.there ? `${to} has not finished bringing ${name} there. ${waitsFor(g)}`
       : `${to} did not answer${g.error ? ` (${g.error})` : ""}. aht asks again every minute.`);
   }
   note(p, q.away ? `The handover of ${name} to ${to} finished.` : `The handover of ${name} to ${to} did not finish. The project stays here.`);
@@ -1865,6 +1951,467 @@ async function release(p) {
     : `Released: ${name} is here again. ` + (d.pauses_sync ? `Keep in sync with ${d.pauses_sync} is paused, so the copy there stays as it is.`
       : `The copy on ${to} stays as it is.`));
   refresh();
+}
+
+// ---- across systems: Bring Here and Send Back; where folders go ------------------------
+// Four verbs between any two of Mac, Windows and Linux.  "Home" keeps the
+// project's record; the "holder" works on it meanwhile.  Hand Over and Take
+// Back run at home; Bring Here and Send Back run at the holder, and need aht
+// at home, which must be a machine aht can ask (not a PC).  A folder can sit
+// at another path on each machine: `remotes.<name>.paths` says where.
+
+const arr = (x) => (Array.isArray(x) ? x : []);
+const spinner = (text) => h("p", { class: "dim" }, h("span", { class: "spin" }), text);
+const sameDir = (a, b) => {
+  const k = (x) => { const s = String(x || "").replace(/[\\/]+$/, ""); return ON_WINDOWS() ? s.replace(/\//g, "\\").toLowerCase() : s; };
+  return k(a) === k(b);
+};
+/** A sentence with commands in it: in `backticks`, or the core's way, after
+ * a colon and two spaces (up to three spaces or the end).  Each is shown as
+ * code with a Copy button; one that ends in "…" (fill in the rest) is shown
+ * only. */
+function withCommands(text, cls) {
+  const line = h("div", { class: (cls || "small") + " fix" });
+  const cmd = (c) => [h("code", { text: c }), /…$/.test(c) ? null : [" ", h("button", { class: "small", text: "Copy", onclick: () => copyText(c) })]];
+  const s = String(text), re = /`([^`]+)`|:\s{2,}((?:aht|git|sudo|ssh|brew) .*?)(?=\s{3,}|\.?$)/g;
+  let at = 0, m;
+  while ((m = re.exec(s))) {
+    line.append(s.slice(at, m.index) + (m[1] === undefined ? ": " : ""), cmd(m[1] === undefined ? m[2] : m[1]));
+    at = m.index + m[0].length;
+  }
+  line.append(s.slice(at));
+  return line;
+}
+/** Blockers about where the folder goes: another folder in its place, a
+ * live project there, or a folder outside every mapped one. */
+const WHERE = /holds another folder|live project of its own|outside yours|remote paths/;
+/** The core's words as a sentence: a capital first, unless it is aht's
+ * own name. */
+const said = (t) => (/^aht\b/.test(String(t || "")) ? String(t).trim() + (/[.!?]$/.test(String(t).trim()) ? "" : ".") : sentence(t).trim());
+/** The core's one blocker for `names`, which namesPart says in full. */
+const NAMES_BLOCKER = /^\d+ names? .* cannot hold \(/;
+/** Why it cannot go ahead, each reason in the core's words, with the
+ * commands they name to copy; `ways`: buttons past one of them.  When it is
+ * about where the folder goes, the way to change that for `machine`. */
+function blockedPart(d, machine, ways, title = "Not possible now") {
+  // the names are listed by namesPart: not twice
+  const named = arr(d.names).length > 0;
+  const b = [...(d.blockers || []), ...(d.error ? [d.error] : [])].filter((x) => !(named && NAMES_BLOCKER.test(x)));
+  if (!b.length) return null;
+  const where = !!machine && b.some((x) => WHERE.test(x)), past = [].concat(ways || []).filter(Boolean);
+  // the folder there (or here) holds something else: the core's own command
+  // for it (`identity.fix`, whole and runnable), not one read out of its words
+  const fix = d.identity && typeof d.identity === "object" && typeof d.identity.fix === "string" && d.identity.fix ? d.identity.fix : null;
+  const own = fix ? b.find((x) => String(x).includes(fix)) || b.find((x) => /holds another folder|live project of its own/.test(x)) : null;
+  const identityLine = (x) => {
+    const s = String(x), at = s.lastIndexOf(fix);
+    const words = (at < 0 ? s : s.slice(0, at)).trim(), rest = at < 0 ? "" : s.slice(at + fix.length).trim();
+    const t = /^aht\b/.test(words) ? words : sentence(words).trim().replace(/[.:]\.$/, (m) => m[0]);
+    return h("div", { class: "small fix" }, t + (/:$/.test(t) ? " " : " To use another place: "), h("code", { text: fix }), " ",
+      h("button", { class: "small", text: "Copy", onclick: () => copyText(fix) }), rest && rest !== "." ? " " + rest : "");
+  };
+  return h("div", { class: "callout" }, h("strong", { text: title }),
+    b.map((x) => (own && x === own ? identityLine(x) : withCommands(said(x)))),
+    where || past.length ? h("div", { class: "row", style: "margin-top:6px" }, past,
+      where ? h("button", { class: "small", text: `Where Projects Go on ${machine}…`, onclick: () => editPaths(machine) }) : null) : null);
+}
+/** The kinds of name Leave Them Out is for: a name Windows cannot hold
+ * whatever else is in the folder.  Names that collide (capitals, Unicode
+ * forms), a path too long or a link are not left out: their names are
+ * ordinary ones (README.md), and handover_excludes counts in every project. */
+const LEAVE_OUT = ["windows_char", "trailing", "reserved"];
+/** Why Windows cannot hold a file named `part` (one part of a path), as the
+ * core's _win_name_kind says it, or null. */
+function winNameKind(part) {
+  if (/[<>:"|?*\\\x00-\x1f]/.test(part)) return "windows_char";
+  if (/[. ]$/.test(part)) return "trailing";
+  if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i.test(part)) return "reserved";
+  return null;
+}
+/** The part of `path` (the core's key: parts joined with "/") that is the
+ * problem of `kind`: the first one Windows cannot hold, as the core's
+ * _cannot_hold finds it; null when none is. */
+function badPart(path, kind) {
+  const parts = String(path).split("/").filter(Boolean);
+  return parts.find((x) => winNameKind(x) === kind) || null;
+}
+/** Names the disk that receives cannot hold (`names`: [{kind, text, count,
+ * names}], each of `names` one name or the names that collide), ten of each
+ * kind at most, and the fix: rename them, or leave them out of what moves
+ * (`handover_excludes`; Leave Them Out adds only the part of each path that
+ * is the problem, then `again()`). */
+function namesPart(d, where, again) {
+  const ns = arr(d.names).filter((x) => x && (x.count || arr(x.names).length));
+  if (!ns.length) return null;
+  const rows = [], bad = [];
+  for (const x of ns) {
+    const list = arr(x.names).slice(0, 10), why = x.text || x.kind || "";
+    for (const n of list) {
+      rows.push(h("li", {}, h("span", { class: "mono", text: [].concat(n).join("  and  ") }), h("span", { class: "dim", text: " — " + why })));
+      if (LEAVE_OUT.includes(x.kind)) bad.push(...[].concat(n).map((y) => badPart(y, x.kind)).filter(Boolean));
+    }
+    const more = (Number(x.count) || list.length) - list.length;
+    if (more > 0) rows.push(h("li", { class: "dim", text: `… and ${more} more: ${why}` }));
+  }
+  // as fnmatch patterns that match only that name; the ones not set yet
+  const had = arr(S.config.handover_excludes);
+  const pats = [...new Set(bad.map((n) => n.replace(/[[\]*?]/g, (c) => `[${c}]`)))].filter((p) => !had.includes(p));
+  const out = async () => {
+    if (!(await confirmIt("Leave these names out?", `${pats.length === 1 ? "This entry goes" : `These ${pats.length} entries go`} into the setting handover_excludes:\n\n`
+      + pats.map((p) => "• " + p).join("\n")
+      + `\n\nA file or folder with ${pats.length === 1 ? "this name" : "one of these names"} stays on this machine, in every project: no handover, Bring Here, Send Back or Keep in sync moves it. Settings has the list.`, "Leave Them Out"))) return;
+    await setConfig("handover_excludes", [...had, ...pats]);
+    if (again) again();
+  };
+  return h("div", { class: "callout names" }, h("strong", { text: `Names ${where} cannot hold` }),
+    h("ul", { class: "files" }, rows),
+    h("div", { class: "row", style: "margin-top:6px" }, h("span", { class: "small grow", text: "Rename them, or leave them out of what moves between your machines." }),
+      pats.length ? h("button", { class: "small", text: "Leave Them Out…", onclick: out }) : null));
+}
+/** The system of the machine on the other side, from a dry run. */
+const farSystem = (d) => d.system || (d.there && typeof d.there === "object" ? d.there.system : null) || null;
+/** The lines a `.gitattributes` gets when a git project without one
+ * crosses to or from Windows, when the core does not name them. */
+const GITATTRIBUTES = ["* text=auto", "*.sh text eol=lf", "*.bat text eol=crlf", "*.cmd text eol=crlf", "*.ps1 text eol=crlf"];
+/** git across systems, from a dry run's `git` row ({is_git, gitattributes,
+ * suggest, env, how}; Pick Up's {here, there} is another thing): the lines
+ * aht suggests for a .gitattributes it never writes, with Copy; and how to
+ * give git the settings aht's session there gets, in your own terminal. */
+function gitattrPart(d) {
+  const g = d.git && typeof d.git === "object" && !("here" in d.git) ? d.git : {};
+  const old = d.gitattributes;        // an earlier sample's form
+  const lines = arr(g.suggest).length ? g.suggest : !old ? [] : arr(old).length ? old : arr(old.lines).length ? old.lines : GITATTRIBUTES;
+  if (!lines.length && !g.how) return null;
+  const text = lines.join("\n") + "\n";
+  return h("div", { class: "box git gitattr" },
+    lines.length ? [h("strong", { text: "This project has no .gitattributes" }),
+      h("div", { class: "small", text: "It crosses between Windows and another system, where git can see every line of a file as changed. These lines, in a file named .gitattributes at the top of the project, keep each file's line endings steady. aht does not write it." }),
+      h("div", { class: "row top" }, h("pre", { class: "grow", style: "margin:4px 0", text: text.trim() }),
+        h("button", { class: "small", text: "Copy", onclick: () => copyText(text) }))] : null,
+    g.how ? withCommands(sentence(g.how).trim()) : null);
+}
+/** What a return across systems leaves as it was (`eol_only`: files that
+ * differ only in line endings, not taken; `eol_kept`: changed files whose
+ * line endings went back to how they were at home; `unsafe_names`: [{there,
+ * kept_as}], files whose name home cannot hold, set aside under a safe
+ * name), then the .gitattributes hint.  `home`: "here", or that machine. */
+function crossNotes(d, home) {
+  const here = home === "here", at = here ? "here" : `on ${home}`;
+  const fold = (head, files, fmt) => (files.length ? h("details", { class: "small eol" }, h("summary", { text: head }),
+    h("ul", { class: "files" }, files.slice(0, 50).map((f) => h("li", { class: "mono", text: fmt ? fmt(f) : String(f) })),
+      files.length > 50 ? h("li", { class: "dim", text: `… and ${files.length - 50} more` }) : null)) : null);
+  const eol = arr(d.eol_only), kept = arr(d.eol_kept), odd = arr(d.unsafe_names);
+  return [
+    fold(`${plural(eol.length, "file")} ${eol.length === 1 ? "differs" : "differ"} only in line endings: ${here ? "the ones here stay" : home + "'s stay"}.`, eol),
+    fold(`${plural(kept.length, "changed file")}: line endings kept as they were ${at}.`, kept),
+    fold(`Kept aside ${at}: ${plural(odd.length, "file")} whose name ${here ? "this machine" : home} cannot hold.`, odd,
+      (x) => (x && typeof x === "object" ? `${x.there || x.name}  →  ${x.kept_as || ""}` : String(x))),
+    gitattrPart(d)];
+}
+/** The core's other lines for this crossing (`notes`: "2 scripts lose their
+ * executable mark here", say) and its warnings. */
+const sayLines = (d) => [arr(d.notes).map((t) => h("p", { class: "small", text: sentence(t).trim() })),
+  arr(d.warnings).map((w) => h("p", { class: "warn small", text: "⚠ " + w }))];
+
+/** "On pc since 14:10 (brought there from pc). Send it back from pc." with
+ * [Release…]: a project of this machine's that comes back from there. */
+function awayLine(p, a) {
+  const at = a.since ? " since " + clock(a.since) : "";
+  return h("div", { class: "row awayrow" },
+    h("span", { class: "grow", text: `On ${a.name}${at}${a.there ? ` (brought there from ${a.name})` : ""}. Send it back from ${a.name}${a.take ? ", or take it back here" : ""}.` }),
+    h("button", { class: "small", text: "Release…", onclick: () => release(p) }), helpBtn("Hand a project over"));
+}
+
+/** Bring Here from M, first step: the projects aht keeps on M (`bring
+ * --from M --list --json`: rows with path, here_path, can_bring, why_not,
+ * state, away, open, session), each with Bring Here… (bringHere).  One no
+ * mapped folder here reaches (`here_error`) can still come: the sheet's
+ * Another Folder… picks where. */
+async function bringList(machine) {
+  const s = sheet(`Bring a project here from ${machine}`, "Hand a project over", 760);
+  let d = null, filter = "";
+  const load = async () => {
+    d = null; paint();
+    const got = await dryRun(["bring", "--from", machine, "--list", "--json"]);
+    if (!s.body.isConnected) return;
+    d = got; paint();
+  };
+  const row = (r) => {
+    const path = r.path || "";
+    const away = r.away && typeof r.away === "object" ? r.away.holder || r.away.remote || "another machine" : r.away || null;
+    const can = "can_bring" in r ? !!r.can_bring || (!!r.here_error && r.why_not === r.here_error) : !away && !!path;
+    const state = away ? `on ${away}` : { handing: "moving", gone: "gone", copy: "a copy" }[r.state]
+      || (r.open === "idle" ? "open there" : r.open || "");
+    const sess = r.session && typeof r.session === "object" ? r.session : {};
+    const facts = [sess.title ? `“${sess.title}”` : null, sess.updated ? "last used " + ago(sess.updated) : null].filter(Boolean).join(" · ");
+    return h("div", { class: "s" }, h("div", { class: "grow" },
+      h("div", { class: "row" }, h("strong", { text: r.name || base(path) }),
+        state ? h("span", { class: "badge " + (r.open === "working" ? "working" : r.open === "waiting" ? "waiting" : ""), text: state }) : null),
+      h("div", { class: "dim small mono", style: "overflow-wrap:anywhere", text: path + (r.here_path ? `  →  ${r.here_path}` : "") }),
+      facts ? h("div", { class: "dim small", text: facts }) : null,
+      r.why_not ? withCommands(said(r.why_not), "small warn") : null),
+    h("button", { class: "small", text: "Bring Here…", disabled: !can, onclick: () => bringHere(machine, path) }));
+  };
+  const paint = () => {
+    const b = clear(s.body), f = clear(s.foot);
+    f.append(h("button", { text: "Ask Again", disabled: !d, onclick: load }), h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+    if (!d) return b.append(spinner(`Asking ${machine}…`));
+    const rows = arr(d.projects);
+    if (problems(d)) {
+      b.append(h("div", { class: "callout" }, h("strong", { text: rows.length ? "Not possible now" : `aht could not ask ${machine}` }),
+        [...arr(d.blockers), ...(d.error ? [d.error] : [])].map((x) => withCommands(said(x)))));
+      if (!rows.length) return;
+    }
+    if (!rows.length) return b.append(h("p", { class: "dim", text: `aht on ${machine} keeps no project that could come here.` }));
+    b.append(h("p", { class: "dim small", text: `A project comes here with its files and Claude Code's history. On ${machine} it is marked as being here, and its own copy stays as it is. When you are done, Send Back returns your work to ${machine}.` }));
+    const list = h("div", { class: "sessions bringlist" });
+    const fill = () => clear(list).append(rows.filter((r) => !filter || String(r.path || "").toLowerCase().includes(filter)).map(row));
+    if (rows.length > 8) {
+      b.append(h("input", { type: "search", placeholder: "Filter projects", style: "width:100%;margin-bottom:6px",
+        oninput: (e) => { filter = e.target.value.toLowerCase(); fill(); } }));
+    }
+    b.append(list);
+    fill();
+  };
+  paint();
+  load();
+}
+
+/** What comes, in counts: a whole copy (`files`, `bytes`, `history_bytes`;
+ * Bring Here's), or Take Back's plan ({project, history}: take, new, delete,
+ * conflict, kept); `where`: where the changes were made, `other`: the other
+ * side. */
+function planFacts(plan, where, other) {
+  if (!plan || typeof plan !== "object") return [];
+  if ("files" in plan || "bytes" in plan) {
+    return [["Files", `${plural(plan.files || 0, "file")} (${bytes(plan.bytes)})`],
+      plan.history_bytes != null ? ["History", `Claude Code's, ${bytes(plan.history_bytes)}`] : null].filter(Boolean);
+  }
+  const n = plan.project || {}, hs = plan.history || {};
+  return [["Files", `${n.take || 0} changed, ${n.new || 0} new, ${n.delete || 0} removed ${where}; ${n.kept || 0} changed only ${other}`],
+    hs.take || hs.new ? ["History", `${hs.take || 0} continued, ${hs.new || 0} new`] : null].filter(Boolean);
+}
+const factsGrid = (rows) => (rows.length ? h("div", { class: "facts" }, rows.map(([k, v]) => [h("span", { class: "dim", text: k }), typeof v === "string" ? h("span", { text: v }) : v])) : null);
+
+/** Bring Here from M: the dry run (`bring <path there> --from M --json`)
+ * in a sheet: where it comes from and goes, what comes, what blocks it and
+ * how past it, what stays there, then [Bring Here].  The session opens here
+ * in a new terminal; nothing runs until you type.  `o.here`: the folder
+ * here to use (`--here`: the project's folder itself). */
+async function bringHere(machine, there, o = {}) {
+  const name = base(there);
+  const st = { here: o.here || null, idle: false, d: null };
+  const s = sheet(`Bring “${name}” here from ${machine}`, "Hand a project over", 760);
+  const opts = () => [...(st.here ? ["--here", st.here] : []), ...(st.idle ? ["--allow-idle"] : [])];
+  const look = async () => {
+    st.d = null; paint();
+    const d = await dryRun(["bring", there, "--from", machine, ...opts(), "--json"]);
+    if (!s.body.isConnected) return;
+    st.d = d; paint();
+  };
+  // another folder here: the project goes into the folder chosen
+  const change = async () => {
+    const dir = await pickFolder(`Choose the folder to put “${name}” in`);
+    if (!dir || !s.body.isConnected) return;
+    st.here = dir.replace(/[\\/]+$/, "") + (ON_WINDOWS() ? "\\" : "/") + name;
+    look();
+  };
+  const go = async () => {
+    closeSheet();
+    const a = await busy(`bringing ${name} here…`, () => job(["bring", there, "--from", machine, ...opts(), "--apply", "--json"], "bringing it here", true));
+    const d = a.json || {};
+    const failed = problems(d) || (a.ok && d.applied ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
+    await refresh();
+    const here = d.here_path || (st.d || {}).here_path || st.here;
+    const p = S.projects.find((x) => sameDir(x.real_path, here));
+    const got = d.fetched || {}, line = d.command_line || "";
+    const text = failed ? "It did not come here:\n\n" + failed
+      : `Brought here from ${machine}${here ? ` into ${here}` : ""}${got.files != null ? `: ${plural(got.files, "file")} (${bytes(got.bytes)})` : ""}. On ${machine} it is marked as being here.\n\n`
+        + (d.opened ? "Its session is open in a new terminal: nothing runs until you type."
+          : line ? `No terminal window opened. Run this in a terminal to go on:\n\n${line}` : "")
+        + (d.set_aside ? `\n\nWhat was in that folder before is kept in ${d.set_aside}.` : "")
+        + (arr(d.warnings).length ? "\n\n" + d.warnings.map((w) => "⚠ " + w).join("\n") : "");
+    if (!p) return tell(failed ? "Not brought here" : "Brought here", text);
+    S.tab = "projects"; S.selection = p.real_path; drawTop();
+    note(p, text, d.set_aside || null);
+  };
+  const paint = () => {
+    const b = clear(s.body), f = clear(s.foot), d = st.d;
+    const cancel = h("button", { text: "Cancel", onclick: closeSheet });
+    if (!d) { b.append(spinner(`Asking ${machine}…`)); f.append(h("span", { class: "spacer" }), cancel); return; }
+    const why = problems(d), plan = d.plan || {};
+    const wrap = h("div", { class: "stack" });
+    b.append(wrap);
+    wrap.append(factsGrid([
+      [`On ${machine}`, h("span", { class: "mono", text: d.there_path || there })],
+      ["Here", h("span", {}, h("span", { class: "mono", text: d.here_path || st.here || "—" }), " ",
+        h("button", { class: "small", text: "Another Folder…", onclick: change }))]]));
+    // an idle session there blocks, unless allowed: if anyone types into it
+    // later, Send Back keeps both versions
+    const idle = !st.idle && arr(d.blockers).some((x) => /--allow-idle/.test(x));
+    if (why) {
+      wrap.append(blockedPart(d, machine, idle ? h("button", { class: "small", text: "Bring It Anyway",
+        onclick: () => { st.idle = true; look(); } }) : null));
+      if (idle) wrap.append(h("p", { class: "dim small", text: `Bring It Anyway leaves the idle session on ${machine} as it is. If anyone types into it later, Send Back keeps both versions.` }));
+    }
+    wrap.append(namesPart(d, "this computer", look));
+    if (!why) {
+      const sess = d.session && typeof d.session === "object" ? d.session : {};
+      wrap.append(factsGrid([...planFacts(plan, `on ${machine}`, "here"),
+        plan.set_aside ? ["Here", `${plural(plan.set_aside, "file")} in the folder here ${plan.set_aside === 1 ? "is" : "are"} set aside first`] : null,
+        ["Session", sess.id ? `${sess.title ? `“${sess.title}” — ` : ""}opens here in a new terminal; nothing runs until you type` : "none yet"]].filter(Boolean)));
+      if (st.idle) wrap.append(h("p", { class: "small", text: `The idle session on ${machine} stays as it is. If anyone types into it later, Send Back keeps both versions.` }));
+      wrap.append(h("p", { class: "small", text: `On ${machine} the project is marked as being here; its own copy stays as it is. Send Back returns your work when you are done.` }));
+    }
+    // what does not come, or comes with less
+    const modes = arr(d.modes_lost);
+    wrap.append(modes.length ? h("details", { class: "small eol" }, h("summary", { text: `${plural(modes.length, "script")} ${modes.length === 1 ? "loses its" : "lose their"} “executable” mark here; ${modes.length === 1 ? "it gets it" : "they get it"} back on ${machine}.` }),
+      h("ul", { class: "files" }, modes.slice(0, 50).map((x) => h("li", { class: "mono", text: x })))) : null,
+    arr(d.other_histories).map((a) => h("p", { class: "small", text: `${AGENTS[a] || a}'s history stays on ${machine}; only Claude Code's comes.` })),
+    !why && d.session && d.session.id && plan.file_history === false ? h("p", { class: "dim small", text: `Claude Code's /rewind snapshots stay on ${machine}: the folder's path differs here.` }) : null,
+    crossNotes(d, machine), sayLines(d));
+    f.append(h("span", { class: "spacer" }), cancel, h("button", { class: "primary", text: "Bring Here", disabled: !!why, onclick: go }));
+  };
+  paint();
+  look();
+}
+
+/** Send Back to M, at the holder: M (home) plans the return against what
+ * left it (`send-back <path> --json`, Take Back's words), then [Send Back]
+ * pushes the files and M places them; what they replace is set aside there.
+ * Changed on both: Keep Both (M's stays, this one goes next to it: the
+ * default) or the versions from here (`--prefer here`: M's are set aside
+ * there).  A newer Claude Code wrote the history here: Send Back Anyway
+ * (`--ignore-version`). */
+async function sendBack(p) {
+  const name = base(p.real_path), c = copyOf(p) || {};
+  let to = c.remote || c.from || "the other machine";
+  if (S.projects.includes(p)) note(p, null);
+  const st = { d: null, ignore: false, prefer: null };
+  const s = sheet(`Send “${name}” back to ${to}`, "Hand a project over", 760);
+  const look = async () => {
+    st.d = null; paint();
+    const d = await dryRun(["send-back", p.real_path, ...(st.ignore ? ["--ignore-version"] : []), "--json"]);
+    if (!s.body.isConnected) return;
+    st.d = d;
+    if (d.remote && d.remote !== to) { to = d.remote; s.head.querySelector("h1").textContent = `Send “${name}” back to ${to}`; }
+    paint();
+  };
+  const go = async () => {
+    const flags = [...(st.ignore ? ["--ignore-version"] : []), ...(st.prefer ? ["--prefer", st.prefer] : [])];
+    closeSheet();
+    const a = await busy(`sending ${name} back to ${to}…`, () => job(["send-back", p.real_path, ...flags, "--apply", "--json"], "sending it back", true));
+    const d = a.json || {};
+    const failed = problems(d) || (a.ok && d.applied ? null : ((a.out || "") + (a.err || "")).trim() || "aht gave no answer.");
+    const both = arr(((d.done || {}).project || {}).conflicts).map((x) => (x && typeof x === "object" ? x.their_version || x.file : x));
+    const text = failed ? "It was not sent back:\n\n" + failed
+      : `Sent back to ${to}: the project is on ${to} again, with the work done here. Whatever it replaced there is set aside on ${to}, not deleted${d.set_aside ? ` (${d.set_aside})` : ""}. This folder stays here as it is.`
+        + (both.length ? `\n\nChanged on both machines, kept twice on ${to}:\n` + both.slice(0, 6).map((x) => "• " + x).join("\n") : "");
+    await refresh();
+    const q = S.projects.find((x) => sameDir(x.real_path, p.real_path));
+    if (q) note(q, text); else tell(failed ? "Not sent back" : "Sent back", text);
+  };
+  const paint = () => {
+    const b = clear(s.body), f = clear(s.foot), d = st.d;
+    const cancel = h("button", { text: "Cancel", onclick: closeSheet });
+    if (!d) { b.append(spinner(`Asking ${to}…`)); f.append(h("span", { class: "spacer" }), cancel); return; }
+    const why = problems(d);
+    const wrap = h("div", { class: "stack" });
+    b.append(wrap);
+    wrap.append(factsGrid([["Here", h("span", { class: "mono", text: d.here_path || p.real_path })],
+      [`On ${to}`, h("span", { class: "mono", text: d.there_path || "—" })]]));
+    const newer = !st.ignore && arr(d.blockers).find((x) => /--ignore-version/.test(x));
+    if (why) {
+      wrap.append(blockedPart(d, to, newer ? h("button", { class: "small", text: "Send Back Anyway…", onclick: async () => {
+        if (!(await confirmIt("Send it back anyway?", `${sentence(newer).trim()}\n\nUpdate Claude Code on ${to} before you continue the session there.`, "Send Back Anyway"))) return;
+        st.ignore = true; look();
+      } }) : null));
+    }
+    if (!why) {
+      wrap.append(factsGrid(planFacts(d.plan, "here", `on ${to}`)));
+      const both = Object.values(d.conflicts || {}).flat();
+      if (both.length) {
+        const pick = (v, text) => h("label", { class: "check" }, h("input", { type: "radio", name: "sb-prefer", checked: st.prefer === v,
+          onchange: () => { st.prefer = v; } }), text);
+        wrap.append(h("div", { class: "callout" }, h("strong", { text: "Changed on both machines" }),
+          h("ul", { class: "files" }, both.slice(0, 10).map((x) => h("li", { class: "mono", text: String(x) })),
+            both.length > 10 ? h("li", { class: "dim", text: `… and ${both.length - 10} more` }) : null),
+          pick(null, `Keep both: ${to}'s version stays, the one from here goes next to it`),
+          pick("here", `Use the versions from here: ${to}'s are set aside there`)));
+      }
+      wrap.append(h("p", { class: "small", text: `Then the project is on ${to} again, with your work. Whatever it replaces there is set aside on ${to}, not deleted. This folder stays here as it is.` }));
+    }
+    wrap.append(namesPart(d, to), crossNotes(d, to), sayLines(d));
+    f.append(h("span", { class: "spacer" }), cancel, h("button", { class: "primary", text: "Send Back", disabled: !!why, onclick: go }));
+  };
+  paint();
+  look();
+}
+
+/** Where a project in a folder here goes on a machine (`remotes.<name>.paths`):
+ * "same", "home", or [here, there] pairs (tried first, longest first, then
+ * the home folders). */
+function pathsText(v) {
+  if (v === "same") return "at the same paths as here";
+  if (v === "home") return "at the same place in the home folder";
+  if (arr(v).length) return arr(v).map((x) => `${x[0]} → ${x[1]}`).join(" · ") + "; else the same place in the home folder";
+  return "set the first time a project goes there";
+}
+function pathsLine(name, r) {
+  return h("div", { class: "row small paths" }, h("span", { class: "dim", text: "Folders there:" }),
+    h("span", { class: "grow", text: pathsText(r.paths) }),
+    h("button", { class: "small", text: "Change…", onclick: () => editPaths(name) }));
+}
+/** Where projects go on a machine (`remote paths NAME --json`), and the
+ * changes, each at once: --home, --same, --add HERE THERE, --remove HERE. */
+async function editPaths(name) {
+  const s = sheet(`Where projects go on ${name}`, "Hand a project over", 640);
+  let d = null, said = null;
+  const load = async () => {
+    const got = await dryRun(["remote", "paths", name, "--json"]);
+    if (!s.body.isConnected) return;
+    d = got; paint();
+  };
+  const change = async (args) => {
+    const a = await busy("changing it…", () => run(["remote", "paths", name, ...args, "--json"]));
+    const x = a.json || {};
+    said = problems(x) || (a.ok ? null : ((a.err || "") + (a.out || "")).trim() || "aht gave no answer.");
+    if (!s.body.isConnected) return;
+    if (!said && "paths" in x) { d = x; paint(); } else await load();
+    refresh();
+  };
+  const paint = () => {
+    const b = clear(s.body), f = clear(s.foot);
+    f.append(h("span", { class: "spacer" }), h("button", { class: "primary", text: "Done", onclick: closeSheet }));
+    if (!d) return b.append(spinner("Reading it…"));
+    if (!("paths" in d) && problems(d)) return b.append(h("p", { class: "warn small", style: "white-space:pre-wrap", text: problems(d) }));
+    const v = d.paths, pairs = arr(v);
+    // an example from the two home folders (`here_home`, `there_home`),
+    // each spelled its system's way
+    const farWin = (d.system || (((S.status.handover || {}).remotes || {})[name] || {}).system) === "Windows";
+    const hereWin = d.here_system ? d.here_system === "Windows" : ON_WINDOWS();
+    const join = (root, win) => String(root).replace(/[\\/]+$/, "") + (win ? "\\code\\shop" : "/code/shop");
+    const ex = d.here_home && d.there_home ? ` ${join(d.here_home, hereWin)} here is ${join(d.there_home, farWin)} on ${name}.` : "";
+    const radio = (val, text, hint) => h("div", {}, h("label", { class: "check" }, h("input", { type: "radio", name: "paths", checked: val === "same" ? v === "same" : v !== "same",
+      onchange: () => change([val === "same" ? "--same" : "--home"]) }), text), h("div", { class: "dim small check-note", text: hint }));
+    const here = h("input", { type: "text", placeholder: ON_WINDOWS() ? "a folder here, e.g. D:\\work" : "a folder here, e.g. /data/work", style: "flex:1;min-width:160px" });
+    const far = h("input", { type: "text", placeholder: `the folder on ${name}`, style: "flex:1;min-width:160px" });
+    b.append(h("div", { class: "stack" },
+      h("p", { text: `A project here goes to the matching folder on ${name}, and comes back to the same folder here. Projects already there keep the folder they went to.` }),
+      radio("home", "The same place in the home folder", `Any user name, any system.${ex}`),
+      radio("same", "The same paths", "Only when both machines have the same folders: the same user name on two Macs, say."),
+      h("h3", { text: "Folders that go somewhere else" }),
+      pairs.length ? h("div", { class: "pairs" }, pairs.map((x) => h("div", { class: "row" }, h("span", { class: "mono grow", text: `${x[0]}  →  ${x[1]}` }),
+        h("button", { class: "small", text: "Remove", onclick: () => change(["--remove", x[0]]) }))))
+        : h("p", { class: "dim small", text: "None: every project is in the home folder." }),
+      h("div", { class: "row" }, here, h("span", { text: "→" }), far,
+        h("button", { class: "small", text: "Add", onclick: () => { if (here.value.trim() && far.value.trim()) change(["--add", here.value.trim(), far.value.trim()]); } })),
+      h("p", { class: "dim small", text: "These are tried first, the longest first; a project outside all of them and the home folder cannot go there." }),
+      said ? h("p", { class: "warn small", style: "white-space:pre-wrap", text: said }) : null,
+      d.warning ? h("p", { class: "warn small", text: "⚠ " + d.warning }) : null, sayLines(d)));
+  };
+  paint();
+  load();
 }
 
 // Look back: loose ends, report; tidy up
@@ -2088,7 +2635,9 @@ function drawMachines(m) {
       h("span", { class: "dim mono", text: r.ssh || "" }), r.system ? h("span", { class: "dim small", text: SYSTEMS[r.system] || r.system }) : null,
       send && name === ho.default_remote ? h("span", { class: "badge ok", text: "used for handovers" }) : null,
       h("span", { class: "grow" }),
-      send && name !== ho.default_remote ? h("button", { class: "small", text: "Use This One", onclick: async () => { await run(["remote", "default", name]); refresh(); } }) : null,
+      // a PC is never handed a project: it brings one there itself
+      send && name !== ho.default_remote && !winBox ? h("button", { class: "small", text: "Use This One", onclick: async () => { await run(["remote", "default", name]); refresh(); } }) : null,
+      !winBox ? h("button", { class: "small", text: "Bring a Project Here…", onclick: () => bringList(name) }) : null,
       send && !winBox ? menu("Sync", [["Keep All Projects in Sync…", () => syncAll(name, true)],
         ["Stop Keeping All in Sync…", () => syncAll(name, false), !S.projects.some((p) => p.mirror)]], { right: true, small: true }) : null,
       h("button", { class: "small", text: "Check…", onclick: () => checkMachine(name) }),
@@ -2103,6 +2652,7 @@ function drawMachines(m) {
         h("label", { class: "check", title: winBox ? "aht cannot ask a Windows machine yet." : null },
           h("input", { type: "checkbox", checked: !!r.watch, disabled: winBox, onchange: (e) => watchMachine(name, e.target) }), "Watch"),
         h("span", { class: "grow" }), heardLine(name, r)),
+      pathsLine(name, r),
       send ? syncLine(name) : null);
     m.append(box);
   }
@@ -2235,7 +2785,7 @@ async function checkMachine(name) {
     if (hand.length && send) box.append(h("h3", { text: "For handing over" }), h("div", { class: "dim small", text: "What handing a project over to it needs." }), steps(hand));
     else if (hand.length) {
       box.append(h("details", { class: "later" }, h("summary", {}, h("h3", { text: "For handing over" })),
-        h("div", { class: "dim small", text: (ON_WINDOWS() ? "Handing projects over from Windows comes in a later version. " : "") + "This is what it will need." }), steps(hand)));
+        h("div", { class: "dim small", text: "This copy of aht cannot hand projects over; this is what it would need." }), steps(hand)));
     }
   } else if (rows.length) box.append(steps(rows));
 }
@@ -2699,12 +3249,24 @@ async function showWelcome(again) {
 
 // ---- start ------------------------------------------------------------------------
 
+/** The window opened for one project (the tray's Projects brought here ▸
+ * Send Back…): that project picked, and with "send-back" Send Back's dry
+ * run open; a folder not in the list still gets Send Back. */
+function openOn(go) {
+  const p = S.projects.find((x) => sameDir(x.real_path, go.path));
+  S.tab = "projects";
+  if (p) S.selection = p.real_path;
+  drawTop(); draw();
+  // a PC's project goes back from the PC: its line says so
+  if (go.do === "send-back" && !(p && pcHome(copyOf(p)))) sendBack(p || { real_path: go.path, exists: true });
+}
 async function start() {
   $("#guide-btn").addEventListener("click", () => openGuide(null));
   drawTop(); draw();
   await refresh();
   const st = S.status;
-  if (!st.setup_done && (st.tracked || 0) <= 2 && !st.setup_dismissed) showWelcome(false);
+  if (GO) openOn(GO);
+  else if (!st.setup_done && (st.tracked || 0) <= 2 && !st.setup_dismissed) showWelcome(false);
   setInterval(() => { if (!LOST && !document.hidden && $("#sheet-back").hidden) refresh(); }, 20000);
   document.addEventListener("visibilitychange", () => { if (!LOST && !document.hidden) refresh(); });
   // the server stops after a while without a request: while this page is

@@ -232,6 +232,9 @@ struct Project: Identifiable, Hashable {
     let away: String?               // the machine's own name, while handed over
     let awayRemote: String?         // the name it was added under
     let awaySince: String?
+    let awayDrivenBy: String?       // "there": that machine took it with Bring Here
+    let awaySystem: String?         // Darwin, Linux or Windows: the machine that has it
+    let awayHolder: String?         // that machine's own name for itself
     let mirror: String?
     let syncedAt: Double?
     let syncStatus: String?
@@ -263,6 +266,17 @@ struct Project: Identifiable, Hashable {
     /// The machine this project was picked up from, by this Mac's name for it,
     /// while that is open: Hand Back to it is `leave-note --on` it.
     var pickedUpFrom: String? { pickedUp.flatMap { knowsPickupFrom ? $0.remote : $0.name } }
+    /// Take Back can ask the machine that has it from here: one this Mac set
+    /// up, and not a PC (a PC answers no other machine).
+    var canTakeBack: Bool {
+        away != nil && awaySystem != "Windows" && (awayDrivenBy != "there" || awayRemote != nil)
+    }
+    /// The machine Send Back returns this folder to: it was brought (or
+    /// handed over) here from there.
+    var sendBackTo: String? {
+        guard away == nil, let c = copyOf, c.kind == "brought" || c.kind == "handover" else { return nil }
+        return c.remote ?? c.from
+    }
     var name: String { (path as NSString).lastPathComponent }
     var parent: String {
         ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent
@@ -288,9 +302,13 @@ struct Project: Identifiable, Hashable {
     init(_ d: [String: Any]) {
         path = d["real_path"] as? String ?? "?"
         exists = d["exists"] as? Bool ?? false
-        away = d["away"] as? String
-        awayRemote = d["away_remote"] as? String
-        awaySince = d["away_since"] as? String
+        let aw = d["away"] as? [String: Any]     // a core that gives the record itself
+        away = firstText(d["away"], aw?["host"], aw?["remote"])
+        awayRemote = firstText(d["away_remote"], aw?["remote"])
+        awaySince = firstText(d["away_since"], aw?["since"])
+        awayDrivenBy = firstText(d["away_driven_by"], aw?["driven_by"])
+        awaySystem = firstText(d["away_system"], aw?["system"])
+        awayHolder = firstText(d["away_holder"], aw?["holder"])
         mirror = d["mirror"] as? String
         syncedAt = (d["mirror_synced_at"] as? NSNumber)?.doubleValue
         syncStatus = d["mirror_status"] as? String
@@ -403,10 +421,14 @@ struct Handing: Hashable {
     let state: String               // "running" (now) | "checking" | "unreachable"
     let silentSince: Date?          // unreachable: no answer since then
     let release: Bool               // no answer for an hour: Release is offered
+    let drivenBy: String?           // "there": that machine was bringing it there
+    let reachable: Bool             // this Mac has that machine set up (`remote`)
 
     init(_ d: [String: Any]) {
         machine = [d["remote"], d["holder"], d["host"]].compactMap { $0 as? String }
             .first { !$0.isEmpty } ?? "the other machine"
+        drivenBy = firstText(d["driven_by"])
+        reachable = firstText(d["remote"]) != nil
         since = moment(d["since"])
         state = d["state"] as? String ?? "checking"
         silentSince = moment(d["unreachable_since"])
@@ -461,6 +483,11 @@ struct CopyOf: Hashable {
     let remote: String?             // … by this Mac's name for it, when the core knows one
     let kind: String                // "sync" | "handover" | "brought" | "returned"
     let at: Date?
+    let system: String?             // the home's system ("Windows": a PC, which no machine can ask)
+
+    /// Its home is a PC: it goes back from there (Take Back on the PC), never
+    /// with Send Back from here.
+    var pcHome: Bool { system == "Windows" }
 
     init?(_ any: Any?) {
         guard let d = any as? [String: Any],
@@ -470,6 +497,7 @@ struct CopyOf: Hashable {
         remote = (d["remote"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         kind = d["kind"] as? String ?? "sync"
         at = moment(d["at"] ?? d["since"])
+        system = firstText(d["system"])
     }
 }
 
@@ -788,10 +816,14 @@ func stoppedText(_ to: String, ok: Bool, err: String, now: Project?, changed: Bo
 
 /// The line under a folder that is a copy of a project on another machine.
 func copyLine(_ c: CopyOf) -> String {
+    if c.pcHome && (c.kind == "handover" || c.kind == "brought") {
+        return (c.kind == "brought" ? "Brought here from " : "Handed over from ") + "\(c.from): "
+            + "take it back on \(c.remote ?? c.from)"
+    }
     switch c.kind {
     case "sync": return "Copy kept in sync from \(c.from): changes made here pause that sync"
-    case "handover": return "Handed over from \(c.from): it goes back when \(c.from) takes it back"
-    case "brought": return "Brought here from \(c.from)"
+    case "handover": return "Handed over from \(c.from): Take Back there or Send Back here returns it"
+    case "brought": return "Brought here from \(c.from): Send Back returns it"
     case "returned": return "A copy of a project that went back to \(c.from)"
     default: return "A copy of a project on \(c.from)"
     }
@@ -1063,6 +1095,7 @@ struct Machine: Identifiable, Hashable {
     let target: String
     var watch = false               // asked every 2 minutes for sessions that wait for you
     var system = ""                 // Darwin, Linux or Windows, as it answered when added
+    var paths: PathMap? = nil       // its folders: the same paths, home to home, or pairs
     var id: String { name }
 }
 
@@ -1072,7 +1105,7 @@ func machinesFrom(_ remotes: Any?) -> [Machine] {
     ((remotes as? [String: Any]) ?? [:]).map { k, v in
         let d = (v as? [String: Any]) ?? [:]
         return Machine(name: k, target: d["ssh"] as? String ?? "", watch: d["watch"] as? Bool ?? false,
-                       system: d["system"] as? String ?? "")
+                       system: d["system"] as? String ?? "", paths: pathMap(d["paths"]))
     }.sorted { $0.name < $1.name }
 }
 
@@ -1098,6 +1131,488 @@ func heardText(_ last: Double?, stale: Bool) -> String {
     guard let t = last else { return "not heard from yet" }
     return stale ? "not heard since " + clock(NSNumber(value: t))
         : "last heard " + ago(NSNumber(value: t))
+}
+
+// ---- Bring Here, Send Back and folders at other paths (phase 7) ----
+
+/// The last part of a path from any system: shop for /home/me/shop or C:\Users\me\shop.
+func baseName(_ path: String) -> String {
+    path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? path
+}
+
+/// Text on the clipboard (a command to run, the suggested .gitattributes).
+func toClipboard(_ s: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(s, forType: .string)
+}
+
+/// A list of names in the core's JSON: strings, or rows that name a file.
+func nameList(_ any: Any?) -> [String] {
+    ((any as? [Any]) ?? []).compactMap { v in
+        if let s = v as? String { return s }
+        let d = (v as? [String: Any]) ?? [:]
+        return [d["path"], d["file"], d["name"], d["there"]].compactMap { $0 as? String }.first
+    }
+}
+
+/// The first of these values that is a non-empty string.
+func firstText(_ vs: Any?...) -> String? {
+    for v in vs { if let s = v as? String, !s.isEmpty { return s } }
+    return nil
+}
+
+/// A project aht knows on another machine (`bring --from M --list --json`'s
+/// `projects`): what Bring Here from M lists.
+struct ThereProject: Identifiable, Hashable {
+    let path: String                // the folder there, that machine's way
+    let here: String?               // where it would go on this Mac (the mapped path)
+    let title: String?              // its latest session
+    let updated: Date?
+    let open: String?               // "working" | "waiting" | "idle": a session is open there
+    let away: String?               // it is on another machine already
+    let blocked: String?            // why it cannot come here (`why_not`), in the core's words
+    var id: String { path }
+    var name: String { baseName(path) }
+
+    init(_ d: [String: Any]) {
+        let s = (d["session"] as? [String: Any]) ?? [:]
+        let aw = d["away"] as? [String: Any]
+        path = firstText(d["path"], d["real_path"]) ?? "?"
+        here = firstText(d["here_path"])
+        title = firstText(s["title"], d["title"])
+        updated = moment(s["updated"]) ?? moment(d["last_activity"])
+        open = firstText(d["open"])
+        away = firstText(aw?["holder"], aw?["host"], d["away"])
+        let cannot = d["can_bring"] as? Bool == false
+        blocked = firstText(d["why_not"], d["here_error"]) ?? (cannot ? "it cannot come here now" : nil)
+    }
+}
+
+/// The projects in a list from another machine, the latest first.
+func thereProjects(_ d: [String: Any]) -> [ThereProject] {
+    let rows = (d["projects"] as? [[String: Any]]) ?? (d["rows"] as? [[String: Any]]) ?? []
+    return rows.map(ThereProject.init)
+        .sorted { ($0.updated ?? .distantPast) > ($1.updated ?? .distantPast) }
+}
+
+/// What the list says under a project, when it cannot simply come: the
+/// core's reason, else where it is or the session open there.
+func thereState(_ t: ThereProject) -> String? {
+    if let b = t.blocked { return b }
+    if let a = t.away { return "on \(a) now" }
+    switch t.open {
+    case "working": return "a session is working in it there"
+    case "waiting": return "a session waits for you there"
+    case .some: return "an idle session is open there"
+    default: return nil
+    }
+}
+
+/// One kind of name the receiving disk cannot hold (a dry run's `names`).
+struct NameProblem: Hashable {
+    let kind: String
+    let text: String                // the core's plain words, else ours for the kind
+    let count: Int
+    let names: [String]             // each a name, or a group: "README.md and readme.md"
+}
+
+/// The plain words for each kind of name problem.
+let NAME_WORDS: [String: String] = [
+    "case": "two files whose names differ only in capitals",
+    "unicode": "two files with the same name in two Unicode forms",
+    "chars": "contains a character Windows does not allow",
+    "trailing": "Windows would drop the trailing dot or space",
+    "reserved": "a name Windows reserves",
+    "long": "the path would be too long on Windows",
+    "symlink": "links cannot be created there for your account"]
+
+/// The same kinds by the other names a core may give them.
+let NAME_KINDS = ["windows_char": "chars", "char": "chars", "characters": "chars", "dot": "trailing",
+                  "space": "trailing", "long_path": "long", "long_paths": "long", "too_long": "long",
+                  "link": "symlink", "links": "symlink", "symlinks": "symlink"]
+
+func nameProblems(_ d: [String: Any]) -> [NameProblem] {
+    ((d["names"] as? [[String: Any]]) ?? []).compactMap { g in
+        let kind = g["kind"] as? String ?? ""
+        let names = ((g["names"] as? [Any]) ?? []).compactMap { n -> String? in
+            if let s = n as? String { return s }
+            let group = ((n as? [Any]) ?? []).compactMap { $0 as? String }
+            return group.isEmpty ? nil : group.joined(separator: " and ")
+        }
+        let count = max(tally(g["count"]) ?? 0, names.count)
+        guard count > 0 else { return nil }
+        let text = firstText(g["text"]) ?? NAME_WORDS[NAME_KINDS[kind] ?? kind] ?? kind
+        return NameProblem(kind: kind, text: text, count: count, names: names)
+    }
+}
+
+/// The names blocker in plain words: what `on` cannot hold, a few names of
+/// each kind, and the way past it.
+func namesText(_ ps: [NameProblem], on: String) -> String {
+    var s = "Some names here cannot be created or kept apart on \(on):"
+    for p in ps {
+        let shown = p.names.prefix(4).joined(separator: "; ")
+        let more = p.count > min(p.names.count, 4) ? " …" : ""
+        s += "\n• " + p.text + (p.count > 1 ? " (\(p.count))" : "") + (shown.isEmpty ? "" : ": " + shown + more)
+    }
+    return s + "\n\nRename them, or leave them out of handovers (the setting handover_excludes)."
+}
+
+/// A blocker in the core's words, split into its sentence and the command
+/// that fixes it: "… go on mac: `aht remote paths mac --add D:\work /Users/me/work`."
+func fixIn(_ s: String) -> (text: String, fix: String?) {
+    if let a = s.range(of: "`aht "), let b = s.range(of: "`", range: a.upperBound..<s.endIndex) {
+        let fix = String(s[s.index(after: a.lowerBound)..<b.lowerBound])
+        let before = s[..<a.lowerBound].trimmingCharacters(in: .whitespaces)
+        let after = s[b.upperBound...].trimmingCharacters(in: .whitespaces)
+        return (before + (after.isEmpty || after == "." ? "" : " " + after), fix)
+    }
+    // the core's way: "… go on mac:  aht remote paths mac --add …   (a note)"
+    guard let a = s.range(of: ":  ") else { return (s, nil) }
+    var cmd = s[a.upperBound...].trimmingCharacters(in: .whitespaces), note = ""
+    if let n = cmd.range(of: "   (") {
+        note = " " + cmd[n.lowerBound...].trimmingCharacters(in: .whitespaces)
+        cmd = String(cmd[..<n.lowerBound])
+    }
+    guard cmd.hasPrefix("aht ") || cmd.hasPrefix("git ") else { return (s, nil) }
+    return (String(s[..<a.lowerBound]) + note + ":", cmd)
+}
+
+/// The command the identity check gives for a folder that holds something
+/// else (`identity.fix`: whole and runnable), or nil when the folder is fine.
+func identityFix(_ d: [String: Any]) -> String? {
+    firstText((d["identity"] as? [String: Any])?["fix"])
+}
+
+/// A blocker and the command that fixes it: the identity check's own
+/// (`identity.fix`) for its blocker, else the one the sentence names.
+func blockerFix(_ b: String, _ d: [String: Any]) -> (text: String, fix: String?) {
+    guard let fix = identityFix(d),
+          b.contains(fix) || b.contains("holds another folder") || b.contains("live project of its own")
+    else { return fixIn(b) }
+    guard let r = b.range(of: fix, options: .backwards) else { return (b, fix) }
+    let text = b[..<r.lowerBound].trimmingCharacters(in: .whitespaces)
+    return (text.hasSuffix(":") ? text : text + ":", fix)
+}
+
+/// The blockers a sheet lists one by one: the core's, less the ones that
+/// only repeat the names problem (listed apart), and its error.
+func blockerLines(_ d: [String: Any]) -> [String] {
+    let names = nameProblems(d).map { $0.text }
+    var all = ((d["blockers"] as? [Any]) ?? []).compactMap { b -> String? in
+        firstText(b, (b as? [String: Any])?["text"])
+    }
+    all = all.filter { b in !names.contains { b.contains($0) } }
+    if let e = firstText(d["error"]) { all.append(e) }
+    return all
+}
+
+/// Hand Over stops on a names problem or a folder there that is not this
+/// project: the sheet says it, with the command that fixes it.
+func crossingBlocks(_ d: [String: Any]) -> Bool {
+    !nameProblems(d).isEmpty || identityFix(d) != nil || blockerLines(d).contains { $0.contains("remote paths") }
+}
+
+/// Files that differ only in line endings (`eol_only`, not copied: the ones
+/// on `keeper` stay), and files that got back the endings they left with
+/// (`eol_kept`).
+func eolText(_ d: [String: Any], keeper: String) -> String? {
+    let only = nameList(d["eol_only"]), kept = nameList(d["eol_kept"] ?? d["eol_restored"])
+    var lines: [String] = []
+    if !only.isEmpty {
+        lines.append("\(fileCount(only.count)) differ only in line endings: the ones on \(keeper) stay as "
+                     + "they are (" + only.prefix(3).joined(separator: ", ") + (only.count > 3 ? ", …)" : ")"))
+    }
+    if !kept.isEmpty {
+        lines.append("Line endings kept as they were on \(keeper): " + kept.prefix(3).joined(separator: ", ")
+                     + (kept.count > 3 ? ", …" : ""))
+    }
+    return lines.isEmpty ? nil : lines.joined(separator: "\n")
+}
+
+/// Files made there whose names `receiver` cannot hold (`unsafe_names`):
+/// they come into the set-aside folder under a safe name.
+func unsafeText(_ d: [String: Any], receiver: String) -> String? {
+    let rows = (d["unsafe_names"] as? [Any]) ?? []
+    guard !rows.isEmpty else { return nil }
+    let shown = rows.prefix(3).map { r -> String in
+        let x = (r as? [String: Any]) ?? [:]
+        let there = firstText(r, x["there"], x["name"]) ?? "?"
+        return firstText(x["kept_as"]).map { "\(there) (as \(baseName($0)))" } ?? there
+    }
+    return "Kept aside: \(fileCount(rows.count)) whose name \(receiver) cannot hold: "
+        + shown.joined(separator: ", ") + (rows.count > 3 ? ", …" : "")
+}
+
+/// The `.gitattributes` aht suggests for a git project that crosses to or
+/// from Windows without one; aht never writes it.
+let GITATTRIBUTES_LINES = ["* text=auto", "*.sh text eol=lf", "*.bat text eol=crlf",
+                           "*.cmd text eol=crlf", "*.ps1 text eol=crlf"]
+
+/// The lines the dry run suggests (`git.suggest`): a git project that
+/// crosses to or from Windows without a `.gitattributes`; nil when none.
+func gitattributesHint(_ d: [String: Any]) -> [String]? {
+    let lines = nameList((d["git"] as? [String: Any])?["suggest"])
+    return lines.isEmpty ? nil : lines
+}
+
+/// The git settings aht's session gets across systems, and the command that
+/// gives them to git in your own terminal (`git.how`).
+func gitNote(_ d: [String: Any]) -> (text: String, fix: String?)? {
+    guard let how = firstText((d["git"] as? [String: Any])?["how"]) else { return nil }
+    let f = fixIn(how)
+    return f.fix == nil ? (how, nil) : ("For git " + f.text, f.fix)
+}
+
+/// What the dry run notes besides its warnings (an executable mark lost on
+/// Windows, say).
+func crossNotes(_ d: [String: Any]) -> [String] { nameList(d["notes"]) }
+
+/// "1,204": a count as this Mac writes numbers.
+func grouped(_ n: Int) -> String { NumberFormatter.localizedString(from: NSNumber(value: n), number: .decimal) }
+
+/// The files of a plan: `files`, or what comes (`take` and `new`).
+func planFiles(_ d: [String: Any]) -> Int? {
+    let n = (d["plan"] as? [String: Any]) ?? [:]
+    if let f = tally(n["files"]) ?? tally(d["files"]) { return f }
+    guard let p = n["project"] as? [String: Any] else { return nil }
+    return (tally(p["take"]) ?? 0) + (tally(p["new"]) ?? 0)
+}
+
+/// Bring Here's plan in words (`bring <path there> --from M --json`).
+func bringText(_ d: [String: Any], machine: String) -> String {
+    let n = (d["plan"] as? [String: Any]) ?? [:]
+    let bytes = (n["bytes"] ?? d["bytes"]) as? NSNumber
+    let hist = (n["history_bytes"] ?? d["history_bytes"]) as? NSNumber
+    var s = planFiles(d).map { "\(grouped($0)) file(s) come here" } ?? "The project comes here"
+    s += bytes.map { " (\(byteText($0)))" } ?? ""
+    s += hist.map { ", with \(byteText($0)) of Claude history." } ?? ", with its history."
+    let ses = (d["session"] as? [String: Any]) ?? [:]
+    if firstText(ses["id"]) == nil {
+        s += "\nNo Claude Code session yet: nothing opens here."
+    } else {
+        s += "\nSession: " + (firstText(ses["title"]).map { "“\($0)”" } ?? "the latest one")
+            + " opens here in a new terminal window; nothing runs until you type."
+        if n["file_history"] as? Bool == false { s += "\n/rewind's snapshots stay on \(machine) (the path differs here)." }
+    }
+    if let k = tally(n["set_aside"]), k > 0 { s += "\n\(fileCount(k)) in the folder here are set aside first." }
+    let lost = nameList(d["modes_lost"])
+    if !lost.isEmpty {
+        s += "\n\(lost.count) script(s) lose their “executable” mark here; they get it back on \(machine)."
+    }
+    for a in nameList(d["other_histories"]) { s += "\n\(AGENT_LABEL[a] ?? a)'s history stays on \(machine)." }
+    s += "\nOn \(machine) the project is marked as being on this Mac; its copy there stays as it is."
+    for w in crossNotes(d) { s += "\n" + w }
+    for w in nameList(d["warnings"]) { s += "\n⚠ " + w }
+    return s
+}
+
+/// Send Back's plan in Take Back's words (`send-back <path> --json`):
+/// `machine` is home, where the files go.
+func sendBackText(_ d: [String: Any], machine: String, preferHere: Bool = false) -> String {
+    let plan = (d["plan"] as? [String: Any]) ?? [:]
+    let p = (plan["project"] as? [String: Any]) ?? [:]
+    let h = (plan["history"] as? [String: Any]) ?? [:]
+    var s = "\(tally(p["take"]) ?? 0) file(s) changed here, \(tally(p["new"]) ?? 0) new, "
+        + "\(tally(p["delete"]) ?? 0) removed; \(tally(p["kept"]) ?? 0) changed only on \(machine) stay. "
+        + "Whatever they replace on \(machine) is set aside there, not deleted."
+    let talk = (tally(h["take"]) ?? 0) + (tally(h["new"]) ?? 0)
+    if talk > 0 { s += "\nHistory: \(talk) conversation(s) go back with it." }
+    let both = ((d["conflicts"] as? [String: Any]) ?? [:]).values.flatMap { nameList($0) }
+    if !both.isEmpty {
+        s += "\nChanged on both machines: " + both.prefix(4).joined(separator: ", ") + (both.count > 4 ? ", …" : "")
+            + (preferHere ? ". This Mac's version is taken; \(machine)'s is set aside there."
+                          : ". \(machine)'s stays, and the one from here is kept next to it.")
+    }
+    s += "\nThen \(machine) has the project again; this folder stays here as a copy."
+    for w in crossNotes(d) { s += "\n" + w }
+    for w in nameList(d["warnings"]) { s += "\n⚠ " + w }
+    return s
+}
+
+/// What Bring Here did (`bring … --apply --json`).
+func bringDoneText(_ d: [String: Any], machine: String) -> String {
+    if let why = pickupProblems(d) { return "Bring Here did not go through:\n\n" + why }
+    var s = "Brought here from \(machine)" + (firstText(d["here_path"]).map { ": " + tilde($0) } ?? "") + "."
+    if d["opened"] as? Bool == true {
+        s += " Its session is open in a new terminal window; nothing runs until you type."
+    } else if let line = firstText(d["command_line"], d["start_line"]) {
+        s += " To go on in its session: " + line
+    }
+    s += "\nOn \(machine) the project is marked as being here. Send Back returns it."
+    if let aside = firstText(d["set_aside"]) { s += "\nWhat was in the folder here is kept in: " + aside }
+    for w in nameList(d["warnings"]) { s += "\n⚠ " + w }
+    return s
+}
+
+/// What Send Back did (`send-back … --apply --json`).
+func sendBackDoneText(_ d: [String: Any], machine: String) -> String {
+    if let why = pickupProblems(d) { return "Send Back did not go through:\n\n" + why }
+    var s = "Sent back: \(machine) has the project again."
+    let done = ((d["done"] as? [String: Any])?["project"] as? [String: Any]) ?? [:]
+    let both = nameList(done["conflicts"])
+    if !both.isEmpty {
+        s += "\nChanged on both machines, both kept on \(machine): " + both.prefix(3).joined(separator: ", ")
+            + (both.count > 3 ? ", …" : "")
+    }
+    let kept = nameList(done["eol_kept"])
+    if !kept.isEmpty { s += "\nLine endings kept as they were on \(machine): " + kept.prefix(3).joined(separator: ", ") }
+    if let aside = firstText(d["set_aside"]) { s += "\nReplaced files are kept on \(machine) in: " + aside }
+    s += "\nThis folder stays here as a copy."
+    for w in nameList(d["warnings"]) { s += "\n⚠ " + w }
+    return s
+}
+
+/// The dry run blocks on an idle session there (`--allow-idle` lifts it).
+func idleBlock(_ d: [String: Any]) -> Bool {
+    d["idle_there"] as? Bool == true || blockerLines(d).contains { $0.contains("--allow-idle") }
+}
+
+/// The dry run blocks because a newer Claude Code wrote here (`--ignore-version`).
+func versionBlock(_ d: [String: Any]) -> Bool {
+    blockerLines(d).contains { $0.contains("--ignore-version") }
+}
+
+/// Bring Here from M: the projects there, the one picked, its dry run, and
+/// what --apply did.
+struct BringView: Identifiable {
+    let id = UUID()
+    let machine: String
+    var listing = true
+    var list: [String: Any] = [:]
+    var said = ""                   // what aht said when it gave no JSON
+    var picked: String?             // the folder there
+    var loading = false
+    var dry: [String: Any] = [:]
+    var allowIdle = false           // --allow-idle
+    var applying = false
+    var done: [String: Any]?
+}
+
+func bringArgs(_ v: BringView, apply: Bool = false) -> [String] {
+    ["bring", v.picked ?? "", "--from", v.machine] + (v.allowIdle ? ["--allow-idle"] : [])
+        + (apply ? ["--apply"] : []) + ["--json"]
+}
+
+func bringReady(_ v: BringView) -> Bool {
+    v.picked != nil && !v.loading && !v.applying && v.done == nil && !v.dry.isEmpty
+        && pickupProblems(v.dry) == nil && nameProblems(v.dry).isEmpty
+}
+
+/// Send Back to M, on a project brought here from M.
+struct SendBackView: Identifiable {
+    let id = UUID()
+    let project: Project
+    let machine: String
+    var loading = true
+    var dry: [String: Any] = [:]
+    var said = ""
+    var ignoreVersion = false       // --ignore-version
+    var preferHere = false          // --prefer here: this Mac's version of a file changed on both wins
+    var applying = false
+    var done: [String: Any]?
+}
+
+func sendBackArgs(_ v: SendBackView, apply: Bool = false) -> [String] {
+    ["send-back", v.project.path] + (v.ignoreVersion ? ["--ignore-version"] : [])
+        + (v.preferHere ? ["--prefer", "here"] : []) + (apply ? ["--apply"] : []) + ["--json"]
+}
+
+func sendBackReady(_ v: SendBackView) -> Bool {
+    !v.loading && !v.applying && v.done == nil && !v.dry.isEmpty && pickupProblems(v.dry) == nil
+        && nameProblems(v.dry).isEmpty
+}
+
+/// The line over a project another machine took from here with Bring Here:
+/// "On pc since 14:10 (brought there from pc). Send it back from pc."
+/// Why Send Back cannot ask the project's home from here: it is not set up
+/// here (copy_of.remote is null), or it is a PC, which answers no machine.
+func sendBackBlocked(_ p: Project, _ ms: [Machine]) -> String? {
+    guard let c = p.copyOf, let to = p.sendBackTo else { return nil }
+    if c.pcHome { return "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)" }
+    guard let r = c.remote, let mc = ms.first(where: { $0.name == r }) else {
+        return "\(c.from) is not set up on this Mac: add it under Machines, then send it back"
+    }
+    return mc.system == "Windows" ? "\(to) is a Windows PC, which this Mac cannot reach: take it back on \(to)" : nil
+}
+
+func awayLine(_ p: Project) -> String? {
+    guard let host = p.awayHolder ?? p.away, p.awayDrivenBy == "there" else { return nil }
+    let at = clock(p.awaySince)
+    return "On \(host)" + (at.isEmpty ? "" : " since \(at)") + " (brought there from \(host)). "
+        + "Send it back from \(host)."
+}
+
+/// How the folders here match the folders on a machine (`remotes.<name>.paths`).
+struct PathMap: Hashable {
+    let mode: String                // "same" | "home" | "pairs"
+    let pairs: [[String]]           // [here, there], tried longest first; then the two homes
+    let hereHome: String?
+    let thereHome: String?
+    var rules: [[String]] = []      // `remote paths --json`'s rules: [here, there, kind], in order
+}
+
+/// A machine's `paths` setting (and the homes, when the row names them).
+func pathMap(_ v: Any?, _ row: [String: Any] = [:]) -> PathMap? {
+    let hh = firstText(row["here_home"]), th = firstText(row["there_home"], row["home"])
+    let rules = ((row["rules"] as? [[String: Any]]) ?? []).compactMap { r -> [String]? in
+        guard let k = firstText(r["kind"]) else { return nil }
+        return [firstText(r["here"]) ?? "", firstText(r["there"]) ?? "", k]
+    }
+    if let s = v as? String, !s.isEmpty {
+        return PathMap(mode: s, pairs: [], hereHome: hh, thereHome: th, rules: rules)
+    }
+    guard let list = v as? [Any] else { return nil }
+    let pairs = list.compactMap { p -> [String]? in
+        let two = ((p as? [Any]) ?? []).compactMap { $0 as? String }
+        if two.count == 2 { return two }
+        let d = (p as? [String: Any]) ?? [:]
+        guard let a = firstText(d["here"]), let b = firstText(d["there"]) else { return nil }
+        return [a, b]
+    }
+    return PathMap(mode: pairs.isEmpty ? "home" : "pairs", pairs: pairs, hereHome: hh, thereHome: th, rules: rules)
+}
+
+/// `remote paths --json`: each machine's mapping, by its name. Takes
+/// `machines` rows, a `remotes` table, or one machine's answer.
+func pathMaps(_ d: [String: Any]) -> [String: PathMap] {
+    var rows = (d["machines"] as? [[String: Any]]) ?? []
+    for (k, v) in (d["remotes"] as? [String: Any]) ?? [:] {
+        if let r = v as? [String: Any] { rows.append(r.merging(["remote": k]) { a, _ in a }) }
+    }
+    if d["paths"] != nil { rows.append(d) }
+    var out: [String: PathMap] = [:]
+    for r in rows {
+        if let name = firstText(r["remote"], r["machine"], r["name"]), let pm = pathMap(r["paths"], r) {
+            out[name] = pm
+        }
+    }
+    return out
+}
+
+/// A folder under the home there, spelled that system's way.
+func underHome(_ home: String, _ rest: String) -> String {
+    let sep = home.contains("\\") ? "\\" : "/"
+    return home + (home.hasSuffix(sep) ? "" : sep) + rest.replacingOccurrences(of: "/", with: sep)
+}
+
+/// The Machines line: how a folder here is found on that machine.
+func pathMapText(_ p: PathMap, machine: String) -> String {
+    let shown = p.rules.filter { $0[2] != "same" && !$0[0].isEmpty && !$0[1].isEmpty }
+    if p.mode != "same" && !shown.isEmpty {
+        // the core's rules, in the order it tries them
+        return "Folders here → on \(machine): "
+            + shown.map { tilde($0[0]) + " → " + $0[1] + ($0[2] == "home" ? " (home)" : "") }.joined(separator: " · ")
+    }
+    let home = p.thereHome.map { "~/code/shop here is \(underHome($0, "code/shop")) on \(machine)" }
+        ?? "a folder in your home folder here goes into the home folder on \(machine)"
+    switch p.mode {
+    case "same": return "Folders: the same paths on \(machine) as here"
+    case "pairs":
+        return "Folders: " + p.pairs.map { tilde($0[0]) + " → " + $0[1] }.joined(separator: " · ")
+            + "; elsewhere " + home
+    default: return "Folders: home to home: " + home
+    }
 }
 
 struct Found: Identifiable, Hashable {
@@ -1383,6 +1898,8 @@ struct HandoverPlan: Identifiable {
     let body: String
     var task = ""
     var replaceThere = false        // the copy there changed: set it aside (--replace-there)
+    var dry: [String: Any] = [:]    // the dry run: paths, names, line endings, git
+    var blocked = false             // names or the folder there stand in the way
 }
 
 struct RulesView: Identifiable {
@@ -2241,6 +2758,9 @@ final class AppModel: ObservableObject {
     @Published var showUpdate = false
     @Published var offsite: OffsiteView?        // Fetch Backups From…
     @Published var pickup: PickupView?          // Pick Up from M, Leave a Note on M
+    @Published var bring: BringView?            // Bring Here from M
+    @Published var sendBack: SendBackView?      // Send Back to M
+    @Published var pathsOf: [String: PathMap] = [:]  // each machine's folders (`remote paths --json`)
     var openWelcome: (() -> Void)?              // the welcome window, again
     var openWelcomeFirst: ((String) -> Void)?   // … to install aht (this app's version)
     @Published var itermControl = "closed"      // itermControlState(ask: false)
@@ -2485,6 +3005,12 @@ final class AppModel: ObservableObject {
                     if pick == 1 { self.handOver(p, replacing: c) }
                     return
                 }
+                if crossingBlocks(plan) {
+                    // names the disk there cannot hold, or a folder there that is not
+                    // this project: the sheet says it, with the command that fixes it
+                    self.handoverPlan = HandoverPlan(project: p, remote: there, body: "", dry: plan, blocked: true)
+                    return
+                }
                 if let why = self.problems(plan) {
                     self.note(p.path, "Cannot be handed over now:\n\n" + why)
                     return
@@ -2511,7 +3037,7 @@ final class AppModel: ObservableObject {
                 body += "\nThe session is resumed there and this folder is marked as "
                     + "away until you take it back."
                 self.handoverPlan = HandoverPlan(project: p, remote: remote, body: body,
-                                                 replaceThere: replacing != nil)
+                                                 replaceThere: replacing != nil, dry: plan)
             }
         }
     }
@@ -3501,6 +4027,118 @@ final class AppModel: ObservableObject {
         textSheet = TextSheet(title: "Note from \(i.name): \(p.name)", text: text, project: nil,
                               wide: true, topic: "Pick up on another machine")
     }
+
+    // ---- Bring Here and Send Back ----
+
+    /// Run aht off the main thread; `then` gets its JSON (nil when it gave
+    /// none) and what it said on stderr, on the main thread.
+    func askCore(_ args: [String], then: @escaping ([String: Any]?, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = shWithStderr(PY, [ahtScript()] + args)
+            let d = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]
+            let said = r.err.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async { then(d, said) }
+        }
+    }
+
+    /// What --apply answered, or what went wrong when it gave no JSON.
+    func answered(_ d: [String: Any]?, _ said: String) -> [String: Any] {
+        d ?? ["error": said.isEmpty ? "aht gave no answer — see the log (Settings)." : said]
+    }
+
+    /// Bring Here from M: M is asked for the projects aht keeps there.
+    func openBring(from machine: String) {
+        let v = BringView(machine: machine)
+        bring = v
+        guard !demo else { return }
+        askCore(["bring", "--from", machine, "--list", "--json"]) { d, said in
+            guard self.bring?.id == v.id else { return }
+            self.bring?.listing = false
+            self.bring?.list = d ?? [:]
+            self.bring?.said = d == nil ? said : ""
+        }
+    }
+
+    /// The dry run for the project picked there; again when "bring it
+    /// anyway" (--allow-idle) changes.
+    func lookBring(_ path: String) {
+        guard bring != nil, bring?.done == nil else { return }
+        if bring?.picked != path { bring?.allowIdle = false }
+        bring?.picked = path
+        bring?.loading = true
+        bring?.dry = [:]
+        guard !demo, let v = bring else { return }
+        askCore(bringArgs(v)) { d, said in
+            guard let now = self.bring, now.id == v.id, now.picked == path, now.allowIdle == v.allowIdle
+            else { return }
+            self.bring?.loading = false
+            self.bring?.dry = d ?? [:]
+            self.bring?.said = d == nil ? said : ""
+        }
+    }
+
+    func applyBring() {
+        guard let v = bring, bringReady(v) else { return }
+        bring?.applying = true
+        guard !demo else { return }
+        askCore(bringArgs(v, apply: true)) { d, said in
+            guard self.bring?.id == v.id else { return }
+            self.bring?.applying = false
+            self.bring?.done = self.answered(d, said)
+            self.refresh()
+        }
+    }
+
+    /// Send Back on a project brought here: home plans the return against
+    /// its own copy (a dry run), the sheet shows it.
+    func openSendBack(_ p: Project) {
+        guard let to = p.sendBackTo, p.copyOf?.pcHome != true else { return }
+        sendBack = SendBackView(project: p, machine: to)
+        lookSendBack()
+    }
+
+    func lookSendBack() {
+        guard let v = sendBack, v.done == nil else { return }
+        sendBack?.loading = true
+        sendBack?.dry = [:]
+        guard !demo else { return }
+        askCore(sendBackArgs(v)) { d, said in
+            guard let now = self.sendBack, now.id == v.id, now.ignoreVersion == v.ignoreVersion,
+                  now.preferHere == v.preferHere else { return }
+            self.sendBack?.loading = false
+            self.sendBack?.dry = d ?? [:]
+            self.sendBack?.said = d == nil ? said : ""
+        }
+    }
+
+    func applySendBack() {
+        guard let v = sendBack, sendBackReady(v) else { return }
+        sendBack?.applying = true
+        guard !demo else { return }
+        askCore(sendBackArgs(v, apply: true)) { d, said in
+            guard self.sendBack?.id == v.id else { return }
+            self.sendBack?.applying = false
+            self.sendBack?.done = self.answered(d, said)
+            self.refresh()
+        }
+    }
+
+    /// Each machine's folders (`remote paths --json`), for Machines; until it
+    /// answers, what the config says.
+    func loadPaths() {
+        guard !demo, !machines.isEmpty else { return }
+        let names = machines.map { $0.name }
+        DispatchQueue.global(qos: .utility).async {
+            var maps: [String: PathMap] = [:]
+            for n in names {
+                let d = ahtJSON(["remote", "paths", n, "--json"]) ?? [:]
+                if firstText(d["error"]) == nil, let pm = pathMap(d["paths"], d) { maps[n] = pm }
+            }
+            DispatchQueue.main.async { self.pathsOf = maps }
+        }
+    }
+
+    func pathsFor(_ mc: Machine) -> PathMap? { pathsOf[mc.name] ?? mc.paths }
 
     // ---- tidy up ----
 
@@ -4550,6 +5188,8 @@ struct MainView: View {
         .sheet(isPresented: $m.showUpdate) { UpdateSheet() }
         .sheet(item: $m.offsite) { _ in FetchBackupsSheet() }
         .sheet(item: $m.pickup) { _ in PickupSheet() }
+        .sheet(item: $m.bring) { _ in BringSheet() }
+        .sheet(item: $m.sendBack) { _ in SendBackSheet() }
     }
 }
 
@@ -4560,7 +5200,7 @@ struct ProjectsView: View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 TextField("Search", text: $m.search)
-                    .textFieldStyle(.roundedBorder).frame(width: 220)
+                    .textFieldStyle(.roundedBorder).frame(width: 160)
                 Spacer()
                 if m.machines.count > 1 {
                     Picker("Machine", selection: Binding(
@@ -4568,10 +5208,11 @@ struct ProjectsView: View {
                         set: { n in m.machines.first { $0.name == n }.map(m.use) })) {
                         ForEach(m.machines) { Text($0.name).tag($0.name) }
                     }
-                    .frame(width: 220)
+                    .frame(width: 150)
                 } else if let one = m.machine {
                     Text("Machine: \(one)").foregroundColor(.secondary).lineLimit(1).fixedSize()
                 }
+                BringMenu()
                 Button("Sync Now") { m.syncNow() }
                     .disabled(m.working != nil || m.machine == nil)
                 Button("Find Moved Folders") { m.reconcile() }
@@ -4639,6 +5280,7 @@ struct DetailView: View {
                         .help(c.at.map { "Since " + clock($0) } ?? "")
                 }
                 if let h = p.handing, h.state != "running" { HandingBanner(p: p, h: h) }
+                if let line = awayLine(p) { HeldThereBanner(p: p, line: line) }
                 if let s = p.syncPaused, let to = p.mirror, p.away == nil, p.handing == nil {
                     SyncPausedBanner(p: p, s: s, to: s.machine ?? to)
                 }
@@ -4647,64 +5289,13 @@ struct DetailView: View {
                 if let i = p.pickedUp, p.away == nil { IncomingBanner(p: p, i: i) }
                 HStack(spacing: 10) {
                     if p.away != nil {
-                        Button("Take Back…") { m.takeBack(p) }
-                            .keyboardShortcut(.defaultAction)
-                        Button("Open Session") { m.openSession(p) }
-                        Button("Release…") { m.release(p) }
-                            .help("Stop waiting for it: the files here stay as they are, "
-                                  + "and the copy over there is not touched")
-                        HelpButton("Hand a project over")
+                        AwayButtons(p: p)
                     } else if p.exists {
-                        Button(m.machine.map { "Hand Over to \($0)…" } ?? "Hand Over…") {
-                            m.handOver(p)
-                        }
-                        .disabled(m.machine == nil || !m.supported || p.open != nil
-                                  || p.handing != nil)
-                        Toggle("Keep in sync" + (p.mirror.map { " with \($0)" } ?? ""),
-                               isOn: Binding(get: { p.mirror != nil },
-                                             set: { m.keepInSync(p, $0) }))
-                            .disabled(m.machine == nil || !m.supported || p.handing != nil
-                                      || (p.mirror == nil && syncRefused(p, m.machine)))
-                            .help(p.mirror == nil && syncRefused(p, m.machine)
-                                  ? "This folder is \(m.machine ?? "that machine")'s synced copy: syncing "
-                                    + "it back would overwrite one copy with the other"
-                                  : "")
-                        HelpButton("Hand a project over")
-                        Button("Continue Session") { m.continueHere(p) }
-                            .disabled(p.sessions == 0 || p.handing != nil)
-                        Menu("Switch Agent") {
-                            ForEach(switchItems(p, m.agentCLIs), id: \.self) { i in
-                                Button(i.title) {
-                                    if i.back { m.handBack(p) } else { m.switchAgent(p, to: i.to) }
-                                }
-                                if i.back { Divider() }
-                            }
-                        }
-                        .fixedSize()
-                        .disabled(p.sessions == 0 && p.agents.isEmpty || p.handing != nil)
-                        HelpButton("Continue in another agent")
-                        MachinesMenu(p: p)
+                        HereButtons(p: p)
                     }
                     Spacer()
                     if p.exists {
-                        Menu("More") {
-                            Button("Show Sessions…") { m.openSessionList(p) }
-                            Button("What Changed…") { m.openChanges(p) }
-                            Button("Undo a Session…") { m.openUndo(p) }
-                            Button("Journal") { m.journal(p) }
-                            Button("AI-Use Statement") { m.statement(p) }
-                            Button("Share a Session…") { m.share(p) }
-                            Divider()
-                            Button("Project Rules…") { m.openRules(p) }
-                            Button("Check for Secrets") { m.checkSecrets(p) }
-                            Divider()
-                            Button("Second Opinion…") { m.openOpinion(p) }
-                            Button("Night Shift…") { m.openNightShift(p) }
-                                .disabled(m.machine == nil || !m.supported)
-                            Divider()
-                            Button("Show in Finder") { m.reveal(p) }
-                        }
-                        .fixedSize()
+                        MoreMenu(p: p)
                         HelpButton("The window at a glance")
                     }
                 }
@@ -4713,44 +5304,9 @@ struct DetailView: View {
                     Text("Add a machine under Machines to hand projects over.")
                         .font(.callout).foregroundColor(.secondary)
                 } else if let o = p.open, p.away == nil {
-                    Text(o == "idle"
-                         ? "An agent session is open in this project. Exit it (/exit) "
-                           + "before handing the project over."
-                         : o == "waiting"
-                         ? "An agent session in this project is waiting for you. Answer it "
-                           + "in its terminal; the project cannot be handed over until it "
-                           + "has finished and is closed."
-                         : "An agent is working in this project. It can be handed over "
-                           + "once that has finished and the session is closed.")
-                        .font(.callout).foregroundColor(.orange)
+                    Text(openText(o)).font(.callout).foregroundColor(.orange)
                 }
-                if p.limitSession != nil && p.away == nil {
-                    HStack(spacing: 10) {
-                        Text("Claude stopped at its usage limit"
-                             + (p.limitResets.map { "; it resets \($0)" } ?? "") + ".")
-                            .font(.callout).foregroundColor(.orange)
-                        if let t = m.limitSwitchTo {
-                            Button("Continue in \(AGENT_LABEL[t] ?? t)…") { m.switchAgent(p, to: t) }
-                                .controlSize(.small)
-                        } else {
-                            Text("Settings can offer another agent here.")
-                                .font(.caption).foregroundColor(.secondary)
-                        }
-                    }
-                }
-                if let n = m.notes[p.path] {
-                    HStack(alignment: .top, spacing: 10) {
-                        ScrollView {
-                            Text(n).font(.callout).textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        if let f = m.summaries[p.path] {
-                            Button("Show Summary in Finder") {
-                                NSWorkspace.shared.selectFile(f, inFileViewerRootedAtPath: "")
-                            }
-                        }
-                    }
-                }
+                DetailNotes(p: p)
                 Spacer(minLength: 0)
             } else {
                 Spacer()
@@ -4764,13 +5320,41 @@ struct DetailView: View {
         .padding(.horizontal, 16).padding(.vertical, 10)
     }
 
+    /// Why a project with an open session cannot be handed over yet.
+    func openText(_ o: String) -> String {
+        switch o {
+        case "idle":
+            return "An agent session is open in this project. Exit it (/exit) before handing the project over."
+        case "waiting":
+            return "An agent session in this project is waiting for you. Answer it in its terminal; the "
+                + "project cannot be handed over until it has finished and is closed."
+        default:
+            return "An agent is working in this project. It can be handed over once that has finished and "
+                + "the session is closed."
+        }
+    }
+
     func state(_ p: Project) -> String {
         if let host = p.away {
-            return "handed over to \(host)" + (p.awaySince.map { ", " + ago($0) } ?? "")
+            return (p.awayDrivenBy == "there" ? "brought to \(host)" : "handed over to \(host)")
+                + (p.awaySince.map { ", " + ago($0) } ?? "")
         }
         if !p.exists { return "the folder is gone; its histories are safe" }
         return "\(p.sessions) session(s), \(byteText(NSNumber(value: p.bytes))) of history"
     }
+}
+
+/// A Bring Here that the other machine drives (`driven_by` "there"): it
+/// finishes it or undoes it; aht here never asks it (a PC cannot be asked),
+/// and the notices check offers Release an hour after it began.
+func handingWaitText(_ h: Handing) -> String {
+    if h.release {
+        return "\(h.machine) did not finish. Release lets the project go on here; what was copied to "
+            + "\(h.machine) stays there."
+    }
+    let due = h.since.map { clock($0.addingTimeInterval(3600)) } ?? ""
+    return "When \(h.machine) finishes, the project shows as on \(h.machine). aht waits for \(h.machine); "
+        + "Release is offered after an hour" + (due.isEmpty ? "." : " (at \(due)).")
 }
 
 /// A handover that did not finish (yet): what is known, and the two ways on.
@@ -4783,13 +5367,15 @@ struct HandingBanner: View {
     var body: some View {
         let silent = h.state == "unreachable"
         let at = clock(silent ? h.silentSince ?? h.since : h.since)
+        let there = h.drivenBy == "there"     // that machine drives it: nobody here to ask
+        let what = there ? "Bringing it to \(h.machine)" : "Handover to \(h.machine)"
         HStack(alignment: .center, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
             VStack(alignment: .leading, spacing: 2) {
-                Text(silent ? "Handover to \(h.machine) did not finish"
-                            : "Handover to \(h.machine) unfinished: checking…")
+                Text(silent ? "\(what) did not finish" : there ? "\(what) unfinished" : "\(what) unfinished: checking…")
                     .fontWeight(.semibold)
-                Text(silent
+                Text(there ? handingWaitText(h)
+                     : silent
                      ? "\(h.machine) has not answered" + (at.isEmpty ? "" : " since \(at)")
                        + ". Release lets the project go on here; what was done on "
                        + "\(h.machine) stays there."
@@ -4800,7 +5386,9 @@ struct HandingBanner: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
-            Button("Check Now") { m.checkHanding(p) }.disabled(!m.supported)
+            if !there {
+                Button("Check Now") { m.checkHanding(p) }.disabled(!m.supported || !h.reachable)
+            }
             Button("Release…") { m.release(p) }     // after an hour of silence, the way on
                 .keyboardShortcut(h.release ? .defaultAction : nil)
         }
@@ -5286,11 +5874,47 @@ struct HandoverSheet: View {
     @State var plan: HandoverPlan
 
     var body: some View {
+        if plan.blocked { blocked } else { asking }
+    }
+
+    /// The folder there when it is not this one's path.
+    @ViewBuilder var paths: some View {
+        if let there = firstText(plan.dry["there_path"], plan.dry["remote_path"]), there != plan.project.path {
+            PathPair(from: "Here", fromPath: plan.project.path, to: "On \(plan.remote)", toPath: there,
+                     hereFirst: true)
+        }
+    }
+
+    /// Names the disk there cannot hold, or a folder there that is not this
+    /// project: what it is, in plain words, and the command that fixes it.
+    var blocked: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            headed("“\(plan.project.name)” cannot go to \(plan.remote) yet", "Hand a project over")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    paths
+                    CrossingNotes(d: plan.dry, receiver: plan.remote, keeper: plan.remote)
+                    BlockerList(d: plan.dry)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 380)
+            HStack {
+                Spacer()
+                Button("Close") { m.handoverPlan = nil }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20).frame(width: 560)
+    }
+
+    var asking: some View {
         VStack(alignment: .leading, spacing: 12) {
             headed("Hand “\(plan.project.name)” over to \(plan.remote)?", "Hand a project over")
+            paths
             Text(plan.body).frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+            CrossingNotes(d: plan.dry, receiver: plan.remote, keeper: plan.remote)
             Text("A task to start on over there (optional)").padding(.top, 6)
             TextEditor(text: $plan.task)
                 .font(.body).frame(height: 70)
@@ -5310,6 +5934,557 @@ struct HandoverSheet: View {
             }
         }
         .padding(20).frame(width: 520)
+    }
+}
+
+/// Where a project goes: the folder it leaves and the folder it lands in,
+/// each that machine's way (C:\Users\me\shop on a PC).
+struct PathPair: View {
+    let from: String                // "On box"
+    let fromPath: String
+    let to: String
+    let toPath: String
+    let hereFirst: Bool             // which of the two is this Mac's (shown as ~/…)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            row(from, hereFirst ? tilde(fromPath) : fromPath)
+            row(to, hereFirst ? toPath : tilde(toPath))
+        }
+    }
+
+    func row(_ label: String, _ path: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).foregroundColor(.secondary).frame(width: 90, alignment: .trailing)
+            Text(path).font(.system(.callout, design: .monospaced))
+                .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+        }
+    }
+}
+
+/// A command to run, with a Copy button.
+struct CopyLine: View {
+    let command: String
+    @State var copied = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(command).font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled).lineLimit(2).truncationMode(.middle)
+            if !command.contains("…") {     // "aht remote paths box …" is a pattern, not a command
+                Button(copied ? "Copied" : "Copy") {
+                    toClipboard(command)
+                    copied = true
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+}
+
+/// A blocker in plain words, and the command that fixes it.
+struct FixLine: View {
+    let text: String
+    let fix: String?
+    var icon = "exclamationmark.triangle.fill"
+    var tint = Color.orange         // a blocker; a note is .primary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(text, systemImage: icon).foregroundColor(tint)
+                .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            if let f = fix { CopyLine(command: f).padding(.leading, 22) }
+        }
+    }
+}
+
+/// What stands in the way, each with its fix (`aht remote paths …`).
+struct BlockerList: View {
+    let d: [String: Any]
+
+    var body: some View {
+        ForEach(blockerLines(d), id: \.self) { b in
+            let f = blockerFix(b, d)
+            FixLine(text: f.text, fix: f.fix)
+        }
+    }
+}
+
+/// The suggested `.gitattributes`, to copy into the project.
+struct GitattributesHint: View {
+    let lines: [String]
+    @State var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("This git project has no .gitattributes. With one like this, git keeps line endings "
+                  + "the same on both systems. aht never writes it for you.", systemImage: "text.alignleft")
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(alignment: .top) {
+                Text(lines.joined(separator: "\n")).font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                Spacer()
+                Button(copied ? "Copied" : "Copy") {
+                    toClipboard(lines.joined(separator: "\n") + "\n")
+                    copied = true
+                }
+                .controlSize(.small)
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+            .padding(.leading, 22)
+        }
+    }
+}
+
+/// What crossing to another system means for the files: names the
+/// receiving disk cannot hold (they block), files that differ only in line
+/// endings, names kept aside, the git note and the `.gitattributes` hint.
+struct CrossingNotes: View {
+    let d: [String: Any]
+    let receiver: String            // where the files go: "this Mac", "pc"
+    let keeper: String              // whose copy stays when only line endings differ
+
+    var body: some View {
+        let names = nameProblems(d)
+        VStack(alignment: .leading, spacing: 8) {
+            if !names.isEmpty {
+                FixLine(text: namesText(names, on: receiver), fix: nil, icon: "textformat")
+            }
+            if let e = eolText(d, keeper: keeper) {
+                Label(e, systemImage: "arrow.left.arrow.right").fixedSize(horizontal: false, vertical: true)
+            }
+            if let u = unsafeText(d, receiver: receiver) {
+                Label(u, systemImage: "tray.full").fixedSize(horizontal: false, vertical: true)
+            }
+            if let g = gitNote(d) {
+                FixLine(text: g.text, fix: g.fix, icon: "arrow.triangle.branch", tint: .primary)
+            }
+            if let lines = gitattributesHint(d) { GitattributesHint(lines: lines) }
+        }
+    }
+}
+
+/// Bring Here from M: the projects aht knows there, then the dry run of the
+/// one picked (where it lands here, what comes, what stands in the way),
+/// then Bring Here.
+struct BringSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let v = m.bring ?? BringView(machine: "")
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Bring a project here from \(v.machine)", "Hand a project over")
+            if v.done == nil { list(v) }
+            if v.picked != nil {
+                Divider()
+                plan(v)
+            }
+            Divider()
+            footer(v)
+        }
+        .padding(20).frame(width: 660, height: 640)
+    }
+
+    @ViewBuilder func list(_ v: BringView) -> some View {
+        let rows = thereProjects(v.list)
+        if v.listing {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Asking \(v.machine) for the projects aht keeps there…").foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        } else if rows.isEmpty {
+            Text(firstText(v.said, pickupProblems(v.list) ?? "") ?? "aht keeps no project on \(v.machine).")
+                .foregroundColor(v.list.isEmpty ? .orange : .secondary).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        } else {
+            BlockerList(d: v.list)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(rows) { t in ThereProjectRow(t: t, picked: t.path == v.picked) }
+                }
+            }
+            .frame(maxHeight: v.picked == nil ? .infinity : 150)
+        }
+    }
+
+    @ViewBuilder func plan(_ v: BringView) -> some View {
+        let name = baseName(v.picked ?? "")
+        if v.loading {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Asking \(v.machine) about \(name)…").foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        } else if v.dry.isEmpty {
+            Text(v.said.isEmpty ? "aht gave no answer — see the log (Settings)." : v.said)
+                .foregroundColor(.orange).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    PathPair(from: "On \(v.machine)", fromPath: firstText(v.dry["there_path"]) ?? v.picked ?? "",
+                             to: "Here", toPath: firstText(v.dry["here_path"]) ?? "?", hereFirst: false)
+                    if let d = v.done {
+                        Text(bringDoneText(d, machine: v.machine))
+                            .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                    } else {
+                        Text(bringText(v.dry, machine: v.machine)).fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                        CrossingNotes(d: v.dry, receiver: "this Mac", keeper: "this Mac")
+                        BlockerList(d: v.dry)
+                        if idleBlock(v.dry) || v.allowIdle { idle(v) }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    @ViewBuilder func idle(_ v: BringView) -> some View {
+        Toggle("Bring it anyway; the idle session there stays open", isOn: Binding(
+            get: { m.bring?.allowIdle ?? false },
+            set: { m.bring?.allowIdle = $0; m.lookBring(v.picked ?? "") }))
+            .toggleStyle(.checkbox).disabled(v.done != nil)
+        Text("If anyone types into that session later, Send Back keeps both versions.")
+            .font(.caption).foregroundColor(.secondary)
+    }
+
+    @ViewBuilder func footer(_ v: BringView) -> some View {
+        HStack {
+            if let d = v.done {
+                Spacer()
+                Button("Done") {
+                    // the project that came, selected in Projects
+                    if pickupProblems(d) == nil, let here = firstText(d["here_path"]) {
+                        (m.tab, m.selection) = (.projects, here)
+                    }
+                    m.bring = nil
+                }
+                .keyboardShortcut(.defaultAction)
+            } else {
+                Button("Cancel") { m.bring = nil }.keyboardShortcut(.cancelAction)
+                Spacer()
+                if v.applying {
+                    ProgressView().controlSize(.small)
+                    Text("Bringing it here…").foregroundColor(.secondary)
+                }
+                Button("Bring Here") { m.applyBring() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!bringReady(v))
+                    .help("Copy the project and its history here, mark it on \(v.machine) as being here, "
+                          + "and open its session here")
+            }
+        }
+    }
+}
+
+/// One project in Bring Here's list.
+struct ThereProjectRow: View {
+    @EnvironmentObject var m: AppModel
+    let t: ThereProject
+    let picked: Bool
+
+    var body: some View {
+        Button(action: { if !picked { m.lookBring(t.path) } }) {
+            HStack(spacing: 8) {
+                Image(systemName: picked ? "largecircle.fill.circle" : "circle")
+                    .foregroundColor(picked ? .accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(t.name).fontWeight(.medium)
+                        + Text(t.title.map { "   “\($0)”" } ?? "").foregroundColor(.secondary)
+                    Text(t.path).font(.caption).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                    if let st = thereState(t) {
+                        Text(st).font(.caption).foregroundColor(.orange).lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 8)
+                if let u = t.updated { Text(ago(u)).foregroundColor(.secondary) }
+            }
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(m.bring?.applying ?? false)
+        .help(t.blocked ?? t.here.map { "It comes here to " + tilde($0) } ?? "")
+    }
+}
+
+/// Send Back to M on a project brought here from M: M plans the return
+/// against its own copy, this sheet shows it in Take Back's words.
+struct SendBackSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let v = m.sendBack ?? SendBackView(project: Project([:]), machine: "")
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Send “\(v.project.name)” back to \(v.machine)?", "Hand a project over")
+            if v.loading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Asking \(v.machine) what changed on both sides…").foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
+            } else if v.dry.isEmpty {
+                Text(v.said.isEmpty ? "aht gave no answer — see the log (Settings)." : v.said)
+                    .foregroundColor(.orange).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            } else {
+                ScrollView { plan(v).frame(maxWidth: .infinity, alignment: .leading) }
+            }
+            Divider()
+            footer(v)
+        }
+        .padding(20).frame(width: 600, height: 520)
+    }
+
+    @ViewBuilder func plan(_ v: SendBackView) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            PathPair(from: "Here", fromPath: firstText(v.dry["here_path"]) ?? v.project.path,
+                     to: "On \(v.machine)", toPath: firstText(v.dry["there_path"]) ?? "?", hereFirst: true)
+            if let d = v.done {
+                Text(sendBackDoneText(d, machine: v.machine))
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            } else {
+                notes(v)
+            }
+        }
+    }
+
+    /// The plan in Take Back's words, what crossing means for the files, and
+    /// what stands in the way ("send it back anyway" lifts the version check).
+    @ViewBuilder func notes(_ v: SendBackView) -> some View {
+        Text(sendBackText(v.dry, machine: v.machine, preferHere: v.preferHere))
+            .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        if !((v.dry["conflicts"] as? [String: Any]) ?? [:]).isEmpty || v.preferHere {
+            Picker("Changed on both machines", selection: Binding(
+                get: { m.sendBack?.preferHere ?? false },
+                set: { m.sendBack?.preferHere = $0; m.lookSendBack() })) {
+                Text("Keep both (\(v.machine)'s stays, this one next to it)").tag(false)
+                Text("Use this Mac's versions (\(v.machine)'s set aside there)").tag(true)
+            }
+            .pickerStyle(.radioGroup)
+        }
+        CrossingNotes(d: v.dry, receiver: v.machine, keeper: v.machine)
+        BlockerList(d: v.dry)
+        if versionBlock(v.dry) || v.ignoreVersion {
+            Toggle("Send it back anyway", isOn: Binding(
+                get: { m.sendBack?.ignoreVersion ?? false },
+                set: { m.sendBack?.ignoreVersion = $0; m.lookSendBack() }))
+                .toggleStyle(.checkbox)
+                .help("The history here was written by a newer Claude Code than the one on \(v.machine): "
+                      + "update it there first, or send it back as it is")
+        }
+    }
+
+    @ViewBuilder func footer(_ v: SendBackView) -> some View {
+        HStack {
+            if v.done != nil {
+                Spacer()
+                Button("Done") { m.sendBack = nil }.keyboardShortcut(.defaultAction)
+            } else {
+                Button("Cancel") { m.sendBack = nil }.keyboardShortcut(.cancelAction)
+                Spacer()
+                if v.applying {
+                    ProgressView().controlSize(.small)
+                    Text("Sending it back…").foregroundColor(.secondary)
+                }
+                Button("Send Back") { m.applySendBack() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!sendBackReady(v))
+            }
+        }
+    }
+}
+
+/// A project another machine took from here with Bring Here: where it is,
+/// that it goes back from there, and Release (Take Back too, when this Mac
+/// reaches that machine).
+struct HeldThereBanner: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+    let line: String
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "laptopcomputer.and.arrow.down").foregroundColor(.blue)
+            Text(line).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            if p.canTakeBack { Button("Take Back…") { m.takeBack(p) }.disabled(!m.supported) }
+            Button("Release…") { m.release(p) }
+                .help("Stop waiting for it: the files here stay as they are, and the copy on "
+                      + "\(p.awayHolder ?? p.away ?? "that machine") is not touched")
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue.opacity(0.08)))
+        .disabled(m.working != nil)
+    }
+}
+
+/// Under a project's buttons: Claude's usage limit, and how the last action went.
+struct DetailNotes: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+
+    var body: some View {
+        if p.limitSession != nil && p.away == nil {
+            HStack(spacing: 10) {
+                Text("Claude stopped at its usage limit"
+                     + (p.limitResets.map { "; it resets \($0)" } ?? "") + ".")
+                    .font(.callout).foregroundColor(.orange)
+                if let t = m.limitSwitchTo {
+                    Button("Continue in \(AGENT_LABEL[t] ?? t)…") { m.switchAgent(p, to: t) }
+                        .controlSize(.small)
+                } else {
+                    Text("Settings can offer another agent here.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+        if let n = m.notes[p.path] {
+            HStack(alignment: .top, spacing: 10) {
+                ScrollView {
+                    Text(n).font(.callout).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let f = m.summaries[p.path] {
+                    Button("Show Summary in Finder") {
+                        NSWorkspace.shared.selectFile(f, inFileViewerRootedAtPath: "")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// More: what else there is for a project.
+struct MoreMenu: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+
+    var body: some View {
+        Menu("More") {
+            Button("Show Sessions…") { m.openSessionList(p) }
+            Button("What Changed…") { m.openChanges(p) }
+            Button("Undo a Session…") { m.openUndo(p) }
+            Button("Journal") { m.journal(p) }
+            Button("AI-Use Statement") { m.statement(p) }
+            Button("Share a Session…") { m.share(p) }
+            Divider()
+            Button("Project Rules…") { m.openRules(p) }
+            Button("Check for Secrets") { m.checkSecrets(p) }
+            Divider()
+            Button("Second Opinion…") { m.openOpinion(p) }
+            Button("Night Shift…") { m.openNightShift(p) }
+                .disabled(m.machine == nil || !m.supported)
+            Divider()
+            Button("Show in Finder") { m.reveal(p) }
+        }
+        .fixedSize()
+    }
+}
+
+/// The buttons of a project that is on another machine.
+struct AwayButtons: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+
+    var body: some View {
+        if p.awayDrivenBy != "there" {
+            Button("Take Back…") { m.takeBack(p) }
+                .keyboardShortcut(.defaultAction)
+            Button("Open Session") { m.openSession(p) }
+            Button("Release…") { m.release(p) }
+                .help("Stop waiting for it: the files here stay as they are, "
+                      + "and the copy over there is not touched")
+        }
+        HelpButton("Hand a project over")
+    }
+}
+
+/// The buttons of a project that is here.
+struct HereButtons: View {
+    @EnvironmentObject var m: AppModel
+    let p: Project
+
+    var body: some View {
+        if let to = p.sendBackTo, p.copyOf?.pcHome == true {
+            // a PC cannot be asked: the project goes back from there
+            Text("Take it back on \(to)").foregroundColor(.secondary)
+                .help("\(to) is a Windows PC, which no other machine can ask: take the project back there")
+        } else if let to = p.sendBackTo {
+            let why = sendBackBlocked(p, m.machines)
+            Button("Send Back to \(to)…") { m.openSendBack(p) }
+                .keyboardShortcut(.defaultAction)
+                .disabled(why != nil || !m.canReach || p.open == "working" || p.handing != nil)
+                .help(why ?? "Send the work done here back to \(to), which keeps this project")
+        } else {
+            Button(m.machine.map { "Hand Over to \($0)…" } ?? "Hand Over…") { m.handOver(p) }
+                .disabled(m.machine == nil || !m.supported || p.open != nil || p.handing != nil)
+        }
+        syncToggle
+        HelpButton("Hand a project over")
+        Button("Continue Session") { m.continueHere(p) }
+            .disabled(p.sessions == 0 || p.handing != nil)
+        Menu("Switch Agent") {
+            ForEach(switchItems(p, m.agentCLIs), id: \.self) { i in
+                Button(i.title) {
+                    if i.back { m.handBack(p) } else { m.switchAgent(p, to: i.to) }
+                }
+                if i.back { Divider() }
+            }
+        }
+        .fixedSize()
+        .disabled(p.sessions == 0 && p.agents.isEmpty || p.handing != nil)
+        HelpButton("Continue in another agent")
+        MachinesMenu(p: p)
+    }
+
+    var syncToggle: some View {
+        let refused = p.mirror == nil && (syncRefused(p, m.machine) || p.sendBackTo != nil)
+        return Toggle("Keep in sync" + (p.mirror.map { " with \($0)" } ?? ""),
+                      isOn: Binding(get: { p.mirror != nil }, set: { m.keepInSync(p, $0) }))
+            .disabled(m.machine == nil || !m.supported || p.handing != nil || refused)
+            .help(!refused ? ""
+                  : p.sendBackTo != nil ? "This folder is \(p.sendBackTo ?? "")'s project, brought here: "
+                    + (p.copyOf?.pcHome == true ? "take it back on \(p.sendBackTo ?? "")" : "Send Back returns the work")
+                  : "This folder is \(m.machine ?? "that machine")'s synced copy: syncing "
+                    + "it back would overwrite one copy with the other")
+    }
+}
+
+/// How the folders here are found on a machine, in Machines.
+struct PathMapLine: View {
+    let mc: Machine
+    let map: PathMap
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder").foregroundColor(.secondary)
+            Text(pathMapText(map, machine: mc.name)).font(.caption).foregroundColor(.secondary)
+                .lineLimit(2).textSelection(.enabled)
+        }
+        .help("aht remote paths \(mc.name) --same | --home | --add HERE THERE changes it")
+    }
+}
+
+/// Bring Here from … in Projects: the machines that can be asked.
+struct BringMenu: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let from = askableMachines(m.machines)
+        if !from.isEmpty {
+            Menu("Bring Here") {
+                ForEach(from, id: \.self) { n in Button("From \(n)…") { m.openBring(from: n) } }
+            }
+            .fixedSize()
+            .disabled(m.working != nil || !m.canReach)
+            .help("Bring a project aht keeps on another machine here, with its history")
+        }
     }
 }
 
@@ -6920,6 +8095,11 @@ struct MachinesView: View {
                                         .buttonStyle(.borderless).foregroundColor(.orange)
                                         .help(pausedHelp(held, mc.name))
                                 }
+                                if mc.system != "Windows" {
+                                    Button("Bring Here…") { m.openBring(from: mc.name) }
+                                        .disabled(!m.canReach)
+                                        .help("Bring a project aht keeps on \(mc.name) here, with its history")
+                                }
                                 Button("Check") { m.check(mc) }
                                 Button("Remove…") { m.remove(mc) }
                             }
@@ -6938,6 +8118,7 @@ struct MachinesView: View {
                                         .help(b.error ?? "")
                                 }
                             }
+                            if let pm = m.pathsFor(mc) { PathMapLine(mc: mc, map: pm) }
                             if let e = m.checkError[mc.name] {
                                 Text("✗ " + e).foregroundColor(.red)
                             }
@@ -6992,6 +8173,7 @@ struct MachinesView: View {
         }
         .onAppear {
             m.discover()
+            m.loadPaths()
             // "last heard" comes with the sessions board: read it when it is old
             if !m.machines.isEmpty && (m.boardAt.map { -$0.timeIntervalSinceNow > 120 } ?? true) {
                 m.refreshBoard()
@@ -11027,6 +12209,192 @@ if CommandLine.arguments.contains("--selftest") {
         print("PHASE 6 SAMPLES not checked (" + (dir6.isEmpty ? "AHT_FIXTURES_PHASE6 names no folder"
                                                        : "no remote_check samples in \(dir6) yet") + ")")
     }
+    // Phase 7: Bring Here, Send Back, folders at other paths, names across
+    // systems: the core's JSON shapes through the app's own readers
+    let list7 = thereProjects(["projects": [
+        ["path": "/home/me/code/api", "open": "working", "last_activity": "2026-10-27T18:00:00"],
+        ["path": "C:\\Users\\me\\code\\shop", "title": "Checkout", "last_activity": "2026-10-28T09:10:00",
+         "here_path": "/Users/me/code/shop"],
+        ["path": "/home/me/code/site", "away": ["host": "studio"], "last_activity": "2026-10-20T10:00:00"]]])
+    let names7 = nameProblems(["names": [
+        ["kind": "case", "count": 2, "names": [["README.md", "readme.md"], ["a.txt", "A.txt"]]],
+        ["kind": "reserved", "names": ["aux.md"]], ["kind": "chars", "count": 0, "names": [Any]()]]])
+    let fix7 = fixIn("aht moves projects between the home folders of your machines. D:\\work\\shop is outside "
+                     + "yours. Tell aht where such projects go on mac: `aht remote paths mac --add D:\\work /Users/me/work`.")
+    let fix7b = fixIn("on mac, /Users/me/code/shop holds another folder (412 files). Move it away there, or "
+                      + "choose another place: `aht remote paths mac --home`")
+    let fix7c = fixIn("a handover has not finished; release it to work on it here:  aht reclaim /x --release")
+    let fix7d = fixIn("Tell aht where projects from box go, or bring it with --here PATH:  aht remote paths box "
+                      + "--add /home/me/x ~/x   (swap the two: HERE first)")
+    let listOK = list7.map { $0.name } == ["shop", "api", "site"]
+        && list7.map { thereState($0) ?? "-" } == ["-", "a session is working in it there", "on studio now"]
+        && list7[0].here == "/Users/me/code/shop" && list7[0].title == "Checkout"
+    let nameKindsOK = names7.count == 2 && names7[0].names == ["README.md and readme.md", "a.txt and A.txt"]
+        && names7[1].text == "a name Windows reserves" && names7[1].count == 1
+        && namesText(names7, on: "pc").contains(
+            "\n• two files whose names differ only in capitals (2): README.md and readme.md; a.txt and A.txt\n")
+    let fixOK = fix7.fix == "aht remote paths mac --add D:\\work /Users/me/work"
+        && fix7.text.hasSuffix("Tell aht where such projects go on mac:")
+        && fix7b.fix == "aht remote paths mac --home" && fixIn("install or update aht on mac first").fix == nil
+        && fix7c.fix == "aht reclaim /x --release" && fix7c.text.hasSuffix("to work on it here:")
+        && fix7d.fix == "aht remote paths box --add /home/me/x ~/x"
+        && fix7d.text == "Tell aht where projects from box go, or bring it with --here PATH (swap the two: HERE first):"
+    let pc7 = Project(["real_path": "/x/shop", "exists": true, "away": "pc", "away_since": "2026-10-28T14:10:00",
+                       "away_driven_by": "there", "away_system": "Windows", "away_remote": NSNull()])
+    let box7 = Project(["real_path": "/x/api", "exists": true, "away": ["host": "box", "remote": "box",
+                        "driven_by": "there", "system": "Linux", "since": "2026-10-28T14:10:00"]])
+    let mine7 = Project(["real_path": "/x/site", "exists": true, "away": "box", "away_remote": "box"])
+    let copy7 = Project(["real_path": "/x/blog", "exists": true,
+                         "copy_of": ["from": "box", "kind": "brought", "remote": "box"]])
+    let given7 = Project(["real_path": "/x/wiki", "exists": true,
+                          "copy_of": ["from": "pc", "kind": "handover", "remote": NSNull()]])
+    let ms7 = machinesFrom(["box": ["ssh": "me@box", "system": "Linux"], "pc": ["ssh": "me@pc", "system": "Windows"]])
+    let rowsOK = awayLine(pc7) == "On pc since \(clock("2026-10-28T14:10:00")) (brought there from pc). "
+            + "Send it back from pc."
+        && !pc7.canTakeBack && box7.canTakeBack && box7.away == "box" && awayLine(box7) != nil
+        && mine7.canTakeBack && awayLine(mine7) == nil && copy7.sendBackTo == "box" && mine7.sendBackTo == nil
+        && given7.sendBackTo == "pc" && sendBackBlocked(copy7, ms7) == nil
+        && sendBackBlocked(given7, ms7)?.hasPrefix("pc is not set up on this Mac") == true
+        && sendBackBlocked(Project(["real_path": "/x/w", "copy_of": ["from": "pc", "kind": "handover", "remote": "pc"]]),
+                           ms7)?.contains("Windows PC") == true
+        && Handing(["remote": NSNull(), "host": "pc", "driven_by": "there"]).reachable == false
+    let rules7 = pathMap([["D:\\work", "/Users/me/work"]], ["here_home": "C:\\Users\\me", "rules": [
+        ["here": "D:\\work", "there": "/Users/me/work", "kind": "pair"],
+        ["here": "C:\\Users\\me", "there": "/Users/me", "kind": "home"]]])
+    let maps7 = pathMaps(["machines": [
+        ["remote": "box", "paths": "same"], ["remote": "pc", "paths": "home", "there_home": "C:\\Users\\me"],
+        ["remote": "lab", "paths": [["/data/x", "/srv/x"]]]], "remotes": ["mini": ["paths": "home"]]])
+    let mapsOK = maps7.keys.sorted() == ["box", "lab", "mini", "pc"] && maps7["lab"]?.pairs == [["/data/x", "/srv/x"]]
+        && maps7["pc"].map { pathMapText($0, machine: "pc") }
+            == "Folders: home to home: ~/code/shop here is C:\\Users\\me\\code\\shop on pc"
+        && maps7["box"].map { pathMapText($0, machine: "box") } == "Folders: the same paths on box as here"
+        && machinesFrom(["lab": ["ssh": "me@lab", "paths": [["/a", "/b"]]]]).first?.paths?.mode == "pairs"
+        && rules7.map { pathMapText($0, machine: "mac") }
+            == "Folders here → on mac: D:\\work → /Users/me/work · C:\\Users\\me → /Users/me (home)"
+    let eol7 = eolText(["eol_only": ["a.txt", "b.sh", "c.md", "d.py"]], keeper: "box") ?? ""
+    let hint7 = [gitattributesHint(["git": ["is_git": true, "gitattributes": false, "suggest": GITATTRIBUTES_LINES]]),
+                 gitattributesHint(["git": ["is_git": true, "gitattributes": true, "suggest": [Any]()]]),
+                 gitattributesHint(["git": ["suggest": ["* text=auto"]]]), gitattributesHint([:])]
+    let how7 = gitNote(["git": ["how": "in your own terminal on box:  git -c core.filemode=false status   "
+                                + "(aht's session there has this set)"]])
+    let notesOK = eol7.hasPrefix("4 files differ only in line endings: the ones on box stay as they are (a.txt")
+        && hint7[0] == GITATTRIBUTES_LINES && hint7[1] == nil && hint7[2] == ["* text=auto"] && hint7[3] == nil
+        && unsafeText(["unsafe_names": [["there": "a:b.txt", "kept_as": "/x/aside/a%3Ab.txt"]]], receiver: "this Mac")
+            == "Kept aside: 1 file whose name this Mac cannot hold: a:b.txt (as a%3Ab.txt)"
+        && how7?.fix == "git -c core.filemode=false status"
+        && how7?.text == "For git in your own terminal on box (aht's session there has this set):"
+        && gitNote(["git": ["how": NSNull()]]) == nil
+    var bp7 = BringView(machine: "box")
+    bp7.picked = "/home/me/code/shop"
+    bp7.allowIdle = true
+    var sb7 = SendBackView(project: copy7, machine: "box")
+    let sbArgs7 = sendBackArgs(sb7)
+    sb7.preferHere = true
+    let argsOK = bringArgs(bp7) == ["bring", "/home/me/code/shop", "--from", "box", "--allow-idle", "--json"]
+        && bringArgs(bp7, apply: true).suffix(2) == ["--apply", "--json"]
+        && sbArgs7 == ["send-back", "/x/blog", "--json"] && !bringReady(bp7) && !sendBackReady(sb7)
+        && sendBackArgs(sb7, apply: true) == ["send-back", "/x/blog", "--prefer", "here", "--apply", "--json"]
+    let blocksOK = crossingBlocks(["names": [["kind": "reserved", "names": ["aux.md"]]]])
+        && crossingBlocks(["blockers": ["Move it away there: `aht remote paths mac --home`"]])
+        && !crossingBlocks(["blockers": ["a session is open"]])
+        && blockerLines(["names": [["kind": "reserved", "names": ["aux.md"], "text": "a name Windows reserves"]],
+                         "blockers": ["1 name: a name Windows reserves (aux.md)", "x"], "error": "y"]) == ["x", "y"]
+        && idleBlock(["blockers": ["an idle session is open there; pass --allow-idle"]])
+        && versionBlock(["blockers": ["a newer Claude Code wrote here (--ignore-version)"]])
+    let bringOK = listOK && nameKindsOK && fixOK && rowsOK && mapsOK && notesOK && argsOK && blocksOK
+    print("BRING HERE AND SEND BACK \(bringOK ? "OK" : "FAIL — list \(listOK) names \(nameKindsOK) fix \(fixOK) rows \(rowsOK) maps \(mapsOK) notes \(notesOK) args \(argsOK) blocks \(blocksOK)")")
+    // Phase 7's fix round. (1) Leave Them Out: this app has no such button;
+    // it lists the names and says to rename them or set handover_excludes.
+    // (2) the identity fix is the core's `identity.fix`, copied whole, also
+    // where the sentence would mislead a reading of it
+    let idFix7 = "aht bring /x/a --from mac --here '/Users/me/a:  b-mac'"
+    let idSaid7 = "here, /Users/me/a:  b holds another folder (3 items). Move it away, or bring it to another place:  " + idFix7
+    let idOn7 = blockerFix(idSaid7, ["identity": ["ok": false, "fix": idFix7]])
+    let idOK = idOn7.fix == idFix7
+        && idOn7.text == "here, /Users/me/a:  b holds another folder (3 items). Move it away, or bring it to another place:"
+        && fixIn(idSaid7).fix != idFix7
+        && blockerFix(idSaid7, ["identity": ["ok": true, "fix": NSNull()]]).fix == fixIn(idSaid7).fix
+        && identityFix(["identity": ["ok": true, "fix": NSNull()]]) == nil
+        && crossingBlocks(["identity": ["ok": false, "fix": idFix7], "blockers": [idSaid7]])
+        && blockerFix("install or update aht on mac first", ["identity": ["fix": idFix7]]).fix == nil
+    print("IDENTITY FIX FROM identity.fix \(idOK ? "OK" : "FAIL — \(idOn7)")")
+    // (3) a project a PC handed over here: no Send Back, "take it back on pc"
+    let pcCopy7 = Project(["real_path": "/x/pcwork", "exists": true,
+                           "copy_of": ["from": "DESKTOP-PC", "kind": "handover", "remote": "pc", "system": "Windows"]])
+    let boxCopy7 = Project(["real_path": "/x/boxwork", "exists": true,
+                            "copy_of": ["from": "box", "kind": "brought", "remote": "box", "system": "Linux"]])
+    let pcHomeOK = pcCopy7.copyOf?.pcHome == true && boxCopy7.copyOf?.pcHome == false
+        && copyLine(pcCopy7.copyOf!) == "Handed over from DESKTOP-PC: take it back on pc"
+        && copyLine(boxCopy7.copyOf!) == "Brought here from box: Send Back returns it"
+        && sendBackBlocked(pcCopy7, [])?.hasSuffix("take it back on pc") == true
+        && sendBackBlocked(boxCopy7, ms7) == nil && copy7.copyOf?.pcHome == false
+    print("SEND BACK NOT FOR A PC'S PROJECT \(pcHomeOK ? "OK" : "FAIL — \(copyLine(pcCopy7.copyOf!))")")
+    // (4) a Bring Here the other machine drives: aht waits, Release after an hour
+    let began7 = Date().addingTimeInterval(-600)
+    let wait7 = handingWaitText(Handing(["holder": "pc", "host": "DESKTOP-PC", "remote": NSNull(), "driven_by": "there",
+                                         "since": began7.timeIntervalSince1970, "state": "checking"]))
+    let late7 = handingWaitText(Handing(["holder": "pc", "driven_by": "there", "state": "unreachable", "release": true]))
+    let waitOK = wait7 == "When pc finishes, the project shows as on pc. aht waits for pc; Release is offered after an hour (at "
+            + clock(began7.addingTimeInterval(3600)) + ")."
+        && late7.hasPrefix("pc did not finish. Release lets the project go on here") && !wait7.contains("asks")
+    print("BRING HERE BY THE OTHER MACHINE: WAITS \(waitOK ? "OK" : "FAIL — \(wait7) | \(late7)")")
+    let fix7OK = idOK && pcHomeOK && waitOK
+    // … and the core's phase-7 samples: AHT_FIXTURES_PHASE7
+    var phase7OK = true
+    let dir7 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE7"] ?? ""
+    let files7 = ((try? FileManager.default.contentsOfDirectory(atPath: dir7)) ?? []).filter { $0.hasSuffix(".json") }
+    if !dir7.isEmpty && !files7.isEmpty {
+        let want7 = ["bring_list.json", "bring_dry.json", "bring_apply.json", "send_back_dry.json",
+                     "send_back_apply.json", "remote_paths.json", "handover_blocked_names.json", "projects.json"]
+        var miss: [String] = [], seen: [String] = []
+        for n in want7 where files7.contains(n) {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir7).appendingPathComponent(n))
+            guard let d = data.flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] else {
+                miss.append(n + " (not JSON)")
+                continue
+            }
+            var wrong = false
+            switch n {
+            case "bring_list.json":
+                let rows = thereProjects(d)
+                wrong = rows.isEmpty || rows.contains { $0.path == "?" || $0.name.isEmpty }
+                seen.append("\(rows.count) there")
+            case "bring_dry.json", "send_back_dry.json":
+                let t = n == "bring_dry.json" ? bringText(d, machine: "box") : sendBackText(d, machine: "box")
+                wrong = firstText(d["here_path"]) == nil || firstText(d["there_path"]) == nil
+                    || t.contains("<null>") || t.contains("Optional(")
+                    || (n == "send_back_dry.json" && !(d["plan"] is [String: Any]))
+            case "bring_apply.json", "send_back_apply.json":
+                let t = n == "bring_apply.json" ? bringDoneText(d, machine: "box") : sendBackDoneText(d, machine: "box")
+                wrong = d["applied"] as? Bool != true || !(t.hasPrefix("Brought here from box") || t.hasPrefix("Sent back:"))
+                    || t.contains("<null>") || t.contains("Optional(")
+            case "remote_paths.json":
+                let maps = pathMaps(d)
+                wrong = maps.isEmpty
+                seen.append("paths " + maps.keys.sorted().map { "\($0): \(maps[$0]?.mode ?? "")" }.joined(separator: ", "))
+            case "handover_blocked_names.json":
+                let ps = nameProblems(d)
+                let fixes = blockerLines(d).compactMap { blockerFix($0, d).fix }
+                wrong = ps.isEmpty || !crossingBlocks(d) || ps.contains { $0.text.isEmpty || $0.names.isEmpty }
+                    || identityFix(d) == nil || fixes != [identityFix(d)!]
+                seen.append("names " + ps.map { $0.kind }.joined(separator: ",") + ", fix " + (fixes.first ?? "none"))
+            default:
+                let rows = sampleRows(d).map(Project.init)
+                let held = rows.filter { awayLine($0) != nil }.count
+                let brought = rows.filter { $0.sendBackTo != nil }.count
+                wrong = held + brought == 0
+                seen.append("\(held) held there, \(brought) brought here")
+            }
+            if wrong { miss.append(n) }
+        }
+        let absent7 = want7.filter { !files7.contains($0) }
+        phase7OK = miss.isEmpty
+        print("PHASE 7 SAMPLES \(phase7OK ? "OK" : "FAIL \(miss)") — \(dir7) [" + seen.joined(separator: "; ") + "]"
+              + (absent7.isEmpty ? "" : " (not there yet: " + absent7.joined(separator: ", ") + ")"))
+    } else {
+        print("PHASE 7 SAMPLES not checked (" + (dir7.isEmpty ? "AHT_FIXTURES_PHASE7 names no folder"
+                                                       : "no samples in \(dir7) yet") + ")")
+    }
     // the welcome's login switch: a first setup's "off" is an answer too, and
     // the core then keeps it (answered, and Getting started's step optional)
     var loginOK = loginAnswered(false, was: false, start: true)
@@ -11064,7 +12432,7 @@ if CommandLine.arguments.contains("--selftest") {
          && releaseOK && pauseOK && backOnOK && offsiteOK && fetchPartialOK && relayOK && dialogOK && samplesOK
          && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
          && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK
-         && pause5OK && phase5OK && transferOK && phase6OK ? 0 : 1)
+         && pause5OK && phase5OK && transferOK && phase6OK && bringOK && phase7OK && fix7OK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them
@@ -11143,7 +12511,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--spotlight-check"),
 // layout without clicking through it (needs a login session; nothing changes)
 //   --snapshot DIR [--select-first] [--query WORDS]
 //              [--corner-only | --welcome-only | --handover-only | --machines-only
-//               | --pickup-only | --sync-only]
+//               | --pickup-only | --sync-only | --transfer-only | --bring-only]
 /// --dark renders in the dark appearance; the window's own background is
 /// drawn under every snapshot, so the PNG is opaque (a transparent one is
 /// unreadable on a page of the other colour)
@@ -11411,6 +12779,185 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"),
                 demo.selection = p.path
                 snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
                          dir + "/detail-sync-sample-\(k + 1).png", NSSize(width: 900, height: 176))
+            }
+        }
+        exit(0)
+    }
+    if args.contains("--bring-only") {
+        // Bring Here and Send Back: the list from another machine, a dry run,
+        // names this Mac cannot hold, Send Back with line endings and the
+        // .gitattributes hint, Hand Over blocked by names and by the folder
+        // there, the row of a project a PC took, a brought copy, and each
+        // machine's folders in Machines; made-up rows in the shape of the
+        // core's JSON, then the core's own samples (AHT_FIXTURES_PHASE7) when
+        // there are some. Nothing asks the core or another machine.
+        let now = Date().timeIntervalSince1970
+        let demo = AppModel()
+        demo.demo = true
+        (demo.loaded, demo.running) = (true, true)
+        demo.status = ["version": "phase 7", "tracked": 6, "hook_installed": true,
+                       "handover": ["supported": true, "can_reach": true, "default_remote": "box", "remotes": [
+                           "box": ["ssh": "me@box", "system": "Linux", "paths": "same"],
+                           "lab": ["ssh": "me@lab", "system": "Linux", "paths": [["/Volumes/Work", "/data/me"]]],
+                           "pc": ["ssh": "me@pc", "system": "Windows", "paths": "home"]]]]
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? HOME
+        demo.pathsOf = pathMaps(["machines": [
+            ["remote": "box", "paths": "same", "here_home": home, "there_home": home],
+            ["remote": "lab", "paths": [["/Volumes/Work", "/data/me"]], "here_home": home, "there_home": "/home/me"],
+            ["remote": "pc", "paths": "home", "here_home": home, "there_home": "C:\\Users\\me"]]])
+        let stamp7 = { (ago: Double) -> String in
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+            return f.string(from: Date().addingTimeInterval(-ago))
+        }
+        var bv = BringView(machine: "box")
+        bv.listing = false
+        bv.list = ["remote": "box", "projects": [
+            ["path": home + "/code/shop", "here_path": home + "/code/shop", "title": "Checkout flow refactor",
+             "sessions": 3, "last_activity": stamp7(900)],
+            ["path": home + "/code/api", "here_path": home + "/code/api", "title": "session cookies",
+             "sessions": 5, "last_activity": stamp7(4000), "open": "working", "can_bring": false,
+             "why_not": "a session is working in it there"],
+            ["path": home + "/code/site", "sessions": 1, "last_activity": stamp7(86400 * 3), "can_bring": false,
+             "away": ["holder": "studio", "since": stamp7(7200), "driven_by": "here"], "why_not": "on studio since 22:10"],
+            ["path": home + "/papers/thesis", "title": "chapter 3 figures", "sessions": 9,
+             "last_activity": stamp7(86400 * 6)]]]
+        demo.bring = bv
+        snapshot(BringSheet().environmentObject(demo), dir + "/sheet-bring-list.png", NSSize(width: 660, height: 640))
+        let dry: [String: Any] = ["command": "bring", "applied": false, "blockers": [], "warnings": [],
+            "remote": "box", "here_path": home + "/code/shop", "there_path": home + "/code/shop",
+            "names": [], "eol_only": [], "unsafe_names": [], "other_histories": ["codex"],
+            "session": ["id": "0f3a9c2e-5b7d-4e1f-9a8b-7c6d5e4f3a2b", "title": "Checkout flow refactor"],
+            "plan": ["files": 1204, "bytes": 40_055_603, "history_bytes": 4_299_161, "file_history": true]]
+        bv.picked = home + "/code/shop"
+        bv.dry = dry
+        demo.bring = bv
+        snapshot(BringSheet().environmentObject(demo), dir + "/sheet-bring-dry.png", NSSize(width: 660, height: 640))
+        let caseNames: [String: Any] = ["kind": "case", "count": 2, "text": "two files whose names differ only in capitals",
+                                        "names": [["README.md", "readme.md"], ["Makefile", "makefile"]]]
+        let namesSaid: String = "2 names this machine cannot hold (two files whose names differ only in capitals: "
+            + "README.md / readme.md; Makefile / makefile) — rename them on box, or add them to handover_excludes"
+        let otherSaid: String = "here, \(home)/code/shop holds another folder (412 items). Move it away, or bring "
+            + "it to another place with --here PATH"
+        let idleSaid: String = "an idle Claude Code session is open in it on box, or pass --allow-idle to bring it anyway"
+        bv.dry = dry.merging(["names": [caseNames], "blockers": [namesSaid, otherSaid, idleSaid]]) { $1 }
+        demo.bring = bv
+        snapshot(BringSheet().environmentObject(demo), dir + "/sheet-bring-blocked.png", NSSize(width: 660, height: 640))
+        bv.dry = dry
+        bv.done = ["applied": true, "here_path": home + "/code/shop", "opened": true, "warnings": []]
+        demo.bring = bv
+        snapshot(BringSheet().environmentObject(demo), dir + "/sheet-bring-done.png", NSSize(width: 660, height: 640))
+        // a project brought here from pc, and one a PC took from here
+        let row = { (name: String, extra: [String: Any]) -> Project in
+            Project(["real_path": home + "/code/" + name, "exists": true, "sessions": 4, "bytes": 2_400_000,
+                     "agents": ["claude"], "last_activity": stamp7(600)].merging(extra) { $1 })
+        }
+        demo.projects = [
+            row("shop", ["away": "pc", "away_since": stamp7(5400), "away_driven_by": "there",
+                         "away_holder": "pc", "away_system": "Windows", "away_remote": NSNull()]),
+            row("api", ["copy_of": ["from": "box", "kind": "brought", "at": now - 3600, "remote": "box",
+                                    "from_path": "/home/me/code/api"]]),
+            row("site", ["away": "box", "away_remote": "box", "away_since": stamp7(7200), "away_driven_by": "there",
+                         "away_system": "Linux"])]
+        for (p, name) in zip(demo.projects, ["held-by-pc", "brought-here", "held-by-box"]) {
+            demo.selection = p.path
+            snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                     dir + "/detail-\(name).png", NSSize(width: 900, height: 176))
+        }
+        demo.tab = .projects
+        demo.selection = demo.projects[0].path
+        snapshot(MainView().environmentObject(demo), dir + "/projects-held-by-pc.png", NSSize(width: 900, height: 620))
+        let back: [String: Any] = ["command": "send-back", "applied": false, "blockers": [], "warnings": [],
+            "remote": "box", "here_path": home + "/code/api", "there_path": "/home/me/code/api",
+            "names": [], "eol_only": ["src/app.js", "README.md", "build.sh"],
+            "unsafe_names": [], "git": ["is_git": true, "gitattributes": false, "suggest": GITATTRIBUTES_LINES],
+            "conflicts": ["project": ["src/cart.js"]],
+            "plan": ["project": ["take": 14, "new": 2, "delete": 1, "conflict": 1, "kept": 0],
+                     "history": ["take": 1, "new": 0, "delete": 0, "conflict": 0, "kept": 0]]]
+        var sb = SendBackView(project: demo.projects[1], machine: "box")
+        sb.loading = false
+        sb.dry = back
+        demo.sendBack = sb
+        snapshot(SendBackSheet().environmentObject(demo), dir + "/sheet-send-back.png", NSSize(width: 600, height: 520))
+        sb.dry = back.merging(["blockers": ["the history here was written by Claude Code 2.1.320, newer than "
+                                            + "2.1.310 on box: update it there, or pass --ignore-version"]]) { $1 }
+        demo.sendBack = sb
+        snapshot(SendBackSheet().environmentObject(demo), dir + "/sheet-send-back-version.png",
+                 NSSize(width: 600, height: 520))
+        // Hand Over: blocked by names lab cannot hold and a folder outside the mapping; then a
+        // plan with another path there, the git note and the .gitattributes hint
+        let api = demo.projects[1]
+        let named: [String: Any] = ["command": "handover", "remote": "lab", "there_path": "/data/me/api",
+            "names": [["kind": "unicode", "count": 1, "names": [["notes/café.md", "notes/cafe\u{301}.md"]]],
+                      ["kind": "symlink", "count": 2, "names": ["bin/run", "data/latest"]]],
+            "blockers": ["aht moves projects between the home folders of your machines. /Volumes/Data/api is "
+                         + "outside yours. Tell aht where such projects go on lab:  "
+                         + "aht remote paths lab --add /Volumes/Data /home/me/Data"]]
+        snapshot(HandoverSheet(plan: HandoverPlan(project: api, remote: "lab", body: "", dry: named, blocked: true))
+                    .environmentObject(demo), dir + "/sheet-handover-blocked.png", NSSize(width: 560, height: 520))
+        let body = "1,204 file(s) to send (38.2 MB), history 4.1 MB.\nSession: Checkout flow refactor\n\n"
+            + "The session is resumed there and this folder is marked as away until you take it back."
+        let crossing: [String: Any] = ["there_path": "/data/me/api", "git": [
+            "is_git": true, "gitattributes": false, "suggest": GITATTRIBUTES_LINES, "env": ["core.filemode": "false"],
+            "how": "in your own terminal on lab:  git -c core.filemode=false status   (aht's session there has this set)"]]
+        snapshot(HandoverSheet(plan: HandoverPlan(project: api, remote: "lab", body: body, dry: crossing))
+                    .environmentObject(demo), dir + "/sheet-handover-crossing.png", NSSize(width: 520, height: 640))
+        demo.tab = .machines
+        snapshot(MainView().environmentObject(demo), dir + "/machines-paths.png", NSSize(width: 900, height: 520))
+        // the core's samples, when it has written them
+        let dir7 = ProcessInfo.processInfo.environment["AHT_FIXTURES_PHASE7"] ?? ""
+        func sample(_ n: String) -> [String: Any]? {
+            let data = try? Data(contentsOf: URL(fileURLWithPath: dir7).appendingPathComponent(n))
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        }
+        guard !dir7.isEmpty else { exit(0) }
+        if let d = sample("bring_list.json") {
+            var v = BringView(machine: firstText(d["remote"]) ?? "box")
+            (v.listing, v.list) = (false, d)
+            demo.bring = v
+            snapshot(BringSheet().environmentObject(demo), dir + "/sheet-bring-list-sample.png",
+                     NSSize(width: 660, height: 640))
+            if let dd = sample("bring_dry.json") {
+                (v.picked, v.dry) = (firstText(dd["there_path"]) ?? thereProjects(d).first?.path ?? "?", dd)
+                demo.bring = v
+                snapshot(BringSheet().environmentObject(demo), dir + "/sheet-bring-dry-sample.png",
+                         NSSize(width: 660, height: 640))
+            }
+        }
+        if let d = sample("send_back_dry.json") {
+            var v = SendBackView(project: Project(["real_path": firstText(d["here_path"]) ?? "/x/shop", "exists": true]),
+                                 machine: firstText(d["remote"]) ?? "box")
+            (v.loading, v.dry) = (false, d)
+            demo.sendBack = v
+            snapshot(SendBackSheet().environmentObject(demo), dir + "/sheet-send-back-sample.png",
+                     NSSize(width: 600, height: 520))
+        }
+        if let d = sample("handover_blocked_names.json") {
+            let p = Project(["real_path": firstText(d["project"]) ?? "/x/shop", "exists": true])
+            snapshot(HandoverSheet(plan: HandoverPlan(project: p, remote: firstText(d["remote"]) ?? "pc", body: "",
+                                                      dry: d, blocked: true))
+                        .environmentObject(demo), dir + "/sheet-handover-blocked-sample.png",
+                     NSSize(width: 560, height: 520))
+        }
+        if let d = sample("remote_paths.json"), let name = firstText(d["remote"]) {
+            // that machine among the ones set up, with the folders it answered
+            var ho = (demo.status["handover"] as? [String: Any]) ?? [:]
+            var rs = (ho["remotes"] as? [String: Any]) ?? [:]
+            rs[name] = ["ssh": "me@" + name, "system": firstText(d["system"]) ?? ""]
+            ho["remotes"] = rs
+            demo.status["handover"] = ho
+            demo.pathsOf = pathMaps(d)
+            demo.tab = .machines
+            snapshot(MainView().environmentObject(demo), dir + "/machines-paths-sample.png",
+                     NSSize(width: 900, height: 520))
+        }
+        if let d = sample("projects.json") {
+            demo.projects = sampleRows(d).map(Project.init).filter { awayLine($0) != nil || $0.sendBackTo != nil }
+            for (k, p) in demo.projects.prefix(6).enumerated() {
+                demo.selection = p.path
+                snapshot(DetailView().environmentObject(demo).frame(width: 900, height: 176),
+                         dir + "/detail-phase7-sample-\(k + 1).png", NSSize(width: 900, height: 176))
             }
         }
         exit(0)

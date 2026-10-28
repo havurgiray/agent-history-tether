@@ -101,7 +101,9 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 | Pick Up and Leave a Note: a project's context moves between machines, git moves the files | ✓ | ✓ | ✓ (the PC starts every exchange, with Mac and Linux machines) |
 | Be asked by your other machines | ✓ | ✓ | — (a PC is never asked, so it needs no ssh server) |
 | Backups on another machine: copy them there, fetch them back | ✓ | ✓ | ✓ (to and from Mac and Linux machines) |
-| Handover, keep in sync, night shift | ✓ | ✓ | — (not from Windows yet) |
+| Hand Over and Take Back, keep in sync, night shift | ✓ | ✓ | ✓ (to Mac and Linux machines; nothing is handed over to a PC) |
+| Bring Here and Send Back (the machine that gets the work starts it) | ✓ | ✓ | ✓ (from Mac and Linux machines) |
+| Projects at other paths on each machine; names, line endings, executable marks and git across systems | ✓ | ✓ | ✓ |
 | Stay awake while a handed-over agent works there (a closed lid still sleeps) | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or the GNOME desktop's own inhibitor (`gnome-session-inhibit`) where ssh sessions may not use it) | — |
 | Notices (waiting for you, done, usage limit, new version) | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session (a copy of the folder when a session starts) | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
@@ -111,8 +113,10 @@ window of Edge or Chrome, with the same tabs and dialogs.  What needs macOS
 A Windows PC asks; it is never asked.  From a PC, aht adds and checks
 your Mac and Linux machines, watches them, shows their sessions, searches
 them, picks up their work, leaves notes on them and keeps a copy of its
-backups on one of them; it cannot hand a project over yet.  The guide's
-*A Windows PC with your other machines* says how to set up the keys.
+backups on one of them.  It also hands projects over to them and takes
+them back, and brings their projects to the PC and sends them back.  The
+guide's *A Windows PC with your other machines* says how to set up the
+keys.
 
 CI runs the whole test suite on Linux and macOS for every push, including
 aht's window (its doors, its page and a command through it), and on real
@@ -249,19 +253,30 @@ keep working on it there over ssh or from your phone, and take it back later.
 The files, the agent's history and the session itself move; nothing is
 installed on the other machine but what it needs anyway (python3, tmux or
 byobu, the agent CLI); rsync 3 is optional: it makes big changes faster.
-macOS and Linux, Claude Code sessions for now; aht cannot ask a Windows
-PC yet (`aht remote add` and `aht remote check` stop after one harmless
-`echo` there, and make nothing on it).
+Claude Code sessions for now.  It works between any of macOS, Linux and
+Windows: a Mac, a Linux machine or a PC hands projects over to a Mac or
+Linux machine.  The other way round, **Bring Here** runs on the machine
+that gets the work: it fetches a project with Claude Code's history, and
+**Send Back** returns it, so a PC can work on a Mac's project.  aht cannot
+ask a Windows PC yet (`aht remote add` and `aht remote check` stop after
+one harmless `echo` there, and make nothing on it), so nothing is handed
+over to a PC.
 
 ```sh
 aht remote discover                      # machines of your network that qualify
 aht remote add homebox you@homebox       # ssh must work without a prompt
 aht remote check                         # what it still lacks, with the fix
+aht remote paths homebox                 # where projects go there
 aht mirror ~/Desktop/paper --on          # optional: keep its copy there warm
 aht handover ~/Desktop/paper             # dry run: what would travel
 aht handover ~/Desktop/paper --apply     # send it, resume the session there
 aht attach ~/Desktop/paper               # open that session
 aht reclaim ~/Desktop/paper --apply      # bring files and history back
+
+# on the machine that gets the work (a PC, say)
+aht bring --from mac --list              # the projects aht keeps on mac
+aht bring /Users/me/code/shop --from mac --apply   # fetch one, open its session here
+aht send-back C:\Users\me\code\shop --apply        # return the work to mac
 ```
 
 On macOS the same is in the app's window (**∞ ▸ Open aht…**): pick a project
@@ -274,13 +289,33 @@ session is open in it, and a transfer shows its progress.
   like, pick one per handover with `--to <name>` (the tray: *Machine*), and
   `aht remote default <name>` sets the one used when none is named.  A
   project remembers where it went, so taking it back needs no name.
-
-- **Same path on both sides.**  Agent CLIs key their history on the project's
-  absolute path, so `/Users/you/Desktop/paper` must exist under that very
-  path on the other machine — as a real folder, not a link.  On Linux, create
-  it once: `sudo mkdir -p /Users/you && sudo chown $USER /Users/you`; on a
-  machine other people use too, add `chmod 700 /Users/you` (`aht remote
-  check` tells you when that is missing).
+- **Bring Here and Send Back** need aht installed on the project's home,
+  which keeps the record that the project is away and plans the way back
+  (the same three-way plan as Take Back; what it replaces is set aside
+  there).  Other agents' histories stay home; the session gets a summary.
+  On a PC the tray's *Projects brought here* offers Send Back.
+- **Where projects go** (`aht remote paths <machine>`): at the same place
+  below the home folder there (`home`, what a machine added now gets:
+  `/Users/me/code/shop` is `C:\Users\me\code\shop` on a PC), at the same
+  paths (`same`), or by pairs of folders you add (`--add D:\work
+  /Users/me/work`), tried first.  Claude Code's history is filed under the
+  folder's path there; /rewind's snapshots go only when the path is the
+  same.  A project outside every mapped folder is refused, with the
+  `--add` line that fixes it; so is a folder there that holds something
+  else.  With `same`, the path must exist there as a real folder, not a
+  link: on Linux, create it once with `sudo mkdir -p /Users/you && sudo
+  chown $USER /Users/you` (on a machine other people use too, add `chmod
+  700 /Users/you`; `aht remote check` tells you when that is missing).
+- **Across systems.**  Names the receiving disk cannot hold (Windows'
+  reserved names and characters, two names that differ only in case) stop
+  the dry run, which lists them; rename them or add them to
+  `handover_excludes`.  On the way back, a file that changed only in its
+  line endings is not taken, and one whose line endings flipped as a whole
+  gets back the ones it left with; a git project without `.gitattributes`
+  gets suggested lines for one (aht never writes it).  Executable marks
+  survive a round trip through a PC.  A session aht starts gets
+  `core.filemode=false` (on a PC) through `GIT_CONFIG_*` in its
+  environment; `.git/config` is never edited.
 - **Nothing moves while something runs.**  An open agent session blocks the
   transfer, working or idle, and no flag overrides that: exit it first.  So
   does a background shell the session started, or any other program whose
@@ -305,8 +340,8 @@ session is open in it, and a transfer shows its progress.
   not keep such a folder in sync too, and *Keep All Projects in Sync*
   leaves it out.
 - **What travels**: the folder, the history store, the `/rewind` checkpoints
-  and, with `--include <path>`, files and folders outside the project
-  (remembered per project; Take Back brings them back, also after a
+  (on an unchanged path) and, with `--include <path>`, files and folders
+  outside the project (remembered per project; Take Back brings them back, also after a
   handover that was cut off).  **What stays**: `node_modules`, `.venv`,
   `__pycache__` and the like (rebuilt per machine), Finder's icon files,
   temporary files, running processes.
@@ -713,7 +748,8 @@ click: a row is selected first, a button pressed second.
 (leveled `[WARN]`/`[ERROR]` lines, size-rotated at `~/.aht/aht.log`) ·
 `tag` · `keys <path>`
 (each backend's store key for a path) · `encode` · `hook` · `version` ·
-`remote` · `mirror` · `handover` · `attach` · `reclaim` · `resume-here` ·
+`remote` (also `remote paths`) · `mirror` · `handover` · `attach` ·
+`reclaim` · `bring` · `send-back` · `resume-here` ·
 `search` · `board` · `switch` · `relays` · `pickup` · `leave-note` ·
 `journal` · `rules` · `secrets` · `notices` ·
 `changes` · `report` · `share` · `tidy` · `limits` · `checkpoint` · `undo` ·

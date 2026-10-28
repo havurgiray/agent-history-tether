@@ -1,0 +1,75 @@
+{
+  "home": {
+    "uuid": "5b0c2f6e9a3d4c1b8e7f6a5d4c3b2a19",
+    "real_path": "/Users/me/code/shop",
+    "exists": true,
+    "stores": [
+      "claude"
+    ],
+    "updated_at": "2026-10-27T14:10:00",
+    "is_git": true,
+    "away": "pc",
+    "away_remote": null,
+    "away_since": "2026-10-27T14:10:00",
+    "away_driven_by": "there",
+    "away_holder": "pc",
+    "away_path": "C:\\Users\\me\\code\\shop",
+    "away_system": "Windows",
+    "mirror": null,
+    "mirror_synced_at": null,
+    "mirror_status": null,
+    "mirror_paused": null,
+    "handing": null,
+    "copy_of": null,
+    "relay": null,
+    "pickup_from": null,
+    "agents": [
+      "claude"
+    ],
+    "open": null,
+    "limit": null,
+    "sessions": 3,
+    "bytes": 4299161,
+    "last_activity": "2026-10-27T14:09:00"
+  },
+  "brought": {
+    "uuid": "5b0c2f6e9a3d4c1b8e7f6a5d4c3b2a19",
+    "real_path": "C:\\Users\\me\\code\\shop",
+    "exists": true,
+    "stores": [
+      "claude"
+    ],
+    "updated_at": "2026-10-27T14:10:00",
+    "is_git": true,
+    "away": null,
+    "away_remote": null,
+    "away_since": null,
+    "away_driven_by": null,
+    "away_holder": null,
+    "away_path": null,
+    "away_system": null,
+    "mirror": null,
+    "mirror_synced_at": null,
+    "mirror_status": null,
+    "mirror_paused": null,
+    "handing": null,
+    "copy_of": {
+      "from": "mac",
+      "kind": "brought",
+      "at": "2026-10-27T14:10:00",
+      "from_path": "/Users/me/code/shop",
+      "remote": "mac",
+      "system": "Darwin"
+    },
+    "relay": null,
+    "pickup_from": null,
+    "agents": [
+      "claude"
+    ],
+    "open": null,
+    "limit": null,
+    "sessions": 3,
+    "bytes": 4299161,
+    "last_activity": "2026-10-27T14:09:00"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "remote": "mac",
+  "paths": [
+    [
+      "D:\\work",
+      "/Users/me/work"
+    ]
+  ],
+  "default": false,
+  "system": "Darwin",
+  "here_system": "Windows",
+  "here_home": "C:\\Users\\me",
+  "there_home": "/Users/me",
+  "rules": [
+    {
+      "here": "D:\\work",
+      "there": "/Users/me/work",
+      "kind": "pair"
+    },
+    {
+      "here": "C:\\Users\\me",
+      "there": "/Users/me",
+      "kind": "home"
+    }
+  ],
+  "applied": true,
+  "error": null
+}

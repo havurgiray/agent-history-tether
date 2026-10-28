@@ -1,6 +1,6 @@
 # Privacy policy
 
-**agent-history-tether (aht)** · effective 2026-10-27
+**agent-history-tether (aht)** · effective 2026-10-28
 
 This policy applies to every version of aht on macOS, Windows and Linux,
 however it was installed: from source, from the release downloads, or
@@ -78,8 +78,14 @@ switch agents off (`backends`) or point aht at other folders
 - Claude Code's settings file `~/.claude/settings.json`, to add and remove
   aht's hooks, and to show whether Remote Control and going on after the
   usage limit are on;
-- during a handover: whether Claude Code trusts the project folder, from
-  its `~/.claude.json`;
+- during a handover or a Bring Here: whether Claude Code trusts the
+  project folder, from its `~/.claude.json` on the machine the project
+  leaves;
+- before a project moves between machines (a handover, a take-back, Bring
+  Here, Send Back): whether it is a git repository and has a
+  `.gitattributes` file, to suggest one when it crosses to or from
+  Windows; and on Windows, before a handover or a sync, whether git
+  converts line endings in it (`git config core.autocrlf`);
 - on macOS with iTerm2: window and tab titles, tab colours and profiles,
   for session names and saved workspaces, and three of iTerm2's settings
   (whether its Python API and its new-output indicator are on, and whether
@@ -142,13 +148,14 @@ switch agents off (`backends`) or point aht at other folders
   project's instruction files with `aht rules --unify --apply`, and files
   put back with `aht undo --apply` or `aht changes --revert --apply`.
   Whatever these replace is set aside in `~/.aht` first;
-- only when you hand a project over, switch agents, or pick up work or
-  leave a note across machines, in `.aht/handover/`: a handover's summary,
-  and for each switch, Hand Back, Pick Up and note a record of who handed
-  the work to whom, `relay-<id>.json` (this computer's name, its random id
-  from `machine.json` and its system; for a Pick Up or a note also the
-  other machine's name in aht, its random id and its system, and the
-  project's path there; the project's path and identifier; the two
+- only when you hand a project over, bring one here, switch agents, or
+  pick up work or leave a note across machines, in `.aht/handover/`: a
+  handover's summary, and for each switch, Hand Back, Pick Up, note and
+  Bring Here a record of who handed the work to whom, `relay-<id>.json`
+  (this computer's name, its random id from `machine.json` and its
+  system; for a Pick Up, a note or a Bring Here also the other machine's
+  name, its random id and its system, and the project's path there; the
+  project's path and identifier; the two
   agents, their session ids and the session's title, masked; when; and the
   git branch, the latest commit, and how many files were not committed and
   commits not pushed), its summary `relay-<id>.md`
@@ -168,7 +175,25 @@ switch agents off (`backends`) or point aht at other folders
 - during a take-back that brings files back, aht briefly makes and removes
   a `.aht-case-…` file in the project folder (and in its Claude Code
   history folder), to learn whether the disk takes `readme.md` and
-  `README.md` for one name;
+  `README.md` for one name.  It does the same in the project folder on
+  the home before a Send Back is planned there, and before a Bring Here
+  in the folder the project goes into (or the nearest folder above it
+  that exists).  On Windows, for a take-back or a Bring Here, it also
+  briefly makes and removes a `.aht-link-…` link there, to learn whether
+  your account may make links, and reads from the registry whether
+  Windows allows long paths (`LongPathsEnabled`), to tell which names
+  this computer cannot hold;
+- when a take-back or a Send Back gives a changed file back the line
+  endings it left with, aht writes the new version next to it as
+  `<name>.aht-eol-…` and then puts it in the file's place, keeping its
+  time and mode;
+- never a project's `.git/config`.  A session that aht starts after a
+  handover or a Bring Here gets git settings in its environment instead
+  (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_…`, `GIT_CONFIG_VALUE_…`:
+  `core.filemode=false` on a PC, `core.autocrlf=true` when the project
+  comes from a PC whose git converts line endings).  For a project that
+  crosses to or from Windows without a `.gitattributes`, aht only
+  suggests lines for one; it never writes that file;
 - while aht's own copy (`handover_transfer`; used where rsync is not)
   brings files into a folder, on this computer or on your other machine
   (a project folder, Claude Code's history, checkpoints and plans for it,
@@ -204,7 +229,17 @@ switch agents off (`backends`) or point aht at other folders
   remain, it writes the cache again without aht's);
 - the `aht` command (macOS and Linux);
 - on macOS: Spotlight entries for your session titles (`spotlight`, on by
-  default) and Time Machine exclusions for aht's folder copies.
+  default) and Time Machine exclusions for aht's folder copies;
+- only when you bring a project here (`aht bring`): the project's folder,
+  its Claude Code history (filed under the folder's path here), the plans
+  of its sessions and, when the folder has the same path on both
+  machines, their /rewind snapshots, in Claude Code's folder; and, when
+  Claude Code trusted the folder on the machine it came from and
+  `handover_carry_trust` is on, that trust in Claude Code's
+  `~/.claude.json` here (on Windows under the folder's path written with
+  forward slashes), with a copy of that file kept as
+  `~/.claude.json.bak-aht`.  aht changes `~/.claude.json` only while no
+  agent session is open on this computer.
 
 ## What aht keeps in its own folder
 
@@ -214,10 +249,11 @@ encrypt it.
 
 | What | What it holds | How long it is kept |
 |---|---|---|
-| `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`) and whether you watch it (`remotes.<name>.watch`) | until you delete it, or `aht uninstall --purge` |
-| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, syncs or hands a project over to another machine (whose `copies.json` names this computer by it), or writes a record of a switch, a Pick Up or a note into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
+| `config.json` | your settings, also the machines you added, each one's system (`remotes.<name>.system`), whether you watch it (`remotes.<name>.watch`), the path of your home folder there (`remotes.<name>.home`), where projects go there (`remotes.<name>.paths`: `same`, `home`, or pairs of a folder here and a folder there) and the random identifier of aht there (`remotes.<name>.machine_id`), so that a project brought from there goes back to the right machine | until you delete it, or `aht uninstall --purge` |
+| `machine.json` | a random identifier of this computer (12 hex digits), its name and when the file was made; made the first time aht copies backups to another machine, where it names this computer's folder, syncs or hands a project over to another machine (whose `copies.json` names this computer by it), brings a project here (whose home then records it as here, on this computer), or writes a record of a switch, a Pick Up or a note into a project (which names this computer by it).  Not in `config.json`, so a copied config does not clone it | until you delete it |
+| `install.json` | the version of the aht installed on this computer and the number of the protocol it speaks with your other machines (`version`, `protocol`), written by every aht command run here (never by the copy of aht another machine runs here).  When another machine asks this one, the answer says whether aht is installed here, with that version and protocol number, so that machine can tell whether this one keeps the records Bring Here and Send Back need | until you delete it; rewritten when aht is updated |
 | `offsite.json` | which backups were sent to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched; it replaces `run/offsite.json`, which older versions wrote and aht removes | rewritten at each copy and fetch |
-| `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync and with which machine (and, when a release or a sync paused that, why, when and for which machine; for a sync's pause also how many files were changed, new or removed there and the names of up to 50 of them, or for a folder there that held something else the names of up to 50 of its files and its project identifier, if any), names the disk there cannot hold apart (up to 10 groups of each kind), and how the last take-back or release went (how many files changed, and the names of those kept in both versions); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
+| `registry.json` (and `.bak`) | the projects aht tracks: an identifier, the folder's path, where each agent keeps that project's history, and when it was last updated; for handovers: which machine a project is on or is being handed to (its name in aht, its host name, its system and its aht's random id), the folder's path there, whether this computer handed it over or that machine brought it there itself (Bring Here), since when, the session handed over and the one that came back, a task you gave it, the files and folders outside the project you take along (`--include`), which projects are kept in sync, with which machine and at which path there (and, when a release or a sync paused that, why, when and for which machine; for a sync's pause also how many files were changed, new or removed there and the names of up to 50 of them, or for a folder there that held something else the names of up to 50 of its files and its project identifier, if any), names the disk there cannot hold apart (up to 10 groups of each kind), and how the last take-back, Send Back or release went (how many files changed, the names of those kept in both versions, the folder's path on the other machine, for a Send Back the identifier of its attempt, the names of files that differed only in line endings or got back the line endings they left with, and of files kept aside under a safe name because this computer cannot hold their names); also the identifiers of projects you told aht to forget, with when you did (no paths), so that a scan does not take them on again; where a move you said no to went, so that aht does not ask again; the paths of the git repositories in the watched folders, for the git badge, and when aht last looked; on Linux, which version of aht's emblems the git folders have | until you delete it, or `aht uninstall --purge` |
 | `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session identifiers, the names of your other machines (and, when aht reached one by its Tailscale address, that address), the notices it showed (for example "input needed" or "the agent finished after 4 minute(s)"), warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one, so about 10 MB at most |
 | `aht-watcher.log` (macOS, Windows), `aht-watcher.err` and `aht-notices.err` (macOS) | the background watcher's and the notices check's own output, including any errors, which can name project folders; on Linux the watcher's goes to your user journal instead (`journalctl --user -u aht-watcher`) | not rotated; delete them any time |
 | `backups/` | see [Backups](#backups) | the newest 10 snapshots per project; copies made before a rewrite, until you delete them |
@@ -225,7 +261,8 @@ encrypt it.
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`, on by default), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`) |
 | `workspaces/` | macOS: saved iTerm2 layouts (this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session identifiers, each Claude session's name, with keys masked, and the options it was started with that it keeps when it starts again: permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, and `--verbose`, never a first prompt; the tab titles are kept as iTerm2 has them, so that restoring a layout sets them back) | the newest 40 (`workspace_keep`) |
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
-| `handover/<project id>/` | for a project handed over: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files); for a project handed over or kept in sync, one file per machine in `there/` (`there/<machine>.json`; an older `there.json` is read the same way): the lists of its files and folders and of its Claude history on both machines (names, sizes, times, link targets, and checksums of the files there up to 64 MB each) as they were after the last sync, handover or take-back with that machine, with that machine's name in aht and the folder's path there, which the next sync, Hand Over and *Bring Them Here* compare the copy there with; and in `replaced/` what a take-back (also *Bring Them Here*) replaced or removed here | the list until the project is back or released, then the newest 5 earlier lists; each machine's file in `there/` until the next sync, handover or take-back with that machine replaces it; in `replaced/` the newest 5 folders and every one younger than 30 days |
+| `handover/<project id>/` | for a project handed over, or brought to another machine with Bring Here: the list of its files and folders on both machines when it left (names, sizes, times, which files are executable, and checksums of its conversation files); for a project handed over or kept in sync, one file per machine in `there/` (`there/<machine>.json`; an older `there.json` is read the same way): the lists of its files and folders and of its Claude history on both machines (names, sizes, times, link targets, and checksums of the files there up to 64 MB each) as they were after the last sync, handover or take-back with that machine, with that machine's name in aht and the folder's path there, which the next sync, Hand Over and *Bring Them Here* compare the copy there with; in `replaced/` what a take-back (also *Bring Them Here*) or a Send Back from another machine replaced or removed here, and in `replaced/<time>/kept-aside/` files a take-back brought whose names this computer cannot hold, under safe names (`a%3Ab.txt`), or, when their path would be too long here, under a short name of one part (`0-notes.txt`); while a Send Back arrives, its files wait in an `incoming-…` folder; for a project brought here, in `brought/`, what was in the folder here before and was replaced or did not belong to the project | the list until the project is back or released, then the newest 5 earlier lists; each machine's file in `there/` until the next sync, handover or take-back with that machine replaces it; in `replaced/` and in `brought/` the newest 5 folders and every one younger than 30 days; the `incoming-…` folder until the Send Back ends |
+| `remote/copies.json` | the folders on this computer that are copies of another machine's projects, each with the kind of copy, the project's identifier, the machine it came from (its name and its aht's random id), the project's path and system there, whether git converts line endings there (`autocrlf`), which attempt it came with, and since when.  aht writes a note when you bring a project here (`brought`, then `returned` once you send it back), and when another machine keeps a project in sync here or hands one over to this computer (see [What can leave your device](#what-can-leave-your-device)) | until you delete the file; a later copy into the same folder replaces that folder's note |
 | `opinions/`, `night-shift.json` | copies of a project for `aht second-opinion`, and planned night shifts | until you discard them |
 | `run/` | short-lived state: notices already shown (with when each of your other machines was last asked for them, and since when one that holds a project of yours has not answered), open sessions, the names aht gave sessions (`tab-names.json`) and the iTerm2 tabs it last saw, with their titles (`iterm-tabs.json`), both as they are, not masked, since aht compares names with tab titles, when setup ran, the last answer about new versions (version number and release notes), backups on their way in while a fetch runs, and for a moment a copy of another program's database aht reads (Codex's `state_5.sqlite`), deleted right after | overwritten as aht runs |
 | `run/board.json` | for each of your other machines, when it last answered and the sessions it had open then: for each session its agent, project folder (the path there), process and session ids, state and since when, and its name, title and what it waits for, masked as that machine sent them | rewritten each time one of those machines answers; a machine you remove, or add again under the same name, is dropped at once |
@@ -290,21 +327,31 @@ aht itself never sends anything to the author or to any server the author
 runs.  With its default settings it makes no network connections.  The
 features below send data, and only after you set them up.
 
-1. **Your other machines** (handover, `aht mirror`, `offsite_backup` and
-   fetching backups, `aht night-shift`, Pick Up and Leave a Note, and the
-   session list, notices, Watch and search for those machines).  This
-   works from macOS, Windows and Linux.  A Windows PC only asks your other
-   machines (their sessions, notices, Watch and search, Pick Up and Leave
-   a Note), copies its backups to one of them and fetches backups from it
-   (`offsite_backup`), and hands no project over yet; it is never asked
-   itself.  aht
+1. **Your other machines** (handover and take-back, Bring Here and Send
+   Back, `aht mirror`, `offsite_backup` and fetching backups, `aht
+   night-shift`, Pick Up and Leave a Note, and the session list, notices,
+   Watch and search for those machines).  This works between macOS,
+   Windows and Linux.  A Windows PC only asks your other machines: it
+   hands projects over to them and takes them back, keeps projects in sync
+   with them, brings their projects to itself and sends them back, asks
+   for their sessions, notices, Watch and search, picks up their work and
+   leaves notes on them, and copies its backups to one of them and fetches
+   backups from it (`offsite_backup`); it is never asked itself, so no
+   project is handed over to a PC.  aht
    connects over SSH, or mosh if both machines have it, to the machines
    you add with `aht remote add`.
    Before its first command to a new machine, `aht remote add` and `aht
    remote check` ask which system answers there (`echo aht-os %OS%
    $env:OS`); aht cannot ask a Windows PC yet, so for one it stops right
    there and makes nothing on it.  The machine's system is kept in
-   `config.json` (`remotes.<name>.system`).  aht sends the project folder,
+   `config.json` (`remotes.<name>.system`), and so are, once aht has
+   asked, the path of your home folder there (`remotes.<name>.home`) and
+   the random identifier of aht there (`remotes.<name>.machine_id`).
+   Where a project goes there follows `remotes.<name>.paths` (`aht remote
+   paths`): the same path, the same place below the home folder there, or
+   folders you name; for a machine set up before this rule existed, aht
+   once looks whether this computer's home folder path exists there.
+   aht sends the project folder,
    its agent history, Claude Code's checkpoints and plans for it and a
    readable handover summary.  The project's `.aht/handover/` (summaries
    and records of who handed the work to whom) goes with a handover, which
@@ -317,12 +364,16 @@ features below send data, and only after you set them up.
    there, aht briefly makes and removes a `.aht-write-test-…` file in the
    project folder there, and, when it checks the machine, in the path of
    this computer's home folder there (or in the nearest existing parent of
-   either).  When Claude
+   either).  Before a handover it also briefly makes and removes a
+   `.aht-case-…` file in the folder that holds the project folder there,
+   to learn whether that disk takes `readme.md` and `README.md` for one
+   name.  When Claude
    Code trusts the project folder here, a handover with
    `handover_carry_trust` (on by default) marks it as trusted in Claude
    Code's `~/.claude.json` there, keeping a copy of that file as
-   `~/.claude.json.bak-aht`.  When your home folder's path differs between
-   the two machines, aht links `.claude` under this computer's home path
+   `~/.claude.json.bak-aht`.  When a project keeps its exact path there
+   but your home folder's path differs between the two machines, aht
+   links `.claude` under this computer's home path
    there to that machine's `~/.claude`, since the history names that path.
    With `handover_remote_control` (on by default for handovers), the
    session on that machine can be reached from the Claude app through
@@ -333,9 +384,14 @@ features below send data, and only after you set them up.
    each handover notes the folder there as a copy of a project of this
    computer, in `~/.aht/remote/copies.json` on that machine: the folder's
    path there, the project's identifier, this computer's name and its
-   random identifier (from `machine.json`), the kind of copy (kept in
-   sync, handed over, or an old copy whose project went back here), since
-   when, and for a handover the identifier of its attempt.  A take-back
+   random identifier (from `machine.json`), the project's path here
+   (`from_path`), this computer's system (`system`) and, on Windows,
+   whether git converts line endings in the project here (`autocrlf`),
+   the kind of copy (kept in sync, handed over, or an old copy whose
+   project went back here), since when, and for a handover the identifier
+   of its attempt.  This computer keeps the same file for the projects it
+   brings here (see
+   [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)).  A take-back
    changes the note's kind, and turning Keep in sync off asks that machine
    to drop it.  aht writes that file in one place only, for those steps.
    When aht is installed on that machine, it reads the file there: to say
@@ -350,7 +406,9 @@ features below send data, and only after you set them up.
    the note the session reads first, its settings, the command it runs
    (with your task, if you gave one), and when this handover's session was
    started (so that aht can tell later, should the link drop, whether it
-   started).  While the agent works there, aht keeps that machine from
+   started), and git settings for the session in that command
+   (`core.autocrlf=true` when the project comes from a PC whose git
+   converts line endings; never in the project's `.git/config`).  While the agent works there, aht keeps that machine from
    sleeping (`handover_keep_awake`, on by default): a helper of aht's next
    to the session holds `caffeinate` (macOS), or on Linux
    `systemd-inhibit`, or the GNOME desktop's own inhibitor
@@ -463,6 +521,76 @@ features below send data, and only after you set them up.
      `.aht/handover/` here (with `--apply`: *Open in* or *Copy the Start
      Line*; a look that writes nothing keeps nothing).
 
+   **Bring Here and Send Back** (`aht bring`, `aht send-back`), only when
+   you ask, and only with a machine where aht is installed, since that
+   machine (the project's home) keeps the project's record.
+   - *The list of projects there* (`aht bring --from <machine> --list`,
+     *Bring Here → From …*): for each project aht keeps there, its path,
+     name and identifier, whether it is there, away (on which machine and
+     since when), being handed over, or a copy of another machine's
+     project (that machine's name), whether a session is open in it
+     (working, waiting or idle), and its latest Claude Code session: its
+     id, its title, masked there, and when it was last written.  With it
+     come that machine's name, random identifier, system, home folder path
+     and clock, and whether aht is installed there (its version and
+     protocol number, from `~/.aht/install.json` there).
+   - *For the project you pick:* the sessions and other programs running
+     in it there (process ids, names, state), its latest Claude Code
+     session's id and title (the title masked there), how many sessions it
+     has and their ids, the path of its Claude Code history there and the
+     names of its sessions' plans, Claude Code's version there, whether
+     Claude Code trusts the folder there, which other agents keep a history
+     of it, whether git converts line endings in it there (only when that
+     machine is a PC), and the lists of the project's files and folders and
+     of its Claude Code history (names, sizes, times, link targets, which
+     files are executable).
+   - *Then, with `--apply`, the files:* the project's files, its Claude
+     Code history, the plans of its sessions and, when the folder has the
+     same path on both machines, their /rewind snapshots.  The other
+     agents' histories stay there.
+   - *What Bring Here tells that machine:* this computer's name, random
+     identifier (from `machine.json`, made then if missing), system and
+     host name, the folder's path here, and an identifier of this
+     attempt; once the copy is complete, the lists of the project's files
+     and folders on both machines.  That machine notes in its
+     `registry.json` that the project is here (all of the above, since
+     when, and the session), keeps the lists, with checksums of the
+     conversation files it holds, as the record of what left
+     (`~/.aht/handover/<project id>/manifest.json` there), and notes the
+     bring in its log.  When the copy fails before that, aht asks it to
+     drop the record again; when the link drops just after, aht asks it
+     again (then, or when you run the same Bring Here again), and it
+     answers that it noted it, changing nothing.
+   - *What Send Back sends there:* the lists of the project's files and
+     folders and of its Claude Code history here, this computer's name,
+     random identifier, system and the folder's path here, the attempt it
+     came with, and what that machine asks for to plan the way back: a
+     SHA-256 checksum of the beginning of each conversation file that left
+     (to check that it continues), for some text files their size, a
+     SHA-256 checksum of each as it is and with its line endings read as
+     LF, and their line-ending style, the Claude Code versions that wrote
+     the conversations here, and this computer's Claude Code version.
+     That machine answers with its plan (file names), the sessions and
+     programs running in the project there, and what stands in the way.
+     With `--apply` aht sends the files of that plan, the plans of the
+     project's sessions and, on an unchanged path, their /rewind
+     snapshots.
+   - *What Send Back writes there:* that machine puts the files in place,
+     sets aside what they replace or remove in
+     `~/.aht/handover/<project id>/replaced/` there (the newest 5 of those
+     folders and every one younger than 30 days are kept), keeps both
+     versions of a file changed on both machines (`notes (from pc
+     2026-10-27).md`), marks the open hand-off records in the project's
+     `.aht/handover/` there as closed, notes in its `registry.json` how the
+     return went (as under
+     [What aht keeps in its own folder](#what-aht-keeps-in-its-own-folder)),
+     keeps the lists of both copies in its `there/<machine>.json` when it
+     knows this computer by a name, and shows a notice there.  It answers with what it did, where it set
+     files aside, and the latest session's id and title (the title masked
+     there).  Asked again for the same attempt (when the link dropped
+     before this computer heard the answer), it answers that it is done,
+     with the same record, and changes nothing.
+
    **What Pick Up and Leave a Note write there.**  Leave a Note writes its
    summary (`relay-<id>.md`) and its record (`relay-<id>.json`, as under
    [What aht changes](#what-aht-changes)) into the project's
@@ -556,9 +684,13 @@ features below send data, and only after you set them up.
    once.  In a folder that `~/.aht/remote/copies.json` names as a copy of
    another machine's project, the hook adds one line to each Claude
    session that starts there: that machine's name, and whether the copy is
-   kept in sync from it, was handed over from it, or is an old copy of a
-   project that went back to it.  On another machine, aht installed there
-   adds these lines.  These go to Anthropic with your next message in
+   kept in sync from it, was handed over from it or brought here from it
+   (then also the folder's path on that machine, when it differs), or is
+   an old copy of a project that went back to it.  In a project that is
+   away, handed over or brought to another machine, the hook warns each
+   Claude session that starts in it here: which machine has it, at which
+   path there when it differs, and since when.  On another machine, aht
+   installed there adds these lines.  These go to Anthropic with your next message in
    that session.
 4. **What an agent does with its own files.**  The session names aht
    records become part of the agent's history.  An agent may sync that
@@ -608,7 +740,7 @@ access to them and no control over them.
   | `checkpoints`, `checkpoint_keep`, `checkpoint_excludes` | folder copies at session start |
   | `icons_enabled` | folder badges |
   | `tab_names`, `spotlight`, `workspace_keep` | session names from iTerm2 tabs, Spotlight entries, saved layouts (macOS) |
-  | `handover_carry_trust` | whether a handover marks the folder as trusted in Claude Code on the other machine (on by default) |
+  | `handover_carry_trust` | whether a handover marks the folder as trusted in Claude Code on the other machine, and a Bring Here on this computer (on by default) |
   | `notifications`, `notify_phone` | notices on this computer and on your phone |
   | `backends`, `watch_roots` | which agents and folders aht looks at |
   | `log_level` | how much aht writes to its log |
@@ -632,7 +764,9 @@ access to them and no control over them.
    and the folder you set in `backup_dir`, if any.  The copies of Claude
    Code's settings file that aht kept lie next to it:
    `~/.claude/settings.json.bak-aht` and `settings.json.bak-aht-uninstall`;
-   delete them too.  Summaries, records of who handed the work to whom and
+   delete them too, and `~/.claude.json.bak-aht` if a Bring Here left
+   one.  Projects you brought here stay where they are, with their Claude
+   Code history, until you delete them.  Summaries, records of who handed the work to whom and
    journals stay in your projects' `.aht/handover/` and `.aht/journal/`
    folders until you delete those folders.
 3. Remove the app: drag `aht.app` to the Trash or
@@ -647,7 +781,9 @@ access to them and no control over them.
    no longer want, the
    summaries and records that Pick Up and Leave a Note left in those
    projects' `.aht/handover/`, and `~/.claude.json.bak-aht` if a handover
-   left one.  Here, deleting
+   left one.  aht there also names this computer, in its `registry.json`
+   and `~/.aht/handover/`, for each project this computer brought from
+   there or sent back.  Here, deleting
    `~/.aht` also removes `machine.json` and `offsite.json`.
 
 ## Security

@@ -228,9 +228,10 @@ Getting started.
 - **Your other machines from Windows:** a PC asks your Mac and Linux
   machines what runs there, watches them, searches them, picks up their
   work and leaves notes on them, and keeps a copy of its backups on one
-  of them (see *A Windows PC with your other machines*). Handover,
-  keeping in sync and the night shift do not work from Windows yet; the
-  Machines tab says so.
+  of them. It also hands projects over to them and takes them back, keeps
+  projects in sync with them, and brings their projects here and sends
+  them back (see *A Windows PC with your other machines* and *Bring a
+  project here, and send it back*). Nothing can be handed over to a PC.
 - **Start at login:** Settings → This computer → *Start aht's tray at
   login* (on Windows the tray then also keeps the watcher running). On
   Linux the switch can be turned on only when the tray can run there: it
@@ -276,8 +277,9 @@ Getting started.
 ## A Windows PC with your other machines
 
 From a Windows PC, aht can ask your Mac and Linux machines what runs
-there, and pick up their work. It uses Windows' own ssh. The PC always does
-the asking and is never asked itself, so it needs no ssh server.
+there, pick up their work, hand projects over to them and bring their
+projects here. It uses Windows' own ssh. The PC always does the asking and
+is never asked itself, so it needs no ssh server.
 
 > **Example.** A long Claude Code session runs on your Linux box at home.
 > On the PC at work you add it under **Machines → Add a Machine…** as
@@ -324,9 +326,11 @@ and press **Check…**. Its rows come in two groups:
   in a terminal (`ssh you@homebox`) and accept the machine's key* when the
   PC does not know that machine yet, and *Turn on Remote Login on the Mac*
   when a Mac refuses the connection.
-- **For handing over:** folded away on a PC. It lists what a handover will
-  need, for a later version, and what copies the files (*copies files
-  with — aht's own copy*, always on a PC).
+- **For handing over:** what a handover to that machine needs (tmux
+  there, a writable folder, where projects go there) and what copies the
+  files (*copies files with — aht's own copy*, always on a PC). Bring
+  Here and Send Back need only the rows for asking, and aht installed on
+  that machine.
 
 **What a PC can do today:**
 
@@ -344,7 +348,18 @@ and press **Check…**. Its rows come in two groups:
   exchange: Pick Up from the Mac when you sit down, and Leave a Note (or
   Hand Back) on the Mac before you go;
 - keep a copy of its backups on one of them, and fetch backups from it
-  (see below).
+  (see below);
+- **Hand Over** a project to one of them and take it back (**Take
+  Back**), as a Mac does (see *Hand a project over to another machine*). **Open Session**
+  opens a console window with `ssh -t` to the session there: Windows has
+  no mosh. **Keep in sync** and the **Night Shift** work from the PC too;
+- **Bring Here** a project of theirs, and send it back (**Send Back**)
+  when you are done (see *Bring a project here, and send it back*). The PC starts both,
+  so the Mac or Linux machine never has to reach the PC. The tray lists
+  what came this way under **Projects brought here**.
+
+The project usually sits at another path on the PC (`C:\Users\me\code\shop`
+for `/Users/me/code/shop`): see *Across systems and folders*.
 
 **Backups from a PC.** **Settings → Backups on another machine**: pick
 one of your Mac or Linux machines. After each daily backup, aht adds the
@@ -369,12 +384,13 @@ for asking it.
 
 **What it cannot do yet:**
 
-- hand a project over, take it back, keep it in sync or plan a night
-  shift;
 - be asked by another machine. Adding a PC as a machine on a Mac or on
   Linux stops with *aht cannot ask a Windows machine yet*, and makes
   nothing on the PC. So a Mac cannot pick up work from the PC or leave a
-  note on it.
+  note on it, hand a project over to it, or take back a project the PC
+  brought there: the PC sends it back. While the PC holds it, the
+  project on the Mac says *On pc since 14:10 (brought there from pc).
+  Send it back from pc.*, with **Release…** for a PC that is gone.
 
 **In the terminal:**
 
@@ -396,6 +412,13 @@ for asking it.
 - `aht backup --offsite-list` — list every computer's folder of backups on
   homebox; `aht backup --fetch-offsite --from office-pc` fetches that
   computer's backups to this PC.
+- `aht handover $HOME\code\shop --to homebox` — show what handing shop
+  over to homebox would send, and where it goes there; `--apply` does it.
+- `aht bring --from homebox --list` — list the projects aht keeps on
+  homebox; `aht bring /home/me/code/shop --from homebox` shows what
+  bringing one here would do.
+- `aht send-back $HOME\code\shop` — show what sending it back would
+  change on homebox; `--apply` does it.
 
 ## New versions
 
@@ -1473,9 +1496,10 @@ the laptop or your phone.
    that fixes it and a **Copy** button. aht looks for machines when you open
    the Machines tab (*Looking on your network and in ~/.ssh/config…*);
    **Look Again** looks once more, for example after you switched one on.
-2. On that machine, create your home folder's path once, because a project
-   keeps its exact path there:
-   `sudo mkdir -p /Users/you && sudo chown $USER /Users/you`
+2. Nothing to create there: a machine added now gets each project at the
+   same place below its own home folder, so `/Users/me/code/shop` here is
+   `/home/me/code/shop` on a Linux box. To change where projects go, see
+   *Across systems and folders*.
 
 > **Example.** Before you leave, select the paper project → **Hand Over to
 > homebox…**. The dialog shows what will be sent. Optionally type a task,
@@ -1492,8 +1516,14 @@ the laptop or your phone.
 - **Nothing moves while something runs:** while an agent works or waits for
   you in the project, or another program runs in the folder, the handover
   waits.
-- **Same Claude Code everywhere:** the other machine gets this Mac's exact
-  version.
+- **Same Claude Code everywhere:** the other machine gets this computer's
+  exact version.
+- **From any system:** a Mac, a Linux machine or a Windows PC hands
+  projects over to a Mac or Linux machine and takes them back. The
+  project may sit at another path there, and Claude Code's history is
+  filed under that path (see *Across systems and folders*). A machine
+  can also fetch a project itself and return it later: see *Bring a
+  project here, and send it back*.
 - **It stays awake while the agent works.** While the session there works
   or waits for you, aht keeps that machine from sleeping: `caffeinate` on
   a Mac; on Linux `systemd-inhibit`, or the GNOME desktop's own inhibitor
@@ -1571,9 +1601,9 @@ the laptop or your phone.
   out.
 - **A Windows PC** cannot be the other machine yet. **Check and Add**
   (`aht remote add`, `aht remote check`) stops with *aht cannot ask a
-  Windows machine yet*, and nothing is made on the PC. A PC can ask your
-  Mac and Linux machines, though: see *A Windows PC with your other
-  machines*.
+  Windows machine yet*, and nothing is made on the PC. A PC hands
+  projects over to your Mac and Linux machines and brings theirs to
+  itself, though: see *A Windows PC with your other machines*.
 
 **Keep in sync looks first.** Before each sync, aht compares the copy on
 the other machine with the list of that copy it kept after the last sync,
@@ -1648,7 +1678,8 @@ both machines, aht compares its content on both.
     (*Left out: 1 folder that is a copy of another machine's projects
     (api).*).
   - the project says where it came from: *Copy kept in sync from mac*,
-    *Handed over from mac*, or *A copy of a project that went back to
+    *Handed over from mac*, *Brought here from mac* (see *Bring a project
+    here, and send it back*), or *A copy of a project that went back to
     mac*.
   - a Claude Code session that starts in the folder gets one line from
     aht's hook: *[aht] This folder is a copy kept in sync from “mac”;
@@ -1823,6 +1854,280 @@ before the session there starts says *did not finish* at once.
   `aht remote remove homebox` forgets it (while it holds a handed-over
   project it refuses, and names `aht reclaim … --release` for each);
   `aht remote check all` checks every machine.
+
+## Bring a project here, and send it back
+
+Hand Over starts on the machine that has the project. **Bring Here** starts
+on the machine that will work on it: it fetches the project with Claude
+Code's history, and the project's own machine (its home) notes that the
+project is away. **Send Back**, on the same machine, returns the work. The
+home never has to reach the machine that brought it, so a Windows PC can
+bring a project from your Mac and send it back.
+
+> **Example.** On the PC at work: **Projects → Bring Here → From mac…**
+> lists the projects aht keeps on the Mac, each with where it would go:
+> `/Users/me/code/shop  →  C:\Users\me\code\shop`. **Bring Here…** on shop
+> shows 1,204 files (38.2 MB) and 4.1 MB of Claude history, that its
+> session *Checkout flow refactor* opens here, and that 2 scripts lose
+> their "executable" mark here and get it back on mac. **Bring Here**
+> copies it and opens the session in a console window; nothing runs until
+> you type. On the Mac, shop now says *On pc since 14:10 (brought there
+> from pc). Send it back from pc.* In the evening, on the PC, **Send Back
+> to mac…** shows *14 changed, 2 new, 1 removed here; 0 changed only on
+> mac* and *3 files differ only in line endings: mac's stay*. **Send Back**
+> puts your work into the Mac's copy.
+
+- **What it needs:** aht installed on the project's home, at this version
+  or newer, since that machine keeps the project's record. Otherwise
+  Bring Here says *install aht on mac first*, or *update aht on mac first
+  (and open it once)*. The home must be a Mac or a Linux machine; a
+  project on a PC goes the other way, with Hand Over on the PC.
+- **What stops it:**
+  - a session working or waiting in the project there. An idle one stops
+    it too, unless you press **Bring It Anyway** (`--allow-idle`): if
+    anyone types into that session later, Send Back keeps both versions;
+  - the project is away already, or the folder there is itself a copy of
+    another machine's project (*bring it from there*);
+  - an agent session open in the folder here;
+  - the folder here holds something else, or names in the project that
+    this computer cannot hold (see *Across systems and folders*);
+  - too little free space here.
+- **Where it goes here:** where the machine's path rule puts it (see
+  *Across systems and folders*), or another folder you choose (**Another
+  Folder…**, `--here`). When the folder here already holds files of this
+  project, what came replaces them, and files there that did not come are
+  set aside first, in `~/.aht/handover/<project id>/brought/`.
+- **What comes:**
+  - the project's files, without the rebuilt folders and
+    `handover_excludes`, as in a handover;
+  - Claude Code's history, filed under the folder's path here, the way
+    Claude Code names it on this system (`C:\Users\me\code\shop` is
+    `C--Users-me-code-shop`). The conversation files are not changed:
+    Send Back checks that each one still begins as it left. Claude's
+    memory for the project comes with them;
+  - the plans of the project's sessions;
+  - /rewind's snapshots only when the folder has the same path on both
+    machines, since they name files by their full path. Otherwise the
+    dry run says *not carried /rewind's snapshots (the path differs
+    here)*;
+  - Claude Code's trust in the folder, when the home trusted it and
+    `handover_carry_trust` is on.
+- **What stays there:** the histories of the other agents (Codex, Kimi
+  Code, Antigravity and so on). The dry run names each: *Codex's history
+  stays on mac*. The session here gets a summary instead, in the
+  project's `.aht/handover/`: where it came from, both paths, the latest
+  exchanges, open to-dos, and what did not come along.
+- **The session opens here** in a new terminal window (a console window
+  on Windows) with `claude --resume`; nothing runs until you type.
+  `--no-open` opens none, and the result shows the line to run.
+- **If it fails halfway,** before the home has noted that the project is
+  here, aht tells the home to forget the attempt. What arrived here
+  stays, and the next Bring Here sets it aside.
+- **Send Back** runs where you brought the project. The home plans the
+  way back against its record, as Take Back does, and puts the files in
+  place:
+  - a file changed on both machines is kept twice on the home, as
+    `cart (from pc 2026-10-27).py` next to the home's; **Use the versions
+    from here** (`--prefer here`) takes the ones from here and sets the
+    home's aside;
+  - whatever it replaces or removes is set aside on the home, in
+    `~/.aht/handover/<project id>/replaced/`;
+  - a conversation that does not continue the one that left is kept as
+    two;
+  - when a newer Claude Code wrote the history here than the home has, it
+    stops (**Send Back Anyway…**, `--ignore-version`);
+  - no agent session may be open in the folder here, nor in the project
+    on the home, idle or not. On Windows aht also warns when an agent
+    runs anywhere on the PC, since it cannot tell in which folder.
+
+  The folder here stays as it is, as an old copy of the home's project.
+- **Take Back at home** works too, when the home can reach the machine
+  that brought the project (a Mac or Linux machine added there). A PC
+  cannot be reached: the home shows *On pc since 14:10 (brought there
+  from pc). Send it back from pc.* with **Release…**, for a PC that is
+  gone.
+- **A project handed over** to a Mac or Linux machine with aht installed
+  can go back with Send Back on that machine too, when it can reach the
+  machine that handed it over.
+- **The hook says so.** A Claude session that starts in the brought
+  folder hears *This folder was brought here from “mac” (where it is at
+  /Users/me/code/shop); send it back when done (aht send-back).* One that
+  starts in the project on the home is warned that it was brought to pc
+  and is worked on there.
+- **On a PC,** the tray's **Projects brought here** menu lists those
+  projects; **shop — Send Back to mac…** opens aht's window with Send
+  Back's plan. In aht's window and the Mac app, **Projects → Bring Here**
+  lists your machines, and in the Machines tab each machine has **Bring
+  Here…** (in aht's window **Bring a Project Here…**).
+
+**In the terminal:**
+
+- `aht bring --from mac --list` — list the projects aht keeps on mac, where
+  each would go here, and why one cannot come.
+- `aht bring /Users/me/code/shop --from mac` — show what bringing shop here
+  would do, without changing anything; `--apply` brings it and opens its
+  session.
+- `aht bring /Users/me/code/shop --from mac --here C:\Users\me\code\shop-mac --apply`
+  — bring it into another folder here.
+- `aht bring /Users/me/code/shop --from mac --allow-idle --apply` — bring it
+  although an idle session is open in it on mac.
+- `aht bring /Users/me/code/shop --from mac --no-open --apply` — bring it
+  without opening its session; the result shows the line to run.
+- `aht send-back C:\Users\me\code\shop` — show what sending it back would
+  change on mac; `--apply` sends it.
+- `aht send-back C:\Users\me\code\shop --prefer here --apply` — for files
+  changed on both machines, take the ones from here and set mac's aside
+  there.
+- `aht send-back C:\Users\me\code\shop --ignore-version --apply` — send it
+  back although a newer Claude Code wrote its history here.
+- `aht send-back C:\Users\me\code\shop --to mac` — name the machine, when
+  aht here knows it by another name than the one it came from.
+
+## Across systems and folders
+
+Hand Over, Take Back, Bring Here and Send Back work between any of a Mac,
+a Linux machine and a Windows PC (a PC starts each of them itself), also
+when the project sits at another path on each machine. Nothing is lost on
+the way: what follows says what aht does about paths, names, line endings,
+executable marks and git.
+
+**Where projects go.** Each machine you added has a rule:
+
+- **The same place in the home folder** (`home`): the part below your home
+  folder stays the same. `/Users/me/code/shop` here is
+  `/home/me/code/shop` on a Linux box and `C:\Users\me\code\shop` on a PC.
+  A machine you add now gets this rule.
+- **The same paths** (`same`): a project keeps its exact path there. Only
+  for machines with the same folders, the same user name on two Macs, say.
+- **Folders that go somewhere else:** pairs of a folder here and a folder
+  there, such as `D:\work` → `/Users/me/work`. They are tried first, the
+  longest first, then the two home folders.
+- A machine you set up before this version gets `same` when your home
+  folder's path exists there, else `home` (always `home` when either side
+  is Windows). aht writes that choice into its config the first time, so
+  it does not change by itself.
+- A project that went there keeps its folder there while its record
+  lasts (handed over, brought, or kept in sync), whatever the rule says
+  later.
+- In aht's window, **Machines → Folders there → Change…** sets it, and the
+  sheet of a refused move offers **Where Projects Go on mac…**. The Mac
+  app shows the rule under each machine. `aht remote paths` sets it from a
+  terminal; a change applies at once.
+
+> **Example.** Your projects on the PC live in `D:\work`, outside your
+> home folder. Hand Over stops: *aht moves projects between the home
+> folders of your machines. D:\work\shop is outside yours. Tell aht where
+> such projects go on mac:  aht remote paths mac --add D:\work
+> /Users/me/work*. Run that line, or add the pair under **Where Projects
+> Go on mac…**, and `D:\work\shop` goes to `/Users/me/work/shop`. Bring
+> Here says the same the other way round, and also offers `--here`.
+
+**The same project, not another folder.** Before anything moves, aht looks
+at the folder the project would go into. It goes ahead when that folder is
+missing or empty, or holds this very project (by the id in its
+`.aht/.project-id`) as a copy. Otherwise it stops, and names a way past:
+
+- *on box, /home/me/code/shop holds another folder (412 items). Move it
+  away there, or choose another place:  aht remote paths box --add
+  /Users/me/code /home/me/code/mac*;
+- *here, C:\Users\me\code\shop holds another folder (12 items). Move it
+  away, or bring it to another place:  aht bring /Users/me/code/shop
+  --from mac --here C:\Users\me\code\shop-mac*;
+- a folder there that is that machine's own live copy of this project is
+  refused as well (*is a live project of its own there*), so an old copy
+  on a PC is never handed over onto the Mac's project.
+
+**Names the other system cannot hold.** Before a handover or a Bring Here,
+aht checks every name against the disk that receives it. It tries that
+disk rather than reading its settings: whether it ignores case, whether
+your account may make links there, and on Windows whether long paths are
+on. The dry run stops and lists up to 10 names of each kind:
+
+| What | Checked when |
+|---|---|
+| two files whose names differ only in capitals | the receiving disk ignores case (usually a Mac's or a PC's) |
+| two files with the same name in two Unicode forms | always |
+| contains a character Windows does not allow (`< > : " \| ? *`, control characters, `\`) | the receiver is Windows |
+| Windows would drop the trailing dot or space | the receiver is Windows |
+| a name Windows reserves (CON, PRN, AUX, NUL, COM1–9, LPT1–9, with any extension, such as `aux.md`) | the receiver is Windows |
+| the path would be too long on Windows (over 259 characters) | Windows without long paths |
+| links cannot be created there for your account | the account there cannot make links (Windows without developer mode, say) |
+
+Rename them on the machine that has them, or leave them out: **Leave Them
+Out…** in aht's window adds them to `handover_excludes`, so no handover,
+Bring Here, Send Back or Keep in sync moves a file or folder of that name,
+in any project. Windows' own files (`desktop.ini`, `Thumbs.db`,
+`$RECYCLE.BIN` and the like) never move, like a Mac's `.DS_Store`.
+
+When a PC takes a project back, a file made there whose name Windows
+cannot hold does not go into the project. It is kept aside under a safe
+name (`a%3Ab.txt` for `a:b.txt`), in
+`~/.aht/handover/<project id>/replaced/<time>/kept-aside/`, and listed:
+*kept aside: 1 file whose name this machine cannot hold*.
+
+**Line endings.** Tools on Windows often end lines with CRLF, tools on a
+Mac or Linux with LF. Hand Over and Bring Here copy every file as it is.
+On the way back (Take Back and Send Back), for a text file under 5 MB:
+
+- one that changed there only in its line endings is not taken; the one
+  at home stays. The plan lists it: *3 files differ only in line endings:
+  mac's stay*;
+- one that changed there and whose line endings flipped as a whole (all
+  LF at home and all CRLF there, or the other way round) comes back with
+  its changes and the line endings it left with: *1 file gets back the
+  line endings it left mac with* (in aht's window *line endings kept as
+  they were on mac*);
+- one with mixed line endings, or a new file, comes back as it is. So
+  does a binary file, or one of 5 MB or more.
+
+When a git project crosses to or from Windows and has no
+`.gitattributes`, the dry run says so and suggests these lines for one at
+the top of the project, which keep each file's line endings steady:
+
+```
+* text=auto
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+```
+
+aht never writes that file; add and commit it yourself if you want it.
+aht's window has a **Copy** button for the lines.
+
+**Executable marks.** Windows has no "executable" mark. aht notes which
+files had it when the project left. Bring Here to a PC says how many
+scripts lose it there (*2 scripts lose their "executable" mark here; they
+get it back on mac*). When it comes back from the PC, a file that
+replaces one at home keeps the home file's mark, and one that is no
+longer at home gets back the mark it left with, so `bin/run.sh` is still
+executable on the Mac after a round trip through a PC. Between Macs and Linux machines the marks travel
+as they are.
+
+**git.** A copied `.git` folder keeps the settings of the system it came
+from. A session that aht starts (after a Hand Over, and after a Bring
+Here) gets these in its environment, through `GIT_CONFIG_COUNT`,
+`GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`:
+
+- `core.filemode=false` when the machine that works on the project is a
+  PC, so git does not see every file as changed;
+- `core.autocrlf=true` when the project's home is a PC whose git converts
+  line endings for it.
+
+aht never edits `.git/config`, and this is not a setting. git that you
+run yourself in another terminal does not get them; the dry run says what
+to type there, for example *in your own terminal here:  git -c
+core.filemode=false status*. Each git command takes the same `-c`.
+
+**In the terminal:**
+
+- `aht remote paths mac` — show where projects go on mac, rule by rule.
+- `aht remote paths mac --home` — projects go to the same place below the
+  home folder there.
+- `aht remote paths mac --same` — projects keep their exact path there.
+- `aht remote paths mac --add D:\work /Users/me/work` — projects in
+  `D:\work` here go to `/Users/me/work` on mac; `aht remote paths mac
+  --remove D:\work` drops that pair.
 
 ## Pick up on another machine
 
@@ -2161,7 +2466,9 @@ a part opens its section; the **?** at the top opens the whole guide.
 - **Projects tab, top row:** a search field over the project list; the
   machine projects are handed over to (a menu when you added several);
   **Sync Now** (copies every project you keep in sync to that machine now);
-  **Find Moved Folders**; **Look Back** with *Loose Ends…* and *Report…*;
+  **Find Moved Folders**; **Bring Here** with *From box…* for each machine
+  aht can ask (see *Bring a project here, and send it back*); **Look
+  Back** with *Loose Ends…* and *Report…*;
   **Tidy Up (n)…** when something needs a decision (with **Choose
   Folder…**, **Reconnect**, **Forget** and, for a history without a folder
   that is not a link, **Remove…**).
@@ -2173,7 +2480,10 @@ a part opens its section; the **?** at the top opens the whole guide.
 - **Under the list, for the selected project:** **Hand Over…** or, while it
   is away, **Take Back…**, **Open Session** and **Release…**; while a
   handover is unfinished, a note with **Check Now** and **Release…** (see
-  *Hand a project over to another machine*); **Keep in sync**, and a note
+  *Hand a project over to another machine*); for a project another
+  machine brought there, *On pc since 14:10 (brought there from pc). Send
+  it back from pc.* with **Release…**; for a project brought here,
+  **Send Back to box…**; **Keep in sync**, and a note
   when a sync paused, with **Bring Them Here…**, **Replace Them…**,
   **Allow the Removals…** or **Stop Syncing** (see *Keep in sync looks
   first*);
@@ -2196,9 +2506,11 @@ a part opens its section; the **?** at the top opens the whole guide.
   *Continue Here…* on one from another machine.
 - **Machines tab:** the machines you added, with **Sync** (keep every
   project in sync with it, or stop) and how many of those syncs are
-  paused, **Check**, **Use for Handover** and
+  paused, **Bring Here…**, **Check**, **Use for Handover** and
   **Remove…** (refused, with the reason, while the machine holds a
-  project), and under each one **Watch** and when aht last heard from it;
+  project), and under each one **Watch**, when aht last heard from it,
+  and where projects go there (in aht's window *Folders there* with
+  **Change…**; see *Across systems and folders*);
   **Add Another…**; machines aht found on your
   Tailscale network or in `~/.ssh/config`, each with **Add…**, and **Look
   Again**.
@@ -2318,7 +2630,8 @@ all of them can be set with `aht config --set name=value` and put back with
 **Handover**
 
 - `remotes` and `default_remote` — your machines (also whether you watch
-  each one), set in the Machines tab or with `aht remote`.
+  each one, and where projects go there), set in the Machines tab or with
+  `aht remote` (`aht remote paths` for where projects go).
 - `mirror_interval_minutes` (30) — how often a kept copy is synced.
 - `handover_excludes` (none) — more names that never travel (besides
   `node_modules`, `.venv` and the like).

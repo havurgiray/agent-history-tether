@@ -1,0 +1,86 @@
+{
+  "command": "bring",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "remote": "mac",
+  "there_path": "/Users/me/code/shop",
+  "mode": "bring",
+  "agent": "claude",
+  "allow_idle": false,
+  "there": {
+    "host": "mac",
+    "system": "Darwin",
+    "claude_version": "2.1.310",
+    "sessions": [],
+    "processes": [],
+    "aht": {
+      "installed": true,
+      "version": "0.16.0",
+      "protocol": 2,
+      "phone_here": false
+    }
+  },
+  "uuid": "5b0c2f6e9a3d4c1b8e7f6a5d4c3b2a19",
+  "session": {
+    "id": "0f3a9c2e-5b7d-4e1f-9a8b-7c6d5e4f3a2b",
+    "title": "Checkout flow refactor",
+    "open": null
+  },
+  "sessions": 3,
+  "other_histories": [
+    "codex"
+  ],
+  "project": "C:\\Users\\me\\code\\shop",
+  "here_path": "C:\\Users\\me\\code\\shop",
+  "identity": {
+    "exists": false,
+    "entries": 0,
+    "marker": null,
+    "owner": "none",
+    "ok": true,
+    "fix": null
+  },
+  "here": {
+    "sessions": [],
+    "processes": [],
+    "system": "Windows"
+  },
+  "names": [],
+  "plan": {
+    "files": 1204,
+    "bytes": 40055603,
+    "history_files": 4,
+    "history_bytes": 4299161,
+    "replaces": 0,
+    "set_aside": 0,
+    "plans": 1,
+    "file_history": false,
+    "free_bytes": 120000000000
+  },
+  "modes_lost": [
+    "bin/run.sh",
+    "scripts/deploy.sh"
+  ],
+  "claude": {
+    "here": "2.1.310",
+    "there": "2.1.310"
+  },
+  "git": {
+    "is_git": true,
+    "gitattributes": false,
+    "suggest": [
+      "* text=auto",
+      "*.sh text eol=lf",
+      "*.bat text eol=crlf",
+      "*.cmd text eol=crlf",
+      "*.ps1 text eol=crlf"
+    ],
+    "env": {
+      "core.filemode": "false"
+    },
+    "how": "in your own terminal here:  git -c core.filemode=false status   (aht's session here has this set)"
+  },
+  "eol_only": [],
+  "unsafe_names": []
+}

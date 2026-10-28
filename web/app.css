@@ -195,3 +195,14 @@ details.later > summary h3 { display: inline; }
 /* Machines: the projects kept in sync with one, and the paused ones */
 .synced { margin-top: 4px; }
 .synced button.link { font-size: inherit; }
+/* Bring Here and Send Back: names the other disk cannot hold, line-ending
+   notes, the .gitattributes hint; where a machine's folders go */
+.callout.names ul.files li { margin: 1px 0; }
+details.eol > summary { cursor: pointer; }
+details.eol ul.files { margin: 4px 0 0; padding-left: 18px; }
+details.eol ul.files li { overflow-wrap: anywhere; }
+.box.gitattr pre { white-space: pre; }
+.awayrow { margin: 2px 0; }
+.paths { margin-top: 4px; }
+.pairs .row { padding: 3px 0; border-bottom: 1px solid var(--line); }
+.pairs .mono { overflow-wrap: anywhere; }

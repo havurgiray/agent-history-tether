@@ -24,6 +24,10 @@ can read.
     aht window              open the window (start the server if needed)
     aht window --no-open    serve, print the address to open
     aht window --selftest   start, check the doors and one command, stop
+
+With AHT_WINDOW_PROJECT=<folder> (and AHT_WINDOW_DO=send-back) in its
+environment, `aht window` opens on that project (and its Send Back); the
+Windows tray opens it so for a project brought there.
 """
 import json
 import os
@@ -56,11 +60,26 @@ COMMANDS = {
     "status", "config", "projects", "sessions", "search", "journal", "changes", "undo",
     "checkpoint", "rules", "secrets", "report", "share", "tidy", "loose-ends", "board",
     "remote", "handover", "reclaim", "mirror", "resume-here", "switch", "relays", "pickup",
-    "leave-note", "second-opinion",
+    "leave-note", "second-opinion", "bring", "send-back",
     "night-shift", "backup", "restore", "icons", "backends", "adopt", "setup", "update",
     "getting-started", "doctor", "reconcile", "reload", "version", "notices", "limits",
     "logs", "checkup", "forget", "orphans", "prune", "guide", "bind", "autostart",
 }
+
+# what the window may open on (the tray's Projects brought here ▸ Send Back…):
+# AHT_WINDOW_PROJECT=<a folder> and AHT_WINDOW_DO=<one of these> in the
+# environment of `aht window`, passed on through /open to the page, after #
+OPEN_DO = ("show", "send-back")
+
+
+def open_hint(env=None) -> str:
+    """The query part that makes the page open on one project, from
+    AHT_WINDOW_PROJECT and AHT_WINDOW_DO ("show" if not given), or ""."""
+    env = os.environ if env is None else env
+    path, do = env.get("AHT_WINDOW_PROJECT") or "", env.get("AHT_WINDOW_DO") or "show"
+    if not path or do not in OPEN_DO:
+        return ""
+    return "&" + urllib.parse.urlencode({"p": path, "do": do})
 
 
 def _own_dirs() -> list:
@@ -337,8 +356,11 @@ class Handler(BaseHTTPRequestHandler):
                     cookie, key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
                     self.server.sessions[cookie] = key
             self.server.last = time.time()
+            # the project the window opens on, quoted: it goes after # too
+            go = {k: (q.get(k) or [""])[0] for k in ("p", "do")}
+            hint = "&" + urllib.parse.urlencode(go) if go["p"] and go["do"] in OPEN_DO else ""
             return self._send(302, b"", "text/plain", {
-                "Location": "/#k=" + key,
+                "Location": "/#k=" + key + hint,
                 "Set-Cookie": f"aht={cookie}; HttpOnly; SameSite=Strict; Path=/"})
         if u.path == "/launch":                             # a second `aht window`
             given = (q.get("control") or [""])[0].encode("utf-8", "replace")
@@ -765,11 +787,16 @@ def _sweep_job_files() -> None:
 
 
 def serve(open_it: bool = True, port: int = 0) -> int:
+    # read once: a server started this way does not pass them on to the
+    # commands it runs
+    hint = open_hint()
+    for k in ("AHT_WINDOW_PROJECT", "AHT_WINDOW_DO"):
+        os.environ.pop(k, None)
     old = running()
     if old:
         if open_it:
-            open_window(old["url"])
-        print(old["url"])
+            open_window(old["url"] + hint)
+        print(old["url"] + hint)
         return 0
     _sweep_job_files()
     # stopped at logout or from a terminal: window.json goes too (below); a
@@ -785,7 +812,7 @@ def serve(open_it: bool = True, port: int = 0) -> int:
     srv = Server(port)
     _private_write(state_path(), {"pid": os.getpid(), "port": srv.port, "control": srv.control,
                                   "started": time.time()})
-    url = srv.url()
+    url = srv.url() + hint
     print(url, flush=True)
     aht.log(f"WINDOW serving on 127.0.0.1:{srv.port}")
     if open_it:

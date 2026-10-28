@@ -1,0 +1,49 @@
+{
+  "command": "bring",
+  "applied": false,
+  "blockers": [],
+  "warnings": [],
+  "remote": "mac",
+  "list": true,
+  "system": "Darwin",
+  "here_system": "Windows",
+  "error": null,
+  "projects": [
+    {
+      "path": "/Users/me/code/shop",
+      "name": "shop",
+      "uuid": "5b0c2f6e9a3d4c1b8e7f6a5d4c3b2a19",
+      "state": "home",
+      "away": null,
+      "copy_of": null,
+      "open": null,
+      "session": {
+        "id": "0f3a9c2e-5b7d-4e1f-9a8b-7c6d5e4f3a2b",
+        "title": "Checkout flow refactor",
+        "updated": 1793133000.0
+      },
+      "here_path": "C:\\Users\\me\\code\\shop",
+      "here_error": null,
+      "can_bring": true,
+      "why_not": null
+    },
+    {
+      "path": "/Users/me/code/api",
+      "name": "api",
+      "uuid": "411427d023d84383a4e8ed65b59d16d2",
+      "state": "away",
+      "away": {
+        "holder": "box",
+        "since": "2026-10-27T14:10:00",
+        "driven_by": "here"
+      },
+      "copy_of": null,
+      "open": null,
+      "session": null,
+      "here_path": "C:\\Users\\me\\code\\api",
+      "here_error": null,
+      "can_bring": false,
+      "why_not": "on box since 14:10"
+    }
+  ]
+}

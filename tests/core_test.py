@@ -2236,7 +2236,8 @@ def phase5_suite(henv, hrun, J, project_row):
     fx += fx5(brow, "projects.json", "copy")
     bnote = subprocess.run([PY, CLI, "hook"], env=benv, capture_output=True, text=True,
                            input=json.dumps({"cwd": farS})).stdout
-    ck(brow.get("copy_of") == {"from": here, "kind": "sync", "at": c.get("at")}
+    ck({k: (brow.get("copy_of") or {}).get(k) for k in ("from", "kind", "at")}
+       == {"from": here, "kind": "sync", "at": c.get("at")}
        and f"a copy kept in sync from “{here}”" in bnote,
        f"box's row and hook name the machine it is kept in sync from "
        f"({brow.get('copy_of')}, {bnote!r})")
@@ -2255,7 +2256,7 @@ def phase5_suite(henv, hrun, J, project_row):
         fsi = core.Remote("box", {"root": str(box)}).connect(projS, fs=True).get("fs")
     finally:
         os.environ.pop("AHT_CASELESS", None)
-    ck(fsi == {"case_sensitive": False},
+    ck((fsi or {}).get("case_sensitive") is False,
        f"the probe says whether the disk there ignores case (AHT_CASELESS reaches it) ({fsi})")
     projK = os.path.realpath(str(roots / "Cases"))
     os.makedirs(projK)
@@ -2296,6 +2297,17 @@ def phase5_suite(henv, hrun, J, project_row):
        f"Stop Syncing drops box's note on its copy; uncopy leaves another project's "
        f"({other}, {copies_there()})")
 
+    # box's aht registered its copy as a project (its hook ran there), and
+    # after Stop Syncing nothing notes it as a copy: Hand Over refuses to go
+    # over it, as over any live project of box's own (the identity check)
+    d = nrun("handover", projS, "--no-start", "--replace-there", "--json")
+    ck(any("is a live project of its own there" in b for b in d.get("blockers", [])),
+       f"identity: box's own live project with this id is not handed over onto "
+       f"({d.get('blockers')})")
+    breg = bhome / ".aht" / "registry.json"
+    r5 = json.loads(breg.read_text())
+    r5["projects"] = {u: e for u, e in r5["projects"].items() if e.get("real_path") != farS}
+    breg.write_text(json.dumps(r5))
     # a handover and a take back write there.json too, and box's note says
     # what its copy is: handed over, then returned
     d = nrun("handover", projS, "--apply", "--no-start", "--replace-there", "--json")
@@ -2563,6 +2575,638 @@ def phase5_suite(henv, hrun, J, project_row):
     ck(not fx, f"the phase-5 JSON keeps the shape of tests/fixtures/phase5 ({fx})")
     hrun("config", "--set", "remotes=" + json.dumps(
         {"box": {"root": str(Path(os.path.realpath(sb)) / "box")}}))
+
+FIXTURES7 = HERE / "fixtures" / "phase7"
+
+def phase7_suite(stubs, henv, J):
+    """Handover between systems at different paths, with a folder standing in
+    for the other machine ("box") and a home of its own here ("pc"): path
+    mapping, the identity check, Bring Here and Send Back (the attempt, the
+    idle block, the version blocker, a conflict kept twice, unmark after a
+    failure, Release), names Windows cannot hold, line endings, modes, safe
+    names on the way back and git's settings (AHT_AS_WINDOWS makes this
+    machine count as Windows for those, and for nothing else)."""
+    print("\n[16g] handover between all three systems, at different paths")
+    fx = []
+    base7 = Path(os.path.realpath(sb)) / "p7"
+    box, pc = base7 / "box", base7 / "pc"
+    bhome, phome = box / "home", pc / "home"
+    (bhome / ".claude" / "projects").mkdir(parents=True)
+    phome.mkdir(parents=True)
+    tlog = base7 / "terminal.log"
+    penv = dict(env, **henv, HOME=str(phome), AHT_HOME=str(phome / ".aht"),
+                AHT_MACHINE_NAME="pc", AHT_REMOTE_MACHINE_NAME="box",
+                AHT_TERMINAL_LOG=str(tlog), AHT_NOTIFY_LOG=str(base7 / "notify.log"),
+                AHT_NO_SEARCH_INDEX="1", AHT_ITERM_TABS=str(base7 / "no-tabs.json"))
+    (base7 / "no-tabs.json").write_text("{}")
+    penv.pop("AHT_ROOTS", None)
+    penv.pop("AHT_AS_WINDOWS", None)
+    for k in [k for k in penv if k.startswith("AHT_ROOT_")]:
+        penv[k] = str(pc / "tools" / k[9:].lower())
+        Path(penv[k]).mkdir(parents=True, exist_ok=True)
+    pclaude = Path(penv["AHT_ROOT_CLAUDE"])
+    (pclaude.parent.parent / ".claude.json").write_text("{}")   # beside its ~/.claude
+    benv = dict(penv, HOME=str(bhome), AHT_HOME=str(bhome / ".aht"),
+                AHT_ROOT_CLAUDE=str(bhome / ".claude" / "projects"), AHT_MACHINE_NAME="box")
+    def praw(*a, **extra):
+        return subprocess.run([PY, CLI, *a], env=dict(penv, **extra), capture_output=True,
+                              text=True)
+    def prun(*a, **extra):
+        return J(praw(*a, **extra))
+    def brun(*a, **extra):
+        return subprocess.run([PY, CLI, *a], env=dict(benv, **extra), capture_output=True,
+                              text=True)
+    def breg():
+        return json.loads((bhome / ".aht" / "registry.json").read_text())["projects"]
+    def copies():
+        try:
+            return json.loads((phome / ".aht" / "remote" / "copies.json").read_text())
+        except (OSError, ValueError):
+            return {}
+    def fx7(real, name, part=None):
+        sample = json.loads((FIXTURES7 / name).read_text())
+        return [f"{name}{m}" for m in same_shape(real, sample[part] if part else sample)]
+    prun("config", "--set", "remotes=" + json.dumps({"box": {"root": str(box),
+                                                             "paths": "home"}}))
+    prun("config", "--set", "handover_keep_awake=false")
+
+    # where a project goes: below the home folder there; outside: refused
+    rem = None
+    d = prun("remote", "paths", "box", "--json")
+    ck(d.get("paths") == "home" and d.get("there_home") == "/home"
+       and d.get("rules") == [{"here": str(phome), "there": "/home", "kind": "home"}],
+       f"remote paths: below the home folder here, below /home on the test machine ({d})")
+    d = prun("remote", "paths", "box", "--add", "/Volumes/work", "/home/work", "--json")
+    fx += fx7(d, "remote_paths.json")
+    ck(d.get("applied") and d.get("paths") == [["/Volumes/work", "/home/work"]]
+       and [r["kind"] for r in d.get("rules", [])] == ["pair", "home"],
+       f"remote paths --add: a pair, tried before the homes ({d.get('rules')})")
+    d = prun("remote", "paths", "box", "--remove", "/Volumes/work", "--json")
+    ck(d.get("applied") and d.get("paths") == "home", "remote paths --remove: back to home")
+
+    # the project on box: registered by box's own aht, with a Claude history
+    bproj = bhome / "code" / "shop"
+    for rel, body in (("src/app.py", "print(1)\n"), ("README.md", "line one\nline two\n"),
+                      ("docs/notes.txt", "a\nb\n"), ("bin/run.sh", "#!/bin/sh\necho run\n")):
+        (bproj / rel).parent.mkdir(parents=True, exist_ok=True)
+        (bproj / rel).write_text(body)
+    os.chmod(bproj / "bin" / "run.sh", 0o755)
+    brun("tag", str(bproj), "--apply")
+    bstore = bhome / ".claude" / "projects" / enc(str(bproj))
+    bstore.mkdir(parents=True)
+    T1 = "".join(json.dumps(e) + "\n" for e in (
+        {"type": "user", "cwd": str(bproj), "version": "9.9.9",
+         "message": {"role": "user", "content": "refactor the checkout flow"}},
+        {"type": "ai-title", "aiTitle": "Checkout flow refactor"}))
+    (bstore / "s1.jsonl").write_text(T1)
+    brun("tag", str(bproj), "--apply")
+    uid = read_text_or_none(bproj / ".aht" / ".project-id")
+    (bhome / ".claude.json").write_text(json.dumps(
+        {"projects": {str(bproj): {"hasTrustDialogAccepted": True}}}))
+    here = str(phome / "code" / "shop")
+
+    d = prun("bring", "--from", "box", "--list", "--json")
+    fx += fx7(d, "bring_list.json")
+    row = next((p for p in d.get("projects") or [] if p["path"] == "/home/code/shop"), {})
+    ck(row.get("can_bring") and row.get("here_path") == here and row.get("uuid") == uid
+       and row.get("state") == "home" and (row.get("session") or {}).get("title")
+       == "Checkout flow refactor",
+       f"bring --list: box's projects, each with where it would go here ({row})")
+    fx += fx7(prun("bring", "/home/code/shop", "--from", "box", "--json",
+                   AHT_AS_WINDOWS="1"), "bring_dry.json")         # as a PC asks
+    d = prun("bring", "/home/code/shop", "--from", "box", "--json")
+    ck(not d.get("applied") and not d.get("blockers") and d.get("here_path") == here
+       and d.get("there_path") == "/home/code/shop" and d.get("plan", {}).get("files") == 5
+       and d.get("session", {}).get("id") == "s1" and not os.path.exists(here)
+       and not (phome / ".aht" / "machine.json").exists(),
+       f"bring dry run: what would come and where, nothing written ({d.get('plan') or d})")
+
+    # the identity check here: another folder in the way
+    (phome / "code" / "shop").mkdir(parents=True)
+    (phome / "code" / "shop" / "mine.txt").write_text("mine\n")
+    d = prun("bring", "/home/code/shop", "--from", "box", "--json")
+    ck(any("holds another folder (1 item)" in b and "--here " in b
+           for b in d.get("blockers", [])) and d.get("identity", {}).get("ok") is False
+       and d["identity"].get("fix") == f"aht bring /home/code/shop --from box --here {here}-box",
+       f"bring: a folder here that holds something else blocks ({d.get('blockers')})")
+    shutil.rmtree(phome / "code" / "shop")
+
+    # an idle session open there blocks, unless --allow-idle
+    sessions = bhome / ".claude" / "sessions"
+    sessions.mkdir(exist_ok=True)
+    sleeper = subprocess.Popen(["sleep", "600"], cwd="/")
+    (sessions / f"{sleeper.pid}.json").write_text(json.dumps(
+        {"pid": sleeper.pid, "cwd": str(bproj), "status": "idle", "sessionId": "s1"}))
+    d1 = prun("bring", "/home/code/shop", "--from", "box", "--json")
+    d2 = prun("bring", "/home/code/shop", "--from", "box", "--allow-idle", "--json")
+    ck(any("exit it first" in b and "--allow-idle" in b for b in d1.get("blockers", []))
+       and not d2.get("blockers")
+       and any("Send Back keeps both versions" in w for w in d2.get("warnings", [])),
+       f"bring: an idle session there blocks, --allow-idle brings it anyway "
+       f"({d1.get('blockers')}, {d2.get('warnings')})")
+    sleeper.kill(); sleeper.wait()
+    (sessions / f"{sleeper.pid}.json").unlink()
+
+    # names a Windows PC cannot hold (this machine counted as Windows)
+    (bproj / "aux.md").write_text("x\n")
+    (bproj / "a:b.txt").write_text("x\n")
+    d = prun("bring", "/home/code/shop", "--from", "box", "--json", AHT_AS_WINDOWS="1")
+    fx += fx7(d, "handover_blocked_names.json")
+    kinds = {r["kind"]: r["names"] for r in d.get("names") or []}
+    ck(kinds.get("reserved") == [["aux.md"]] and kinds.get("windows_char") == [["a:b.txt"]]
+       and any("cannot hold" in b and "handover_excludes" in b for b in d.get("blockers", []))
+       and d.get("modes_lost") == ["bin/run.sh"],
+       f"bring to a PC: aux.md and a:b.txt block, run.sh would lose its mark ({d.get('names')})")
+    (bproj / "aux.md").unlink()
+    (bproj / "a:b.txt").unlink()
+
+    # cut off after the files came: box forgets the attempt again (unmark)
+    d = prun("bring", "/home/code/shop", "--from", "box", "--apply", "--json",
+             AHT_TEST_DROP="fetched")
+    e = breg().get(uid) or {}
+    ck(d.get("error") and not d.get("applied") and not e.get("handing") and not e.get("away")
+       and not copies() and any("keeps the project" in w for w in d.get("warnings", [])),
+       f"bring cut off: unmark there, nothing is marked anywhere ({d.get('error')}, "
+       f"{d.get('warnings')})")
+
+    # Bring Here, as a PC
+    tlog.write_text("") if tlog.exists() else None
+    d = prun("bring", "/home/code/shop", "--from", "box", "--apply", "--json",
+             AHT_AS_WINDOWS="1")
+    fx += fx7(d, "bring_apply.json")
+    e = breg().get(uid) or {}
+    a = e.get("away") or {}
+    c = copies().get(here) or {}
+    pstore = pclaude / enc(here)
+    term = read_text_or_none(tlog) or ""
+    ck(d.get("applied") and (Path(here) / "src" / "app.py").read_text() == "print(1)\n"
+       and (pstore / "s1.jsonl").read_text() == T1
+       and a.get("driven_by") == "there" and a.get("holder") == "pc"
+       and a.get("remote_path") == here and a.get("attempt") == d.get("attempt")
+       and not e.get("handing") and c.get("kind") == "brought" and c.get("from") == "box"
+       and c.get("uuid") == uid,
+       f"bring --apply: the project and its history here (under this path's key), box "
+       f"records it as here, this machine notes the copy ({d.get('error') or a})")
+    ck("claude" in term and "--resume s1" in term and "GIT_CONFIG_KEY_0=core.filemode" in term
+       and d.get("opened") and any(json.loads(f.read_text()).get("kind") == "bring"
+                                   for f in (Path(here) / ".aht" / "handover").glob("relay-*.json")),
+       f"bring: the session opens here with git's settings for a PC, a relay of kind bring "
+       f"({term.strip()[-160:]})")
+    ck(json.loads((pclaude.parent.parent / ".claude.json").read_text()).get("projects", {})
+       .get(here, {}).get("hasTrustDialogAccepted") is True,
+       "bring: the folder trusted there is trusted here")
+    bm = json.loads((bhome / ".aht" / "handover" / uid / "manifest.json").read_text())
+    ck(bm.get("attempt") == d.get("attempt") and "src/app.py" in bm["here"]["project"]
+       and bm.get("transcripts", {}).get("s1.jsonl", [0])[0] == len(T1.encode())
+       and bm.get("modes", {}).get("project", {}).get("bin/run.sh") == 0o755,
+       "box keeps the record of what left: the lists, the transcripts' checksums, the modes")
+    hk = subprocess.run([PY, CLI, "hook"], env=penv, capture_output=True, text=True,
+                        input=json.dumps({"cwd": here})).stdout
+    ck("brought here from “box”" in hk and "send it back when done" in hk,
+       f"the hook tells a session here where the folder came from ({hk.strip()[-200:]})")
+    brow = next((r for r in json.loads(brun("projects", "--json").stdout)["projects"]
+                 if r["uuid"] == uid), {})
+    prow = next((r for r in prun("projects", "--json").get("projects", [])
+                 if r["real_path"] == here), {})
+    fx += fx7(brow, "projects.json", "home") + fx7(prow, "projects.json", "brought")
+    ck(brow.get("away_driven_by") == "there" and brow.get("away_holder") == "pc"
+       and brow.get("away_path") == here
+       and (prow.get("copy_of") or {}).get("kind") == "brought"
+       and (prow.get("copy_of") or {}).get("remote") == "box",
+       f"projects: box shows it on pc, brought there; pc shows a brought copy ({prow.get('copy_of')})")
+    d = J(brun("reclaim", str(bproj), "--json"))
+    ck(any("send it back from pc" in b for b in d.get("blockers", [])),
+       f"box cannot take back what pc brought: Send Back there, or Release ({d.get('blockers')})")
+
+    # work on both machines
+    Path(here, "src", "app.py").write_text("print('pc')\n")
+    (bproj / "src" / "app.py").write_text("print('box')\n")
+    Path(here, "README.md").write_bytes(b"line one\r\nline two\r\n")       # endings only
+    Path(here, "docs", "notes.txt").write_bytes(b"a\r\nb\r\nc\r\n")        # changed, flipped
+    Path(here, "bin", "run.sh").write_text("#!/bin/sh\necho run 2\n")
+    os.chmod(Path(here, "bin", "run.sh"), 0o644)                           # as a PC has it
+    Path(here, "src", "new.py").write_text("new\n")
+    with open(pstore / "s1.jsonl", "a") as fh:
+        fh.write(json.dumps({"type": "user", "version": "9.9.9", "message": {
+            "role": "user", "content": "done on pc"}}) + "\n")
+
+    # Send Back: a copy from another attempt is refused
+    cf = phome / ".aht" / "remote" / "copies.json"
+    keep = cf.read_text()
+    cc = json.loads(keep)
+    cc[here]["attempt"] = "20200101-000000-dead"
+    cf.write_text(json.dumps(cc))
+    d = prun("send-back", here, "--json", AHT_AS_WINDOWS="1")
+    ck(d.get("error") and "another handover" in d["error"] and not d.get("applied"),
+       f"send-back: a copy from another attempt is refused ({d.get('error')})")
+    cf.write_text(keep)
+
+    # a newer Claude Code wrote here: blocked, unless --ignore-version
+    with open(pstore / "s1.jsonl", "a") as fh:
+        fh.write(json.dumps({"type": "assistant", "version": "99.0.0", "message": {
+            "role": "assistant", "content": "ok"}}) + "\n")
+    d1 = prun("send-back", here, "--json", AHT_AS_WINDOWS="1")
+    d = prun("send-back", here, "--ignore-version", "--json", AHT_AS_WINDOWS="1")
+    fx += fx7(d, "send_back_dry.json")
+    ck(any("Claude Code 99.0.0 was used on pc, box has 9.9.9" in b for b in d1.get("blockers", []))
+       and not d.get("blockers") and d.get("warnings"),
+       f"send-back: a newer Claude Code blocks; --ignore-version lets it go ({d1.get('blockers')})")
+    pl = d.get("plan") or {}
+    ck(d.get("eol_only") == ["README.md"] and d.get("eol_kept") == ["docs/notes.txt"]
+       and d.get("conflicts") == {"project": ["src/app.py"]}
+       and pl.get("history", {}).get("take") == 1 and pl.get("project", {}).get("new", 0) >= 1
+       and not d.get("applied"),
+       f"send-back dry run: endings only stay there, a flipped file keeps box's style, a "
+       f"change on both is kept twice ({d.get('eol_only')}, {d.get('eol_kept')}, "
+       f"{d.get('conflicts')}, {pl})")
+    d = prun("send-back", here, "--ignore-version", "--apply", "--json", AHT_AS_WINDOWS="1")
+    fx += fx7(d, "send_back_apply.json")
+    e = breg().get(uid) or {}
+    day = time.strftime("%Y-%m-%d")
+    twin = bproj / "src" / f"app (from pc {day}).py"
+    ck(d.get("applied") and not e.get("away") and (e.get("returned") or {}).get("sent_back")
+       and (bproj / "src" / "app.py").read_text() == "print('box')\n"
+       and twin.is_file() and twin.read_text() == "print('pc')\n"
+       and (bproj / "README.md").read_bytes() == b"line one\nline two\n"
+       and (bproj / "docs" / "notes.txt").read_bytes() == b"a\nb\nc\n"
+       and (bproj / "src" / "new.py").read_text() == "new\n"
+       and "done on pc" in (bstore / "s1.jsonl").read_text()
+       and (copies().get(here) or {}).get("kind") == "returned",
+       f"send-back --apply: home places it, a change on both kept twice, line endings kept, "
+       f"the conversation goes on there; the copy here is a returned one "
+       f"({d.get('error') or d.get('done')})")
+    ck(stat_mode(bproj / "bin" / "run.sh") == 0o755
+       and "run 2" in (bproj / "bin" / "run.sh").read_text(),
+       f"modes: run.sh comes back from a PC with its new content and keeps 0755 "
+       f"({oct(stat_mode(bproj / 'bin' / 'run.sh'))})")
+    ret = e.get("returned") or {}
+    ck(ret.get("eol_only") == ["README.md"] and ret.get("eol_kept") == ["docs/notes.txt"]
+       and d.get("set_aside") and Path(d["set_aside"]).is_dir(),
+       f"returned: what stayed for its line endings, and the set-aside folder there ({ret})")
+
+    # Release at home ends a bring that will not come back
+    d = prun("bring", "/home/code/shop", "--from", "box", "--apply", "--no-open", "--json")
+    d1 = J(brun("reclaim", str(bproj), "--release", "--json"))
+    out1 = brun("reclaim", str(bproj), "--release").stdout
+    d2 = J(brun("reclaim", str(bproj), "--release", "--apply", "--json"))
+    d3 = prun("send-back", here, "--json")
+    e = breg().get(uid) or {}
+    ck(d.get("applied") and d1.get("remote") == "pc" and "stays on pc" in out1
+       and d2.get("released") and not e.get("away")
+       and d3.get("error") and "not away from box" in d3["error"],
+       f"Release at home: the work on pc stays there, and Send Back is refused after "
+       f"({d.get('error')}, {out1.strip()[-120:]}, {d3.get('error')})")
+
+    # a session title with a key in it is masked there: in Bring Here's list,
+    # its dry run and Send Back's answer
+    KEY7 = "sk-" + "ant-" + "api03-" + "Zr4" * 12        # made up, built in pieces
+    with open(bstore / "s1.jsonl", "a") as fh:
+        fh.write(json.dumps({"type": "ai-title", "aiTitle": "Ship it with " + KEY7}) + "\n")
+    dl = praw("bring", "--from", "box", "--list", "--json").stdout
+    dd = praw("bring", "/home/code/shop", "--from", "box", "--json").stdout
+    ck(KEY7 not in dl and KEY7 not in dd and "Ship it with [" in dl and "Ship it with [" in dd,
+       f"a session title is masked there, for Bring Here's list and dry run ({dd[-200:]})")
+
+    # the link drops once box noted the bring (mark-away): asked again, still
+    # cut off, the run says so and notes nothing here; the same Bring Here
+    # run again asks box, which answers that it was done, and finishes it
+    # here without copying anything again
+    d = prun("bring", "/home/code/shop", "--from", "box", "--apply", "--no-open", "--json",
+             AHT_TEST_DROP="mark-away")
+    a1 = ((breg().get(uid) or {}).get("away") or {}).get("attempt")
+    ck(d.get("error") and "Run the same Bring Here again" in d["error"] and not d.get("applied")
+       and a1 and (copies().get(here) or {}).get("attempt") != a1,
+       f"bring cut off after box noted it: box has it as here, nothing noted here yet "
+       f"({d.get('error')}, {a1})")
+    d2 = prun("bring", "/home/code/shop", "--from", "box", "--json")
+    d3 = prun("bring", "/home/code/shop", "--from", "box", "--apply", "--no-open", "--json")
+    c = copies().get(here) or {}
+    ck(d2.get("finish") == a1 and not d2.get("applied") and not d2.get("blockers")
+       and d3.get("applied") and d3.get("attempt") == a1
+       and any(f"already done for attempt {a1}" in w for w in d3.get("warnings", []))
+       and c.get("kind") == "brought" and c.get("attempt") == a1
+       and ((breg().get(uid) or {}).get("away") or {}).get("attempt") == a1
+       and any(r["real_path"] == here and r.get("copy_of")
+               for r in prun("projects", "--json").get("projects", [])),
+       f"bring again: box answers that it was done, and this machine finishes its side "
+       f"({d2.get('finish')}, {d3.get('error') or d3.get('warnings')})")
+    d4 = prun("bring", "/home/code/shop", "--from", "box", "--apply", "--no-open", "--json")
+    ck(not d4.get("applied") and any("it is here already" in b for b in d4.get("blockers", [])),
+       f"bring once more: it is here already ({d4.get('blockers')})")
+    # …and once the files went back (return-apply): asked again, box says it
+    # has it back, and this machine finishes its side in the same run
+    Path(here, "src", "dropped.py").write_text("after the drop\n")
+    d = prun("send-back", here, "--apply", "--json", AHT_TEST_DROP="return-apply")
+    e = breg().get(uid) or {}
+    ret = e.get("returned") or {}
+    ck(d.get("applied") and d.get("already") == f"already done for attempt {a1}"
+       and not e.get("away") and ret.get("attempt") == a1 and ret.get("sent_back")
+       and (bproj / "src" / "dropped.py").read_text() == "after the drop\n"
+       and (copies().get(here) or {}).get("kind") == "returned"
+       and KEY7 not in json.dumps(d) and "Ship it with [" in str(d.get("session_title")),
+       f"send-back cut off after box placed the files: asked again, box says it is done; the "
+       f"copy here is a returned one; the title came masked ({d.get('error') or d.get('already')})")
+    # …and when that answer was lost too: the same Send Back run again
+    cc = json.loads(cf.read_text())
+    cc[here]["kind"] = "brought"
+    cf.write_text(json.dumps(cc))
+    d5 = prun("send-back", here, "--json")
+    k5 = (copies().get(here) or {}).get("kind")
+    d6 = prun("send-back", here, "--apply", "--json")
+    ck(d5.get("already") and not d5.get("applied") and k5 == "brought"
+       and d6.get("applied") and d6.get("already")
+       and (copies().get(here) or {}).get("kind") == "returned"
+       and (breg().get(uid) or {}).get("returned", {}).get("attempt") == a1,
+       f"send-back again: box answers that it was done, nothing is sent, this machine notes "
+       f"it ({d5.get('already')}, {d6.get('error') or d6.get('already')})")
+
+    # Bring Here of a project with no Claude history there (both movers), and
+    # what earlier Bring Heres set aside here is pruned as replaced/ is
+    def stamp7(days):
+        return time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - days * 86400))
+    nproj = bhome / "code" / "nohist"
+    nproj.mkdir(parents=True)
+    (nproj / "a.txt").write_text("a\n")
+    brun("tag", str(nproj), "--apply")
+    nuid = read_text_or_none(nproj / ".aht" / ".project-id")
+    nhere = phome / "code" / "nohist"
+    bdir = phome / ".aht" / "handover" / str(nuid) / "brought"
+    olds = {days: stamp7(days) for days in (2, 31, 32, 33, 34, 35, 36, 37)}
+    for name in olds.values():
+        (bdir / name / "project").mkdir(parents=True)
+        (bdir / name / "project" / "x.txt").write_text("x")
+    d = prun("bring", "/home/code/nohist", "--from", "box", "--apply", "--no-open", "--json")
+    left = sorted(p.name for p in bdir.iterdir()) if bdir.is_dir() else []
+    ck(d.get("applied") and (nhere / "a.txt").read_text() == "a\n"
+       and (d.get("fetched") or {}).get("history_bytes") == 0
+       and not (pclaude / enc(str(nhere))).exists(),
+       f"bring: a project with no Claude history there comes without one "
+       f"({os.environ.get('AHT_TRANSFER')}: {d.get('error') or d.get('fetched')})")
+    ck(all(olds[x] in left for x in (2, 31, 32, 33, 34))
+       and not any(olds[x] in left for x in (35, 36, 37)),
+       f"bring: brought/ keeps the newest 5 folders and every one younger than 30 days ({left})")
+    J(brun("reclaim", str(nproj), "--release", "--apply", "--json"))
+
+    # Hand Over from here to box below its home folder; Take Back as a PC
+    projH = phome / "code" / "hand"
+    (projH / "bin").mkdir(parents=True)
+    (projH / "a.txt").write_text("one\ntwo\n")
+    (projH / "desktop.ini").write_text("[x]\n")
+    (projH / "Thumbs.db").write_text("x")
+    (projH / "bin" / "run.sh").write_text("#!/bin/sh\n")
+    os.chmod(projH / "bin" / "run.sh", 0o755)
+    hstore = pclaude / enc(str(projH))
+    hstore.mkdir(parents=True)
+    (hstore / "s2.jsonl").write_text(json.dumps({"type": "user", "cwd": str(projH),
+                                                 "version": "9.9.9", "message": {
+                                                     "role": "user", "content": "hi"}}) + "\n")
+    fh_dir = pclaude.parent / "file-history" / "s2"
+    fh_dir.mkdir(parents=True)
+    (fh_dir / "snap@v1").write_text("old\n")
+    prun("tag", str(projH), "--apply")
+    farH = box / "home" / "code" / "hand"
+    d = prun("handover", str(projH), "--to", "box", "--json")
+    ck(not d.get("blockers") and d.get("there_path") == "/home/code/hand"
+       and d.get("here_path") == str(projH) and d.get("identity", {}).get("ok"),
+       f"hand over: below box's home folder ({d.get('blockers') or d.get('there_path')})")
+    d = prun("handover", str(projH), "--to", "box", "--apply", "--json")
+    a = (prun("projects", "--json").get("projects") and next(
+        (r for r in prun("projects", "--json")["projects"] if r["real_path"] == str(projH)), {}))
+    rstoreH = bhome / ".claude" / "projects" / enc(str(farH))
+    notes = list((bhome / ".aht" / "remote" / "run").glob("*/note.txt"))
+    note = max(notes, key=lambda p: p.stat().st_mtime).read_text() if notes else ""
+    ck(d.get("applied") and (farH / "a.txt").is_file() and not (farH / "desktop.ini").exists()
+       and not (farH / "Thumbs.db").exists() and (rstoreH / "s2.jsonl").is_file()
+       and not (bhome / ".claude" / "file-history" / "s2").exists()
+       and a.get("away_path") == str(farH) and stat_mode(farH / "bin" / "run.sh") == 0o755,
+       f"hand over: the history under the path there, no /rewind snapshots on another path, "
+       f"Windows' own files stay ({d.get('error') or a.get('away_path')})")
+    ck("the folder is at /home/code/hand here (it was " + str(projH) + " on pc)" in note,
+       f"the arrival note names both paths ({note[:300]})")
+    # done there: endings only, a name a PC cannot hold, and a path too long
+    # for a PC without long paths
+    (farH / "a.txt").write_bytes(b"one\r\ntwo\r\n")
+    (farH / "a:b.txt").write_text("made there\n")
+    longH = "deep/" + "d" * max(10, min(200, 262 - len(str(projH)) - 26)) \
+        + "/notes about the trip.txt"
+    (farH / longH).parent.mkdir(parents=True)
+    (farH / longH).write_text("far\n")
+    d = prun("reclaim", str(projH), "--stop", "--apply", "--json", AHT_AS_WINDOWS="1",
+             AHT_SHORT_PATHS="1")
+    un = d.get("unsafe_names") or [{}]
+    ck(d.get("applied") and (projH / "a.txt").read_bytes() == b"one\ntwo\n"
+       and d.get("eol_only") == ["a.txt"] and not (projH / "a:b.txt").exists()
+       and un[0].get("there") == "a:b.txt" and un[0].get("kept_as", "").endswith(
+           "kept-aside/a%3Ab.txt") and Path(un[0]["kept_as"]).read_text() == "made there\n",
+       f"take back as a PC: endings only stay, a:b.txt is kept aside as a%3Ab.txt "
+       f"({d.get('error') or d.get('blockers') or un})")
+    lk = next((u for u in un if u.get("there") == longH), {})
+    ck(lk.get("kept_as", "").endswith("kept-aside/1-notes about the trip.txt")
+       and Path(lk["kept_as"]).read_text() == "far\n" and not (projH / longH).exists(),
+       f"take back as a PC without long paths: a path too long here is kept aside under a "
+       f"short name, its own name listed ({lk or un})")
+
+    # names Windows cannot hold, with the probe's answer saying Windows there
+    projW = phome / "code" / "win"
+    projW.mkdir(parents=True)
+    for n in ("aux.md", "a:b.txt", "trail.", "ok.txt"):
+        (projW / n).write_text("x\n")
+    os.symlink("ok.txt", projW / "lnk")
+    fake = ("import json, sys, aht\n"
+            "orig = aht.Remote.connect\n"
+            "def connect(self, path=None, fs=False):\n"
+            "    info = orig(self, path, fs)\n"
+            "    info['system'] = 'Windows'\n"
+            "    info['fs'] = dict(info.get('fs') or {}, symlinks=False)\n"
+            "    return info\n"
+            "aht.Remote.connect = connect\n"
+            "sys.exit(aht.main(['handover', sys.argv[1], '--to', 'box', '--json']))\n")
+    r = subprocess.run([PY, "-c", fake, str(projW)], capture_output=True, text=True,
+                       env=dict(penv, PYTHONPATH=str(HERE.parent)))
+    d = J(r)
+    kinds = {x["kind"]: [n[0] for n in x["names"]] for x in d.get("names") or []}
+    ck(kinds == {"windows_char": ["a:b.txt"], "trailing": ["trail."], "reserved": ["aux.md"],
+                 "symlink": ["lnk"]}
+       and any("cannot hold" in b for b in d.get("blockers", [])) and not d.get("applied"),
+       f"name blockers when the probe says Windows: a:b.txt, trail., aux.md, a link "
+       f"({kinds or d})")
+
+    # outside the home folder: refused, with the rule that would help
+    projO = base7 / "outside"
+    projO.mkdir()
+    (projO / "x.txt").write_text("x\n")
+    d = prun("handover", str(projO), "--to", "box", "--json")
+    ck(any("is outside yours" in b and "aht remote paths box --add" in b
+           for b in d.get("blockers", [])),
+       f"a project outside every mapped folder is refused ({d.get('blockers')})")
+
+    # identity refusals on Hand Over: another folder there; box's own project
+    projI = phome / "code" / "idt"
+    projI.mkdir(parents=True)
+    (projI / "x.txt").write_text("x\n")
+    prun("tag", str(projI), "--apply")
+    farI = bhome / "code" / "idt"
+    (farI / ".aht").mkdir(parents=True)
+    (farI / ".aht" / ".project-id").write_text("0" * 32)
+    (farI / "theirs.txt").write_text("t\n")
+    d1 = prun("handover", str(projI), "--to", "box", "--json")
+    shutil.rmtree(farI)
+    shutil.copytree(projI, farI)
+    brun("tag", str(farI), "--apply")
+    d2 = prun("handover", str(projI), "--to", "box", "--json")
+    ck(any("on box, /home/code/idt holds another folder (2 items)" in b
+           for b in d1.get("blockers", []))
+       and (d1.get("identity") or {}).get("fix")
+       == f"aht remote paths box --add {phome / 'code'} /home/code/pc"
+       and any("is a live project of its own there" in b for b in d2.get("blockers", [])),
+       f"identity: another folder there, or box's own live project, blocks a hand over "
+       f"({d1.get('blockers')}, {d2.get('blockers')})")
+    # …unless this machine's records say the project came home from that very
+    # folder there: its `returned`, the lists of the last time both copies
+    # agreed (there/box.json), or a record of what left
+    iuid = read_text_or_none(projI / ".aht" / ".project-id")
+    regp = phome / ".aht" / "registry.json"
+    def set_returned(rec):
+        rg = json.loads(regp.read_text())
+        rg["projects"][iuid]["returned"] = rec
+        regp.write_text(json.dumps(rg))
+    own = lambda dd: any("is a live project of its own there" in b
+                         for b in dd.get("blockers", []))
+    set_returned({"from": "box", "at": "2026-10-20T10:00:00", "mode": "away",
+                  "from_path": "/home/code/idt", "session": None})
+    d3 = prun("handover", str(projI), "--to", "box", "--json")
+    set_returned({"from": "lab", "at": "2026-10-20T10:00:00", "mode": "away",
+                  "from_path": "/home/code/idt", "session": None})
+    d4 = prun("handover", str(projI), "--to", "box", "--json")
+    set_returned(None)
+    thd = phome / ".aht" / "handover" / str(iuid) / "there"
+    thd.mkdir(parents=True)
+    (thd / "box.json").write_text(json.dumps({"v": 2, "kind": "take-back", "remote": "box",
+                                              "there": {},
+                                              "remote_path": str(box) + "/home/code/idt"}))
+    d5 = prun("handover", str(projI), "--to", "box", "--json")
+    (thd / "box.json").write_text(json.dumps({"v": 2, "kind": "sync", "remote": "box",
+                                              "there": {},
+                                              "remote_path": str(box) + "/home/code/idt"}))
+    d6 = prun("handover", str(projI), "--to", "box", "--json")
+    shutil.rmtree(thd)
+    ck(not own(d3) and (d3.get("identity") or {}).get("ok")
+       and any("it came back from there" in w for w in d3.get("warnings", []))
+       and own(d4) and not own(d5) and own(d6),
+       f"identity: box's aht lists it as its own, but it came back from that folder there "
+       f"(returned, or there/box.json of a take-back): Hand Over goes into it; from another "
+       f"machine, or after a sync only, it does not ({d3.get('blockers')}, "
+       f"{d4.get('blockers')}, {d5.get('blockers')}, {d6.get('blockers')})")
+    # what aht 0.13.0 left: the same path there, a `returned` without a mode
+    # or the path there, named after the host; or only its record of what left
+    projK = phome / "old13" / "k"
+    projK.mkdir(parents=True)
+    (projK / "x.txt").write_text("x\n")
+    prun("tag", str(projK), "--apply")
+    kuid = read_text_or_none(projK / ".aht" / ".project-id")
+    prun("remote", "paths", "box", "--add", str(projK.parent), str(projK.parent))
+    farK = Path(str(box) + str(projK))
+    shutil.copytree(projK, farK)
+    brun("tag", str(farK), "--apply")
+    k1 = prun("handover", str(projK), "--to", "box", "--json")
+    rg = json.loads(regp.read_text())
+    rg["projects"][kuid]["returned"] = {
+        "from": __import__("platform").node().split(".")[0], "left": "2026-10-01T09:00:00",
+        "at": "2026-10-02T09:00:00", "session": None, "handed_over": None, "updated": 0,
+        "new": 0, "deleted": 0, "conflicts": []}
+    regp.write_text(json.dumps(rg))
+    k2 = prun("handover", str(projK), "--to", "box", "--json")
+    rg["projects"][kuid].pop("returned")
+    regp.write_text(json.dumps(rg))
+    khd = phome / ".aht" / "handover" / str(kuid)
+    khd.mkdir(parents=True, exist_ok=True)
+    (khd / "manifest-20261001-090000.json").write_text(json.dumps(
+        {"uuid": kuid, "project": str(projK), "remote": "box", "at": "2026-10-01T09:00:00",
+         "here": {}, "there": {}, "transcripts": {}}))
+    k3 = prun("handover", str(projK), "--to", "box", "--json")
+    prun("remote", "paths", "box", "--remove", str(projK.parent))
+    ck(own(k1) and not own(k2) and not own(k3) and k2.get("there_path") == str(projK),
+       f"identity: a copy aht 0.13.0 left at the same path there goes on with Hand Over after "
+       f"the update ({k1.get('blockers')}, {k2.get('blockers')}, {k3.get('blockers')})")
+
+    # a claude there that gives no version: blocked, no install planned
+    projC = phome / "code" / "cver"
+    projC.mkdir(parents=True)
+    (projC / "x.txt").write_text("x\n")
+    prun("tag", str(projC), "--apply")
+    noversion = ("import sys, aht\n"
+                 "orig = aht.Remote.connect\n"
+                 "def connect(self, path=None, fs=False):\n"
+                 "    info = orig(self, path, fs)\n"
+                 "    info['claude'], info['claude_version'] = '/opt/x/claude', None\n"
+                 "    return info\n"
+                 "aht.Remote.connect = connect\n"
+                 "sys.exit(aht.main(['handover', sys.argv[1], '--to', 'box', '--json']))\n")
+    d = J(subprocess.run([PY, "-c", noversion, str(projC)], capture_output=True, text=True,
+                         env=dict(penv, PYTHONPATH=str(HERE.parent))))
+    ck(any("Claude Code on box did not answer `claude --version`" in b
+           for b in d.get("blockers", []))
+       and not (d.get("plan") or {}).get("install_claude"),
+       f"a Claude Code there that gives no version blocks, rather than an install every time "
+       f"({d.get('blockers')})")
+
+    # a project a PC handed over: box cannot send it back (the PC is never
+    # asked), its copy row says where it came from
+    projP = phome / "code" / "frompc"
+    projP.mkdir(parents=True)
+    (projP / "x.txt").write_text("x\n")
+    prun("tag", str(projP), "--apply")
+    d = prun("handover", str(projP), "--to", "box", "--apply", "--no-start", "--json",
+             AHT_AS_WINDOWS="1")
+    farP = bhome / "code" / "frompc"
+    db = J(brun("send-back", str(farP), "--json"))
+    crow = subprocess.run([PY, "-c", "import sys, json, aht; print(json.dumps("
+                           "aht._copy_row(sys.argv[1])))", str(farP)], capture_output=True,
+                          text=True, env=dict(benv, PYTHONPATH=str(HERE.parent))).stdout
+    crow = json.loads(crow) if crow.strip().startswith("{") else {}
+    ck(d.get("applied") and any("is a Windows PC, which aht cannot ask: take it back on pc" in b
+                                for b in db.get("blockers", []))
+       and crow.get("system") == "Windows" and crow.get("kind") == "handover",
+       f"send-back of what a PC handed over: refused, take it back on pc; its copy row names "
+       f"the PC's system ({d.get('error') or db.get('blockers')}, {crow})")
+
+    # git: a PC with autocrlf on hands over; .git/config stays as it is
+    projG = phome / "code" / "gitp"
+    projG.mkdir(parents=True)
+    (projG / "f.txt").write_text("x\n")
+    if shutil.which("git"):
+        subprocess.run(["git", "init", "-q", str(projG)], capture_output=True)
+        subprocess.run(["git", "-C", str(projG), "config", "core.autocrlf", "true"],
+                       capture_output=True)
+        gc = (projG / ".git" / "config").read_bytes()
+        prun("tag", str(projG), "--apply")
+        d = prun("handover", str(projG), "--to", "box", "--json", AHT_AS_WINDOWS="1")
+        d2 = prun("handover", str(projG), "--to", "box", "--apply", "--json",
+                  AHT_AS_WINDOWS="1")
+        cmds = [p.read_text() for p in (bhome / ".aht" / "remote" / "run").glob("*/command.txt")]
+        cmd = next((c for c in cmds if "/home/code/gitp" in c), "")
+        ck(d.get("git", {}).get("suggest") == ["* text=auto", "*.sh text eol=lf",
+                                               "*.bat text eol=crlf", "*.cmd text eol=crlf",
+                                               "*.ps1 text eol=crlf"]
+           and not (projG / ".gitattributes").exists() and d2.get("applied")
+           and "GIT_CONFIG_KEY_0=core.autocrlf GIT_CONFIG_VALUE_0=true" in cmd
+           and (projG / ".git" / "config").read_bytes() == gc
+           and (box / "home" / "code" / "gitp" / ".git" / "config").read_bytes() == gc,
+           f"git: the .gitattributes lines are suggested, never written; the session there "
+           f"gets core.autocrlf through GIT_CONFIG_*; no .git/config is edited ({cmd[:200]})")
+    else:
+        print("  SKIP git is not installed: the git settings test needs it")
+    ck(not fx, f"the phase-7 JSON keeps the shape of tests/fixtures/phase7 ({fx})")
+    for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
+        rec = json.loads(w.read_text())
+        if rec.get("alive"):
+            try:
+                os.kill(int(rec["pid"]), 15)
+            except OSError:
+                pass
+
+def stat_mode(p) -> int:
+    return os.stat(p).st_mode & 0o777
 
 def handover_suite():
     box = Path(os.path.realpath(sb)) / "box"    # a folder standing in for the machine
@@ -3073,6 +3717,7 @@ def handover_suite():
 
     phase1_suite(box, bhome, stubs, henv, hrun, J, hook, project_row)
     phase5_suite(henv, hrun, J, project_row)
+    phase7_suite(stubs, henv, J)
 
     for w in (bhome / ".faketmux").glob("*.json"):   # the stand-in sessions
         rec = json.loads(w.read_text())
@@ -3083,7 +3728,8 @@ def handover_suite():
                 pass
 
 if os.name == "nt":
-    print("  SKIP a PC hands projects over in a later version ([16c] tests the copy itself)")
+    print("  SKIP the handover suite's stand-ins (tmux, a far sh) need macOS or Linux; "
+          "[16c] tests the copy itself here and [16g] the rules across systems")
 elif handover_name(sb) > 255:
     print(f"  SKIP the sandbox's path is too long for this test: the other machine's "
           f"history folder name holds it twice, {handover_name(sb)} characters where 255 "
@@ -3310,6 +3956,264 @@ ck(got.get("sent") == ["A-first"]
    f"Keep in sync: a project released or handed over during a run is not sent ({got})")
 
 transport_suite()
+
+def phase7_pure():
+    """[16g] across systems, pure parts (any system): where a project goes on
+    another machine (map_path, ntpath and posixpath), names a disk cannot
+    hold, safe names, the trust key, git's settings, line endings, the
+    identity check and the plan of a way back (return_plan)."""
+    print("\n[16g] handover between all three systems: the rules (any system)")
+    mp = core.map_path
+    ck(mp("/Users/me/code/shop", "home", "/Users/me", "/home/me", "Darwin", "Linux")
+       == "/home/me/code/shop"
+       and mp("/home/me/code/shop", "home", "/Users/me", "/home/me", "Darwin", "Linux",
+              back=True) == "/Users/me/code/shop"
+       and mp("/Users/me", "home", "/Users/me", "/home/me", "Darwin", "Linux") == "/home/me",
+       "map_path: below the home folder here, below the home folder there, both ways")
+    ck(mp("/Users/me/code/shop", "home", "/Users/me", "C:\\Users\\me", "Darwin", "Windows")
+       == "C:\\Users\\me\\code\\shop"
+       and mp("C:\\Users\\me\\code\\shop", "home", "/Users/me", "C:\\Users\\me", "Darwin",
+              "Windows", back=True) == "/Users/me/code/shop"
+       and mp("c:/users/ME/code/shop", "home", "/Users/me", "C:\\Users\\me", "Darwin",
+              "Windows", back=True) == "/Users/me/code/shop"
+       and mp("C:\\Users\\me\\x", "home", "C:\\Users\\me", "/home/me", "Windows", "Linux")
+       == "/home/me/x",
+       "map_path: a Mac computes a PC's path (ntpath) and back; a drive's names ignore case")
+    pairs = [["D:\\work", "/Users/me/work"], ["D:\\work\\big", "/Volumes/big"]]
+    ck(mp("D:\\work\\big\\a", pairs, "C:\\Users\\me", "/Users/me", "Windows", "Darwin")
+       == "/Volumes/big/a"
+       and mp("D:\\work\\shop", pairs, "C:\\Users\\me", "/Users/me", "Windows", "Darwin")
+       == "/Users/me/work/shop"
+       and mp("C:\\Users\\me\\x", pairs, "C:\\Users\\me", "/Users/me", "Windows", "Darwin")
+       == "/Users/me/x"
+       and mp("E:\\x", pairs, "C:\\Users\\me", "/Users/me", "Windows", "Darwin") is None
+       and mp("/Users/me/work/shop", pairs, "C:\\Users\\me", "/Users/me", "Windows", "Darwin",
+              back=True) == "D:\\work\\shop",
+       "map_path: pairs tried longest first, then the two homes; outside every rule: None")
+    ck(mp("/a/b", "same", "/Users/me", "/home/me", "Darwin", "Linux") == "/a/b"
+       and mp("/a/b", "same", "/Users/me", "C:\\Users\\me", "Darwin", "Windows") is None
+       and mp("/Users/me/../etc", "home", "/Users/me", "/home/me") is None
+       and mp("/Users/meow/x", "home", "/Users/me", "/home/me") is None,
+       "map_path: same keeps the path (never across systems); no .., no look-alike prefix")
+    # a part that is a path of its own where it goes (a\..\x, a drive, x:y)
+    # would land outside the folder it maps to: refused, both ways
+    ck(mp("/Users/me/a\\..\\..\\..\\Windows\\Temp\\x", "home", "/Users/me", "C:\\Users\\me",
+          "Darwin", "Windows") is None
+       and mp("/Users/me/D:", "home", "/Users/me", "C:\\Users\\me", "Darwin", "Windows") is None
+       and mp("/Users/me/x:y", "home", "/Users/me", "C:\\Users\\me", "Darwin", "Windows") is None
+       and mp("/Users/me/work/D:", pairs, "C:\\Users\\me", "/Users/me", "Windows", "Darwin",
+              back=True) is None
+       and mp("/home/me/a\\..\\..\\Windows", "home", "C:\\Users\\me", "/home/me", "Windows",
+              "Linux", back=True) is None
+       and mp("/home/me/E:", "home", "C:\\Users\\me", "/home/me", "Windows", "Linux",
+              back=True) is None
+       and mp("/home/me/a\\b", "home", "/Users/me", "/home/me", "Darwin", "Linux",
+              back=True) == "/Users/me/a\\b"
+       and mp("/Users/me/x:y", "home", "/Users/me", "/home/me", "Darwin", "Linux") == "/home/me/x:y"
+       and mp("/Users/me/work/shop", [["D:", "/Users/me/work"]], "C:\\Users\\me", "/Users/me",
+              "Windows", "Darwin", back=True) == "D:\\shop"
+       and mp("/Users/me/code/a b", "home", "/Users/me", "C:\\Users\\me", "Darwin", "Windows")
+       == "C:\\Users\\me\\code\\a b",
+       "map_path: a part with a separator of the other side, a drive or a colon is refused, to "
+       "a PC and back from one; a backslash between a Mac and Linux is a name's own")
+    # names a disk cannot hold
+    m = {"files": {k: [1, 1] for k in ("aux.md", "Aux.MD.txt", "a:b.txt", "COM1", "x.",
+                                       "y ", "fine/auxiliary.md", "ok.txt", "q?.md")},
+         "raw": {}, "dirs": ["fine"], "modes": {}, "twins": {}}
+    m["files"]["lnk"] = ["l", "target"]
+    rows = {r["kind"]: r for r in core.name_problems(m, {"system": "Windows",
+                                                         "symlinks": False})}
+    names = lambda k: sorted(x[0] for x in (rows.get(k) or {}).get("names", []))
+    ck(names("reserved") == ["Aux.MD.txt", "COM1", "aux.md"]
+       and names("windows_char") == ["a:b.txt", "q?.md"] and names("trailing") == ["x.", "y "]
+       and names("symlink") == ["lnk"] and "fine/auxiliary.md" not in str(rows)
+       and rows["reserved"]["text"] == "a name Windows reserves",
+       f"names Windows cannot hold: reserved, characters, a trailing dot or space, links ({rows})")
+    longp = {"files": {"d/" + "n" * 240 + ".txt": [1, 1]}, "raw": {}, "dirs": ["d"]}
+    ck([r["kind"] for r in core.name_problems(longp, {"system": "Windows",
+                                                       "long_paths": False},
+                                              root="C:\\Users\\me\\code\\shop")]
+       == ["long_path"]
+       and not core.name_problems(longp, {"system": "Windows", "long_paths": True},
+                                  root="C:\\Users\\me\\code\\shop")
+       and not core.name_problems(m, {"system": "Linux", "case_sensitive": True}),
+       "a path over 259 characters only where Windows lacks long paths; Linux holds them all")
+    ck(core._safe_name("a:b.txt") == "a%3Ab.txt" and core._safe_name("aux.md") == "%61ux.md"
+       and core._safe_name("d/x.") == "d/x%2E" and core._safe_name("50%.md") == "50%25.md"
+       and core._cannot_hold(core._safe_name("q?/aux.md"), {"system": "Windows"}) is None,
+       "safe names: reversible, and Windows holds every one")
+    ck(core._trust_key("C:\\Users\\me\\x") == "C:/Users/me/x"
+       and core._key_claude("C:\\Users\\me\\x") == "C--Users-me-x"
+       and (os.name == "nt" or core._trust_key("/home/me/x") == "/home/me/x"),
+       "Windows: the trust key with forward slashes, the history under C--Users-me-x")
+    gs = core.git_settings
+    ck(gs("Windows", "Darwin", False) == {"core.filemode": "false"}
+       and gs("Linux", "Windows", True) == {"core.autocrlf": "true"}
+       and gs("Linux", "Windows", False) == {} and gs("Darwin", "Linux", True) == {}
+       and core.git_env_vars({"core.filemode": "false"}) == {
+           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.filemode",
+           "GIT_CONFIG_VALUE_0": "false"},
+       "git's settings for sessions aht starts: filemode off on a Windows holder, autocrlf "
+       "from a Windows home that has it on; as GIT_CONFIG_* variables")
+    ck(core.can_send_projects() and {"desktop.ini", "Thumbs.db", "ehthumbs.db", "aht-badge.ico",
+                                     "$RECYCLE.BIN", "System Volume Information"}
+       <= set(core.HANDOVER_SKIP),
+       "projects move from every system; Windows' own files stay behind")
+    # line endings
+    ed = sb / "eol"
+    ed.mkdir(exist_ok=True)
+    (ed / "lf").write_bytes(b"a\nb\n")
+    (ed / "crlf").write_bytes(b"a\r\nb\r\n")
+    (ed / "mixed").write_bytes(b"a\r\nb\n")
+    (ed / "bin").write_bytes(b"a\0\r\n")
+    f = {n: core.eol_facts(ed / n) for n in ("lf", "crlf", "mixed", "bin")}
+    ck(f["lf"]["style"] == "lf" and f["crlf"]["style"] == "crlf" and f["mixed"]["style"] == "mixed"
+       and f["bin"]["style"] == "binary" and f["lf"]["norm"] == f["crlf"]["norm"]
+       and f["lf"]["raw"] != f["crlf"]["raw"],
+       "line endings: a file's style, and its checksum with CRLF read as LF")
+    os.utime(ed / "crlf", (1_000_000_000, 1_000_000_000))
+    ck(core.restyle(str(ed / "crlf"), "lf") and (ed / "crlf").read_bytes() == b"a\nb\n"
+       and int(os.stat(ed / "crlf").st_mtime) == 1_000_000_000
+       and core.restyle(str(ed / "lf"), "crlf") and (ed / "lf").read_bytes() == b"a\r\nb\r\n",
+       "a file gets back the line endings it left with, its time kept")
+    # the same project there, or nothing
+    ic = core.identity_check
+    rows = [ic({"path_exists": False}, "u1", "on box", "/x", "fix")[1],
+            ic({"path_exists": True, "path_entries": 0}, "u1", "on box", "/x", "fix")[1],
+            ic({"path_exists": True, "path_entries": 4, "path_marker": "u1",
+                "path_owner": "copy"}, "u1", "on box", "/x", "fix")[1],
+            ic({"path_exists": True, "path_entries": 4, "path_marker": "u2",
+                "path_owner": "none"}, "u1", "on box", "/x", "fix")[1],
+            ic({"path_exists": True, "path_entries": 4, "path_marker": "u1",
+                "path_owner": "own"}, "u1", "on box", "/x", "fix")[1],
+            ic({"path_exists": True, "path_entries": 4, "path_marker": None,
+                "path_owner": "none"}, "u1", "on box", "/x", "fix")[1]]
+    ck(rows[:3] == [None, None, None] and "holds another folder (4 items)" in rows[3]
+       and "live project of its own" in rows[4] and "holds another folder" in rows[5],
+       f"identity: a missing or empty folder, or this project's copy; never another folder, "
+       f"nor that machine's own live project ({rows[3:]})")
+    # the plan of a way back
+    base = {"here": {"project": {"a.txt": [2, 1], "b.txt": [2, 1], "c.txt": [2, 1],
+                                 ".aht/.project-id": [3, 1], "gone.txt": [1, 1]},
+                     "history": {"s1.jsonl": [10, 1]}},
+            "there": {"project": {"a.txt": [2, 1], "b.txt": [2, 1], "c.txt": [2, 1],
+                                  ".aht/.project-id": [3, 1], "gone.txt": [1, 1]},
+                      "history": {"s1.jsonl": [10, 1]}},
+            "transcripts": {"s1.jsonl": [10, "h"]}}
+    ours = {"project": {"files": dict(base["here"]["project"], **{"c.txt": [3, 2]})},
+            "history": {"files": {"s1.jsonl": [10, 1]}}}
+    theirs = {"project": {"files": {"a.txt": [4, 2], "b.txt": [4, 2], "c.txt": [4, 2],
+                                    "new:x.txt": [1, 2], "ok.txt": [1, 2]},
+                          "raw": {}},
+              "history": {"files": {"s1.jsonl": [20, 2]}, "raw": {}}}
+    need = core.return_needs(base, ours, theirs)
+    eol = {"a.txt": {"here": {"raw": "1", "norm": "n", "style": "lf"},
+                     "there": {"raw": "2", "norm": "n", "style": "crlf"}},
+           "b.txt": {"here": {"raw": "1", "norm": "n", "style": "lf"},
+                     "there": {"raw": "3", "norm": "m", "style": "crlf"}}}
+    win = {"system": "Windows"}
+    rp = core.return_plan(base, ours, theirs, prefix_ok={"s1.jsonl": False},
+                          written_by={"s1.jsonl": "2.0.0"}, here_claude="2.0.0", eol=eol,
+                          here_facts=win, here_root="C:\\p")
+    ck(need == {"prefix": {"s1.jsonl": 10}, "written_by": {"s1.jsonl": 10},
+                "eol": ["a.txt", "b.txt", "c.txt"]}
+       and rp["eol_only"] == ["a.txt"] and rp["eol_keep"] == {"b.txt": "lf"}
+       and rp["project"]["take"] == ["b.txt"] and rp["project"]["conflict"] == ["c.txt"]
+       and rp["history"]["conflict"] == ["s1.jsonl"] and not rp["history"]["take"]
+       and [u["kept_as"] for u in rp["unsafe"]] == ["new%3Ax.txt"]
+       and rp["project"]["new"] == ["ok.txt"]
+       and rp["project"]["delete"] == ["gone.txt"] and not rp["blockers"],
+       f"return_plan: endings only stay, a flipped file keeps its style, a transcript that does "
+       f"not continue is kept twice, names this disk cannot hold go aside, .aht/ stays ({rp})")
+    rp2 = core.return_plan(base, ours, theirs, prefix_ok={"s1.jsonl": True},
+                           written_by={"s1.jsonl": "2.1.0"}, here_claude="2.0.0",
+                           prefer="there", there_name="pc", home_name="mac")
+    rp3 = core.return_plan(base, ours, theirs, prefix_ok={"s1.jsonl": True},
+                           written_by={"s1.jsonl": "2.1.0"}, here_claude="2.0.0",
+                           ignore_version=True)
+    ck(rp2["history"]["take"] == ["s1.jsonl"] and "c.txt" in rp2["project"]["take"]
+       and rp2["conflicts"] == {"project": ["c.txt"]}
+       and rp2["blockers"] == ["Claude Code 2.1.0 was used on pc, mac has 2.0.0: an older "
+                               "version may not read the newer history — update Claude Code "
+                               "on mac first (or pass --ignore-version)"]
+       and not rp3["blockers"] and rp3["warnings"],
+       "return_plan: a continued transcript comes; a newer Claude Code blocks unless "
+       "--ignore-version; --prefer there takes theirs")
+    ck(core.plan_id(rp, ours, theirs) == core.plan_id(core.return_plan(
+           base, ours, theirs, prefix_ok={"s1.jsonl": False}, written_by={"s1.jsonl": "2.0.0"},
+           here_claude="2.0.0", eol=eol, here_facts=win, here_root="C:\\p"), ours, theirs)
+       and core.plan_id(rp, ours, theirs) != core.plan_id(rp2, ours, theirs),
+       "a plan's id: the same inputs, the same plan; another plan, another id")
+    # a take-back on a PC without long paths: a file whose path is too long
+    # here is as long below kept-aside/, so it is kept under a short name of
+    # one part, and the take-back never stops over such files
+    longk = "deep/" + "d" * 120 + "/notes about the trip.txt"
+    lroot = "C:\\Users\\me\\code\\" + "p" * 130
+    rpl = core.return_plan(
+        {"here": {"project": {}, "history": {}}, "there": {"project": {}, "history": {}}},
+        {"project": {"files": {}}, "history": {"files": {}}},
+        {"project": {"files": {longk: [5, 2], "a:b.txt": [1, 2]}, "raw": {}},
+         "history": {"files": {}, "raw": {}}},
+        prefix_ok={}, written_by={}, here_claude=None,
+        here_facts={"system": "Windows", "long_paths": False}, here_root=lroot)
+    ck([(u["there"], u["kept_as"]) for u in rpl["unsafe"]]
+       == [("a:b.txt", "a%3Ab.txt"), (longk, "1-notes about the trip.txt")]
+       and core._flat_aside("d/" + "n" * 200 + ".txt", 3) == "3-" + "n" * 37 + ".txt"
+       and core._flat_aside("x/aux.", 0) == "0-aux%2E",
+       f"kept aside on a PC: a path too long there gets a short name of one part, the list "
+       f"names the file as it was ({rpl['unsafe']})")
+    class Kept:                     # the far end: names come, kept-aside files do not
+        def __init__(self):
+            self.renamed = None
+        def fetch(self, src, dst, entries=None, aside=None, rename=None, **kw):
+            if rename:
+                self.renamed = dict(rename)
+                return {"ok": False, "error": "File name too long", "problems": []}
+            for k in entries:
+                t = Path(dst) / k
+                t.parent.mkdir(parents=True, exist_ok=True)
+                t.write_text("x")
+            return {"ok": True}
+    kt = sb / "kept-tree"
+    kt.mkdir()
+    kr = Kept()
+    try:
+        kd = core._pull_tree(kr, {"take": [], "new": ["ok.txt"], "delete": [], "conflict": [],
+                                  "kept": []}, "/far", str(kt), {}, sb / "kept-x" / "project",
+                             "box", False, [], False,
+                             unsafe=[{"key": longk, "there": longk,
+                                      "kept_as": "0-notes about the trip.txt"}])
+    except core.HandoverError as x:
+        kd = {"raised": str(x)}
+    ck((kt / "ok.txt").is_file() and kd.get("unsafe") == []
+       and kd.get("unsafe_failed") == [{"there": longk, "key": longk,
+                                        "error": "File name too long"}],
+       f"a take-back goes on when files kept aside do not come: they are named ({kd})")
+    deep = sb / ("a" * 120) / ("b" * 120) / "project"
+    os.environ.update(AHT_AS_WINDOWS="1", AHT_SHORT_PATHS="1")
+    try:
+        kr2 = Kept()
+        core._pull_tree(kr2, {"take": [], "new": [], "delete": [], "conflict": [], "kept": []},
+                        "/far", str(kt), {}, deep, "box", False, [], False,
+                        unsafe=[{"key": "x/a:b.txt", "there": "x/a:b.txt",
+                                 "kept_as": "x/a%3Ab.txt"}])
+    except core.HandoverError:
+        pass
+    finally:
+        del os.environ["AHT_AS_WINDOWS"], os.environ["AHT_SHORT_PATHS"]
+    ck(kr2.renamed == {"x/a:b.txt": "0-a%3Ab.txt"},
+       f"kept aside where even the safe name's path is too long: a short name ({kr2.renamed})")
+    # the line to continue a session, as a PC's cmd.exe runs it
+    env8 = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.filemode",
+            "GIT_CONFIG_VALUE_0": "false"}
+    ck(core.env_prefix(env8, nt=True) == 'set "GIT_CONFIG_COUNT=1" && set "GIT_CONFIG_KEY_0='
+       'core.filemode" && set "GIT_CONFIG_VALUE_0=false" && '
+       and core.env_prefix(env8, nt=False) == "export GIT_CONFIG_COUNT=1; export "
+       "GIT_CONFIG_KEY_0=core.filemode; export GIT_CONFIG_VALUE_0=false; "
+       and core.env_prefix({}, nt=True) == "" and core.env_prefix({"bad name": "x"}) == "",
+       "the continue line: set \"K=V\" && for cmd.exe on a PC, export in sh")
+
+phase7_pure()
 
 print("\n[17] across agents: search, secrets, journal, rules, switch, board")
 from datetime import datetime, timezone
@@ -4253,6 +5157,8 @@ class _Rem:
     info = {"home": "/h", "claude_home": "/h/.claude"}
     def path(self, p):
         return p
+    there = path
+    _logical = path
     def spec(self, p):
         return p
     def agent(self, *a, **kw):
@@ -4646,6 +5552,21 @@ ck(r.returncode == 0 and "new" in json.loads((wb / ".aht" / "config.json").read_
    and {"box", "lab"} <= set(bj),
    f"remote add: nothing heard from an earlier machine of that name is kept "
    f"({r.stderr.strip()[-200:]}, {sorted(bj)})")
+# added again under its name: what was chosen for it stays (its paths and
+# pairs, whether it is watched), and what it said before
+wcfg = wb / ".aht" / "config.json"
+cj = json.loads(wcfg.read_text())
+first_mid = cj["remotes"]["new"].get("machine_id")
+cj["remotes"]["new"].update(paths=[["/Users/me/work", "/home/me/work"]], watch=True,
+                            machine_id="feedfacecafe")
+wcfg.write_text(json.dumps(cj))
+r = subprocess.run([PY, CLI, "remote", "add", "new", "me@127.0.0.5"], env=we,
+                   capture_output=True, text=True)
+nr = json.loads(wcfg.read_text())["remotes"]["new"]
+ck(r.returncode == 0 and nr.get("paths") == [["/Users/me/work", "/home/me/work"]]
+   and nr.get("watch") is True and nr.get("home")
+   and nr.get("machine_id") == (first_mid or "feedfacecafe"),
+   f"remote add again: its paths (pairs too), Watch and what it said are kept ({nr})")
 old_board("new")
 r = subprocess.run([PY, CLI, "remote", "remove", "new"], env=we, capture_output=True, text=True)
 bj = json.loads(bjson.read_text())

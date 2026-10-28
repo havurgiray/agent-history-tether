@@ -249,11 +249,36 @@ def refresh(force=False):
     shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
 
-def act_open_window():
+def act_open_window(project=None, do="show"):
     """aht's window: a page aht.exe serves to this computer only, in an app
-    window of Edge or Chrome."""
+    window of Edge or Chrome.  `project`: the folder it opens on, and `do`
+    ("send-back": with Send Back's dry run open), passed to `aht window` in
+    its environment (aht_web.open_hint)."""
+    env = dict(os.environ, AHT_WINDOW_PROJECT=project, AHT_WINDOW_DO=do) if project else None
     subprocess.Popen(winlayer.self_cmd("window"), creationflags=winlayer.CREATE_NO_WINDOW,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+
+def brought_here(copies=None):
+    """The folders on this PC that Bring Here brought from another machine
+    (~/.aht/remote/copies.json, kind "brought"), newest first:
+    [(path, name, from)], at most 10.  Not one whose home is a PC (`system`
+    "Windows"): aht cannot ask a PC, so it goes back from there, not with
+    Send Back here."""
+    try:
+        copies = aht.read_copies() if copies is None else copies
+    except Exception:
+        return []
+    rows = sorted(((str(c.get("at") or ""), p, str(c.get("from") or "the other machine"))
+                   for p, c in copies.items()
+                   if isinstance(c, dict) and c.get("kind") == "brought"
+                   and c.get("system") != "Windows"), reverse=True)
+    return [(p, p.rstrip("\\/").replace("\\", "/").rsplit("/", 1)[-1] or p, frm)
+            for _, p, frm in rows[:10]]
+
+
+def _send_back(path):
+    return lambda: act_open_window(path, "send-back")
 
 
 NOTICING = [False]
@@ -700,6 +725,13 @@ def build_menu():
     sep(root)
 
     add(root, "Open aht…", act_open_window)
+    # projects of another machine's, brought here: each opens the window on
+    # it, with Send Back's dry run
+    brought = brought_here()
+    if brought:
+        back = submenu(root, "Projects brought here")
+        for path, name, frm in brought:
+            add(back, f"{name} — Send Back to {frm}…", _send_back(path))
     sep(root)
     add(root, "Reconcile now", act_reconcile)
     add(root, "Pause watching" if running else "Resume watching",

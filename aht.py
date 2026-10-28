@@ -41,7 +41,9 @@ from __future__ import annotations   # 3.9-safe
 import errno
 import fnmatch
 import hashlib
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -3343,13 +3345,31 @@ def cmd_status(args):
     return 0
 
 def _copy_row(path: str):
-    """`projects --json` "copy_of": {from, kind, at} when this machine notes
-    the folder as a copy of another machine's project; else None."""
+    """`projects --json` "copy_of": {from, kind, at, from_path, remote, system}
+    when this machine notes the folder as a copy of another machine's project
+    (`system`: that machine's; a Windows PC's copy goes back by Take Back
+    there); else None."""
     try:
         c = copy_of(path)
     except Exception:
         return None
-    return {"from": c.get("from"), "kind": c.get("kind"), "at": c.get("at")} if c else None
+    if not c:
+        return None
+    rem = c.get("remote") if c.get("remote") in remotes_config() else \
+        _remote_for(c.get("from"), c.get("from_id"))
+    return {"from": c.get("from"), "kind": c.get("kind"), "at": c.get("at"),
+            "from_path": c.get("from_path"), "remote": rem, "system": c.get("system")}
+
+def _remote_for(name, mid=None):
+    """This machine's name for another machine: the one whose id it noted,
+    else the one of that name; None when none is set up."""
+    rs = remotes_config()
+    if mid:
+        hit = next((n for n, s in rs.items() if isinstance(s, dict)
+                    and s.get("machine_id") == mid), None)
+        if hit:
+            return hit
+    return name if name in rs else None
 
 def cmd_projects(args):
     reg = load_registry()
@@ -3374,6 +3394,14 @@ def cmd_projects(args):
                "away": (e.get("away") or {}).get("host"),
                "away_remote": (e.get("away") or {}).get("remote"),
                "away_since": (e.get("away") or {}).get("since"),
+               # "here": handed over from here (Take Back here); "there":
+               # brought there by that machine (Send Back there, or Release)
+               "away_driven_by": ((e.get("away") or {}).get("driven_by") or "here")
+               if e.get("away") else None,
+               "away_holder": (e.get("away") or {}).get("holder")
+               or (e.get("away") or {}).get("host"),
+               "away_path": (e.get("away") or {}).get("remote_path"),
+               "away_system": (e.get("away") or {}).get("system"),
                "mirror": (e.get("mirror") or {}).get("remote")
                if (e.get("mirror") or {}).get("enabled") else None,
                "mirror_synced_at": (e.get("mirror") or {}).get("synced_at"),
@@ -3386,7 +3414,7 @@ def cmd_projects(args):
                if (e.get("mirror") or {}).get("enabled") else None,
                "handing": handing_row(e.get("handing"), uid),
                # this folder is a copy of another machine's project
-               # (copies.json): {from, kind, at}
+               # (copies.json): {from, kind, at, from_path, remote, system}
                "copy_of": _copy_row(e["real_path"]),
                # an open hand-off to another agent: what Hand Back answers
                "relay": project_relay(e["real_path"], rels, opens) if rels else None,
@@ -4252,6 +4280,9 @@ HANDOVER_SKIP = (
     # this machine's own metadata
     "Icon\r", ".DS_Store", "._*", ".Spotlight-V100", ".Trashes", ".fseventsd",
     ".aht-rsync-partial", ".aht-partial",
+    # and Windows' own
+    "desktop.ini", "Thumbs.db", "ehthumbs.db", "aht-badge.ico", "$RECYCLE.BIN",
+    "System Volume Information",
     # rebuilt per machine: one OS's binaries are useless on the other
     "node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
     ".pytest_cache", ".next", "DerivedData", ".gradle",
@@ -4265,14 +4296,20 @@ SCRATCH_MAX_BYTES = 100 * 1024 * 1024
 class HandoverError(Exception):
     pass
 
+class OutsideError(HandoverError):
+    """No rule of remotes.<name>.paths reaches the folder."""
+
 class LinkError(HandoverError):
     """The link dropped or the other machine went quiet: whether the last
     step happened there is not known."""
 
 def can_send_projects() -> bool:
     """Projects can move between this machine and another: handover, take
-    back, keep in sync, the night shift and the offsite copy."""
-    return os.name != "nt" and not getattr(sys, "frozen", False)
+    back, Bring Here, Send Back, keep in sync, the night shift and the
+    offsite copy.  Wherever aht runs, since its own copy needs nothing but
+    Python on both sides (a PC hands over and takes back from Mac and Linux
+    machines; it is never asked itself)."""
+    return True
 
 def can_reach_machines() -> bool:
     """Other machines can be asked: their sessions, notices, search and
@@ -4322,6 +4359,232 @@ def _inside(path: str, root: str) -> bool:
     path, root = path.rstrip("/"), root.rstrip("/")
     return path == root or path.startswith(root + "/")
 
+# ---- where a project is on another machine (path mapping) ------------------ #
+#
+# remotes.<name>.paths: "same" (a project keeps its path there), "home" (the
+# path below this machine's home folder is kept below the home folder there),
+# or [[here_prefix, there_prefix], …] pairs, tried longest first, then the
+# two homes.  map_path is a pure function of strings: it uses ntpath or
+# posixpath by system, so a Mac computes a PC's path and a PC a Mac's.
+
+PATH_MODES = ("same", "home")
+
+def _flavour(system):
+    return ntpath if system == "Windows" else posixpath
+
+def _rel_under(p: str, prefix: str, fl):
+    """The parts of `p` below `prefix` ([] for `prefix` itself), as `fl`
+    (ntpath or posixpath) reads paths; None when `p` is not inside it."""
+    if not p or not prefix:
+        return None
+    if fl is ntpath:
+        a, b = p.replace("/", "\\").rstrip("\\"), prefix.replace("/", "\\").rstrip("\\")
+        if re.fullmatch(r"[A-Za-z]:", b):
+            b += "\\"
+        a_, b_ = a.casefold(), b.casefold()     # a drive's names ignore case
+        if a_ == b_.rstrip("\\"):
+            return []
+        if not a_.startswith(b_ if b_.endswith("\\") else b_ + "\\"):
+            return None
+        rest = a[len(b) + (0 if b.endswith("\\") else 1):]
+        parts = [x for x in rest.split("\\") if x]
+    else:
+        a, b = p.rstrip("/") or "/", prefix.rstrip("/") or "/"
+        if a == b:
+            return []
+        if not a.startswith(b if b == "/" else b + "/"):
+            return None
+        parts = [x for x in a[len(b):].split("/") if x]
+    if any(x in (".", "..") for x in parts):
+        return None
+    return parts
+
+def map_path(p: str, rule, here_home: str, there_home: str, here_system: str = None,
+             there_system: str = None, back: bool = False):
+    """Where the folder at `p` is on the other machine (`back`: where the
+    folder at `p` there is here), by `rule` ("same", "home" or a list of
+    [here_prefix, there_prefix] pairs; pairs are tried longest first, then
+    the two homes).  None when no rule reaches it."""
+    src_sys, dst_sys = (there_system, here_system) if back else (here_system, there_system)
+    src, dst = _flavour(src_sys), _flavour(dst_sys)
+    p = str(p or "")
+    if rule in (None, "same"):
+        return p if src is dst and p else None
+    pairs = []
+    if isinstance(rule, list):
+        for pr in rule:
+            if isinstance(pr, (list, tuple)) and len(pr) == 2 and all(
+                    isinstance(x, str) and x for x in pr):
+                pairs.append((pr[1], pr[0]) if back else (pr[0], pr[1]))
+        pairs.sort(key=lambda ab: -len(ab[0]))
+    homes = (there_home, here_home) if back else (here_home, there_home)
+    for a, b in pairs + [homes]:
+        if not (a and b):
+            continue
+        parts = _rel_under(p, a, src)
+        if parts is None:
+            continue
+        # a part that is a path of its own where it goes (a\..\x, D:, x:y)
+        # would land outside the folder it maps to: refused; between a Mac
+        # and Linux a colon is a name's own
+        nt = ntpath in (src, dst)
+        if any((nt and ":" in x) or "/" in x or (dst is ntpath and "\\" in x) for x in parts):
+            return None
+        if dst is ntpath:
+            b = b.replace("/", "\\")
+            b += "\\" if re.fullmatch(r"[A-Za-z]:", b) else ""   # D: alone is D:'s cwd
+        out = dst.join(b, *parts) if parts else b
+        if _rel_under(dst.normpath(out), b, dst) is None:
+            return None
+        return out
+    return None
+
+def _paths_rule(spec: dict):
+    """remotes.<name>.paths as aht reads it: "same", "home", a list of pairs,
+    or None (not chosen yet)."""
+    v = (spec or {}).get("paths")
+    if v in PATH_MODES:
+        return v
+    if isinstance(v, list):
+        return [list(x) for x in v if isinstance(x, (list, tuple)) and len(x) == 2
+                and all(isinstance(y, str) and y for y in x)]
+    return None
+
+def _arg(p: str) -> str:
+    """A path as an argument to type, in any shell: quoted when it has a space."""
+    p = str(p)
+    return f'"{p}"' if re.search(r"[\s'\"&|;<>()$`]", p) else p
+
+def _outside_text(p: str, name: str, here_sys: str = None, there_sys: str = None,
+                  there_home: str = None) -> str:
+    """Why a project at `p` cannot go to (or come from) `name`: no rule maps
+    it; and the rule that would."""
+    hf, tf = _flavour(here_sys), _flavour(there_sys)
+    top = hf.dirname(p.rstrip("/\\")) or p
+    there = tf.join(there_home, hf.basename(top) or "work") if there_home else None
+    return (f"aht moves projects between the home folders of your machines. {p} is outside "
+            f"yours. Tell aht where such projects go on {name}:  aht remote paths {name} "
+            f"--add {_arg(top)} {_arg(there) if there else 'THERE'}")
+
+# ---- names a disk cannot hold ---------------------------------------------- #
+
+_WIN_CHAR = re.compile(r'[<>:"|?*\\\x00-\x1f]')
+_WIN_RESERVED = re.compile(r"(?i)(con|prn|aux|nul|com[1-9¹²³]|"
+                           r"lpt[1-9¹²³])(\..*)?")
+WIN_PATH_MAX = 259
+
+def _win_name_kind(part: str):
+    """Why Windows cannot hold a file named `part` (one part of a path), or
+    None."""
+    if _WIN_CHAR.search(part):
+        return "windows_char"
+    if part.endswith((".", " ")):
+        return "trailing"
+    if _WIN_RESERVED.fullmatch(part):
+        return "reserved"
+    return None
+
+def _my_system() -> str:
+    """This machine's system for the names, line endings and git hints of a
+    move between machines (tests: AHT_AS_WINDOWS=1 makes it Windows there,
+    and nowhere else)."""
+    return "Windows" if os.environ.get("AHT_AS_WINDOWS") else platform.system()
+
+def _can_link(folder: str) -> bool:
+    """Whether this account can make a symbolic link in `folder`: tried
+    (Windows allows it only with developer mode or as an administrator)."""
+    if os.name != "nt" and not os.environ.get("AHT_AS_WINDOWS"):
+        return True
+    if os.environ.get("AHT_AS_WINDOWS") and os.name != "nt":
+        return not os.environ.get("AHT_NO_LINKS")
+    p = os.path.join(folder, f".aht-link-{os.getpid()}-{os.urandom(3).hex()}")
+    try:
+        os.symlink("x", p)
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+    return True
+
+def _long_paths() -> bool:
+    """Whether paths over 260 characters work here (Windows: only with
+    LongPathsEnabled set)."""
+    if os.environ.get("AHT_AS_WINDOWS") and os.name != "nt":
+        return not os.environ.get("AHT_SHORT_PATHS")
+    if os.name != "nt":
+        return True
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Control\FileSystem") as k:
+            return bool(winreg.QueryValueEx(k, "LongPathsEnabled")[0])
+    except Exception:
+        return False
+
+def disk_facts(folder: str) -> dict:
+    """How the disk under `folder` treats names, tried rather than read from
+    settings: {system, case_sensitive, symlinks, long_paths}."""
+    anc = Path(folder)
+    while not anc.exists() and anc != anc.parent:
+        anc = anc.parent
+    return {"system": _my_system(), "case_sensitive": not _ignores_case(str(anc)),
+            "symlinks": _can_link(str(anc)), "long_paths": _long_paths()}
+
+def _safe_name(key: str) -> str:
+    """`key` with every part made a name Windows (and any disk) can hold,
+    reversibly: a%3Ab.txt for a:b.txt, %61ux.md for aux.md."""
+    out = []
+    for part in key.split("/"):
+        s = part.replace("%", "%25")
+        s = _WIN_CHAR.sub(lambda m: "%%%02X" % ord(m.group(0)), s)
+        if s.endswith((".", " ")):
+            s = s[:-1] + "%%%02X" % ord(s[-1])
+        if _WIN_RESERVED.fullmatch(s):
+            s = "%%%02X" % ord(s[0]) + s[1:]
+        out.append(s)
+    return "/".join(out)
+
+def _flat_aside(key: str, n: int) -> str:
+    """A short name of one part for the file `key`, kept aside where its own
+    path would be too long: <n>-<its name, made safe and cut short>."""
+    base = _safe_name(key.rsplit("/", 1)[-1])
+    stem, dot, ext = base.rpartition(".")
+    if not dot or not stem or len(ext) > 12:
+        stem, ext = base, ""
+    stem = stem[:max(8, 40 - len(ext))].rstrip(". ") or "file"
+    return f"{n}-{stem}" + (f".{ext}" if ext else "")
+
+def _too_long_here(p) -> bool:
+    """Whether the path `p` is longer than this Windows can make (no long
+    paths)."""
+    return _my_system() == "Windows" and len(str(p)) > WIN_PATH_MAX and not _long_paths()
+
+def _cannot_hold(key: str, facts: dict, root: str = None):
+    """Why the disk of `facts` cannot hold the file `key` (below `root`), or
+    None."""
+    if (facts or {}).get("system") != "Windows":
+        return None
+    for part in key.split("/"):
+        kind = _win_name_kind(part)
+        if kind:
+            return kind
+    if root and facts.get("long_paths") is False and \
+            len(ntpath.join(root, key.replace("/", "\\"))) > WIN_PATH_MAX:
+        return "long_path"
+    return None
+
+NAME_TEXTS = {
+    "case": "two files whose names differ only in capitals",
+    "unicode": "two files with the same name in two Unicode forms",
+    "windows_char": "contains a character Windows does not allow",
+    "trailing": "Windows would drop the trailing dot or space",
+    "reserved": "a name Windows reserves",
+    "long_path": "the path would be too long on Windows",
+    "symlink": "links cannot be created there for your account",
+}
+
 def handover_dir(uid: str) -> Path:
     return aht_home() / "handover" / uid
 
@@ -4370,16 +4633,20 @@ def _tree_file(root: str, m: dict, k: str) -> str:
     of one file (an --include'd file) is that file."""
     return root if m.get("file") else f"{root}/{(m.get('raw') or {}).get(k) or k}"
 
-def write_there(uid: str, real: str, rem, ours: dict, theirs: dict, how: str) -> None:
+def write_there(uid: str, real: str, rem, ours: dict, theirs: dict, how: str,
+                sums: dict = None) -> None:
     """`ours` / `theirs`: {"project": manifest, "history": manifest,
     "extra:<path>": manifest …}.  The files there are hashed there (a file
     whose size and time the last base had keeps its checksum from then), so
     the next look tells a file that was only touched there from one that
-    was changed, whatever this side did to it since."""
-    prev = read_there(uid, rem.name, rem.path(real)) or {}
+    was changed, whatever this side did to it since.  `sums` given (a Send
+    Back, where that machine cannot be asked): those, and nothing is asked."""
+    rpath = rem.there(real)
+    prev = read_there(uid, rem.name, rpath) or {}
     psums, pthere = prev.get("sums") or {}, prev.get("there") or {}
-    sums, ask = {}, []
-    far = {t: s["path"] for t, s in _far_trees(
+    given = sums is not None
+    sums, ask = dict(sums or {}), []
+    far = {} if given else {t: s["path"] for t, s in _far_trees(
         rem, real, rem.info, [t[6:] for t in theirs if t.startswith("extra:")]).items()}
     for t, m in theirs.items():
         for k, v in (m.get("files") or {}).items():
@@ -4403,7 +4670,7 @@ def write_there(uid: str, real: str, rem, ours: dict, theirs: dict, how: str) ->
                 sums.setdefault(t, {})[k] = got[f"{t}:{k}"]
     _write_json(_there_file(uid, rem.name), {
         "v": 2, "kind": how, "uuid": uid, "project": real, "remote": rem.name,
-        "remote_path": rem.path(real), "at": _now(),
+        "remote_path": rpath, "at": _now(),
         "here": {t: m.get("files") or {} for t, m in ours.items()},
         "there": {t: m.get("files") or {} for t, m in theirs.items()},
         "dirs": {"here": {t: m.get("dirs") or [] for t, m in ours.items()},
@@ -4416,11 +4683,14 @@ def write_there(uid: str, real: str, rem, ours: dict, theirs: dict, how: str) ->
         except OSError:
             pass
 
-def name_problems(manifest: dict, far: dict) -> list:
+def name_problems(manifest: dict, far: dict, root: str = None) -> list:
     """Names in `manifest` (tree_manifest) the disk on the other side cannot
-    hold apart: [{kind, text, count, names: [[name, name], …]}] (up to 10
-    groups each).  `far`: that disk's facts, from the probe's `fs`."""
+    hold, or not apart: [{kind, text, count, names: [[name, name], …]}] (up
+    to 10 groups each).  `far`: that disk's facts (the probe's `fs`, with
+    `system`): case_sensitive, symlinks, long_paths.  `root`: the folder
+    there, for the length of a path on Windows."""
     out = []
+    far = far or {}
     raw = manifest.get("raw") or {}
     if far.get("case_sensitive") is False:
         groups = {}
@@ -4429,12 +4699,38 @@ def name_problems(manifest: dict, far: dict) -> list:
         clash = sorted(sorted(set(g)) for g in groups.values() if len(set(g)) > 1)
         if clash:
             out.append({"kind": "case", "count": len(clash), "names": clash[:10],
-                        "text": "two files whose names differ only in capitals"})
+                        "text": NAME_TEXTS["case"]})
     twins = sorted(sorted(v) for v in (manifest.get("twins") or {}).values())
     if twins:
         out.append({"kind": "unicode", "count": len(twins), "names": twins[:10],
-                    "text": "two files with the same name in two Unicode forms"})
+                    "text": NAME_TEXTS["unicode"]})
+    files = manifest.get("files") or {}
+    if far.get("system") == "Windows":
+        rows = {}
+        for k in sorted(set(files) | set(manifest.get("dirs") or [])):
+            kind = _cannot_hold(k, far, root)
+            if kind:
+                rows.setdefault(kind, []).append([raw.get(k) or k])
+        for kind in ("windows_char", "trailing", "reserved", "long_path"):
+            if rows.get(kind):
+                out.append({"kind": kind, "count": len(rows[kind]), "names": rows[kind][:10],
+                            "text": NAME_TEXTS[kind]})
+    if far.get("symlinks") is False:
+        links = sorted([raw.get(k) or k] for k, v in files.items()
+                       if isinstance(v, list) and v and v[0] == "l")
+        if links:
+            out.append({"kind": "symlink", "count": len(links), "names": links[:10],
+                        "text": NAME_TEXTS["symlink"]})
     return out
+
+def names_blocker(problems: list, where: str, fix_where: str) -> str:
+    """One blocker for name_problems' rows, in plain words."""
+    n = sum(p["count"] for p in problems)
+    shown = "; ".join(f"{p['text']}: " + ", ".join(" / ".join(g) for g in p["names"][:5])
+                      + (" …" if p["count"] > 5 else "") for p in problems)
+    return (f"{_n(n, 'name')} {where} cannot hold ({shown}) — rename "
+            f"{'it' if n == 1 else 'them'} {fix_where}, or add "
+            f"{'it' if n == 1 else 'them'} to handover_excludes")
 
 def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
@@ -4783,6 +5079,322 @@ def three_way(left_here: dict, left_there: dict, here: dict, there: dict) -> dic
             plan["conflict"].append(k)
     return plan
 
+# ---- the same project, not another folder ---------------------------------- #
+
+def folder_identity(path: str) -> dict:
+    """What the probe says of a folder, for a folder here: whether it is
+    there, how many entries it has (a machine's own files such as .DS_Store
+    left out), its project id, and whose it is."""
+    exists = os.path.isdir(path)
+    marker = read_marker(path) if exists else None
+    return {"path_exists": exists, "path_entries": _entries_in(path) if exists else 0,
+            "path_marker": marker, "path_owner": _path_owner(path, marker) if exists else "none"}
+
+def _entries_in(path: str):
+    try:
+        return sum(1 for n in os.listdir(path) if not _skip_name(n, HANDOVER_SKIP))
+    except OSError:
+        return None
+
+def identity_check(ident: dict, uid: str, where: str, folder: str, fix: str,
+                   command: str = None) -> tuple:
+    """({exists, entries, marker, owner, ok, fix}, blocker or None): a project
+    goes into a folder only when the folder is missing or empty, or holds
+    this very project (its id) and is not a live project of that machine's
+    own.  `where`: "on box" or "here"; `fix`: what to do instead, in words,
+    ending in `command` (a whole command to copy: the row's `fix`)."""
+    row = {"exists": bool(ident.get("path_exists")), "entries": ident.get("path_entries") or 0,
+           "marker": ident.get("path_marker"), "owner": ident.get("path_owner") or "none",
+           "ok": True, "fix": None}
+    if not row["exists"] or not row["entries"]:
+        return row, None
+    if uid and row["marker"] == uid and row["owner"] != "own":
+        return row, None
+    row["ok"], row["fix"] = False, command
+    n = _n(row["entries"], "item")
+    what = (f"is a live project of its own there ({n}), which this one would overwrite"
+            if row["marker"] == uid else f"holds another folder ({n})")
+    return row, f"{where}, {folder} {what}. {fix}" + (f":  {command}" if command else "")
+
+def _came_back_from(uid: str, entry: dict, rem, rpath: str, shown: str, real: str,
+                    host: str = None):
+    """Whether this machine's records say the project was at `shown` on
+    `rem` before and came home from there: its `returned`, the lists of the
+    last time both copies agreed (there/<remote>.json), or a record of what
+    left (manifest*.json).  A copy left there by aht 0.13.0, which noted no
+    copies, is registered there as that machine's own project by the
+    sessions' hook.  -> a few words on which record, or None.  A record
+    without the path there is from before paths were mapped: the same path.
+    Lists of a sync (`kind` "sync") do not count: that copy never held the
+    project, and its changes there are its own."""
+    if not uid or uid == "untracked":
+        return None
+    names = {n for n in (rem.name, host) if n}
+    at_path = lambda p: p in (shown, rpath) if p else shown == real
+    r = (entry or {}).get("returned") or {}
+    if r.get("from") in names and r.get("mode", "away") == "away" and at_path(r.get("from_path")):
+        return f"it came back from there at {_clock(r.get('at'))}"
+    t = read_there(uid, rem.name, rpath) or {}
+    if t.get("kind") in ("take-back", "send-back"):
+        return f"it came back from there at {_clock(t.get('at'))}"
+    hd = handover_dir(uid)
+    for m in sorted(hd.glob("manifest*.json"), reverse=True) if hd.is_dir() else []:
+        try:
+            d = json.loads(m.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("remote") == rem.name \
+                and at_path(d.get("remote_path")) and d.get("driven_by") != "there":
+            return f"it was handed over there at {_clock(d.get('at'))}"
+    return None
+
+# ---- git across systems ------------------------------------------------------ #
+
+GITATTRIBUTES_LINES = ["* text=auto", "*.sh text eol=lf", "*.bat text eol=crlf",
+                       "*.cmd text eol=crlf", "*.ps1 text eol=crlf"]
+
+def _git_autocrlf(real: str) -> bool:
+    try:
+        r = subprocess.run(["git", "-C", real, "config", "--get", "core.autocrlf"],
+                           capture_output=True, text=True, timeout=15,
+                           env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), **_NO_WINDOW)
+        return r.stdout.strip().lower() == "true"
+    except Exception:
+        return False
+
+def git_settings(holder_system, home_system, home_autocrlf: bool) -> dict:
+    """The git settings a session aht starts gets in its environment (never
+    in .git/config): a copied .git carries its own system's settings, so on
+    a Windows holder git must not see every file's mode as changed, and a
+    project from a Windows home that converts line endings goes on doing
+    so."""
+    out = {}
+    if holder_system == "Windows":
+        out["core.filemode"] = "false"
+    if home_system == "Windows" and home_autocrlf:
+        out["core.autocrlf"] = "true"
+    return out
+
+def git_env_vars(settings: dict) -> dict:
+    """GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<i> and GIT_CONFIG_VALUE_<i>."""
+    if not settings:
+        return {}
+    env = {"GIT_CONFIG_COUNT": str(len(settings))}
+    for i, (k, v) in enumerate(sorted(settings.items())):
+        env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"] = k, str(v)
+    return env
+
+def git_note(real: str, systems: tuple, settings: dict, there: str) -> dict:
+    """The dry run's git row: whether the project is a git repository; when
+    it crosses to or from Windows without a .gitattributes, the lines aht
+    suggests (it never writes the file); the settings aht's session there
+    gets, and how to give them to git in your own terminal there."""
+    g = {"is_git": False, "gitattributes": None, "suggest": [], "env": dict(settings),
+         "how": None}
+    try:
+        g["is_git"] = bool(real) and os.path.isdir(real) and is_git(real)
+    except Exception:
+        pass
+    if g["is_git"]:
+        g["gitattributes"] = os.path.isfile(os.path.join(real, ".gitattributes"))
+        if "Windows" in systems and not g["gitattributes"]:
+            g["suggest"] = list(GITATTRIBUTES_LINES)
+    if settings:
+        where = "here" if there == "here" else f"on {there}"
+        g["how"] = (f"in your own terminal {where}:  git "
+                    + " ".join(f"-c {k}={v}" for k, v in sorted(settings.items()))
+                    + f" status   (aht's session {'here' if there == 'here' else 'there'} "
+                    "has this set)")
+    return g
+
+def git_lines(g: dict, where: str) -> list:
+    out = []
+    if g.get("suggest"):
+        out.append("   git         no .gitattributes: line endings may flip between the "
+                   "systems; suggested lines (aht does not write the file): "
+                   + "  ".join(g["suggest"]))
+    if g.get("how"):
+        out.append(f"   git {where:<7} {g['how']}")
+    return out
+
+# ---- line endings on the way back -------------------------------------------- #
+
+EOL_MAX = 5 << 20       # a bigger file is compared as it is
+
+def eol_facts(path) -> dict:
+    """{size, raw, norm, style} of a file: its sha256 as it is and with CRLF
+    read as LF, and its line endings ("lf", "crlf", "mixed", "none"); style
+    "binary" (a NUL byte) or "big" (EOL_MAX or more) and no sums otherwise."""
+    try:
+        size = os.path.getsize(path)
+        if size >= EOL_MAX:
+            return {"size": size, "style": "big"}
+        with open(path, "rb") as fh:
+            b = fh.read()
+    except OSError:
+        return None
+    if b"\0" in b[:8192]:
+        return {"size": size, "style": "binary"}
+    crlf = b.count(b"\r\n")
+    lone = b.count(b"\n") - crlf
+    style = "mixed" if crlf and lone else "crlf" if crlf else "lf" if lone else "none"
+    return {"size": size, "raw": hashlib.sha256(b).hexdigest(),
+            "norm": hashlib.sha256(b.replace(b"\r\n", b"\n")).hexdigest(), "style": style}
+
+def restyle(path: str, style: str) -> bool:
+    """Give a text file the line endings `style` ("lf" or "crlf") again,
+    keeping its time and mode."""
+    try:
+        st = os.stat(path)
+        b = Path(path).read_bytes()
+    except OSError:
+        return False
+    nb = b.replace(b"\r\n", b"\n")
+    if style == "crlf":
+        nb = nb.replace(b"\n", b"\r\n")
+    if nb == b:
+        return False
+    tmp = f"{path}.aht-eol-{os.urandom(3).hex()}"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(nb)
+        if os.name != "nt":
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        os.replace(tmp, path)
+        os.utime(path, (st.st_mtime, st.st_mtime))
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+# ---- the plan of a way back, made where the project's record is ------------ #
+
+def _three_ways(base: dict, ours: dict, theirs: dict, cut=None) -> dict:
+    """three_way for the project and its history.  `cut(tree, files)`: what a
+    synced copy leaves out (its .aht/handover)."""
+    cut = cut or (lambda t, f: dict(f or {}))
+    return {t: three_way(cut(t, (base.get("here") or {}).get(t)),
+                         cut(t, (base.get("there") or {}).get(t)),
+                         cut(t, ours[t]["files"]), cut(t, theirs[t]["files"]))
+            for t in ("project", "history")}
+
+def _eol_candidate(a, b) -> bool:
+    return all(isinstance(v, list) and v and isinstance(v[0], int) and v[0] < EOL_MAX
+               for v in (a, b))
+
+def return_needs(base: dict, ours: dict, theirs: dict, cut=None) -> dict:
+    """What return_plan needs from the machine that holds the project, besides
+    its lists: `prefix` {key: size}, the transcripts that must begin with what
+    left (their first bytes' sha256); `written_by` {key: offset}, the
+    transcripts that come, read from where they left off; `eol` [key], files
+    changed there whose line endings are compared."""
+    plans = _three_ways(base, ours, theirs, cut)
+    hp, pp = plans["history"], plans["project"]
+    tr = base.get("transcripts") or {}
+    of, tf = ours["project"]["files"], theirs["project"]["files"]
+    return {"prefix": {k: tr[k][0] for k in hp["take"] if k in tr},
+            "written_by": {k: (tr[k][0] if k in hp["take"] and k in tr else 0)
+                           for k in hp["take"] + hp["new"] + hp["conflict"]
+                           if k.endswith(".jsonl")},
+            "eol": [k for k in pp["take"] + pp["conflict"] if _eol_candidate(of.get(k), tf.get(k))]}
+
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return (0,)
+
+def return_plan(base: dict, ours: dict, theirs: dict, *, prefix_ok: dict, written_by: dict,
+                here_claude, prefer=None, there_claude=None, ignore_version: bool = False,
+                eol: dict = None, here_facts: dict = None, here_root: str = None, cut=None,
+                there_name: str = "the other machine", home_name: str = None) -> dict:
+    """What comes back, and what stands in the way: three_way of `base`
+    (manifest.json: what left, on both sides) against `ours` (the trees at
+    home now) and `theirs` (on the machine that held it), then
+      - a transcript only comes back as a continuation of what left
+        (`prefix_ok` {key: bool}); otherwise both are kept;
+      - the history that comes must be readable here: no Claude Code that
+        wrote it (`written_by`, `there_claude`) newer than `here_claude`;
+      - a take back never removes aht's own .aht/;
+      - a file that changed there only in its line endings stays as it is
+        here (`eol` {key: {here: eol_facts, there: eol_facts}}: "eol_only");
+        one that changed and whose endings flipped as a whole gets the
+        style back it left with ("eol_keep" {key: style});
+      - a file this disk cannot hold (`here_facts`) is kept aside under a
+        safe name ("unsafe");
+      - `prefer` "there": what changed on both sides is taken from there.
+    Pure: the same inputs give the same plan, at home and at the holder."""
+    plans = _three_ways(base, ours, theirs, cut)
+    hp, pp = plans["history"], plans["project"]
+    out = {"blockers": [], "warnings": []}
+    tr = base.get("transcripts") or {}
+    for k in [k for k in hp["take"] if k in tr]:
+        if not (prefix_ok or {}).get(k):
+            hp["take"].remove(k)
+            hp["conflict"].append(k)
+    seen = [v for v in list((written_by or {}).values()) + [there_claude] if v]
+    newest = max(seen, key=_version_tuple) if seen else None
+    out["claude"] = {"here": here_claude, "there": there_claude, "wrote_the_history": newest}
+    if here_claude and newest and _version_tuple(newest) > _version_tuple(here_claude):
+        msg = (f"Claude Code {newest} was used on {there_name}, "
+               f"{home_name or 'this machine'} has {here_claude}: an older version may not "
+               "read the newer history")
+        if ignore_version:
+            out["warnings"].append(msg)
+        else:
+            out["blockers"].append(msg + " — update Claude Code "
+                                   + (f"on {home_name}" if home_name else "here")
+                                   + " first (or pass --ignore-version)")
+    pp["delete"] = [k for k in pp["delete"] if not k.startswith(".aht/")]
+    eol_only, eol_keep = [], {}
+    for k in list(pp["take"]) + list(pp["conflict"]):
+        f = (eol or {}).get(k) or {}
+        h, t = f.get("here") or {}, f.get("there") or {}
+        if not (h.get("norm") and t.get("norm")):
+            continue
+        if h["raw"] != t["raw"] and h["norm"] == t["norm"]:
+            (pp["take"] if k in pp["take"] else pp["conflict"]).remove(k)
+            eol_only.append(k)
+        elif k in pp["take"] and h["norm"] != t["norm"] \
+                and {h.get("style"), t.get("style")} == {"lf", "crlf"}:
+            eol_keep[k] = h["style"]
+    unsafe = []
+    if here_facts:
+        for lst in ("take", "new"):
+            for k in list(pp[lst]):
+                why = _cannot_hold(k, here_facts, here_root)
+                if why:
+                    pp[lst].remove(k)
+                    eol_keep.pop(k, None)
+                    # a path too long here is as long below kept-aside/: a
+                    # short name of one part instead (the list names it)
+                    unsafe.append({"there": (theirs["project"].get("raw") or {}).get(k) or k,
+                                   "key": k, "kept_as": _flat_aside(k, len(unsafe))
+                                   if why == "long_path" else _safe_name(k)})
+    out["conflicts"] = {t: list(p["conflict"]) for t, p in plans.items() if p["conflict"]}
+    if prefer == "there":                   # theirs win; ours are set aside
+        for p in plans.values():
+            p["take"] += p["conflict"]
+            p["conflict"] = []
+    out.update(project=pp, history=hp, eol_only=sorted(eol_only), eol_keep=eol_keep,
+               unsafe=unsafe, counts={t: {k: len(v) for k, v in p.items()}
+                                      for t, p in plans.items()})
+    return out
+
+def plan_id(plan: dict, ours: dict, theirs: dict) -> str:
+    """A short digest of a way back's plan and the lists it was made from:
+    the apply goes ahead only when nothing changed since."""
+    h = hashlib.sha256(json.dumps(
+        {"plan": {t: plan[t] for t in ("project", "history")},
+         "eol_keep": plan.get("eol_keep"), "unsafe": plan.get("unsafe"),
+         "ours": {t: ours[t].get("files") for t in ours},
+         "theirs": {t: theirs[t].get("files") for t in theirs}},
+        sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()[:16]
+
 # ---- rsync ------------------------------------------------------------------ #
 
 _RSYNC = {}
@@ -4914,6 +5526,9 @@ class Remote:
         self.info = {}
         self.on_percent = None          # called with rsync's percentage
         self._route = None              # (ssh target, host key alias) once known
+        self.paths = _paths_rule(spec)  # remotes.<name>.paths (None: not chosen yet)
+        self.home = spec.get("home") if isinstance(spec.get("home"), str) else None
+        self._pinned = {}               # a project's path there, as its record has it
 
     def route(self) -> tuple:
         """(user@address, alias): the name as given when it resolves; else the
@@ -4950,8 +5565,100 @@ class Remote:
         return bool(self.root) and not self.target
 
     def path(self, p: str) -> str:
+        """A path there as that machine names it, inside the test root or the
+        sandbox, if any (nothing else: there() maps a path from here)."""
         base = self.root if self.local else self.sandbox
         return base + p if base else p
+
+    def _logical(self, p: str) -> str:
+        """A path there without the test root or the sandbox around it."""
+        base = self.root if self.local else self.sandbox
+        p = str(p or "")
+        if base and (p == base or p.startswith((base + "/", base + "\\"))):
+            return p[len(base):] or "/"
+        return p
+
+    def there_system(self):
+        return self.info.get("system") or self.system
+
+    def far_home(self):
+        """The home folder there, as that machine names it (noted in the config
+        once known, so mapping needs no question)."""
+        h = self.info.get("home")
+        if not h and not self.home:
+            self.connect()
+            h = self.info.get("home")
+        if h:
+            h = self._logical(h)
+            if h != self.home:
+                self.home = h
+                if not self.local:
+                    _remember_remote(self.name, home=h)
+        return self.home
+
+    def rule(self):
+        """remotes.<name>.paths.  A machine set up before there was a choice
+        gets "same" when this machine's home folder exists there (so its
+        projects stay where they were), else "home"; written into the config
+        on first use, so it never flips.  A test machine (`root`) or a sandbox
+        mirrors this machine's paths unless its paths say otherwise."""
+        if self.paths is None:
+            if self.local:
+                return "same"
+            if self.sandbox:
+                self.paths = "same"     # a test sandbox mirrors this machine's paths
+            elif os.name == "nt" or self.there_system() == "Windows":
+                self.paths = "home"
+            else:
+                info = self.agent("probe", path=self.path(str(Path.home())))
+                self.paths = "same" if info.get("path_exists") else "home"
+            _remember_remote(self.name, paths=self.paths)
+            log(f"REMOTE {self.name}: projects go to {self.paths!r} paths there")
+        return self.paths
+
+    def _homes(self) -> list:
+        h = str(Path.home())
+        return list(dict.fromkeys([os.path.realpath(h), h]))
+
+    def pin(self, p: str, far: str) -> None:
+        """The project at `p` is at `far` there (its record says so): kept while
+        the record lasts, whatever the mapping says now."""
+        if p and far:
+            self._pinned[str(p)] = str(far)
+
+    def there(self, p: str) -> str:
+        """Where the folder at `p` here is there (inside the test root or the
+        sandbox, as path() puts it).  HandoverError when no rule maps it."""
+        p = str(p)
+        if p in self._pinned:
+            return self._pinned[p]
+        rule, mine, theirs = self.rule(), platform.system(), self.there_system()
+        if rule == "same" and (self.local or not theirs or _flavour(mine) is _flavour(theirs)):
+            return self.path(p)
+        far = None
+        if rule != "same":
+            fh = self.far_home()
+            for h in self._homes():
+                far = map_path(p, rule, h, fh, mine, theirs)
+                if far:
+                    break
+        if not far:
+            raise OutsideError(_outside_text(p, self.name, mine, theirs, self.home))
+        return self.path(far)
+
+    def here(self, far: str):
+        """Where the folder at `far` there is here, by the same rules; None when
+        no rule maps it back."""
+        far = self._logical(far)
+        for p, f in self._pinned.items():
+            if self._logical(f) == far:
+                return p
+        rule, mine, theirs = self.rule(), platform.system(), self.there_system()
+        if rule == "same":
+            return far if self.local or not theirs or _flavour(mine) is _flavour(theirs) \
+                else None
+        fh = self.far_home()
+        return map_path(far, rule, self._homes()[0], fh, mine, theirs, back=True)
 
     def spec(self, remote_abs: str) -> str:
         return remote_abs if self.local else f"{self.dest}:{remote_abs}"
@@ -5072,8 +5779,13 @@ class Remote:
 
     def connect(self, path: str = None, fs: bool = False) -> dict:
         """The probe there; `fs`: also how the disk under `path` treats names."""
-        self.info = self.agent("probe", path=self.path(path) if path else None,
-                               claude=self.claude, **({"fs": True} if fs else {}))
+        far = self.there(path) if path else None
+        self.info = self.agent("probe", path=far, claude=self.claude,
+                               **({"fs": True} if fs else {}))
+        if self.info.get("home") and not self.local:
+            self.far_home()             # noted for the next mapping
+            if self.info.get("machine_id"):
+                _remember_remote(self.name, machine_id=self.info["machine_id"])
         return self.info
 
     def rsync(self, src: str, dst: str, *, delete: bool = False,
@@ -5263,13 +5975,15 @@ class Remote:
 
     def fetch(self, remote_root: str, local_root: str, *, entries=None, deletes=(),
               aside: str = None, only=None, update: bool = False, skip=(),
-              add_only: bool = False, progress: bool = False) -> dict:
+              add_only: bool = False, progress: bool = False, rename: dict = None) -> dict:
         """Bring files from `remote_root` there into `local_root` here: the keys
         in `entries` (a list, or {key: its name there}); without `entries`,
         whatever differs there (`only` narrows to keys or folders ending in
         "/", `update`: never over a newer file here).  What it replaces, and
         the keys in `deletes` (removed here first), go to `aside` here.
-        `add_only`: a file here is never written.  Stats as send's."""
+        `add_only`: a file here is never written.  `rename` {key: name}: those
+        arrive under another name here (a name this disk cannot hold; aht's
+        own copy always).  Stats as send's."""
         if entries is not None and not isinstance(entries, dict):
             entries = {k: k for k in entries}
         dels = []
@@ -5281,7 +5995,7 @@ class Remote:
                 else:
                     p.unlink()
                 dels.append(k)
-        if self.transfer() == "rsync":
+        if not rename and self.transfer() == "rsync":
             if (entries is not None and not entries) or (only is not None and not only):
                 return dict(_no_stats("rsync"), deleted=len(dels))
             sel = {"files_from": list(entries.values())} if entries is not None \
@@ -5301,7 +6015,8 @@ class Remote:
             ents, dirs = plan["files"] + plan["links"], plan["dirs"]
         else:
             same = self._same_system()      # a new file: named as rsync would
-            ents = [{"key": k, "src": v or k, "name": (v if same and v else k)}
+            ents = [{"key": k, "src": v or k,
+                     "name": (rename or {}).get(k) or (v if same and v else k)}
                     for k, v in entries.items()]
             dirs = []
         if not ents and not dirs:
@@ -6212,7 +6927,8 @@ def _agent_unpack(req: dict, inp, out) -> dict:
         return {"ok": False, "error": "no folder to copy into"}
     return dict(_place_entries(root, req, inp), ok=True)
 
-STREAM_OPS = {"pack": _agent_pack, "unpack": _agent_unpack}
+STREAM_OPS = {"pack": _agent_pack, "unpack": _agent_unpack,
+              "return-apply": lambda req, inp, out: _agent_return_apply(req, inp, out)}
 
 def remotes_config() -> dict:
     r = cfg_get("remotes") or {}
@@ -6346,15 +7062,13 @@ def _agent_probe(req: dict) -> dict:
             pass
         # which folder is there: its project id, how full it is, and whose
         info["path_marker"] = read_marker(path) if info["path_exists"] else None
-        try:
-            info["path_entries"] = len(os.listdir(path)) if info["path_exists"] else 0
-        except OSError:
-            info["path_entries"] = None
+        info["path_entries"] = _entries_in(path) if info["path_exists"] else 0
         info["path_owner"] = _path_owner(path, info["path_marker"])
         if req.get("fs"):
             # tried next to the folder, not read from settings
             near = os.path.dirname(path) if info["path_exists"] else str(anc)
-            info["fs"] = {"case_sensitive": not _ignores_case(near)}
+            f = disk_facts(near)
+            info["fs"] = {k: f[k] for k in ("case_sensitive", "symlinks", "long_paths")}
         info.update(activity_in(info["path_real"]) if info["path_exists"]
                     else {"sessions": [], "processes": []})
     return info
@@ -6392,15 +7106,19 @@ def _agent_manifest(req: dict) -> dict:
 
 def _agent_hash(req: dict) -> dict:
     """sha256 of files here; `limit`: of their first bytes; `norm` (for all,
-    or per file): CRLF read as LF."""
-    out = {}
+    or per file): CRLF read as LF; `eol` (per file): eol_facts instead, in
+    `eol`."""
+    out, eol = {}, {}
     for f in req.get("files") or []:
+        if f.get("eol"):
+            eol[f["key"]] = eol_facts(f["path"])
+            continue
         try:
             out[f["key"]] = file_sha256(f["path"], f.get("limit"),
                                         bool(f.get("norm", req.get("norm"))))
         except OSError:
             out[f["key"]] = None
-    return {"ok": True, "hashes": out}
+    return {"ok": True, "hashes": out, "eol": eol}
 
 def _agent_written_by(req: dict) -> dict:
     """The newest agent CLI version that wrote into each transcript, from
@@ -6477,29 +7195,49 @@ def _agent_prepare(req: dict) -> dict:
 def _claude_json() -> Path:
     return claude_home().parent / ".claude.json"
 
-def _agent_trust(req: dict) -> dict:
+def _trust_key(path: str) -> str:
+    """The key of a folder in ~/.claude.json: Claude Code on Windows writes
+    it with forward slashes (C:/Users/me/x)."""
+    return str(path).replace("\\", "/") if os.name == "nt" or _DRIVE.match(str(path)) \
+        else str(path)
+
+def is_trusted(path: str) -> bool:
+    """Whether the user told Claude Code here that it may work in `path`."""
+    try:
+        pj = json.loads(_claude_json().read_text()).get("projects") or {}
+    except Exception:
+        return False
+    return any(bool((pj.get(k) or {}).get("hasTrustDialogAccepted"))
+               for k in {str(path), _trust_key(path)})
+
+def set_trust(path: str) -> str:
     """The user already trusted this very folder on the machine it comes
-    from; recorded here only while no agent CLI could overwrite the file."""
+    from; recorded here only while no agent CLI could overwrite the file.
+    -> what happened, in words."""
     cj = _claude_json()
     if not cj.is_file():
-        return {"ok": True, "trust": "not set: the agent CLI was never set up here"}
+        return "not set: the agent CLI was never set up here"
     if running_sessions():
-        return {"ok": True, "trust": "not set: an agent session is open here"}
+        return "not set: an agent session is open here"
     try:
         data = json.loads(cj.read_text())
-        ent = data.setdefault("projects", {}).setdefault(req["path"], {})
+        ent = data.setdefault("projects", {}).setdefault(_trust_key(path), {})
     except Exception as e:
-        return {"ok": True, "trust": f"not set: {cj.name} is unreadable ({e})"}
+        return f"not set: {cj.name} is unreadable ({e})"
     if ent.get("hasTrustDialogAccepted"):
-        return {"ok": True, "trust": "already trusted"}
+        return "already trusted"
     ent["hasTrustDialogAccepted"] = True
     shutil.copy2(cj, str(cj) + ".bak-aht")
     tmp = cj.with_name(cj.name + ".aht-new")
     with open(tmp, "w") as fh:
         json.dump(data, fh, indent=2)
-    os.chmod(tmp, 0o600)
+    if os.name != "nt":
+        os.chmod(tmp, 0o600)
     os.replace(tmp, cj)
-    return {"ok": True, "trust": "carried over"}
+    return "carried over"
+
+def _agent_trust(req: dict) -> dict:
+    return {"ok": True, "trust": set_trust(req["path"])}
 
 def _agent_install_claude(req: dict) -> dict:
     ver = str(req.get("version") or "")
@@ -6540,10 +7278,15 @@ def _agent_start(req: dict) -> dict:
         argv += ["--remote-control", req["remote_control"]]
     if req.get("task"):
         argv += ["--", req["task"]]           # the first prompt: work starts at once
-    line = ("cd %s && env DISABLE_AUTOUPDATER=1 %s; st=$?; cd /; "
+    # git settings for a copy from another system (GIT_CONFIG_*), never in
+    # .git/config
+    genv = {k: str(v) for k, v in (req.get("env") or {}).items()
+            if re.fullmatch(r"GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)", str(k))}
+    line = ("cd %s && env DISABLE_AUTOUPDATER=1 %s%s; st=$?; cd /; "
             "printf '\\n[aht] the agent exited (%%s); this window closes in a minute\\n' "
             "\"$st\"; sleep 60"
-            % (shlex.quote(path), " ".join(shlex.quote(a) for a in argv)))
+            % (shlex.quote(path), "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(genv.items())),
+               " ".join(shlex.quote(a) for a in argv)))
     (run / "command.txt").write_text(line + "\n")
     new = _tmux_socket() + ["new-session", "-d", "-s", name, "-x", "200", "-y", "50",
                             "-c", path, line]
@@ -6867,11 +7610,15 @@ def _agent_prune(req: dict) -> dict:
 
 # ---- folders here that are copies of another machine's projects ------------ #
 #
-# ~/.aht/remote/copies.json = {path: {uuid, from, from_id, kind, at, attempt}}
-# on any machine that holds such copies.  `kind`: "sync" (Keep in sync sends
-# it here), "handover" (handed over here), "brought" (Bring Here, phase 7),
-# "returned" (its project went home; this copy stayed).  One writer:
-# _note_copy, called by the ops `prepare` (its `copy_note`) and `uncopy`.
+# ~/.aht/remote/copies.json = {path: {uuid, from, from_id, kind, at, attempt,
+# from_path, system, autocrlf, remote}} on any machine that holds such copies.  `kind`: "sync" (Keep in
+# sync sends it here), "handover" (handed over here), "brought" (Bring Here
+# made it here), "returned" (its project went home; this copy stayed).
+# `from_path`: where the project is on the machine it came from; `system`
+# and `autocrlf`: that machine's, for git's settings here; `remote`: this
+# machine's own name for it (Bring Here knows it).  One
+# writer: _note_copy, called by the ops `prepare` (its `copy_note`),
+# `uncopy`, and here by Bring Here and Send Back.
 
 COPY_KINDS = ("sync", "handover", "brought", "returned")
 
@@ -6899,7 +7646,8 @@ def _note_copy(path: str, rec) -> bool:
     if not _is_abs(path):
         return False
     if rec is not None:
-        rec = {k: rec.get(k) for k in ("uuid", "from", "from_id", "kind", "attempt")}
+        rec = {k: rec.get(k) for k in ("uuid", "from", "from_id", "kind", "attempt",
+                                       "from_path", "system", "autocrlf", "remote")}
         if rec["kind"] not in COPY_KINDS or not isinstance(rec["uuid"], str):
             return False
     with Lock():
@@ -6943,6 +7691,444 @@ def _path_owner(path: str, marker) -> str:
         pass
     return "none"
 
+# ---- the far end of Bring Here and Send Back: at the project's home -------- #
+#
+# The machine that brings a project to itself, and later sends it back, asks
+# these of the project's home, where aht keeps the project's record:
+#   mark-handing  may it come (check_only), and the record that it is on its
+#                 way, before anything travels (`handing`, driven_by "there")
+#   mark-away     it arrived: `away` and the record of what left (manifest.json)
+#   unmark        it did not arrive: the record goes
+#   return-plan   the way back, planned here against the record (return_plan)
+#   return-apply  (streamed) the files of that plan, placed here
+# A PC that brought a project is never asked anything: it asks.
+
+def _home_entry(req: dict):
+    """(uuid, entry, real path) of the project a request names here, or a
+    reason why not."""
+    real = os.path.realpath(str(req.get("path") or ""))
+    if not _is_abs(str(req.get("path") or "")) or not os.path.isdir(real):
+        return None, None, real, f"there is no folder {req.get('path')} on {_here()}"
+    uid, e = _entry_for(load_registry(), real)
+    if not e:
+        return None, None, real, f"{real} is not a project aht knows on {_here()}"
+    if req.get("uuid") and req["uuid"] != uid:
+        return None, None, real, (f"{real} on {_here()} is another project now (its id is "
+                                  f"{uid}, not {req['uuid']})")
+    return uid, e, real, None
+
+def _agent_mark_handing(req: dict) -> dict:
+    """Bring Here, at home: whether the project may go to the machine that
+    asks, what it would take along, and (unless `check_only`) the record
+    that it is on its way."""
+    uid, e, real, why = _home_entry(req)
+    out = {"ok": True, "blockers": [], "warnings": [], "path": real, "uuid": uid,
+           "host": _here(), "system": platform.system(), "home": str(Path.home()),
+           "claude_home": str(claude_home())}
+    if why:
+        out["blockers"].append(why)
+        return out
+    holder = req.get("holder") if isinstance(req.get("holder"), dict) else {}
+    hname = str(holder.get("name") or "the other machine")
+    c = copy_of(real)
+    if c and c.get("kind") != "returned":
+        out["blockers"].append(f"{real} on {_here()} is itself a copy of a project on "
+                               f"{c.get('from') or 'another machine'}: bring it from there")
+    a, h = e.get("away"), e.get("handing")
+    if a and a.get("driven_by") == "there" and a.get("holder_id") \
+            and a["holder_id"] == holder.get("machine_id"):
+        # brought by the machine that asks: its side may not have heard that
+        # it was noted here (the link dropped); it finishes it, or knows it is
+        # there already
+        out["here_already"] = {"attempt": a.get("attempt"), "since": a.get("since"),
+                               "remote_path": a.get("remote_path")}
+        if not req.get("check_only"):
+            out["blockers"].append(f"it is on {hname} already, since {_clock(a.get('since'))}")
+    elif a:
+        out["blockers"].append(f"it is on {a.get('holder') or a.get('host') or a.get('remote')} "
+                               f"since {_clock(a.get('since'))}: it comes back first")
+    if h and h.get("attempt") != req.get("attempt"):
+        out["blockers"].append(f"a handover of it to {h.get('holder') or h.get('remote')} has "
+                               f"not finished on {_here()}")
+    act = activity_in(real)
+    out["sessions"], out["processes"] = act["sessions"], act["processes"]
+    for s in act["sessions"]:
+        if s.get("status") == "idle" and req.get("allow_idle"):
+            out["warnings"].append(f"an idle session is open in it on {_here()} (pid "
+                                   f"{s['pid']}): if anyone types into it later, Send Back "
+                                   "keeps both versions")
+        else:
+            b = _activity_blockers({"sessions": [s]}, f"on {_here()}")
+            out["blockers"] += [x + (", or pass --allow-idle to bring it anyway"
+                                     if s.get("status") == "idle" else "") for x in b]
+    if act["processes"]:
+        out["warnings"].append(f"still running in it on {_here()}: "
+                               + ", ".join(sorted({p["name"] for p in act["processes"]}))
+                               + " (they go on with the copy there)")
+    store = _store_of(real)
+    sid = latest_session(store)
+    exe = find_claude()
+    out.update(session={"id": sid, "title": redact(session_title(store, sid))},
+               sessions_count=len(_sessions_of(store)), store=str(store) if store else None,
+               sids=_sessions_of(store), plans=_plans_of(store) if store else [],
+               claude_version=claude_version(exe) if exe else None,
+               trusted=is_trusted(real),
+               autocrlf=_git_autocrlf(real) if platform.system() == "Windows" else False,
+               other_histories=sorted(k for k in (e.get("stores") or {})
+                                      if k != "claude" and k in AGENT_NAMES))
+    if out["blockers"] or req.get("check_only"):
+        return out
+    attempt = str(req.get("attempt") or "")
+    if not re.fullmatch(r"[0-9A-Za-z-]{1,40}", attempt):
+        return {"ok": False, "error": f"not an attempt id: {attempt!r}"}
+    rec = {"v": 2, "attempt": attempt,
+           "remote": _remote_for(holder.get("name"), holder.get("machine_id")),
+           "holder": hname, "holder_id": holder.get("machine_id"),
+           "host": holder.get("host") or hname, "system": holder.get("system"),
+           "driven_by": "there", "path": real, "remote_path": holder.get("path"),
+           "since": _now(), "agent": "claude", "session": sid, "window": None,
+           "mux": "local", "relay": req.get("relay"), "task": None,
+           "claude": out["claude_version"], "transfer": "aht"}
+    try:
+        with ProjectLock(uid):
+            with Lock():
+                reg = load_registry()
+                e2 = reg["projects"].get(uid) or {}
+                if e2.get("away") or (e2.get("handing") or {}).get("attempt") not in (None, attempt):
+                    return {"ok": False, "error": f"it was handed over on {_here()} meanwhile"}
+                e2["handing"] = dict(rec, step="sending", at=time.time())
+                save_registry(reg)
+    except HandoverError as x:
+        return {"ok": False, "error": f"{x} on {_here()}"}
+    log(f"BRING {real} -> {hname}: on its way (attempt {attempt})")
+    out["handing"] = rec
+    return out
+
+def _agent_mark_away(req: dict) -> dict:
+    """Bring Here, at home: the project arrived over there.  The record of
+    what left (manifest.json, with the transcripts' checksums taken here)
+    and `away` are written; `handing` goes."""
+    uid, e, real, why = _home_entry(req)
+    if why:
+        return {"ok": False, "error": why}
+    a = e.get("away") or {}
+    if req.get("attempt") and a.get("attempt") == req.get("attempt") \
+            and a.get("driven_by") == "there":
+        # asked again (the link dropped after the first time): it is noted
+        return {"ok": True, "away": a, "already": f"already done for attempt {a['attempt']}"}
+    h = e.get("handing") or {}
+    if h.get("attempt") != req.get("attempt") or h.get("driven_by") != "there":
+        return {"ok": False, "error": f"{_here()} has no record of this bring any more (it was "
+                                      "undone or released there): bring it again"}
+    base = req.get("base") if isinstance(req.get("base"), dict) else {}
+    store = _store_of(real)
+    hist = ((base.get("here") or {}).get("history") or {})
+    sums = {}
+    for k, v in hist.items():
+        if k.endswith(".jsonl") and isinstance(v, list) and isinstance(v[0], int) and store:
+            try:
+                sums[k] = [v[0], file_sha256(Path(store) / k, v[0])]
+            except OSError:
+                pass
+    away = {k: v for k, v in h.items() if k not in HANDING_ONLY}
+    try:
+        with ProjectLock(uid):
+            hd = handover_dir(uid)
+            _retire_manifest(hd)
+            hd.mkdir(parents=True, exist_ok=True)
+            _write_json(hd / "manifest.json", {
+                "v": 2, "attempt": h.get("attempt"), "uuid": uid, "project": real,
+                "remote": h.get("remote") or h.get("holder"), "at": _now(),
+                "driven_by": "there", "remote_path": h.get("remote_path"),
+                "here": base.get("here") or {}, "there": base.get("there") or {},
+                "dirs": base.get("dirs") or {}, "modes": base.get("modes") or {},
+                "transcripts": sums})
+            _update_entry(uid, away=away, handing=None)
+    except HandoverError as x:
+        return {"ok": False, "error": f"{x} on {_here()}"}
+    log(f"BRING {real} -> {away.get('holder')}: it is there (attempt {away.get('attempt')})")
+    try:
+        apply_badge(real, desired_marks(real, True))
+    except Exception:
+        pass
+    return {"ok": True, "away": away}
+
+def _agent_unmark(req: dict) -> dict:
+    """Bring Here, at home: it did not arrive; the record that it was on its
+    way goes (only that attempt's)."""
+    uid, e, _real, why = _home_entry(req)
+    if why:
+        return {"ok": True, "unmarked": False}
+    h = e.get("handing") or {}
+    if h.get("attempt") != req.get("attempt") or h.get("driven_by") != "there":
+        return {"ok": True, "unmarked": False}
+    _update_entry(uid, handing=None)
+    log(f"BRING {e.get('real_path')}: undone (attempt {h.get('attempt')})")
+    return {"ok": True, "unmarked": True}
+
+def _return_context(req: dict) -> dict:
+    """A way back asked by the machine that holds the project: its record
+    here, the record of what left, both sides' lists.  {error} when the
+    record does not fit."""
+    uid, e, real, why = _home_entry(req)
+    if why:
+        return {"error": why}
+    a = e.get("away") or {}
+    holder = req.get("holder") if isinstance(req.get("holder"), dict) else {}
+    r = e.get("returned") or {}
+    if not a and req.get("attempt") and r.get("sent_back") \
+            and r.get("attempt") == req.get("attempt"):
+        # sent back already (the link dropped before the holder heard so)
+        return {"already": f"already done for attempt {r['attempt']}", "uid": uid,
+                "real": real, "returned": r}
+    if not a:
+        return {"error": f"{os.path.basename(real)} is not away from {_here()} (it was taken "
+                         "back or released there)"}
+    if a.get("holder_id") and holder.get("machine_id") and a["holder_id"] != holder["machine_id"]:
+        return {"error": f"{os.path.basename(real)} is on {a.get('holder')} as far as "
+                         f"{_here()} knows, not on {holder.get('name')}"}
+    if a.get("attempt") and req.get("attempt") and a["attempt"] != req["attempt"]:
+        return {"error": f"this copy came over in another handover ({req['attempt']}) than the "
+                         f"one {_here()} has a record of ({a['attempt']}); send it back "
+                         "is not possible: release it on " + _here()}
+    try:
+        base = json.loads((handover_dir(uid) / "manifest.json").read_text())
+    except Exception as x:
+        return {"error": f"the record of what left is unreadable on {_here()} ({x})"}
+    if (base.get("attempt") or a.get("attempt")) and base.get("attempt") != a.get("attempt"):
+        return {"error": "the record of what left belongs to another handover attempt "
+                         f"({base.get('attempt') or 'none'}, not {a.get('attempt') or 'none'}), "
+                         f"so aht cannot tell what changed. Release the project on {_here()} "
+                         f"(aht reclaim {shlex.quote(real)} --release) and bring over what "
+                         "you need by hand"}
+    theirs = req.get("theirs") if isinstance(req.get("theirs"), dict) else {}
+    for t in ("project", "history"):
+        theirs.setdefault(t, {"files": {}, "raw": {}, "dirs": []})
+        theirs[t].setdefault("files", {})
+    store = _store_of(real) or (claude_backend().root() / _key_claude(real))
+    ours = {"project": tree_manifest(real),
+            "history": tree_manifest(str(store), []) if Path(store).is_dir()
+            else tree_manifest(os.devnull, [])}
+    return {"uid": uid, "entry": e, "real": real, "away": a, "base": base, "ours": ours,
+            "theirs": theirs, "store": str(store), "holder": holder}
+
+def _returned_already(ctx: dict) -> dict:
+    """The answer to a way back asked again once it was done: what the first
+    answer said, so the holder finishes its side."""
+    r = ctx["returned"]
+    store = _store_of(ctx["real"])
+    return {"ok": True, "already": ctx["already"], "uuid": ctx["uid"],
+            "attempt": r.get("attempt"), "host": _here(), "system": platform.system(),
+            "path": ctx["real"], "returned": r, "session": r.get("session"),
+            "session_title": redact(session_title(store, r.get("session"))) if store else None}
+
+def _return_plan_of(ctx: dict, req: dict) -> dict:
+    checks = req.get("checks") if isinstance(req.get("checks"), dict) else {}
+    base, ours, theirs, store = ctx["base"], ctx["ours"], ctx["theirs"], ctx["store"]
+    tr = base.get("transcripts") or {}
+    prefix_ok = {k: (checks.get("prefix") or {}).get(k) == tr[k][1]
+                 for k in (checks.get("prefix") or {}) if k in tr}
+    eol = {}
+    for k, f in (checks.get("eol") or {}).items():
+        if isinstance(f, dict):
+            raw = (ours["project"].get("raw") or {}).get(k) or k
+            eol[k] = {"there": f, "here": eol_facts(os.path.join(ctx["real"], raw)) or {}}
+    exe = find_claude()
+    return return_plan(base, ours, theirs, prefix_ok=prefix_ok,
+                       written_by=checks.get("written_by") or {},
+                       here_claude=claude_version(exe) if exe else None,
+                       there_claude=checks.get("claude"), prefer=req.get("prefer"),
+                       ignore_version=bool(req.get("ignore_version")), eol=eol,
+                       here_facts=disk_facts(ctx["real"]), here_root=ctx["real"],
+                       there_name=str(ctx["holder"].get("name") or "the other machine"),
+                       home_name=_here())
+
+def _agent_return_plan(req: dict) -> dict:
+    """Send Back, at home: the way back, planned here against the record of
+    what left.  Without `checks`, what the holder must look at first
+    (`needs`); with them, the plan, its id, and what stands in the way
+    (a newer Claude Code wrote there; something runs here)."""
+    ctx = _return_context(req)
+    if ctx.get("error"):
+        return {"ok": False, "error": ctx["error"]}
+    if ctx.get("already"):
+        return _returned_already(ctx)
+    out = {"ok": True, "uuid": ctx["uid"], "attempt": ctx["away"].get("attempt"),
+           "host": _here(), "system": platform.system(), "path": ctx["real"],
+           "needs": return_needs(ctx["base"], ctx["ours"], ctx["theirs"]),
+           "base_at": ctx["base"].get("at"), "modes": (ctx["base"].get("modes") or {}).get(
+               "project") or {}}
+    if req.get("checks") is None:
+        return out
+    plan = _return_plan_of(ctx, req)
+    act = activity_in(ctx["real"])
+    out.update(plan={t: plan[t] for t in ("project", "history")}, counts=plan["counts"],
+               conflicts=plan["conflicts"], eol_only=plan["eol_only"],
+               eol_keep=plan["eol_keep"], unsafe=plan["unsafe"], claude=plan["claude"],
+               plan_id=plan_id(plan, ctx["ours"], ctx["theirs"]),
+               blockers=plan["blockers"] + _activity_blockers(act, f"on {_here()}"),
+               warnings=plan["warnings"], sessions=act["sessions"], processes=act["processes"])
+    return out
+
+class _Staged:
+    """What a Send Back brought, waiting in a folder of its own: _pull_tree
+    takes the files from there as it fetches them from another machine.  A
+    file that came without its mode (from Windows) keeps the mode of the
+    file it replaces here, or, new here, the mode it left with."""
+    def __init__(self, files: dict, sent_modes: dict, base_modes: dict):
+        self.files, self.sent, self.base = files, sent_modes, base_modes
+
+    def fetch(self, tree, local_root, *, entries, aside=None, skip=(), progress=False,
+              rename=None):
+        os.makedirs(local_root, exist_ok=True)
+        real = os.path.realpath(local_root)
+        probs, n, nb = [], 0, 0
+        for k in entries:
+            src = self.files.get((tree, k))
+            if not src or not os.path.lexists(src):
+                probs.append({"name": k, "error": "it did not arrive"})
+                continue
+            try:
+                p = _dest_path(local_root, real, (rename or {}).get(k) or k)
+                cur = _state(p)
+                if cur in ("dir", "other"):
+                    raise ValueError("a folder is in the way" if cur == "dir"
+                                     else "something else is in the way")
+                mode = self.sent.get((tree, k))
+                if mode is None and cur is not None and cur[0] != "l":
+                    mode = stat.S_IMODE(os.stat(p).st_mode)
+                elif mode is None and cur is None and tree == "project":
+                    mode = self.base.get(k)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                if cur is not None and aside:
+                    _put_aside(p, aside, k)
+                _retry(_move, src, p)
+                if mode is not None and os.name != "nt" and not os.path.islink(p):
+                    os.chmod(p, int(mode) & 0o7777)
+                n += 1
+                nb += os.path.getsize(p) if not os.path.islink(p) else 0
+            except (ValueError, OSError) as x:
+                probs.append({"name": k, "error": _why(x)})
+        return dict(_no_stats("aht"), files=n, bytes=nb, problems=probs, ok=not probs,
+                    error=_problems_text(probs) if probs else "")
+
+def _agent_return_apply(req: dict, inp, out) -> dict:
+    """Send Back, at home: the plan is made again here, and only when it is
+    the one the holder was shown (`plan_id`) do its files come in.  They
+    arrive in a folder of their own, then go into place as Take Back puts
+    them: what they replace is set aside, both versions of what changed on
+    both sides are kept, every write is guarded.  Then the project is home
+    again: `returned`, the lists of both copies, `away` gone."""
+    ctx = _return_context(req)
+    if ctx.get("error"):
+        return {"ok": False, "error": ctx["error"]}
+    if ctx.get("already"):
+        return _returned_already(ctx)
+    uid, real, a, base = ctx["uid"], ctx["real"], ctx["away"], ctx["base"]
+    plan = _return_plan_of(ctx, req)
+    if plan_id(plan, ctx["ours"], ctx["theirs"]) != req.get("plan_id"):
+        return {"ok": False, "error": f"something changed on {_here()} since the plan was made: "
+                                      "nothing was sent back; run Send Back again"}
+    act = activity_in(real)
+    blocked = plan["blockers"] + _activity_blockers(act, f"on {_here()}")
+    if blocked:
+        return {"ok": False, "error": "; ".join(blocked)}
+    want = {(t, k) for t in ("project", "history")
+            for k in plan[t]["take"] + plan[t]["new"] + plan[t]["conflict"]}
+    want |= {("project", u["key"]) for u in plan["unsafe"]}
+    ents = req.get("entries") if isinstance(req.get("entries"), list) else []
+    for e in ents:
+        if not isinstance(e, dict) or (e.get("tree"), e.get("key")) not in want \
+                and e.get("tree") not in ("plans", "file-history"):
+            return {"ok": False, "error": f"{_here()} was sent a file the plan does not take: "
+                                          f"{e.get('tree')}:{e.get('key')}"}
+    hd = handover_dir(uid)
+    store = ctx["store"]
+    holder = str(ctx["holder"].get("name") or a.get("holder") or "the other machine")
+    with ProjectLock(uid):
+        stage = hd / f"incoming-{_stamp()}-{os.urandom(2).hex()}"
+        stage.mkdir(parents=True, exist_ok=True)
+        try:
+            placed = _place_entries(str(stage), {
+                "entries": [{"key": f"{e['tree']}:{e['key']}", "name": str(i), "expect": None,
+                             "size": e.get("size"), "mtime": e.get("mtime"),
+                             **({"link": e["link"]} if e.get("link") is not None else {})}
+                            for i, e in enumerate(ents)],
+                "compress": bool(req.get("compress"))}, inp)
+            files = {(e["tree"], e["key"]): str(stage / str(i)) for i, e in enumerate(ents)}
+            sent = {(e["tree"], e["key"]): e.get("mode") for e in ents}
+            src = _Staged(files, sent, (base.get("modes") or {}).get("project") or {})
+            aside = hd / "replaced" / _stamp()
+            bdirs = base.get("dirs") or {}
+            ours, theirs = ctx["ours"], ctx["theirs"]
+            def made_there(t):
+                was = set((bdirs.get("here") or {}).get(t) or []) \
+                    | set((bdirs.get("there") or {}).get(t) or [])
+                return sorted(d for d in set(theirs[t].get("dirs") or []) - was
+                              - set(ours[t].get("dirs") or []))
+            done = {"project": _pull_tree(src, plan["project"], "project", real,
+                                          theirs["project"].get("raw") or {},
+                                          aside / "project", holder, False, handover_skip(),
+                                          False, ours["project"]["files"],
+                                          made_there("project"), plan["eol_keep"],
+                                          plan["unsafe"])}
+            Path(store).mkdir(parents=True, exist_ok=True)
+            done["history"] = _pull_tree(src, plan["history"], "history", store,
+                                         theirs["history"].get("raw") or {},
+                                         aside / "history", holder, True, [], False,
+                                         ours["history"]["files"], made_there("history"))
+            for sub in ("plans", "file-history"):
+                keys = [e["key"] for e in ents if e.get("tree") == sub]
+                if keys:
+                    (claude_home() / sub).mkdir(parents=True, exist_ok=True)
+                    r = src.fetch(sub, str(claude_home() / sub), entries=keys,
+                                  aside=str(aside / sub))
+                    done[sub] = r["files"]
+            done["arrived"] = {"problems": placed.get("problems") or []}
+            set_aside = str(aside) if aside.is_dir() and any(
+                f.is_file() or f.is_symlink() for f in aside.rglob("*")) else None
+            if not set_aside:
+                shutil.rmtree(aside, ignore_errors=True)
+            pd = done["project"]
+            latest = latest_session(store) or a.get("session")
+            back = {"from": a.get("holder") or a.get("host") or holder,
+                    "left": a.get("since") or base.get("at"),
+                    "at": _now(), "mode": "away", "session": latest,
+                    "handed_over": a.get("session") if a.get("session") != latest else None,
+                    "updated": pd["updated"], "new": pd["new"], "deleted": pd["deleted"],
+                    "conflicts": [c["their_version"] for c in pd["conflicts"]],
+                    "from_path": a.get("remote_path"), "sent_back": True,
+                    "attempt": a.get("attempt"),
+                    "eol_only": plan["eol_only"], "eol_kept": pd["eol_kept"],
+                    "unsafe_names": [{"there": u["there"], "kept_as": u["kept_as"]}
+                                     for u in pd["unsafe"]]}
+            if a.get("remote"):
+                try:
+                    rem = get_remote(a["remote"])
+                    rem.pin(real, a.get("remote_path"))
+                    write_there(uid, real, rem, _our_trees(real)[0], theirs, "send-back",
+                                sums={})
+                except HandoverError:
+                    pass
+            for r in read_relays(real):
+                if relay_row(r, real).get("open"):
+                    close_relay(real, r["id"], "sent-back")
+            _update_entry(uid, away=None, returned=back)
+            _end_pause(uid, a.get("remote"))
+            _retire_manifest(hd)
+            prune_set_asides(hd / "replaced")
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    log(f"SEND BACK {real} <- {holder} ({pd['updated']} updated, {pd['new']} new, "
+        f"{pd['deleted']} removed, {len(pd['conflicts'])} kept twice)")
+    try:
+        apply_badge(real, desired_marks(real, True))
+    except Exception:
+        pass
+    notify_user("Sent back", f"{os.path.basename(real)} is on {_here()} again, from {holder}")
+    return {"ok": True, "done": done, "set_aside": set_aside, "returned": back,
+            "session": latest, "session_title": redact(session_title(store, latest))}
+
 AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "hash": _agent_hash, "prepare": _agent_prepare,
              "trust": _agent_trust, "install-claude": _agent_install_claude,
@@ -6957,7 +8143,9 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "search": lambda req: _agent_search(req),
              "relay-info": lambda req: _agent_relay_info(req),
              "relay-note": lambda req: _agent_relay_note(req),
-             "uncopy": _agent_uncopy}
+             "uncopy": _agent_uncopy,
+             "mark-handing": _agent_mark_handing, "mark-away": _agent_mark_away,
+             "unmark": _agent_unmark, "return-plan": _agent_return_plan}
 
 def cmd_core(args):
     """`aht _core --id`: the id of the core this build carries (the name of
@@ -7175,22 +8363,27 @@ def scratch_dir(real: str, sid: str):
             return p
     return None
 
+SYSTEM_WORDS = {"Darwin": "macOS", "Linux": "Linux", "Windows": "Windows"}
+
 def write_brief(real: str, sid, dig: dict, here: str, there: str,
-                there_system: str, carried: list, scratch: bool, task: str = None) -> tuple:
+                there_system: str, carried: list, scratch: bool, task: str = None,
+                there_path: str = None) -> tuple:
     """The readable summary that travels inside the project, and the short
-    note the resumed session is told on arrival.  -> (file, note)"""
+    note the resumed session is told on arrival (`there_path`: the folder's
+    path there, when it differs).  -> (file, note)"""
     out = Path(real) / ".aht" / "handover"
     out.mkdir(parents=True, exist_ok=True)
     # excerpts of a conversation must never end up in the project's repository
     (out / ".gitignore").write_text("*\n")
     when = time.strftime("%Y-%m-%d %H:%M")
     name = f"{time.strftime('%Y%m%d-%H%M')}-to-{there}.md"
-    system = {"Darwin": "macOS", "Linux": "Linux"}
-    mine = system.get(platform.system(), platform.system())
-    theirs = system.get(there_system, there_system or "?")
+    mine = SYSTEM_WORDS.get(platform.system(), platform.system())
+    theirs = SYSTEM_WORDS.get(there_system, there_system or "?")
+    moved = bool(there_path) and there_path != real
     L = [f"# Handover: {os.path.basename(real)}", "",
          f"- From **{here}** ({mine}) to **{there}** ({theirs}), {when}",
-         f"- Folder: `{real}` (the same path on both machines)"]
+         f"- Folder: `{there_path}` on {there}, `{real}` on {here}" if moved
+         else f"- Folder: `{real}` (the same path on both machines)"]
     if sid:
         L.append(f"- Session: {redact(dig.get('title') or 'untitled')} — `{sid}`"
                  + (f", Claude Code {dig['version']}" if dig.get("version") else ""))
@@ -7217,7 +8410,10 @@ def write_brief(real: str, sid, dig: dict, here: str, there: str,
     prune_relays(out)
     note = [f"[aht] This session was handed over from “{here}” ({mine}) to "
             f"“{there}” ({theirs}) on {when}. The project folder and this "
-            f"conversation's history came along; the folder's path is unchanged.",
+            "conversation's history came along; "
+            + (f"the folder is at {there_path} here (it was {real} on {here}): paths "
+               "named earlier in this conversation point to the old place."
+               if moved else "the folder's path is unchanged."),
             "Not carried: running processes, temporary files (/tmp, /private/tmp)"
             + (f" — a copy of this session's scratch folder is at "
                f".aht/handover/scratch/{sid}/" if scratch else "")
@@ -7401,7 +8597,14 @@ def attach_command(rem: Remote, mux: str, name: str) -> list:
         via = [f"--ssh=ssh -o HostKeyAlias={alias}"] if alias else []
         return [find_tool("mosh")] + via + [rem.dest, "--"] + inner   # survives network changes
     alias = rem.route()[1]
-    return ["ssh", "-t"] + (["-o", f"HostKeyAlias={alias}"] if alias else []) + [rem.dest] + inner
+    return [_ssh(), "-t"] + (["-o", f"HostKeyAlias={alias}"] if alias else []) + [rem.dest] + inner
+
+def _cmdline(argv: list) -> str:
+    """A command as one line this system's shell reads: cmd.exe's quoting on
+    Windows (no mosh there: ssh -t in a console of its own), sh's elsewhere."""
+    if os.name == "nt":
+        return subprocess.list2cmdline([str(a) for a in argv])
+    return " ".join(shlex.quote(str(a)) for a in argv)
 
 # ---- pushing a project over -------------------------------------------------- #
 
@@ -7495,6 +8698,12 @@ def _check_extra(p: str) -> str:
 
 RELAYS_REL = "/.aht/handover/"     # a project's relays: notes left there stay there
 
+def _other_histories(entry: dict) -> list:
+    """The agents other than Claude Code with a history of this project here:
+    theirs do not travel (their formats are their own)."""
+    return sorted(k for k in ((entry or {}).get("stores") or {})
+                  if k in AGENT_NAMES and k != "claude")
+
 def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
                  dry: bool = False, sync: bool = False, attempt: str = None) -> dict:
     """Make the remote copy of a project and of its history equal to what is
@@ -7503,19 +8712,25 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
     what is here into it, and Keep in sync (`sync`) leaves it out.  The
     other machine notes the folder as a copy of this project (copies.json)."""
     real = os.path.realpath(entry["real_path"])
-    rpath = rem.path(real)
+    rpath = rem.there(real)
+    # the same path there: /rewind's snapshots (absolute paths) can go, and
+    # this machine's ~/.claude is made to resolve there, since the history
+    # names it.  Under another path neither would mean anything
+    same = rem._logical(rpath) == real
     rhome, rclaude = rem.info["home"], rem.info["claude_home"]
     aside = f"{rhome}/.aht/remote/replaced/{uid}/{_stamp()}"
-    res = {"project": {}, "history": {}, "extras": [], "aside": aside}
+    res = {"project": {}, "history": {}, "extras": [], "aside": aside, "same_path": same}
     store = _store_of(real)
     sids = _sessions_of(store)
     if not dry:
         rem.agent("prepare", dirs=[rpath, f"{rclaude}/projects", f"{rclaude}/file-history",
-                                   f"{rclaude}/plans", os.path.dirname(aside)],
-                  their_home=rem.path(str(Path.home())),
+                                   f"{rclaude}/plans", posixpath.dirname(aside)],
+                  their_home=rem.path(str(Path.home())) if same else None,
                   copy_note={"path": rpath, "uuid": uid, "from": _here(),
-                             "from_id": machine_id(create=True),
-                             "kind": "sync" if sync else "handover", "attempt": attempt})
+                             "from_id": machine_id(create=True), "from_path": real,
+                             "kind": "sync" if sync else "handover", "attempt": attempt,
+                             "system": _my_system(),
+                             "autocrlf": _my_system() == "Windows" and _git_autocrlf(real)})
     res["project"] = rem.send(real, rpath, delete=True, aside=aside + "/project",
                               skip=handover_skip() + ([RELAYS_REL] if sync else []),
                               protect=() if sync else (RELAYS_REL[1:],),
@@ -7530,7 +8745,7 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
             raise HandoverError("sending the history failed: " + res["history"]["error"])
         side = [(claude_home() / "file-history", "file-history",
                  [f"{s}/" for s in sids
-                  if (claude_home() / "file-history" / s).is_dir()]),
+                  if same and (claude_home() / "file-history" / s).is_dir()]),
                 (claude_home() / "plans", "plans",
                  _plans_of(store) if (claude_home() / "plans").is_dir() else [])]
         for src, sub, inc in side:
@@ -7541,18 +8756,18 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
     for p in _extras(entry):
         isdir = os.path.isdir(p)
         if not dry:
-            rem.agent("prepare", dirs=[rem.path(p) if isdir
-                                       else os.path.dirname(rem.path(p))])
+            rem.agent("prepare", dirs=[rem.there(p) if isdir
+                                       else posixpath.dirname(rem.there(p))])
         # a file goes as the one name of its folder
-        here, there = (p, rem.path(p)) if isdir else \
-            (os.path.dirname(p), os.path.dirname(rem.path(p)))
+        here, there = (p, rem.there(p)) if isdir else \
+            (os.path.dirname(p), posixpath.dirname(rem.there(p)))
         r = rem.send(here, there, only=None if isdir else [os.path.basename(p)],
                      aside=aside + "/extras", skip=handover_skip(), dry=dry,
                      progress=progress)
         res["extras"].append({"path": p, **r})
     if not dry:
         try:
-            rem.agent("prune", dir=os.path.dirname(aside), keep=ASIDE_KEEP)
+            rem.agent("prune", dir=posixpath.dirname(aside), keep=ASIDE_KEEP)
         except HandoverError:
             pass
     return res
@@ -7651,12 +8866,12 @@ def _cut(t: str, files) -> dict:
 def _far_trees(rem: Remote, real: str, info: dict, extras=()) -> dict:
     """The project, its Claude history and what --include carries along
     (`extras`) on the other machine, as the `manifest` op lists them."""
-    rpath = rem.path(real)
+    rpath = rem.there(real)
     out = {"project": {"path": rpath, "skip": handover_skip()},
            "history": {"path": f"{info['claude_home']}/projects/{_key_claude(rpath)}",
                        "skip": []}}
     for p in extras:
-        out[f"extra:{p}"] = {"path": rem.path(p), "skip": handover_skip()}
+        out[f"extra:{p}"] = {"path": rem.there(p), "skip": handover_skip()}
     return out
 
 def _our_trees(real: str, extras=()) -> tuple:
@@ -7811,7 +9026,7 @@ def _sync_check(rem: Remote, uid: str, real: str, info: dict, replace: bool = Fa
     theirs = rem.agent("manifest", timeout=900, trees=specs)["trees"]
     far = {t: s["path"] for t, s in specs.items()}
     near = _near_paths(real, store, theirs)
-    rpath = rem.path(real)
+    rpath = rem.there(real)
     base = read_there(uid, rem.name, rpath)
     there, here = _sync_files(theirs["project"]["files"]), _sync_files(ours["project"]["files"])
     gone = sorted(set(there) - set(here))
@@ -7935,6 +9150,8 @@ def mirror_project(uid: str, entry: dict, progress: bool = False, replace: bool 
             if why:
                 raise HandoverError(why)
             rem = get_remote(mm.get("remote"))
+            if mm.get("remote_path") and mm.get("remote_path_of") == rem.name:
+                rem.pin(real, mm["remote_path"])    # where it went first, while syncs go on
             info = rem.connect(real, fs=True)
             row["remote"] = rem.name
             if info.get("sessions") or info.get("processes"):
@@ -7983,7 +9200,8 @@ def mirror_project(uid: str, entry: dict, progress: bool = False, replace: bool 
                 row["removed"] = chk["removals"]["removed"]
         sent = r["project"].get("bytes", 0) + r["history"].get("bytes", 0) \
             + sum(x.get("bytes", 0) for x in r["extras"])
-        m.update(synced_at=time.time(), status="ok", bytes=sent, path=real)
+        m.update(synced_at=time.time(), status="ok", bytes=sent, path=real,
+                 remote_path=rem.there(real), remote_path_of=rem.name)
         row.update(status="synced", bytes=sent,
                    files=r["project"].get("files", 0) + r["history"].get("files", 0))
         log(f"MIRROR {real} -> {rem.name} ({row['files']} file(s), {_human(sent)})"
@@ -8113,7 +9331,7 @@ def _uncopy_there(remote: str, items: list) -> None:
     try:
         rem = get_remote(remote)
         for real, uid in items:
-            rem.agent("uncopy", timeout=30, path=rem.path(real), uuid=uid)
+            rem.agent("uncopy", timeout=30, path=rem.there(real), uuid=uid)
     except (HandoverError, OSError, ValueError) as e:
         log(f"MIRROR off: {remote} keeps its note on the copy ({e})", "debug")
 
@@ -8403,6 +9621,21 @@ def resolve_handing(uid: str, force: bool = False) -> list:
             return []
     real = e["real_path"]
     name, there = os.path.basename(real) or real, h.get("remote") or "the other machine"
+    if h.get("driven_by") == "there":
+        # the machine that brings it finishes it (mark-away) or undoes it
+        # (unmark); this one never asks it (a PC is never asked).  After an
+        # hour with neither, Release is offered
+        holder = h.get("holder") or h.get("host") or there
+        began = float(h.get("at") or now)
+        if h.get("told_release") or now - began < HANDING_RELEASE_AFTER:
+            return []
+        _update_entry(uid, handing=dict(h, checked_at=now, told_release=True,
+                                        unreachable_since=h.get("unreachable_since") or began))
+        return [{"kind": "handover", "title": f"{name}: Bring Here unfinished",
+                 "message": f"{holder} began to bring {name} over at {_clock(began)} and did "
+                            f"not finish. To work on {name} here, release it in aht; "
+                            f"whatever reached {holder} stays there.",
+                 "info": {"kind": "handover", "project": real, "remote": holder}}]
     hd = handover_dir(uid)
     try:
         lock = ProjectLock(uid).__enter__()
@@ -8417,13 +9650,15 @@ def resolve_handing(uid: str, force: bool = False) -> list:
             base = {}                       # no record of what left in this attempt
         try:
             rem = get_remote(h.get("remote"))
+            if h.get("remote_path"):
+                rem.pin(real, h["remote_path"])     # where this attempt sent it
             info = rem.connect(real)
             runs = bool(info.get("sessions"))
             changed = talked = started = False
             if base and not runs:
-                trees = {"project": {"path": rem.path(real), "skip": handover_skip()},
+                trees = {"project": {"path": rem.there(real), "skip": handover_skip()},
                          "history": {"path": f"{info['claude_home']}/projects/"
-                                             f"{_key_claude(rem.path(real))}", "skip": []}}
+                                             f"{_key_claude(rem.there(real))}", "skip": []}}
                 if h.get("window") and info.get("home"):
                     trees["run"] = {"path": f"{info['home']}/.aht/remote/run/{h['window']}",
                                     "skip": []}
@@ -8542,23 +9777,72 @@ def cmd_handover(args):
             out["blockers"].append(f"still running in this folder: {names} — stop "
                                    "them, or pass --allow-processes to leave them behind")
 
-        # (2) the other machine
+        # (2) the other machine, and where the project goes there
         say(f"checking {rem.name} …")
-        info = rem.connect(real)
+        if rem.there_system() == "Windows" and not rem.local:
+            raise HandoverError(f"aht cannot hand a project over to a Windows PC: on "
+                                f"{rem.name}, use Bring Here instead")
+        try:
+            rpath = rem.there(real)
+            for p in extras:
+                rem.there(p)
+        except OutsideError as e:
+            out["blockers"].append(str(e))
+            return _emit(args, out, lines)
+        info = rem.connect(real, fs=True)
+        if info.get("system") == "Windows" and not rem.local:
+            raise HandoverError(f"aht cannot hand a project over to a Windows PC: on "
+                                f"{rem.name}, use Bring Here instead")
+        shown = rem._logical(rpath)
+        out["here_path"], out["there_path"] = real, shown
         out["there"] = {k: info.get(k) for k in
                         ("host", "system", "home", "claude", "claude_version",
                          "path_exists", "path_writable", "free_bytes",
                          "sessions", "processes")}
-        if info.get("path_real") and info["path_real"] != rem.path(real) \
+        out["there"]["path"] = shown
+        if info.get("path_real") and info["path_real"] != rpath \
                 and info.get("path_exists"):
-            out["blockers"].append(f"{real} is a link on {rem.name} (to "
+            out["blockers"].append(f"{shown} is a link on {rem.name} (to "
                                    f"{info['path_real']}); the histories are keyed "
                                    "on the real path, so it must be a real folder")
         if not info.get("path_writable"):
             out["blockers"].append(
-                f"{rem.name} cannot hold {real}: {info.get('path_base')} is not "
+                f"{rem.name} cannot hold {shown}: {info.get('path_base')} is not "
                 f"writable there — create the folder once, e.g.  sudo mkdir -p "
-                f"{str(Path.home())} && sudo chown $USER {str(Path.home())}")
+                f"{str(Path.home())} && sudo chown $USER {str(Path.home())}"
+                if shown == real else
+                f"{rem.name} cannot hold {shown}: {info.get('path_base')} is not "
+                "writable there")
+        # the same project there, or nothing: never another folder
+        # another place: projects of this folder go into a folder of this
+        # machine's name next to it there
+        top, ftop = os.path.dirname(real), posixpath.dirname(shown.rstrip("/"))
+        alt = posixpath.join(ftop, re.sub(r"[^A-Za-z0-9._-]+", "-", _here()) or "here")
+        ident = info
+        if info.get("path_owner") == "own" and info.get("path_marker") \
+                and info["path_marker"] == (uid or read_marker(real)):
+            # this project's own copy, which that machine's aht took for one
+            # of its own (left there by aht 0.13.0, which noted no copies)
+            came = _came_back_from(uid, entry, rem, rpath, shown, real, info.get("host"))
+            if came:
+                ident = dict(info, path_owner="none")
+                out["warnings"].append(f"aht on {rem.name} lists {shown} as a project of its "
+                                       f"own; it is this project's copy ({came}), so this "
+                                       "handover goes into it")
+        out["identity"], why = identity_check(
+            ident, uid or read_marker(real), f"on {rem.name}", shown,
+            "Move it away there, or choose another place",
+            f"aht remote paths {rem.name} --add {_arg(top)} {_arg(alt)}")
+        if why:
+            out["blockers"].append(why)
+        far_fs = dict(info.get("fs") or {}, system=info.get("system"))
+        out["names"] = name_problems(tree_manifest(real), far_fs, root=shown)
+        if out["names"]:
+            out["blockers"].append(names_blocker(out["names"], f"{rem.name}", "here"))
+        mine_sys = _my_system()
+        gset = git_settings(info.get("system"), mine_sys,
+                            _git_autocrlf(real) if mine_sys == "Windows" else False)
+        out["git"] = git_note(real, (mine_sys, info.get("system")), gset, rem.name)
         out["blockers"] += _activity_blockers(info, f"on {rem.name}")
         if info.get("processes"):
             out["blockers"].append(f"something is running in this folder on {rem.name}: "
@@ -8581,6 +9865,12 @@ def cmd_handover(args):
                                        "the other side keeps its own version")
                 if not info.get("claude"):
                     out["blockers"].append(f"Claude Code is not installed on {rem.name}")
+            elif info.get("claude") and not info.get("claude_version"):
+                # there, but it gives no version: an install would not fix
+                # what is wrong with it, and would come again every time
+                out["blockers"].append(f"Claude Code on {rem.name} did not answer `claude "
+                                       f"--version` ({info['claude']}): run it there to see "
+                                       "why, then hand over again")
             elif info.get("claude_version") != here_ver:
                 install = here_ver
                 if not tools.get("curl"):
@@ -8616,7 +9906,7 @@ def cmd_handover(args):
         # (3b) the copy there: was it worked on since both copies last agreed
         # (a sync, a handover or a take back)?  This handover would set that
         # work aside there
-        base = read_there(uid, rem.name, rem.path(real)) if not out["blockers"] else None
+        base = read_there(uid, rem.name, rem.there(real)) if not out["blockers"] else None
         if base:
             say(f"looking at the copy on {rem.name} …")
             ours0, store0 = _our_trees(real, _extras(entry))
@@ -8656,7 +9946,8 @@ def cmd_handover(args):
                                        f"free, {_human(need)} are needed")
             lines += [f"would hand over:  {real}",
                       f"   to             {rem.name} ({info.get('host')}, "
-                      f"{info.get('system')})",
+                      f"{info.get('system')})"
+                      + (f" at {shown}" if shown != real else ""),
                       f"   files to send  {out['plan']['files']} "
                       f"({_human(out['plan']['bytes'])}), history "
                       f"{_human(out['plan']['history_bytes'])}",
@@ -8667,6 +9958,13 @@ def cmd_handover(args):
             if out["outside_not_carried"]:
                 lines.append("   stays here     " + ", ".join(out["outside_not_carried"][:5])
                              + "   (carry with --include <path>)")
+            out["other_histories"] = _other_histories(entry)
+            for a in out["other_histories"]:
+                lines.append(f"   stays here     {AGENT_NAMES[a]}'s history (only Claude "
+                             "Code's travels)")
+            if not plan.get("same_path") and store:
+                lines.append("   not carried    /rewind's snapshots (the path differs there)")
+            lines += git_lines(out["git"], "there")
             if _paused_with(entry, rem.name):
                 # Release left work there; this handover replaces it
                 out["ends_pause"] = rem.name
@@ -8684,7 +9982,7 @@ def cmd_handover(args):
         away = {"v": 2, "attempt": attempt, "remote": rem.name,
                 "holder": info.get("host") or rem.name, "holder_id": info.get("machine_id"),
                 "host": info.get("host"), "system": info.get("system"),
-                "driven_by": "here", "path": real, "remote_path": rem.path(real),
+                "driven_by": "here", "path": real, "remote_path": rem.there(real),
                 "since": _now(), "agent": "claude", "session": sid,
                 "window": _mux_name(real, uid), "mux": "byobu" if tools.get("byobu") else "tmux",
                 "relay": None, "task": args.task, "claude": here_ver, "transfer": mover}
@@ -8716,7 +10014,8 @@ def cmd_handover(args):
                         shutil.copytree(sdir, keep / sid, symlinks=True)
                         scratch = True
                 brief, note = write_brief(real, sid, dig, _here(), info.get("host") or rem.name,
-                                          info.get("system"), carried, scratch, args.task)
+                                          info.get("system"), carried, scratch, args.task,
+                                          there_path=shown)
                 out["brief"] = str(brief)
                 say(f"sending the project to {rem.name} …")
                 sent = push_project(rem, uid, entry, progress=talk and sys.stderr.isatty(),
@@ -8728,9 +10027,9 @@ def cmd_handover(args):
                                + sent["history"].get("sent", 0)}
 
                 # what left, as seen on BOTH sides: the base of the way back
-                rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
+                rstore = f"{info['claude_home']}/projects/{_key_claude(rem.there(real))}"
                 theirs = rem.agent("manifest", timeout=900, trees={
-                    "project": {"path": rem.path(real), "skip": handover_skip()},
+                    "project": {"path": rem.there(real), "skip": handover_skip()},
                     "history": {"path": rstore, "skip": []}})["trees"]
                 ours = {"project": tree_manifest(real),
                         "history": tree_manifest(str(store), []) if store
@@ -8777,11 +10076,12 @@ def cmd_handover(args):
                     except Exception:
                         pass
                     if trusted and cfg_get("handover_carry_trust", True):
-                        out["trust"] = rem.agent("trust", path=rem.path(real)).get("trust")
+                        out["trust"] = rem.agent("trust", path=rem.there(real)).get("trust")
                     say(f"starting the session on {rem.name} …")
                     handing = dict(handing, step="starting", at=time.time())
                     _update_entry(uid, handing=handing)
-                    st = rem.agent("start", timeout=90, path=rem.path(real), session=sid,
+                    st = rem.agent("start", timeout=90, path=rem.there(real), session=sid,
+                                   env=git_env_vars(gset),
                                    name=away["window"], attempt=attempt,
                                    claude=info["claude"], note=note,
                                    args=list(cfg_get("handover_claude_args") or []),
@@ -8832,7 +10132,7 @@ def cmd_handover(args):
                   f"({_human(out['sent']['wire_bytes'])} on the wire)",
                   f"   session   {dig.get('title') or sid or 'a new one'}",
                   f"   summary   {brief}",
-                  "   open it   " + " ".join(shlex.quote(a) for a in out["attach"]),
+                  "   open it   " + _cmdline(out["attach"]),
                   "   back      aht reclaim " + shlex.quote(real) + " --apply"]
         if out.get("ends_pause"):
             lines.append(f"   Keep in sync with {rem.name} goes on again once you take it back "
@@ -8886,7 +10186,7 @@ def _ignores_case(folder: str) -> bool:
 
 def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
                aside: Path, there: str, inert: bool, skip, progress: bool,
-               here_keys=(), new_dirs=()) -> dict:
+               here_keys=(), new_dirs=(), eol_keep=None, unsafe=None) -> dict:
     """Carry out one three-way plan: set aside what was removed there, fetch
     what changed there (setting aside what it replaces), and keep both
     versions of what changed on both sides.  Removals go first, so a name
@@ -8894,8 +10194,13 @@ def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
     ignores case, instead of being set aside right after.  On such a disk,
     two incoming names that differ only in case, or one that would land on a
     file here that stays, are kept next to it under the conflict name.
-    `new_dirs`: folders made there (git's empty refs/heads) are made here."""
-    done = {"updated": 0, "new": 0, "deleted": 0, "conflicts": [], "kept": len(plan["kept"])}
+    `new_dirs`: folders made there (git's empty refs/heads) are made here.
+    `eol_keep` {key: style}: those get back the line endings they left with;
+    `unsafe` [{key, there, kept_as}]: files whose names this disk cannot
+    hold, fetched into the set-aside folder under safe names.  `rem` is the
+    other machine, or what a Send Back brought (_Staged)."""
+    done = {"updated": 0, "new": 0, "deleted": 0, "conflicts": [], "kept": len(plan["kept"]),
+            "eol_kept": [], "unsafe": []}
     name = lambda k: there_raw.get(k) or k
     gone = set(plan["delete"])
     for k in plan["delete"]:
@@ -8922,6 +10227,36 @@ def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
             raise HandoverError("fetching the changes failed: " + r["error"])
         done["updated"] = len([k for k in plan["take"] if k not in clash])
         done["new"] = len([k for k in plan["new"] if k not in clash])
+        real = os.path.realpath(dst)
+        for k, style in sorted((eol_keep or {}).items()):
+            if k in fetch:
+                try:
+                    if restyle(_dest_path(dst, real, k), style):
+                        done["eol_kept"].append(k)
+                except ValueError:
+                    pass
+    if unsafe:
+        # kept aside under names this disk can hold; one that does not come
+        # is named in `unsafe_failed`, and the rest goes on: by now files were
+        # removed and fetched here
+        box = aside.parent / "kept-aside"
+        names = {u["key"]: u["kept_as"] if not _too_long_here(box / u["kept_as"])
+                 else _flat_aside(u["key"], i) for i, u in enumerate(unsafe)}
+        try:
+            box.mkdir(parents=True, exist_ok=True)
+            r = rem.fetch(src, str(box), entries={u["key"]: u.get("there") or u["key"]
+                                                  for u in unsafe},
+                          rename=names, skip=skip)
+        except (HandoverError, OSError) as x:
+            r = {"ok": False, "error": _why(x), "problems": []}
+        bad = {p["name"]: p.get("error") for p in r.get("problems") or []}
+        if not r.get("ok") and not bad:
+            bad = {u["key"]: r.get("error") for u in unsafe}
+        done["unsafe"] = [dict(u, kept_as=str(box / names[u["key"]])) for u in unsafe
+                          if u["key"] not in bad]
+        done["unsafe_failed"] = [{"there": u["there"], "key": u["key"],
+                                  "error": bad[u["key"]] or "it did not come"}
+                                 for u in unsafe if u["key"] in bad]
     for d in new_dirs:
         try:
             (Path(dst) / d).mkdir(parents=True, exist_ok=True)
@@ -8967,13 +10302,16 @@ def _changed_there(uid: str, entry: dict) -> dict:
     plans = _plans_of(store)
     try:
         base = json.loads((handover_dir(uid) / "manifest.json").read_text())
-        if base.get("attempt") != away.get("attempt"):
-            return {"files": None, "history": None}
+        if base.get("attempt") != away.get("attempt") or not away.get("remote"):
+            return {"files": None, "history": None}     # (no name here: cannot be asked)
         rem = get_remote(away.get("remote"))
+        if rem.there_system() == "Windows" and not rem.local:
+            return {"files": None, "history": None}
+        rem.pin(real, away.get("remote_path") or rem.path(real))
         info = rem.connect()
         rclaude = info["claude_home"]
-        trees = {"project": {"path": rem.path(real), "skip": handover_skip()},
-                 "history": {"path": f"{rclaude}/projects/{_key_claude(rem.path(real))}",
+        trees = {"project": {"path": rem.there(real), "skip": handover_skip()},
+                 "history": {"path": f"{rclaude}/projects/{_key_claude(rem.there(real))}",
                              "skip": []}}
         # file-history and plans were sent as they are here: what differs
         # there now was written there
@@ -9020,7 +10358,7 @@ def _release(args, out: dict, lines: list, real: str) -> int:
     if not rec:
         out["blockers"].append("this project is not handed over")
         return _emit(args, out, lines)
-    there = rec.get("remote") or rec.get("host") or "the other machine"
+    there = rec.get("remote") or rec.get("holder") or rec.get("host") or "the other machine"
     since = rec.get("since")
     def synced(e):
         """The machine Keep in sync sends this project to, when it is the one
@@ -9140,7 +10478,7 @@ def cmd_reclaim(args):
                 return _emit(args, out, lines)
             base = copy
             rem = get_remote(copy.get("remote"))
-            if not copy.get("first") and copy.get("remote_path") != rem.path(real):
+            if not copy.get("first") and copy.get("remote_path") != rem.there(real):
                 out["blockers"].append(f"the copy on {rem.name} was at "
                                        f"{copy.get('remote_path')}; it is not looked for "
                                        "elsewhere")
@@ -9164,10 +10502,28 @@ def cmd_reclaim(args):
                     f"{away.get('attempt') or 'none'}), so aht cannot tell what changed "
                     f"there. Release the project (aht reclaim {shlex.quote(real)} "
                     "--release) and bring over what you need by hand")
+            holder = away.get("holder") or away.get("host") or "the other machine"
+            if not away.get("remote") and away.get("v"):
+                # brought there by a machine this one has no name for (a PC
+                # is never asked): only that machine can send it back
+                out["blockers"].append(
+                    f"{os.path.basename(real)} was brought to {holder}, which this machine "
+                    f"cannot ask: send it back from {holder}, or release it here (aht "
+                    f"reclaim {shlex.quote(real)} --release)")
+                return _emit(args, out, lines)
             rem = get_remote(away.get("remote"))
+            if rem.there_system() == "Windows" and not rem.local:
+                out["blockers"].append(
+                    f"{holder} is a Windows PC, which this machine cannot ask: send it back "
+                    f"from {holder}, or release it here (aht reclaim {shlex.quote(real)} "
+                    "--release)")
+                return _emit(args, out, lines)
+            # where it went, as its record says, whatever the mapping says now
+            rem.pin(real, away.get("remote_path") or rem.path(real))
             there = away.get("host") or rem.name
         rem.on_percent = prog.percent
         out["remote"] = rem.name
+        out["here_path"], out["there_path"] = real, rem._logical(rem.there(real))
 
         act = activity_in(real)
         out["here"] = act
@@ -9176,13 +10532,13 @@ def cmd_reclaim(args):
         say(f"checking {rem.name} …")
         info = rem.connect(real)
         if not copy and not info["sessions"] and away.get("window") and \
-                rem.agent("close", path=rem.path(real), name=away["window"]).get("closed"):
+                rem.agent("close", path=rem.there(real), name=away["window"]).get("closed"):
             info = rem.connect(real)        # the window it ran in is closed now
         if not copy and info["sessions"] and args.stop and \
                 all(s.get("status") == "idle" for s in info["sessions"]):
             if args.apply:
                 say(f"ending the idle session on {rem.name} …")
-                st = rem.agent("stop", timeout=90, path=rem.path(real),
+                st = rem.agent("stop", timeout=90, path=rem.there(real),
                                name=away.get("window") or "")
                 out["stopped"] = st.get("stopped")
                 if not st.get("stopped"):
@@ -9214,7 +10570,7 @@ def cmd_reclaim(args):
 
         # three-way, separately for the project and for the history
         store = _store_of(real) or (claude_backend().root() / _key_claude(real))
-        rstore = f"{info['claude_home']}/projects/{_key_claude(rem.path(real))}"
+        rstore = f"{info['claude_home']}/projects/{_key_claude(rem.there(real))}"
         say("comparing both sides …")
         extras = _extras(entry)
         theirs = rem.agent("manifest", timeout=900,
@@ -9228,7 +10584,7 @@ def cmd_reclaim(args):
         if mine_p and (not info.get("path_exists") or not any(
                 not k.startswith(".aht/") for k in theirs["project"]["files"])):
             out["blockers"].append(
-                f"the folder on {rem.name} ({rem.path(real)}) is "
+                f"the folder on {rem.name} ({rem.there(real)}) is "
                 + ("missing" if not info.get("path_exists") else "empty")
                 + f": bringing it here would empty this project, so nothing is taken from "
                 "it" + ("" if copy else f" — release the project instead (aht reclaim "
@@ -9240,7 +10596,7 @@ def cmd_reclaim(args):
             # come here next to ours, as if changed on both sides; a
             # conversation that went on there comes back if it continues
             # ours; every other file counts as agreed
-            newer = _newer_there(rem, ours, theirs, {"project": rem.path(real),
+            newer = _newer_there(rem, ours, theirs, {"project": rem.there(real),
                                                      "history": rstore},
                                  {"project": real, "history": str(store)},
                                  ("project", "history"))
@@ -9255,59 +10611,53 @@ def cmd_reclaim(args):
                 dirs={"here": {t: ours[t].get("dirs") or [] for t in ("project", "history")},
                       "there": {t: theirs[t].get("dirs") or []
                                 for t in ("project", "history")}})
-        # a synced copy leaves the project's .aht/handover out on both sides
-        cut = _sync_files if copy else (lambda f: f or {})
-        plans = {t: three_way(cut(base["here"].get(t)) if t == "project"
-                              else base["here"].get(t) or {},
-                              cut(base["there"].get(t)) if t == "project"
-                              else base["there"].get(t) or {},
-                              cut(ours[t]["files"]) if t == "project" else ours[t]["files"],
-                              cut(theirs[t]["files"]) if t == "project"
-                              else theirs[t]["files"])
-                 for t in ("project", "history")}
-
-        # a transcript must come back as a continuation of what left (of
-        # what is here, for a synced copy: ours is what was sent there)
-        hp = plans["history"]
+        # the plan, made where the record is (here): return_plan
+        cut = _cut if copy else None    # a synced copy leaves .aht/handover out
         if copy:
-            mine = {k: [ours["history"]["files"][k][0],
-                        file_sha256(Path(store) / (ours["history"]["raw"].get(k) or k))]
-                    for k in hp["take"] if k.endswith(".jsonl")
-                    and isinstance((ours["history"]["files"].get(k) or ["l"])[0], int)}
-        else:
-            mine = base.get("transcripts") or {}
-        check = [k for k in hp["take"] if k in mine]
-        if check:
-            got = rem.agent("hash", timeout=600, files=[
-                {"key": k, "path": f"{rstore}/{theirs['history']['raw'].get(k) or k}",
-                 "limit": mine[k][0]} for k in check])["hashes"]
-            for k in check:
-                if got.get(k) != mine[k][1]:
-                    hp["take"].remove(k)
-                    hp["conflict"].append(k)
+            # a transcript must continue what is here (ours is what was sent)
+            hp0 = _three_ways(base, ours, theirs, cut)["history"]
+            base = dict(base, transcripts={
+                k: [ours["history"]["files"][k][0],
+                    file_sha256(Path(store) / (ours["history"]["raw"].get(k) or k))]
+                for k in hp0["take"] if k.endswith(".jsonl")
+                and isinstance((ours["history"]["files"].get(k) or ["l"])[0], int)})
+        needs = return_needs(base, ours, theirs, cut)
+        tr = base.get("transcripts") or {}
+        asks = [{"key": k, "path": f"{rstore}/{theirs['history']['raw'].get(k) or k}",
+                 "limit": n} for k, n in needs["prefix"].items()]
+        asks += [{"key": "eol:" + k, "eol": True,
+                  "path": f"{rem.there(real)}/{theirs['project']['raw'].get(k) or k}"}
+                 for k in needs["eol"]]
+        got = rem.agent("hash", timeout=600, files=asks) if asks else {}
+        prefix_ok = {k: (got.get("hashes") or {}).get(k) == tr[k][1]
+                     for k in needs["prefix"] if k in tr}
+        eol = {k: {"there": (got.get("eol") or {}).get("eol:" + k) or {},
+                   "here": eol_facts(Path(real) / (ours["project"]["raw"].get(k) or k)) or {}}
+               for k in needs["eol"]}
         # the history that returns must be readable here: neither the CLI over
         # there nor anything that wrote into these transcripts may be newer
         mine = find_claude()
         here_ver = claude_version(mine) if mine else None
-        tv = lambda v: tuple(int(x) for x in str(v).split("."))
-        back = [k for k in hp["take"] + hp["new"] + hp["conflict"] if k.endswith(".jsonl")]
+        wb = needs["written_by"]
         wrote = rem.agent("written-by", timeout=600, files=[
             {"key": k, "path": f"{rstore}/{theirs['history']['raw'].get(k) or k}",
-             "offset": (base.get("transcripts") or {}).get(k, [0])[0]
-             if k in hp["take"] else 0} for k in back])["versions"] if back else {}
-        seen = [v for v in list(wrote.values()) + [info.get("claude_version")] if v]
-        newest = max(seen, key=tv) if seen else None
-        out["claude"] = {"here": here_ver, "there": info.get("claude_version"),
-                         "wrote_the_history": newest}
-        if here_ver and newest and tv(newest) > tv(here_ver):
-            msg = (f"Claude Code {newest} was used on {rem.name}, this machine has "
-                   f"{here_ver}: an older version may not read the newer history")
-            if args.ignore_version:
-                out["warnings"].append(msg)
-            else:
-                out["blockers"].append(msg + " — update Claude Code here first "
-                                       "(or pass --ignore-version)")
-                return _emit(args, out, lines)
+             "offset": off} for k, off in wb.items()])["versions"] if wb else {}
+        rp = return_plan(base, ours, theirs, prefix_ok=prefix_ok, written_by=wrote,
+                         here_claude=here_ver, there_claude=info.get("claude_version"),
+                         ignore_version=args.ignore_version, eol=eol,
+                         here_facts=disk_facts(real), here_root=real, cut=cut,
+                         there_name=rem.name)
+        plans = {t: rp[t] for t in ("project", "history")}
+        hp = plans["history"]
+        out["claude"] = rp["claude"]
+        out["warnings"] += rp["warnings"]
+        out["eol_only"] = rp["eol_only"]
+        out["unsafe_names"] = [{"there": u["there"], "kept_as": u["kept_as"]}
+                               for u in rp["unsafe"]]
+        out["git"] = git_note(real, (_my_system(), info.get("system")), {}, rem.name)
+        if rp["blockers"]:
+            out["blockers"] += rp["blockers"]
+            return _emit(args, out, lines)
         if copy:
             # as the sync's own look did: a file there that was only touched
             # (the same bytes as here) is not fetched
@@ -9316,7 +10666,7 @@ def cmd_reclaim(args):
                     == theirs["project"]["files"][k][0]]
             if same:
                 got = rem.agent("hash", timeout=600, files=[
-                    {"key": k, "path": f"{rem.path(real)}/{theirs['project']['raw'].get(k) or k}"}
+                    {"key": k, "path": f"{rem.there(real)}/{theirs['project']['raw'].get(k) or k}"}
                     for k in same])["hashes"]
                 for k in same:
                     try:
@@ -9363,6 +10713,17 @@ def cmd_reclaim(args):
                                 else "ours stays, theirs is kept next to it"))
         if out["conflicts"] and not args.prefer:
             lines.append(f"     (--prefer there takes the versions from {rem.name} instead)")
+        if rp["eol_only"]:
+            lines.append(f"   = {_n(len(rp['eol_only']), 'file')} "
+                         f"{'differs' if len(rp['eol_only']) == 1 else 'differ'} only in line "
+                         "endings: ours stay" + ("" if len(rp['eol_only']) > 1 else "s"))
+        if rp["eol_keep"]:
+            lines.append(f"   = {_n(len(rp['eol_keep']), 'file')} get back the line endings "
+                         "they left with")
+        if rp["unsafe"]:
+            lines.append(f"   ! kept aside: {_n(len(rp['unsafe']), 'file')} whose name this "
+                         "machine cannot hold: " + ", ".join(u["there"] for u in rp["unsafe"][:5]))
+        lines += git_lines(out["git"], "")
         if not args.apply:
             if out.get("would_stop"):
                 lines.append(f"   the idle session on {rem.name} would be ended first")
@@ -9385,18 +10746,21 @@ def cmd_reclaim(args):
                 return sorted(d for d in set(theirs[t].get("dirs") or []) - was
                               - set(ours[t].get("dirs") or [])
                               if not (copy and (d + "/").startswith(RELAYS_REL[1:])))
-            done = {"project": _pull_tree(rem, pp, rem.path(real), real,
+            done = {"project": _pull_tree(rem, pp, rem.there(real), real,
                                           theirs["project"]["raw"], aside / "project",
                                           there, False, handover_skip(),
                                           talk and sys.stderr.isatty(),
-                                          ours["project"]["files"], made_there("project"))}
+                                          ours["project"]["files"], made_there("project"),
+                                          rp["eol_keep"], rp["unsafe"])}
             Path(store).mkdir(parents=True, exist_ok=True)
             done["history"] = _pull_tree(rem, hp, rstore, str(store),
                                          theirs["history"]["raw"], aside / "history",
                                          there, True, [], False,
                                          ours["history"]["files"], made_there("history"))
             sids = _sessions_of(store)
-            for sub, inc in (("file-history", [f"{s}/" for s in sids]),
+            # /rewind's snapshots hold absolute paths: only on an unchanged path
+            same = rem._logical(rem.there(real)) == real
+            for sub, inc in (("file-history", [f"{s}/" for s in sids] if same else []),
                              ("plans", _plans_of(store))):
                 if inc:
                     (claude_home() / sub).mkdir(parents=True, exist_ok=True)
@@ -9407,8 +10771,8 @@ def cmd_reclaim(args):
             for p in _extras(entry):
                 isdir = os.path.isdir(p)
                 # (not `there`: that names the machine, in `returned` below)
-                far_dir, near_dir = (rem.path(p), p) if isdir else \
-                    (os.path.dirname(rem.path(p)), os.path.dirname(p))
+                far_dir, near_dir = (rem.there(p), p) if isdir else \
+                    (posixpath.dirname(rem.there(p)), os.path.dirname(p))
                 r = rem.fetch(far_dir, near_dir, only=None if isdir else [os.path.basename(p)],
                               update=True, skip=handover_skip(),
                               aside=str(aside / "extras" / os.path.basename(p)))
@@ -9430,7 +10794,18 @@ def cmd_reclaim(args):
                     "mode": "copy" if copy else "away", "session": latest,
                     "handed_over": handed, "updated": pd["updated"],
                     "new": pd["new"], "deleted": pd["deleted"],
-                    "conflicts": [c["their_version"] for c in pd["conflicts"]]}
+                    "conflicts": [c["their_version"] for c in pd["conflicts"]],
+                    "from_path": out["there_path"], "eol_only": rp["eol_only"],
+                    "eol_kept": pd["eol_kept"],
+                    "unsafe_names": [{"there": u["there"], "kept_as": u["kept_as"]}
+                                     for u in pd["unsafe"]]}
+            out["eol_kept"] = pd["eol_kept"]
+            out["unsafe_names"] = back["unsafe_names"]
+            out["unsafe_failed"] = pd.get("unsafe_failed") or []
+            for u in out["unsafe_failed"]:
+                out["warnings"].append(f"{u['there']} (a name this machine cannot hold) "
+                                       f"stays on {rem.name}: it could not be kept aside here "
+                                       f"({u['error']})")
             # both copies as they stand now: the next sync, or handover,
             # compares the one there with this list
             write_there(uid, real, rem, _our_trees(real, extras)[0], theirs, "take-back")
@@ -9440,6 +10815,9 @@ def cmd_reclaim(args):
                 _update_entry(uid, away=None, returned=back)
                 _end_pause(uid, rem.name)   # the two copies agree again
                 _retire_manifest(hd)
+                for r in read_relays(real):     # a bring's relay is answered
+                    if r.get("kind") in ("bring", "handover") and r.get("closed") is None:
+                        close_relay(real, r["id"], "taken-back")
             prune_set_asides(hd / "replaced")
         mm = (load_registry().get("projects", {}).get(uid) or {}).get("mirror") or {}
         synced = mm.get("enabled") and mm.get("remote") == rem.name
@@ -9448,8 +10826,8 @@ def cmd_reclaim(args):
             # that Keep in sync keeps, or as one whose project went home
             try:
                 rem.agent("prepare", dirs=[], copy_note={
-                    "path": rem.path(real), "uuid": uid, "from": _here(),
-                    "from_id": machine_id(create=True),
+                    "path": rem.there(real), "uuid": uid, "from": _here(),
+                    "from_id": machine_id(create=True), "from_path": real,
                     "kind": "sync" if synced else "returned", "attempt": was.get("attempt")})
             except HandoverError as e:
                 out["warnings"].append(f"{rem.name} still notes its copy as handed over ({e})")
@@ -9484,6 +10862,9 @@ def cmd_reclaim(args):
                 lines.append(f"   ! kept both ({t}): {c['file']}  +  {c['their_version']}")
         if out.get("set_aside"):
             lines.append(f"   replaced files are kept in {out['set_aside']}")
+        for u in out.get("unsafe_names") or []:
+            lines.append(f"   ! kept aside, as this machine cannot hold its name: {u['there']}"
+                         f"  →  {u['kept_as']}")
         if latest:
             lines.append(f"   continue with:  cd {shlex.quote(real)} && "
                          f"claude --resume {latest}")
@@ -9494,6 +10875,795 @@ def cmd_reclaim(args):
     except HandoverError as e:
         out["error"] = str(e)
         warn(f"RECLAIM {real}: {e}")
+    return _emit(args, out, lines)
+
+# ---- Bring Here and Send Back: driven by the machine that gets the work ----- #
+#
+# Bring Here (at the holder-to-be) fetches a project from its home, and Send
+# Back (at the holder) pushes it home again.  Home keeps the record, as for a
+# Hand Over: the holder asks it through the ops mark-handing, mark-away,
+# unmark, return-plan and return-apply (aht's own copy of aht answers there,
+# at protocol 2 or newer).  So a PC, which is never asked anything, brings
+# projects from Mac and Linux machines and sends them back.
+
+HOME_PROTOCOL = 2
+
+def _aht_home_blocker(info: dict, name: str):
+    """Bring Here and Send Back need aht installed at the project's home,
+    which keeps the project's record."""
+    t = info.get("aht_there") or {}
+    if not t.get("installed"):
+        return (f"install aht on {name} first: Bring Here and Send Back need it there, "
+                "where the project's record is kept")
+    if int(t.get("protocol") or 0) < HOME_PROTOCOL:
+        return (f"update aht on {name} first (and open it once): Bring Here and Send Back "
+                "need a newer aht there, where the project's record is kept")
+    return None
+
+def _far_arg(rem: Remote, p: str) -> str:
+    """A path on another machine as the user gave it (its own name for it),
+    inside the test root or the sandbox."""
+    p = str(p or "")
+    base = rem.root if rem.local else rem.sandbox
+    return p if base and (p == base or p.startswith((base + "/", base + "\\"))) else rem.path(p)
+
+def _holder_end(path: str, create: bool = True) -> dict:
+    """This machine, as the one that holds (or would hold) a project."""
+    return {"name": _here(), "machine_id": machine_id(create=create),
+            "system": platform.system(), "host": platform.node().split(".")[0] or _here(),
+            "path": path}
+
+def _home_projects() -> list:
+    """The projects aht knows on this machine, for another machine's Bring
+    Here list: path, name, id, whether it is here (`state`: "home", "away",
+    "handing", "copy" of another machine's project, "gone"), an open
+    session, the latest session."""
+    reg = load_registry()
+    try:
+        live = running_sessions()
+    except Exception:
+        live = []
+    home = os.path.realpath(str(Path.home()))
+    rows = []
+    for uid, e in reg.get("projects", {}).items():
+        real = e.get("real_path") or ""
+        if not real or os.path.realpath(real) == home:
+            continue
+        exists = os.path.isdir(real)
+        a, h = e.get("away"), e.get("handing")
+        c = copy_of(real) if exists else None
+        state = ("gone" if not exists else "away" if a else "handing" if h else
+                 "copy" if c and c.get("kind") != "returned" else "home")
+        mine = [s["status"] for s in live
+                if _inside(os.path.realpath(s.get("cwd") or "/"), os.path.realpath(real))]
+        store = _store_of(real) if exists else None
+        sid = latest_session(store) if store else None
+        upd = None
+        if sid:
+            try:
+                upd = os.path.getmtime(Path(store) / f"{sid}.jsonl")
+            except OSError:
+                pass
+        rows.append({"path": real, "name": os.path.basename(real), "uuid": uid, "state": state,
+                     "away": {"holder": a.get("holder") or a.get("host"), "since": a.get("since"),
+                              "driven_by": a.get("driven_by") or "here"} if a else None,
+                     "copy_of": c.get("from") if c and state == "copy" else None,
+                     "open": None if not mine else "waiting" if "waiting" in mine
+                     else "idle" if all(x == "idle" for x in mine) else "working",
+                     "session": {"id": sid, "title": redact(session_title(store, sid)),
+                                 "updated": upd} if sid else None})
+    rows.sort(key=lambda r: r["path"].lower())
+    return rows
+
+def _bring_list(args, rem: Remote, out: dict, lines: list) -> int:
+    out.update(list=True, system=None, here_system=platform.system(), projects=[],
+               error=None)
+    info = rem.agent("relay-info", timeout=120, list=True)
+    rem.info = dict(rem.info, system=info.get("system"), home=info.get("home"))
+    out["system"] = info.get("system")
+    why = _aht_home_blocker({"aht_there": info.get("aht")}, rem.name) \
+        if "aht" in info else None
+    if why:
+        out["blockers"].append(why)
+    for p in info.get("projects") or []:
+        try:
+            here = rem.here(p["path"])
+            herr = None if here else _outside_text(rem._logical(p["path"]), rem.name,
+                                                   rem.there_system(), platform.system(),
+                                                   str(Path.home()))
+        except HandoverError as e:
+            here, herr = None, str(e)
+        st = p.get("state")
+        why = ({"away": f"on {(p.get('away') or {}).get('holder')} since "
+                        f"{_clock((p.get('away') or {}).get('since'))}",
+                "handing": "a handover of it has not finished there",
+                "copy": f"a copy of a project on {p.get('copy_of')}: bring it from there",
+                "gone": "its folder is gone there"}.get(st)
+               or ("a session is working in it there" if p.get("open") in ("working", "waiting")
+                   else None))
+        out["projects"].append(dict(p, path=rem._logical(p["path"]), here_path=here,
+                                    here_error=herr, can_bring=not why and bool(here),
+                                    why_not=why or herr))
+    lines.append(f"projects on {rem.name} ({out['system'] or '?'}):")
+    for p in out["projects"]:
+        mark = "·" if p["can_bring"] else "✗"
+        lines.append(f"  {mark} {p['path']}"
+                     + (f"   → {p['here_path']}" if p["here_path"] and p["can_bring"] else "")
+                     + (f"   ({p['why_not']})" if p["why_not"] else "")
+                     + (f"\n      {p['session']['title']}" if p.get("session")
+                        and p["session"].get("title") else ""))
+    if not out["projects"]:
+        lines.append("  (none)")
+    lines.append(f"bring one here with:  aht bring <path there> --from {rem.name}")
+    return _emit(args, out, lines)
+
+def _bring_brief(here: str, far: str, frm: str, frm_system, sid, dig: dict) -> str:
+    when = time.strftime("%Y-%m-%d %H:%M")
+    mine = SYSTEM_WORDS.get(platform.system(), platform.system())
+    theirs = SYSTEM_WORDS.get(frm_system, frm_system or "?")
+    L = [f"# Brought here: {os.path.basename(here)}", "",
+         f"- From **{frm}** ({theirs}) to **{_here()}** ({mine}), {when}",
+         f"- Folder: `{here}` here, `{far}` on {frm}" if far != here
+         else f"- Folder: `{here}` (the same path on both machines)"]
+    if sid:
+        L.append(f"- Session: {redact(dig.get('title') or 'untitled')} — `{sid}`")
+        L.append(f"- Continue it with: `claude --resume {sid}`")
+    L += _brief_sections(dig)
+    L += ["", "## What did not come along", "",
+          f"- Running processes and temporary files on {frm}.",
+          "- Folders that are rebuilt per machine: `node_modules`, `.venv`, `__pycache__` "
+          "and the like.",
+          f"- Other agents' histories (Codex, Kimi, Antigravity): they stay on {frm}.",
+          "", f"Send it back with:  aht send-back {_arg(here)}"]
+    return "\n".join(L) + "\n"
+
+def cmd_bring(args):
+    """Bring Here: fetch a project from the machine that has it, with Claude
+    Code's history, and continue it here.  Its home keeps the record that it
+    is here; Send Back returns it."""
+    out = {"command": "bring", "applied": False, "blockers": [], "warnings": []}
+    lines = []
+    if not args.from_remote:
+        out["blockers"].append("name the machine it is on: --from NAME")
+        return _emit(args, out, lines)
+    talk = not args.json
+    prog = Progress(args.status_file, talk)
+    say = prog.say
+    attempt = marked = told = None
+    rem = None
+    try:
+        rem = get_remote(args.from_remote)
+        rem.on_percent = prog.percent
+        out["remote"] = rem.name
+        if rem.there_system() == "Windows" and not rem.local:
+            raise HandoverError(f"{rem.name} is a Windows PC, which aht cannot ask: on "
+                                f"{rem.name}, use Hand Over instead")
+        if args.list:
+            return _bring_list(args, rem, out, lines)
+        if not args.path:
+            out["blockers"].append(f"name the project there (aht bring --from {rem.name} "
+                                   "--list shows them)")
+            return _emit(args, out, lines)
+        far = _far_arg(rem, args.path)
+        shown_far = rem._logical(far)
+        out.update(there_path=shown_far, mode="bring", agent="claude",
+                   allow_idle=bool(args.allow_idle))
+        say(f"checking {rem.name} …")
+        info = rem.info = rem.agent("probe", path=far, claude=rem.claude)
+        rem.far_home()
+        if info.get("system") == "Windows" and not rem.local:
+            raise HandoverError(f"{rem.name} is a Windows PC, which aht cannot ask")
+        out["there"] = {k: info.get(k) for k in ("host", "system", "claude_version",
+                                                   "sessions", "processes")}
+        out["there"]["aht"] = info.get("aht_there")
+        if not info.get("path_exists"):
+            out["blockers"].append(f"there is no folder {shown_far} on {rem.name}")
+            return _emit(args, out, lines)
+        why = _aht_home_blocker(info, rem.name)
+        if why:
+            out["blockers"].append(why)
+            return _emit(args, out, lines)
+        chk = rem.agent("mark-handing", path=far, uuid=info.get("path_marker"),
+                        check_only=True, allow_idle=bool(args.allow_idle),
+                        holder=_holder_end("", create=False))
+        uid = chk.get("uuid")
+        out["uuid"] = uid
+        out["blockers"] += chk.get("blockers") or []
+        out["warnings"] += chk.get("warnings") or []
+        sid = (chk.get("session") or {}).get("id")
+        out["session"] = dict(chk.get("session") or {"id": None, "title": ""},
+                              open=next((s.get("status") for s in chk.get("sessions") or []),
+                                        None))
+        out["sessions"] = chk.get("sessions_count", 0)
+        out["other_histories"] = chk.get("other_histories") or []
+        # where it goes here
+        here = os.path.abspath(os.path.expanduser(args.here)) if args.here else None
+        if not here:
+            try:
+                here = rem.here(far)
+            except OutsideError:
+                here = None
+            if not here:
+                tf = _flavour(rem.there_system())
+                top = tf.dirname(shown_far.rstrip("/\\")) or shown_far
+                mine = os.path.join(str(Path.home()), tf.basename(top) or "work")
+                out["blockers"].append(
+                    f"aht moves projects between the home folders of your machines. "
+                    f"{shown_far} is outside {rem.name}'s. Bring it with --here PATH, or tell "
+                    f"aht where such projects go here:  aht remote paths {rem.name} --add "
+                    f"{_arg(mine)} {_arg(top)}")
+                return _emit(args, out, lines)
+        parent = os.path.dirname(here.rstrip("/\\")) or here
+        here = os.path.join(os.path.realpath(parent), os.path.basename(here.rstrip("/\\"))) \
+            if os.path.isdir(parent) else here
+        out["project"] = out["here_path"] = here
+        if _inside(os.path.realpath(str(Path.home())), here):
+            out["blockers"].append("that is your home folder (or holds it), not a project")
+
+        def finish(away: dict, attempt: str, rid: str, r: dict, rh: dict, aside):
+            """This machine's side, once home noted that the project is here:
+            the copy's note, the registry, trust, the relay, the window."""
+            store = claude_backend().root() / _key_claude(here)
+            gset = git_settings(_my_system(), info.get("system"), bool(chk.get("autocrlf")))
+            _note_copy(here, {"uuid": uid, "from": chk.get("host") or rem.name,
+                              "from_id": info.get("machine_id"), "kind": "brought",
+                              "remote": rem.name,
+                              "attempt": attempt, "from_path": chk.get("path") or far,
+                              "system": info.get("system"),
+                              "autocrlf": bool(chk.get("autocrlf"))})
+            with Lock():
+                reg = load_registry()
+                had = reg["projects"].get(uid)
+                if had is None or os.path.realpath(had.get("real_path") or "") == \
+                        os.path.realpath(here):
+                    if read_marker(here) != uid:
+                        write_marker(here, uid)
+                    _register(reg, uid, os.path.realpath(here))
+                    save_registry(reg)
+                else:
+                    out["warnings"].append(f"aht here lists this project at "
+                                           f"{had.get('real_path')} too; that entry stays as "
+                                           "it is")
+            if chk.get("trusted") and cfg_get("handover_carry_trust", True):
+                out["trust"] = set_trust(here)
+            dig = session_digest(store / f"{sid}.jsonl", here) if sid else \
+                session_digest(os.devnull, here)
+            if not any(x.get("id") == rid for x in read_relays(here)):
+                try:
+                    write_relay(here, "bring",
+                                {"machine": chk.get("host") or rem.name,
+                                 "machine_id": info.get("machine_id"),
+                                 "system": info.get("system"),
+                                 "path": chk.get("path") or far, "agent": "claude",
+                                 "session": sid, "title": _line(dig.get("title") or "")},
+                                {"agent": "claude", "session": sid, "mode": "resume"},
+                                _bring_brief(here, shown_far, rem.name, info.get("system"),
+                                             sid, dig),
+                                rid=rid)
+                except OSError as e:
+                    out["warnings"].append(f"the summary could not be written ({e})")
+            out["relay"] = rid
+            out["applied"] = True
+            out["attempt"] = attempt
+            out["away"] = away
+            out["fetched"] = {"files": r.get("files", 0), "bytes": r.get("bytes", 0),
+                              "history_bytes": rh.get("bytes", 0),
+                              "wire_bytes": r.get("received", 0) + rh.get("received", 0)}
+            if aside is not None:
+                if aside.is_dir() and any(f.is_file() or f.is_symlink()
+                                          for f in aside.rglob("*")):
+                    out["set_aside"] = str(aside)
+                else:
+                    shutil.rmtree(aside, ignore_errors=True)
+                prune_set_asides(aside.parent)
+            line = ("" if os.name == "nt" else "exec ") + shell_quote(find_claude() or "claude") \
+                + (" --resume " + shell_quote(sid) if sid else "")
+            env = git_env_vars(gset)
+            out["command_line"] = env_prefix(env) + cd_then(here) + line
+            out["opened"] = False
+            if not args.no_open:
+                out["opened"] = open_terminal(line, "resume-" + os.path.basename(here),
+                                              cwd=here, env=env, echo=False) == 0
+            log(f"BRING {here} <- {rem.name}:{shown_far} (session {sid})")
+            try:
+                apply_badge(here, desired_marks(here, True))
+            except Exception:
+                pass
+            lines.extend([f"brought here:  {rem.name}:{shown_far}  →  {here}",
+                          f"   files     {out['fetched']['files']} "
+                          f"({_human(out['fetched']['bytes'])}); "
+                          f"history {_human(out['fetched']['history_bytes'])}",
+                          f"   session   {dig.get('title') or sid or 'a new one'}"
+                          + (" — opened in a new window" if out["opened"] else ""),
+                          "   continue  " + out["command_line"],
+                          f"   back      aht send-back {_arg(here)} --apply"])
+            return _emit(args, out, lines)
+
+        ha = chk.get("here_already") or {}
+        if ha:
+            # home has it as brought here by this machine already: a Bring
+            # Here whose last word was lost on the way (the link dropped)
+            c0 = copy_of(here) or {}
+            if c0.get("kind") == "brought" and c0.get("attempt") == ha.get("attempt"):
+                out["blockers"].append(f"it is here already, brought from {rem.name} "
+                                       f"{_clock(ha.get('since'))}: send it back when done:  "
+                                       f"aht send-back {_arg(here)}")
+                return _emit(args, out, lines)
+            if not ha.get("remote_path") or not _same_dir(ha["remote_path"], here) \
+                    or read_marker(here) != uid:
+                out["blockers"].append(f"{rem.name} has it as brought to "
+                                       f"{ha.get('remote_path') or 'this machine'} "
+                                       f"{_clock(ha.get('since'))}: send it back from there, "
+                                       f"or release it on {rem.name}")
+                return _emit(args, out, lines)
+            out["finish"] = ha.get("attempt")
+            # what stands in the way of a new Bring Here there (a session
+            # opened there since) does not stop this one from being noted here
+            out["blockers"] = [b for b in out["blockers"] if b not in (chk.get("blockers") or [])]
+            if out["blockers"] or not args.apply:
+                lines += [f"{rem.name} has it as brought here {_clock(ha.get('since'))}, but "
+                          "this machine did not note it (the link dropped): --apply finishes "
+                          "that Bring Here here, nothing is copied again"]
+                return _emit(args, out, lines)
+            say(f"asking {rem.name} …")
+            got = rem.agent("mark-away", timeout=300, path=far, uuid=uid,
+                            attempt=ha.get("attempt"), base={})
+            if got.get("already"):
+                out["warnings"].append(f"{rem.name}: {got['already']}")
+            away = got.get("away") or {}
+            return finish(away, ha.get("attempt"), away.get("relay") or new_relay_id(),
+                          {}, {}, None)
+        ident = folder_identity(here)
+        out["identity"], why = identity_check(
+            ident, uid, "here", here, "Move it away, or bring it to another place",
+            f"aht bring {_arg(shown_far)} --from {rem.name} --here "
+            f"{_arg(here.rstrip(chr(47) + chr(92)) + '-' + rem.name)}")
+        if why:
+            out["blockers"].append(why)
+        act = activity_in(here) if ident["path_exists"] else {"sessions": [], "processes": []}
+        out["here"] = dict(act, system=_my_system())
+        out["blockers"] += _activity_blockers(act, "here")
+        # what would come, and what this disk cannot hold
+        far_store = chk.get("store") or \
+            f"{chk.get('claude_home') or info.get('claude_home')}/projects/{_key_claude(far)}"
+        trees = rem.agent("manifest", timeout=900, trees={
+            "project": {"path": far, "skip": handover_skip()},
+            "history": {"path": far_store, "skip": []}})["trees"]
+        tp, th = trees["project"], trees["history"]
+        facts = disk_facts(here)
+        out["names"] = name_problems(tp, facts, root=here)
+        if out["names"]:
+            out["blockers"].append(names_blocker(out["names"], "this machine", f"on {rem.name}"))
+        local = tree_of(here, handover_skip()) if ident["path_exists"] else \
+            tree_manifest(os.devnull, [])
+        diff = [k for k, v in tp["files"].items() if local["files"].get(k) != v]
+        replaced = [k for k in diff if k in local["files"]]
+        extra = sorted(k for k in local["files"] if k not in tp["files"]
+                       and not k.startswith(RELAYS_REL[1:]))
+        same = _flavour(platform.system()) is _flavour(info.get("system")) \
+            and rem._logical(far) == here
+        out["plan"] = {"files": len(diff),
+                       "bytes": sum(tp["files"][k][0] for k in diff
+                                    if isinstance(tp["files"][k][0], int)),
+                       "history_files": len(th["files"]),
+                       "history_bytes": sum(v[0] for v in th["files"].values()
+                                            if isinstance(v[0], int)),
+                       "replaces": len(replaced), "set_aside": len(replaced) + len(extra),
+                       "plans": len(chk.get("plans") or []), "file_history": same,
+                       "free_bytes": None}
+        try:
+            anc = Path(here)
+            while not anc.exists() and anc != anc.parent:
+                anc = anc.parent
+            out["plan"]["free_bytes"] = shutil.disk_usage(str(anc)).free
+        except OSError:
+            pass
+        need = out["plan"]["bytes"] + out["plan"]["history_bytes"]
+        if out["plan"]["free_bytes"] is not None and need > out["plan"]["free_bytes"]:
+            out["blockers"].append(f"this machine has {_human(out['plan']['free_bytes'])} free, "
+                                   f"{_human(need)} are needed")
+        out["modes_lost"] = sorted(tp.get("modes") or {}) if _my_system() == "Windows" else []
+        mine = find_claude()
+        here_ver = claude_version(mine) if mine else None
+        out["claude"] = {"here": here_ver, "there": chk.get("claude_version")}
+        if not mine:
+            out["warnings"].append("Claude Code was not found on this machine: install it "
+                                   "to continue the session here")
+        elif chk.get("claude_version") and here_ver and \
+                _version_tuple(chk["claude_version"]) > _version_tuple(here_ver):
+            out["warnings"].append(f"Claude Code {chk['claude_version']} wrote this history on "
+                                   f"{rem.name}, this machine has {here_ver}: update Claude "
+                                   "Code here before you continue it")
+        gset = git_settings(_my_system(), info.get("system"), bool(chk.get("autocrlf")))
+        systems = (_my_system(), info.get("system"))
+        out["git"] = {"is_git": ".git/HEAD" in tp["files"] or ".git" in (tp.get("dirs") or []),
+                      "gitattributes": ".gitattributes" in tp["files"], "suggest": [],
+                      "env": gset, "how": None}
+        if out["git"]["is_git"] and "Windows" in systems and not out["git"]["gitattributes"]:
+            out["git"]["suggest"] = list(GITATTRIBUTES_LINES)
+        if gset:
+            out["git"]["how"] = git_note("", systems, gset, "here")["how"]
+        out["eol_only"], out["unsafe_names"] = [], []
+        if out["blockers"]:
+            return _emit(args, out, lines)
+        if not args.apply:
+            lines += [f"would bring here:  {rem.name}:{shown_far}  →  {here}",
+                      f"   files       {out['plan']['files']} "
+                      f"({_human(out['plan']['bytes'])}); Claude history "
+                      f"{_human(out['plan']['history_bytes'])}",
+                      f"   session     {out['session'].get('title') or sid or 'none yet'}"
+                      + (" — opens here; nothing runs until you type" if sid else "")]
+            if out["plan"]["set_aside"]:
+                lines.append(f"   here        {_n(out['plan']['set_aside'], 'file')} in the "
+                             "folder here are set aside first")
+            if out["modes_lost"]:
+                lines.append(f"   on Windows  {_n(len(out['modes_lost']), 'script')} lose their "
+                             f"\"executable\" mark here; they get it back on {rem.name}")
+            for a in out["other_histories"]:
+                lines.append(f"   stays       {AGENT_NAMES[a]}'s history stays on {rem.name}")
+            if not same and sid:
+                lines.append("   not carried /rewind's snapshots (the path differs here)")
+            lines += git_lines(out["git"], "here")
+            lines += [f"   on {rem.name:<8} the project is marked as being here; its own copy "
+                      "stays as it is",
+                      "(dry run — pass --apply to do it)"]
+            return _emit(args, out, lines)
+
+        # do it.  Home records the attempt before anything travels
+        attempt = f"{_stamp()}-{os.urandom(2).hex()}"
+        rid = new_relay_id()
+        say(f"telling {rem.name} …")
+        marked = True                   # from now on, a failure undoes it there
+        got = rem.agent("mark-handing", path=far, uuid=uid, attempt=attempt,
+                        allow_idle=bool(args.allow_idle), holder=_holder_end(here), relay=rid)
+        if got.get("blockers"):
+            out["blockers"] += got["blockers"]
+            return _emit(args, out, lines)
+        hd = handover_dir(uid)
+        aside = hd / "brought" / _stamp()
+        say(f"bringing the project from {rem.name} …")
+        os.makedirs(here, exist_ok=True)
+        r = rem.fetch(far, here, deletes=extra, aside=str(aside / "project"),
+                      skip=handover_skip(), progress=talk and sys.stderr.isatty())
+        if not r["ok"]:
+            raise HandoverError("bringing the project failed: " + r["error"])
+        _test_drop("fetched", rem.name)
+        store = claude_backend().root() / _key_claude(here)
+        if chk.get("store") or th["files"]:
+            store.mkdir(parents=True, exist_ok=True)
+            rh = rem.fetch(far_store, str(store), aside=str(aside / "history"))
+            if not rh["ok"]:
+                raise HandoverError("bringing the history failed: " + rh["error"])
+        else:                           # no Claude history there: none to bring
+            rh = {"ok": True, "files": 0, "bytes": 0, "received": 0}
+        fch = chk.get("claude_home") or info.get("claude_home")
+        for sub, inc in (("plans", chk.get("plans") or []),
+                         ("file-history", [f"{s}/" for s in chk.get("sids") or []]
+                          if same else [])):
+            if inc:
+                (claude_home() / sub).mkdir(parents=True, exist_ok=True)
+                x = rem.fetch(f"{fch}/{sub}", str(claude_home() / sub), only=inc,
+                              aside=str(aside / sub))
+                if not x["ok"]:
+                    out["warnings"].append(f"{sub} did not all come: {x['error']}")
+        # what left there and what arrived here: the base of the way back
+        now_p = tree_manifest(here)
+        now_h = tree_manifest(str(store), []) if store.is_dir() else tree_manifest(os.devnull, [])
+        lost = sorted(set(tp["files"]) - set(now_p["files"]))
+        if lost:
+            out["warnings"].append(f"{len(lost)} file(s) did not arrive, e.g. {lost[0]}")
+        base = {"here": {"project": tp["files"], "history": th["files"]},
+                "there": {"project": now_p["files"], "history": now_h["files"]},
+                "dirs": {"here": {"project": tp.get("dirs") or [], "history": th.get("dirs") or []},
+                         "there": {"project": now_p.get("dirs") or [],
+                                   "history": now_h.get("dirs") or []}},
+                "modes": {"project": tp.get("modes") or {}, "history": th.get("modes") or {}}}
+        say(f"telling {rem.name} it is here …")
+        told = True
+        try:
+            got = rem.agent("mark-away", timeout=300, path=far, uuid=uid, attempt=attempt,
+                            base=base)
+        except LinkError:
+            # the link dropped once home was told, maybe after it noted it:
+            # asked again, it notes it now or answers that it did
+            say(f"asking {rem.name} again …")
+            try:
+                got = rem.agent("mark-away", timeout=300, path=far, uuid=uid,
+                                attempt=attempt, base=base)
+            except LinkError as x:
+                raise HandoverError(f"the link to {rem.name} dropped after it was told the "
+                                    f"project is here ({x}). Run the same Bring Here again "
+                                    f"to finish it: it asks {rem.name} first")
+        marked = False
+        if got.get("already"):
+            out["warnings"].append(f"{rem.name}: {got['already']}")
+        return finish(got.get("away") or {}, attempt, rid, r, rh, aside)
+    except HandoverError as e:
+        out["error"] = str(e)
+        warn(f"BRING {args.path} <- {args.from_remote}: {e}")
+        if marked and rem is not None:
+            # it did not arrive: home forgets that it was on its way; what
+            # came here stays, and the next Bring Here sets it aside
+            try:
+                if rem.agent("unmark", timeout=60, path=_far_arg(rem, args.path),
+                             attempt=attempt).get("unmarked"):
+                    out["warnings"].append(f"{rem.name} keeps the project; what arrived here "
+                                           "stays and is set aside by the next Bring Here")
+            except HandoverError as x:
+                out["warnings"].append(
+                    f"{rem.name} does not answer ({x}): run the same Bring Here again once it "
+                    "does" if told else
+                    f"{rem.name} could not be told that it did not arrive ({x}); aht there "
+                    "offers Release after an hour")
+    return _emit(args, out, lines)
+
+def _send_entries(real: str, store: str, plan: dict, unsafe: list, sids: list,
+                  plans: list, same: bool) -> list:
+    """The files a Send Back sends: what the plan takes (both trees), the
+    plans of this project's sessions and, on an unchanged path, their
+    /rewind snapshots.  A PC sends no modes (home keeps its own)."""
+    modes = os.name != "nt" and _my_system() != "Windows"
+    roots = {"project": real, "history": store}
+    raw = {"project": tree_manifest(real)["raw"], "history": tree_manifest(store, [])["raw"]
+           if os.path.isdir(store) else {}}
+    out = []
+    def add(tree, key, path):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        e = {"tree": tree, "key": key, "src": path}
+        if stat.S_ISLNK(st.st_mode):
+            e["link"] = os.readlink(path)
+        elif stat.S_ISREG(st.st_mode):
+            e.update(size=st.st_size, mtime=int(st.st_mtime))
+            if modes:
+                e["mode"] = stat.S_IMODE(st.st_mode)
+        else:
+            return
+        out.append(e)
+    for t in ("project", "history"):
+        p = plan[t]
+        for k in p["take"] + p["new"] + p["conflict"]:
+            add(t, k, os.path.join(roots[t], raw[t].get(k) or k))
+    for u in unsafe:
+        add("project", u["key"], os.path.join(real, raw["project"].get(u["key"]) or u["key"]))
+    pdir = claude_home() / "plans"
+    for name in plans:
+        add("plans", name, str(pdir / name))
+    if same:
+        for s in sids:
+            d = claude_home() / "file-history" / s
+            if d.is_dir():
+                for k in sorted(tree_manifest(str(d), [])["files"]):
+                    add("file-history", f"{s}/{k}", str(d / k))
+    return out
+
+def cmd_send_back(args):
+    """Send Back: return a project that was brought (or handed over) here to
+    its home.  Home plans the way back against its record (return_plan) and
+    places the files; this machine sends them."""
+    out = {"command": "send-back", "applied": False, "blockers": [], "warnings": []}
+    lines = []
+    real = os.path.realpath(args.path)
+    out.update(project=real, here_path=real, mode="away")
+    talk = not args.json
+    prog = Progress(args.status_file, talk)
+    say = prog.say
+    try:
+        c = copy_of(real)
+        if not c or c.get("kind") not in ("brought", "handover"):
+            out["blockers"].append(
+                f"this project went back to {c.get('from')} already" if c and c.get("kind") ==
+                "returned" else "this folder is not a project brought or handed over here")
+            return _emit(args, out, lines)
+        uid = c.get("uuid")
+        out["uuid"] = uid
+        if read_marker(real) != uid:
+            out["blockers"].append("this folder holds another project now (its id changed)")
+            return _emit(args, out, lines)
+        if c.get("system") == "Windows":
+            # handed over by a PC, which is never asked anything: it asks
+            frm = c.get("from") or "the PC it came from"
+            out["blockers"].append(f"{frm} is a Windows PC, which aht cannot ask: take it "
+                                   f"back on {frm}")
+            return _emit(args, out, lines)
+        name = args.to or (c.get("remote") if c.get("remote") in remotes_config() else
+                           _remote_for(c.get("from"), c.get("from_id")))
+        if not name:
+            out["blockers"].append(f"{c.get('from')} is not set up on this machine: add it "
+                                   f"(aht remote add {c.get('from')} <user@host>), then send "
+                                   "it back")
+            return _emit(args, out, lines)
+        rem = get_remote(name)
+        rem.on_percent = prog.percent
+        out["remote"] = rem.name
+        far = c.get("from_path") or rem.there(real)
+        out["there_path"] = rem._logical(far)
+        # nothing may run in it here
+        act = activity_in(real)
+        out["here"] = dict(act, system=_my_system())
+        out["blockers"] += _activity_blockers(act, "here")
+        if act["processes"]:
+            out["warnings"].append("still running in this folder: " + ", ".join(
+                sorted({p["name"] for p in act["processes"]})) + " (they go on with this copy)")
+        if os.name == "nt":
+            for a in sorted(agents_running_nt()):
+                out["warnings"].append(f"{AGENT_NAMES.get(a, a)} is running on this PC; aht "
+                                       "cannot tell in which folder")
+        say(f"checking {rem.name} …")
+        info = rem.info = rem.agent("probe", path=far, claude=rem.claude)
+        out["there"] = {"host": info.get("host"), "system": info.get("system"),
+                        "sessions": info.get("sessions"), "processes": info.get("processes")}
+        why = _aht_home_blocker(info, rem.name)
+        if why:
+            out["blockers"].append(why)
+        if out["blockers"]:
+            return _emit(args, out, lines)
+        store = _store_of(real) or (claude_backend().root() / _key_claude(real))
+        store = str(store)
+        theirs = {"project": tree_manifest(real),
+                  "history": tree_manifest(store, []) if os.path.isdir(store)
+                  else tree_manifest(os.devnull, [])}
+        req = {"path": far, "uuid": uid, "attempt": c.get("attempt"),
+               "holder": _holder_end(real), "theirs": theirs}
+        def finish_back(res: dict, wire: dict = None, n: int = 0):
+            """This machine's side, once home has the project again: the copy
+            here is a returned one, the window and the relay close."""
+            _note_copy(real, dict(c, kind="returned"))
+            if c.get("kind") == "handover":
+                # the window the handover opened here, once nothing runs in it
+                try:
+                    _agent_close({"path": real,
+                                  "name": _mux_name(c.get("from_path") or real, uid)})
+                except Exception:
+                    pass
+            for r in read_relays(real):
+                if r.get("kind") in ("bring", "handover") and r.get("closed") is None:
+                    close_relay(real, r["id"], "sent-back")
+            out.update(applied=True, done=res.get("done"), set_aside=res.get("set_aside"),
+                       returned=res.get("returned"), session=res.get("session"),
+                       session_title=res.get("session_title"),
+                       sent={"files": n, "wire_bytes": (wire or {}).get("sent", 0)})
+            if res.get("already"):
+                out["already"] = res["already"]
+                out["warnings"].append(f"{rem.name}: {res['already']}; this machine notes it "
+                                       "now")
+            probs = ((res.get("done") or {}).get("arrived") or {}).get("problems") or []
+            if probs:
+                out["warnings"].append(_problems_text(probs))
+            log(f"SEND BACK {real} -> {rem.name}:{out['there_path']}"
+                + (f" ({res['already']})" if res.get("already") else ""))
+            notify_user("Sent back", f"{os.path.basename(real)} is on {rem.name} again")
+            lines.append(f"sent back:  {real}  →  {rem.name}  — it is {rem.name}'s again; "
+                         "this copy stays here as it is")
+            for t, d in (res.get("done") or {}).items():
+                for cf in (d.get("conflicts") or []) if isinstance(d, dict) else []:
+                    lines.append(f"   ! kept both on {rem.name} ({t}): {cf['file']}  +  "
+                                 f"{cf['their_version']}")
+            if res.get("set_aside"):
+                lines.append(f"   replaced files are kept on {rem.name} in {res['set_aside']}")
+            return _emit(args, out, lines)
+
+        say(f"asking {rem.name} for the way back …")
+        first = rem.agent("return-plan", timeout=900, checks=None, **req)
+        if first.get("already"):
+            # it went back before, and this machine did not hear (the link
+            # dropped): only this side is left to do
+            out["attempt"] = first.get("attempt")
+            if not args.apply:
+                out["already"] = first["already"]
+                lines.append(f"{rem.name} has it back already ({first['already']}), but this "
+                             "machine did not note it: --apply notes it, nothing is sent")
+                return _emit(args, out, lines)
+            return finish_back(first)
+        needs = first.get("needs") or {}
+        raw_h, raw_p = theirs["history"].get("raw") or {}, theirs["project"].get("raw") or {}
+        checks = {"prefix": {}, "eol": {}, "written_by": {}}
+        for k, n in (needs.get("prefix") or {}).items():
+            try:
+                checks["prefix"][k] = file_sha256(os.path.join(store, raw_h.get(k) or k), int(n))
+            except (OSError, ValueError):
+                checks["prefix"][k] = None
+        for k in needs.get("eol") or []:
+            checks["eol"][k] = eol_facts(os.path.join(real, raw_p.get(k) or k))
+        wb = needs.get("written_by") or {}
+        if wb:
+            checks["written_by"] = _agent_written_by({"files": [
+                {"key": k, "path": os.path.join(store, raw_h.get(k) or k), "offset": off}
+                for k, off in wb.items()]})["versions"]
+        mine = find_claude()
+        checks["claude"] = claude_version(mine) if mine else None
+        # planned there, where "there" is this machine: --prefer here = ours win
+        req.update(checks=checks, prefer="there" if args.prefer == "here" else None,
+                   ignore_version=bool(args.ignore_version))
+        got = rem.agent("return-plan", timeout=900, **req)
+        out.update(attempt=got.get("attempt"), plan_id=got.get("plan_id"),
+                   plan=got.get("counts"), conflicts=got.get("conflicts") or {},
+                   claude={"here": checks["claude"],
+                           "there": (got.get("claude") or {}).get("here"),
+                           "wrote_the_history": (got.get("claude") or {}).get(
+                               "wrote_the_history")},
+                   eol_only=got.get("eol_only") or [],
+                   eol_kept=sorted(got.get("eol_keep") or {}),
+                   unsafe_names=[{"there": u["there"], "kept_as": u["kept_as"]}
+                                 for u in got.get("unsafe") or []],
+                   names=[], prefer=args.prefer)
+        out["there"].update(sessions=got.get("sessions"), processes=got.get("processes"))
+        out["blockers"] += got.get("blockers") or []
+        out["warnings"] += got.get("warnings") or []
+        out["git"] = git_note(real, (_my_system(), info.get("system")), {}, rem.name)
+        plan = got.get("plan") or {}
+        pc, hc = (out["plan"] or {}).get("project") or {}, (out["plan"] or {}).get("history") or {}
+        verb = "sending back" if args.apply else "would send back"
+        lines += [f"{verb}:  {real}  →  {rem.name}:{out['there_path']}",
+                  f"   project   {pc.get('take', 0)} changed, {pc.get('new', 0)} new, "
+                  f"{pc.get('delete', 0)} removed here; {pc.get('kept', 0)} changed only on "
+                  f"{rem.name}",
+                  f"   history   {hc.get('take', 0)} continued, {hc.get('new', 0)} new file(s)"]
+        for t, ks in out["conflicts"].items():
+            for k in ks[:6]:
+                lines.append(f"   ! changed on both machines ({t}): {k}   → "
+                             + (f"this version is taken, {rem.name}'s is set aside there"
+                                if args.prefer == "here"
+                                else f"{rem.name}'s stays, this one is kept next to it"))
+        if out["eol_only"]:
+            lines.append(f"   = {_n(len(out['eol_only']), 'file')} "
+                         f"{'differs' if len(out['eol_only']) == 1 else 'differ'} only in line "
+                         f"endings: {rem.name}'s stay" + ("" if len(out['eol_only']) > 1 else "s"))
+        if out["eol_kept"]:
+            lines.append(f"   = {_n(len(out['eol_kept']), 'file')} get back the line endings "
+                         f"they left {rem.name} with")
+        if out["unsafe_names"]:
+            lines.append(f"   ! {_n(len(out['unsafe_names']), 'file')} with names {rem.name} "
+                         "cannot hold are kept aside there")
+        lines += git_lines(out["git"], "")
+        if out["blockers"] or not args.apply:
+            if not args.apply:
+                lines.append("(dry run — pass --apply to do it)")
+            return _emit(args, out, lines)
+
+        same = _flavour(platform.system()) is _flavour(info.get("system")) \
+            and out["there_path"] == real
+        sids = _sessions_of(store)
+        ents = _send_entries(real, store, plan, got.get("unsafe") or [], sids,
+                             _plans_of(store) if (claude_home() / "plans").is_dir() else [],
+                             same)
+        comp = bool(cfg_get("handover_compress", True))
+        meter = rem._meter(sum(e.get("size") or 0 for e in ents),
+                           talk and sys.stderr.isatty())
+        def frames():
+            for i, e in enumerate(ents):
+                if e.get("link") is None:
+                    yield from _file_frames(i, e["src"], 0, e["size"], comp, meter)
+            yield b"Z"
+        say(f"sending it back to {rem.name} …")
+        try:
+            res, wire = rem.stream("return-apply", dict(
+                req, plan_id=got.get("plan_id"), compress=comp,
+                entries=[{k: v for k, v in e.items() if k != "src"} for e in ents]),
+                frames=frames)
+        except LinkError as x:
+            # the link dropped, maybe after home placed the files: asked
+            # again, it says whether it has the project back
+            meter(None)
+            say(f"asking {rem.name} again …")
+            try:
+                again = rem.agent("return-plan", timeout=900, **dict(req, checks=None))
+            except LinkError as y:
+                raise HandoverError(f"the link to {rem.name} dropped while sending it back "
+                                    f"({x}), and {rem.name} does not answer ({y}). Run Send "
+                                    f"Back again to finish: it asks {rem.name} first")
+            if not again.get("already"):
+                raise HandoverError(f"the link to {rem.name} dropped while sending it back "
+                                    f"({x}); {rem.name} still has it as here, so nothing "
+                                    "changed there: run Send Back again")
+            return finish_back(again)
+        meter(None)
+        return finish_back(res, wire, len(ents))
+    except HandoverError as e:
+        out["error"] = str(e)
+        warn(f"SEND BACK {real}: {e}")
     return _emit(args, out, lines)
 
 # ---- remotes, attaching, status ---------------------------------------------- #
@@ -9637,9 +11807,21 @@ def remote_checks(rem: Remote, info: dict) -> list:
            f"{get} rsync", needed=forced)
     ck("tmux there", tools.get("tmux"), tools.get("byobu") or tools.get("tmux")
        or "missing", f"{get} tmux")
-    there = rem.agent("probe", path=None if os.name == "nt" else rem.path(home),
+    try:
+        rule = rem.rule()
+    except HandoverError:
+        rule = None
+    there = rem.agent("probe", path=rem.path(home) if rule == "same" else None,
                       test_awake=bool(cfg_get("handover_keep_awake", True)))
-    if os.name != "nt":                 # a PC's folders map to other paths (later)
+    if rule not in (None, "same"):
+        fh = rem.far_home()
+        rows.append({"check": "where projects go there", "key": "paths", "paths": rule,
+                     "ok": True, "needed": False, "group": "handover",
+                     "detail": (f"below its home folder ({fh})" if rule == "home" else
+                                f"{_n(len(rule), 'folder')} of yours mapped, the rest below "
+                                f"its home folder ({fh})")
+                     + f"; change it with:  aht remote paths {rem.name}"})
+    elif rule == "same":
         same = info.get("home") == home or bool(there.get("path_exists"))
         ck(f"{home} exists there", same, "projects keep their path" if same else "missing",
            f'sudo mkdir -p {shlex.quote(home)} && sudo chown "$USER" {shlex.quote(home)}')
@@ -9698,13 +11880,20 @@ def remote_checks(rem: Remote, info: dict) -> list:
 
 def _remember_system(name: str, system) -> None:
     """remotes.<name>.system: what answered there (Darwin, Linux or Windows)."""
-    if not system or (remotes_config().get(name) or {}).get("system") == system:
+    if system:
+        _remember_remote(name, system=system)
+
+def _remember_remote(name: str, **fields) -> None:
+    """Note what was learnt about a machine in its remotes.<name> entry
+    (system, home, paths); a machine no longer set up stays gone."""
+    spec = remotes_config().get(name) or {}
+    if not isinstance(spec, dict) or all(spec.get(k) == v for k, v in fields.items()):
         return
     with Lock():
         cfg = load_config()
         rs = dict(cfg.get("remotes") or {})
-        if name in rs:
-            rs[name] = dict(rs[name], system=system)
+        if name in rs and isinstance(rs[name], dict):
+            rs[name] = dict(rs[name], **fields)
             cfg["remotes"] = rs
             save_config(cfg)
 
@@ -9744,6 +11933,8 @@ def cmd_remote(args):
         print(NO_SSH, file=sys.stderr)
         return 2
     act = args.action or "list"
+    if act == "paths":
+        return _remote_paths(args)
     if act == "watch":
         if not args.name:
             print("usage: aht remote watch <name> [--off]", file=sys.stderr)
@@ -9798,7 +11989,19 @@ def cmd_remote(args):
         with Lock():
             cfg = load_config()
             rs = dict(cfg.get("remotes") or {})
-            rs[args.name] = dict(spec, system=info.get("system"))
+            # a machine added again keeps what was chosen for it (its paths
+            # and pairs, whether it is watched) and what it said before
+            old = rs.get(args.name) if isinstance(rs.get(args.name), dict) else {}
+            kept = {k: old[k] for k in ("paths", "home", "watch", "machine_id")
+                    if old.get(k) is not None}
+            # a machine added from now on: projects go below its home folder
+            # (aht remote paths changes it)
+            rs[args.name] = dict(kept, **spec, system=info.get("system"),
+                                 paths=kept.get("paths", "home"),
+                                 **({"home": rem._logical(info["home"])}
+                                    if info.get("home") else {}),
+                                 **({"machine_id": info["machine_id"]}
+                                    if info.get("machine_id") else {}))
             cfg["remotes"] = rs
             cfg.setdefault("default_remote", args.name)
             save_config(cfg)
@@ -9891,6 +12094,85 @@ def cmd_remote(args):
             print("no other machine yet — add one with:  aht remote add <name> <user@host>")
     return 0
 
+def paths_row(name: str, ask: bool = False) -> dict:
+    """`remote paths --json`: where projects go on a machine.  `paths`
+    "same", "home" or [[here, there], …]; `rules` in the order they are
+    tried; `default`: chosen by aht, not by you.  `ask`: find the home
+    folder there (and the choice for a machine set up before) if not known."""
+    spec = remotes_config().get(name) or {}
+    rem = Remote(name, spec)
+    out = {"remote": name, "paths": rem.paths, "default": "paths" not in spec,
+           "system": rem.there_system(), "here_system": platform.system(),
+           "here_home": str(Path.home()), "there_home": rem.home, "rules": [],
+           "applied": False, "error": None}
+    if ask:
+        try:
+            out["paths"] = rem.rule()
+            if out["paths"] != "same" or not rem.local:
+                out["there_home"] = rem.far_home()
+            out["system"] = rem.there_system()
+        except HandoverError as e:
+            out["error"] = str(e)
+    rule = out["paths"]
+    if rule == "same":
+        out["rules"].append({"here": "/", "there": "/", "kind": "same"})
+    elif rule is not None:
+        for a, b in sorted(rule if isinstance(rule, list) else [], key=lambda ab: -len(ab[0])):
+            out["rules"].append({"here": a, "there": b, "kind": "pair"})
+        out["rules"].append({"here": out["here_home"], "there": out["there_home"],
+                             "kind": "home"})
+    return out
+
+def _remote_paths(args) -> int:
+    name = args.name
+    if not name or name not in remotes_config():
+        print(f"unknown machine {name!r}" if name else
+              "usage: aht remote paths <name> [--same | --home | --add HERE THERE | "
+              "--remove HERE]", file=sys.stderr)
+        return 2
+    change = None
+    if args.same or args.home:
+        change = "same" if args.same else "home"
+    elif args.add or args.remove:
+        cur = _paths_rule(remotes_config()[name])
+        pairs = [list(x) for x in cur] if isinstance(cur, list) else []
+        if args.add:
+            here, there = args.add
+            if not (_is_abs(here) and _is_abs(there)):
+                out = dict(paths_row(name), error="both paths must be full paths: HERE on this "
+                                                  "machine, THERE on the other")
+                print(json.dumps(out, indent=2) if args.json else f"✗ {out['error']}")
+                return 1
+            here = here.rstrip("/\\") or here
+            pairs = [p for p in pairs if p[0] != here] + [[here, there.rstrip("/\\") or there]]
+        else:
+            pairs = [p for p in pairs if p[0] != args.remove.rstrip("/\\")]
+        change = pairs or "home"
+    if change is not None:
+        _remember_remote(name, paths=change)
+        log(f"REMOTE {name}: projects go to {change!r} there")
+    out = paths_row(name, ask=True)
+    out["applied"] = change is not None
+    if out["applied"] and out["error"]:
+        out["warning"], out["error"] = out["error"], None   # saved; that machine is away
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0 if not out["error"] else 1
+    if out["error"]:
+        print(f"✗ {out['error']}")
+    rule = out["paths"]
+    print(f"{name}: " + ({"same": "projects keep their path there",
+                          "home": "the path below your home folder is kept below the home "
+                                  "folder there"}.get(rule) if isinstance(rule, str)
+                         else "these folders first, then the home folders" if rule
+                         else "not chosen yet (aht chooses at the first handover)"))
+    for r in out["rules"]:
+        if r["kind"] != "same":
+            print(f"   {r['here']}  →  {r['there'] or '(its home folder, once known)'}")
+    if out["applied"]:
+        print("   (saved)")
+    return 0
+
 def cmd_attach(args):
     """Open the handed-over session: in this terminal, or in a new window."""
     real = os.path.realpath(args.path)
@@ -9898,6 +12180,10 @@ def cmd_attach(args):
     away = (entry or {}).get("away")
     if not away:
         print("this project is not handed over", file=sys.stderr)
+        return 2
+    if away.get("driven_by") == "there" or not away.get("window"):
+        print(f"this project was brought to {away.get('holder') or away.get('host')}: its "
+              "session runs in a terminal there, not in a window aht can open", file=sys.stderr)
         return 2
     try:
         rem = get_remote(away.get("remote"))
@@ -9908,11 +12194,12 @@ def cmd_attach(args):
         return 1
     cmd = attach_command(rem, away.get("mux"), away.get("window"))
     if args.print:
-        print(" ".join(shlex.quote(a) for a in cmd))
+        print(_cmdline(cmd))
         return 0
-    if args.window:
-        return open_terminal(" ".join(shlex.quote(a) for a in cmd),
-                             f"attach-{away.get('window')}")
+    if args.window or os.name == "nt":
+        # a PC opens it in a console of its own (Windows Terminal when that is
+        # the default): ssh -t <machine> tmux attach -t <window>
+        return open_terminal(_cmdline(cmd), f"attach-{away.get('window')}")
     os.execvp(cmd[0], cmd)
 
 TERMINALS = ("iTerm", "Terminal")         # apps that run a .command file they open
@@ -9935,11 +12222,14 @@ def terminal_choice() -> str:
     iTerm when installed, else Terminal."""
     return cfg_get("terminal_app") or ("iTerm" if app_installed("iTerm") else "Terminal")
 
-def open_terminal(command: str, name: str, cwd: str = None, echo: bool = True) -> int:
+def open_terminal(command: str, name: str, cwd: str = None, echo: bool = True,
+                  env: dict = None) -> int:
     """Run `command` in a new terminal window (the front-ends use this), in
-    the folder `cwd` when one is given.  When no window opens, the line to
-    run by hand is printed (echo False: the caller tells it) -> 1."""
-    full = (cd_then(cwd) if cwd else "") + command
+    the folder `cwd` when one is given, with the variables `env` set (git's
+    settings for a copy from another system).  When no window opens, the line
+    to run by hand is printed (echo False: the caller tells it) -> 1."""
+    env = {k: str(v) for k, v in (env or {}).items() if re.fullmatch(r"[A-Z_][A-Z0-9_]*", k)}
+    full = env_prefix(env) + (cd_then(cwd) if cwd else "") + command
     run = aht_home() / "run"
     run.mkdir(parents=True, exist_ok=True)
     if os.environ.get("AHT_TERMINAL_LOG"):          # tests: note it, open nothing
@@ -9959,9 +12249,11 @@ def open_terminal(command: str, name: str, cwd: str = None, echo: bool = True) -
         # a console of its own (Windows Terminal when it is the default
         # terminal) that starts in the folder: its path never goes through
         # cmd's parser, where & ^ or %…% in a folder's name would run.
-        # /s /k "…": cmd drops the outer quotes and runs the rest as it is
+        # /s /k "…": cmd drops the outer quotes and runs the rest as it is.
+        # The variables go in through the environment, not the command line
         try:
             subprocess.Popen('cmd.exe /s /k "' + command + '"', cwd=cwd,
+                             env=dict(os.environ, **env) if env else None,
                              creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
             return 0
         except OSError:
@@ -10010,10 +12302,22 @@ def cmd_resume_here(args):
     else:
         line = ("" if os.name == "nt" else "exec ") + shell_quote(find_claude() or "claude") \
             + (" --resume " + shell_quote(sid) if sid else "")
+    env = _copy_git_env(real)
     if args.print:
-        print(cd_then(real) + line)
+        print(env_prefix(env) + cd_then(real) + line)
         return 0
-    return open_terminal(line, "resume-" + os.path.basename(real), cwd=real)
+    return open_terminal(line, "resume-" + os.path.basename(real), cwd=real, env=env)
+
+def _copy_git_env(real: str) -> dict:
+    """GIT_CONFIG_* for a session aht opens in a folder brought or handed
+    over here from another machine (git_settings)."""
+    try:
+        c = copy_of(real)
+    except Exception:
+        c = None
+    if not c or c.get("kind") not in ("brought", "handover"):
+        return {}
+    return git_env_vars(git_settings(_my_system(), c.get("system"), bool(c.get("autocrlf"))))
 
 def handover_status() -> dict:
     reg = load_registry()
@@ -10160,8 +12464,13 @@ def _copy_note(cwd: str) -> str:
     if c.get("kind") == "sync":
         return (f"[aht] This folder is a copy kept in sync from “{src}”; changes made here "
                 "pause that sync.")
-    if c.get("kind") in ("handover", "brought"):
-        return f"[aht] This folder was handed over from “{src}”; send it back when done."
+    where = (f" (where it is at {c['from_path']})"
+             if c.get("from_path") and not _same_dir(c["from_path"], cwd) else "")
+    if c.get("kind") == "handover":
+        return f"[aht] This folder was handed over from “{src}”{where}; send it back when done."
+    if c.get("kind") == "brought":
+        return (f"[aht] This folder was brought here from “{src}”{where}; send it back when "
+                "done (aht send-back).")
     if c.get("kind") == "returned":
         return (f"[aht] This folder is an old copy of a project that went back to “{src}”; "
                 f"work done here does not reach {src} by itself.")
@@ -10181,10 +12490,21 @@ def _handover_note(cwd: str) -> str:
                     "whether the session there runs. Changes made here now can collide "
                     "with work there. Tell the user before changing anything.")
         if a:
+            who = a.get("holder") or a.get("host")
             notify_user("Project is handed over",
-                        f"{os.path.basename(cwd)} runs on {a.get('host')} — "
-                        "take it back before working here")
-            return (f"[aht] WARNING: this project was handed over to “{a.get('host')}” on "
+                        f"{os.path.basename(cwd)} runs on {who} — "
+                        + ("it comes back with Send Back there"
+                           if a.get("driven_by") == "there" else
+                           "take it back before working here"))
+            at = (f" (in {a['remote_path']} there)" if a.get("remote_path")
+                  and a.get("v") and a["remote_path"] != a.get("path") else "")
+            if a.get("driven_by") == "there":
+                return (f"[aht] WARNING: this project was brought to “{who}”{at} on "
+                        f"{a.get('since')} and is being worked on there. Changes made here "
+                        "now can collide with that work. Tell the user before changing "
+                        f"anything, and suggest sending it back from {who} first (aht "
+                        "send-back there).")
+            return (f"[aht] WARNING: this project was handed over to “{who}”{at} on "
                     f"{a.get('since')} and is being worked on there. Changes made here "
                     "now can collide with that work. Tell the user before changing "
                     "anything, and suggest taking the project back first (aht reclaim).")
@@ -10888,6 +13208,15 @@ def cd_then(project: str) -> str:
     return f"cd /d {shell_quote(project)} && " if os.name == "nt" \
         else f"cd {shell_quote(project)} && "
 
+def env_prefix(env: dict, nt: bool = None) -> str:
+    """The variables `env` set in front of a line to type: cmd.exe's
+    `set "K=V" && ` on Windows (`nt`), `export K=V; ` in sh."""
+    nt = os.name == "nt" if nt is None else nt
+    env = {k: str(v) for k, v in (env or {}).items() if re.fullmatch(r"[A-Z_][A-Z0-9_]*", k)}
+    if nt:
+        return "".join(f'set "{k}={v}" && ' for k, v in sorted(env.items()))
+    return "".join(f"export {k}={shlex.quote(v)}; " for k, v in sorted(env.items()))
+
 def resume_command(agent: str, sid: str, project: str = None) -> str:
     """The line that continues a session: in `project` (it goes there
     first), or with no project the line to run in the session's folder."""
@@ -11253,9 +13582,14 @@ def search_everywhere(q: str, project: str = None, agent: str = None,
             if not can_reach_machines():
                 raise HandoverError(NO_SSH)
             rem = get_remote(name)
+            far = None
+            if project:
+                try:
+                    far = rem.there(os.path.realpath(project))   # where it is there
+                except HandoverError:
+                    far = rem.path(os.path.realpath(project))
             ans = rem.agent("search", timeout=SEARCH_FAR_WAIT, query=q, agent=agent,
-                            limit=limit,
-                            project=rem.path(os.path.realpath(project)) if project else None)
+                            limit=limit, project=far)
             hits = _far_rows(ans.get("results"))
             row.update(reachable=True, indexed=bool(ans.get("indexed")),
                        index_at=ans.get("index_at"), results=len(hits),
@@ -13745,6 +16079,10 @@ def _agent_relay_info(req: dict) -> dict:
     end may be this machine), which one, and with `brief` a catch-up of what
     happened here since."""
     now = time.time()
+    if req.get("list"):                 # Bring Here's list: the projects aht knows here
+        return {"ok": True, "host": _here(), "machine_id": machine_id(create=False),
+                "system": platform.system(), "home": str(Path.home()), "clock": now,
+                "aht": _aht_there(), "projects": _home_projects()}
     skew = now - (_number(req.get("now")) or now)
     m = _relay_find(req)
     out = {"ok": True, "host": _here(), "machine_id": machine_id(create=False),
@@ -14546,8 +16884,37 @@ def _aht_there() -> dict:
         fresh = time.time() - float(st.get("at") or 0) < PHONE_FRESH
     except (TypeError, ValueError):
         fresh = False
-    return {"installed": installed, "version": st.get("version") if installed else None,
+    try:
+        mark = json.loads(install_mark_path().read_text())
+        mark = mark if isinstance(mark, dict) else {}
+    except (OSError, ValueError):
+        mark = {}
+    return {"installed": installed,
+            "version": (mark.get("version") or st.get("version")) if installed else None,
+            "protocol": mark.get("protocol") if installed else None,
             "phone_here": bool(installed and fresh and cfg_get("notify_phone"))}
+
+def install_mark_path() -> Path:
+    return aht_home() / "install.json"
+
+def _mark_install() -> None:
+    """~/.aht/install.json: the version and protocol of the aht installed
+    here, written by its own runs (never by the copy another machine runs
+    here), so that machine can tell whether this one keeps records it
+    understands (Bring Here, Send Back)."""
+    p = install_mark_path()
+    want = {"version": VERSION, "protocol": AGENT_PROTOCOL}
+    try:
+        if json.loads(p.read_text()) == want:
+            return
+    except (OSError, ValueError):
+        pass
+    if not aht_home().is_dir():
+        return                          # nothing of aht's here yet
+    try:
+        _write_json(p, want)
+    except OSError:
+        pass
 
 def send_to_phone(title: str, message: str, target: str = None) -> str:
     """Pass a notice on to the phone, if the user set that up:
@@ -17385,6 +19752,9 @@ def plan_night_shift(project: str, task: str, start: str, back: str,
     rem = remote or cfg_get("default_remote") or next(iter(sorted(remotes_config())), None)
     if rem not in remotes_config():
         res["blockers"].append("no machine to hand over to; add one first (aht remote add)")
+    elif (remotes_config().get(rem) or {}).get("system") == "Windows":
+        res["blockers"].append(f"{rem} is a Windows PC: the night shift goes to a Mac or Linux "
+                               "machine (a PC is never handed a project)")
     now = time.time()
     try:
         t0 = now if start in (None, "", "now") else _next_time(start, now)
@@ -19916,10 +22286,19 @@ def build_parser():
     s = sub.add_parser("remote", help="the other machines a project can be "
                        "handed over to")
     s.add_argument("action", nargs="?",
-                   choices=("list", "add", "remove", "default", "check", "discover", "watch"))
+                   choices=("list", "add", "remove", "default", "check", "discover", "watch",
+                            "paths"))
     s.add_argument("name", nargs="?")
     s.add_argument("target", nargs="?", help="user@host, as ssh takes it")
     s.add_argument("--off", action="store_true", help="with watch: stop watching it")
+    s.add_argument("--same", action="store_true",
+                   help="with paths: a project keeps its path there")
+    s.add_argument("--home", action="store_true",
+                   help="with paths: the path below your home folder is kept below the "
+                        "home folder there")
+    s.add_argument("--add", nargs=2, metavar=("HERE", "THERE"),
+                   help="with paths: projects in HERE go to THERE on that machine")
+    s.add_argument("--remove", metavar="HERE", help="with paths: drop the rule for HERE")
     s.add_argument("--json", action="store_true")
     s.add_argument("--sandbox", metavar="PATH", help=argparse.SUPPRESS)   # test machines
     s.set_defaults(fn=cmd_remote)
@@ -19999,6 +22378,38 @@ def build_parser():
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_reclaim)
+
+    s = sub.add_parser("bring", help="Bring Here: fetch a project from another machine "
+                       "with Claude Code's history and continue it here; Send Back returns it")
+    s.add_argument("path", nargs="?", help="the project's folder on that machine")
+    s.add_argument("--from", dest="from_remote", metavar="NAME", help="the machine it is on")
+    s.add_argument("--list", action="store_true", help="the projects aht knows there")
+    s.add_argument("--here", metavar="PATH", help="where it goes here (default: the same "
+                   "place below your home folder, by `aht remote paths`)")
+    s.add_argument("--allow-idle", action="store_true", dest="allow_idle",
+                   help="bring it although an idle session is open in it there (if anyone "
+                        "types into it later, Send Back keeps both versions)")
+    s.add_argument("--no-open", action="store_true", dest="no_open",
+                   help="open no terminal for the session afterwards")
+    s.add_argument("--status-file", dest="status_file", metavar="FILE")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_bring)
+
+    s = sub.add_parser("send-back", help="Send Back: return a project brought (or handed "
+                       "over) here to the machine it came from")
+    s.add_argument("path")
+    s.add_argument("--to", metavar="NAME", help="that machine's name here (default: the "
+                   "one it came from)")
+    s.add_argument("--prefer", choices=("here", "there"),
+                   help="what changed on BOTH machines: keep the version on the machine it "
+                        "goes to and put this one next to it (there, the default), or take "
+                        "this machine's and set theirs aside there (here)")
+    s.add_argument("--ignore-version", action="store_true", dest="ignore_version")
+    s.add_argument("--status-file", dest="status_file", metavar="FILE")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_send_back)
 
     s = sub.add_parser("attach", help="open a handed-over project's session")
     s.add_argument("path")
@@ -20333,6 +22744,8 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.fn not in (cmd_agent, cmd_core, cmd_awake):
+        _mark_install()                 # not the copy another machine runs here
     try:
         return args.fn(args) or 0
     except (SystemExit, KeyboardInterrupt, BrokenPipeError):

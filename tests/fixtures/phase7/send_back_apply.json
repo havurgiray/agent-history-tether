@@ -1,0 +1,129 @@
+{
+  "command": "send-back",
+  "applied": true,
+  "blockers": [],
+  "warnings": [],
+  "project": "C:\\Users\\me\\code\\shop",
+  "here_path": "C:\\Users\\me\\code\\shop",
+  "mode": "away",
+  "uuid": "5b0c2f6e9a3d4c1b8e7f6a5d4c3b2a19",
+  "remote": "mac",
+  "there_path": "/Users/me/code/shop",
+  "here": {
+    "sessions": [],
+    "processes": [],
+    "system": "Windows"
+  },
+  "there": {
+    "host": "mac",
+    "system": "Darwin",
+    "sessions": [],
+    "processes": []
+  },
+  "attempt": "20261027-141000-ab12",
+  "plan_id": "71a60b0e70a7c5d4",
+  "plan": {
+    "project": {
+      "take": 14,
+      "new": 2,
+      "delete": 1,
+      "conflict": 0,
+      "kept": 0
+    },
+    "history": {
+      "take": 1,
+      "new": 0,
+      "delete": 0,
+      "conflict": 0,
+      "kept": 0
+    }
+  },
+  "conflicts": {},
+  "claude": {
+    "here": "2.1.310",
+    "there": "2.1.310",
+    "wrote_the_history": "2.1.310"
+  },
+  "eol_only": [
+    "README.md",
+    "docs/notes.md",
+    "src/app.py"
+  ],
+  "eol_kept": [],
+  "unsafe_names": [],
+  "names": [],
+  "prefer": null,
+  "git": {
+    "is_git": true,
+    "gitattributes": false,
+    "suggest": [
+      "* text=auto",
+      "*.sh text eol=lf",
+      "*.bat text eol=crlf",
+      "*.cmd text eol=crlf",
+      "*.ps1 text eol=crlf"
+    ],
+    "env": {},
+    "how": null
+  },
+  "done": {
+    "project": {
+      "updated": 14,
+      "new": 2,
+      "deleted": 1,
+      "conflicts": [
+        {
+          "file": "src/cart.py",
+          "their_version": "src/cart (from pc 2026-10-27).py"
+        }
+      ],
+      "kept": 0,
+      "eol_kept": [
+        "Makefile"
+      ],
+      "unsafe": []
+    },
+    "history": {
+      "updated": 1,
+      "new": 0,
+      "deleted": 0,
+      "conflicts": [],
+      "kept": 0,
+      "eol_kept": [],
+      "unsafe": []
+    },
+    "arrived": {
+      "problems": []
+    }
+  },
+  "set_aside": "/Users/me/.aht/handover/5b0c2f6e9a3d4c1b8e7f6a5d4c3b2a19/replaced/20261027-161200",
+  "returned": {
+    "from": "pc",
+    "left": "2026-10-27T14:10:00",
+    "at": "2026-10-27T16:12:00",
+    "mode": "away",
+    "session": "0f3a9c2e-5b7d-4e1f-9a8b-7c6d5e4f3a2b",
+    "handed_over": null,
+    "updated": 14,
+    "new": 2,
+    "deleted": 1,
+    "conflicts": [
+      "src/cart (from pc 2026-10-27).py"
+    ],
+    "from_path": "C:\\Users\\me\\code\\shop",
+    "sent_back": true,
+    "eol_only": [
+      "README.md"
+    ],
+    "eol_kept": [
+      "Makefile"
+    ],
+    "unsafe_names": []
+  },
+  "session": "0f3a9c2e-5b7d-4e1f-9a8b-7c6d5e4f3a2b",
+  "session_title": "Checkout flow refactor",
+  "sent": {
+    "files": 18,
+    "wire_bytes": 120000
+  }
+}

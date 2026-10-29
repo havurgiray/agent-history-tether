@@ -245,7 +245,8 @@ n2 = d.get("relay") or "?"
 notes = sorted(f for f in files_in(brel) if f.endswith(".json")
                and json.loads((brel / f).read_text()).get("kind") == "note")
 ck(d.get("applied") and d.get("mode") == "new" and d.get("note_for") is None
-   and notes == [f"relay-{n1}.json", f"relay-{n2}.json"] and (brel / f"relay-{n2}.md").is_file()
+   and notes == sorted([f"relay-{n1}.json", f"relay-{n2}.json"])
+   and (brel / f"relay-{n2}.md").is_file()
    and d.get("there_file") == f"{bp}/.aht/handover/relay-{n2}.md"
    and "# Note: paper" in (brel / f"relay-{n2}.md").read_text()
    and "add a login page" in (brel / f"relay-{n2}.md").read_text(),

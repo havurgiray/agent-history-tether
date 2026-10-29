@@ -264,12 +264,26 @@ def notify_user(title, message, info=None):
             return
         env = dict(os.environ, AHT_TOAST_TITLE=title, AHT_TOAST_MSG=message)
         # title/message travel via env vars so no quoting can break the script
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                        "-WindowStyle", "Hidden", "-Command", _TOAST_PS],
-                       capture_output=True, timeout=20, env=env,
-                       creationflags=CREATE_NO_WINDOW)
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-WindowStyle", "Hidden", "-Command", _TOAST_PS],
+                           capture_output=True, timeout=20, env=env,
+                           creationflags=CREATE_NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError(f"PowerShell's toast ended with exit {r.returncode}")
+    except Exception as e:
+        # the core's own warning, as on a Mac or Linux; once an hour per
+        # kind of failure (a notice can come every few seconds)
+        _warn_once(f"notice-{type(e).__name__}", f"NOTICE not shown ({title})", e)
+
+
+def _warn_once(key, what, e):
+    """A failure into aht's log as a warning, with the error (masked, one
+    line), once an hour per key across aht's processes (the core's
+    warn_once).  Never raises: logging stops nothing."""
+    try:
+        aht.warn_once(key, f"{what}: {aht._errmsg(e)}")
     except Exception:
-        pass
+        pass                    # nowhere else to say it
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +299,9 @@ def apply_badge(path, marks):
         import winbadge
         winbadge.apply(path, marks)
     except Exception as e:
-        aht.log(f"badge failed for {path}: {e}")
+        # a warning (not INFO), as the core's: once an hour per kind of
+        # failure, not once per folder
+        _warn_once(f"badge-{type(e).__name__}", f"BADGE not updated for {path}", e)
 
 
 # --------------------------------------------------------------------------- #

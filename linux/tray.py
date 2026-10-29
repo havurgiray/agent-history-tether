@@ -72,13 +72,41 @@ def _set_shared(key, value):
         aht.save_config(cfg)
 
 
+def _log(what, exc=None, level="error"):
+    """One of the tray's own failures into aht's log, as `APP tray: …`
+    (the core's app_log: keys masked, one line, at most 20 a minute), as
+    the Windows tray and the Mac app put theirs.  Never raises: a log that
+    cannot be written is no new failure."""
+    try:
+        aht.app_log(level, "tray", f"{what}: {aht._errmsg(exc)}" if exc is not None
+                    else str(what))
+    except Exception:
+        pass                    # an older core, or no log: nowhere else to say it
+
+
+def _guarded(fn):
+    """`fn` for a menu item or a thread of its own: what it raises goes to
+    the log with the action's name (act_reconcile failed: …) rather than
+    to stderr, where nobody sees it."""
+    def run(*a):
+        try:
+            return fn(*a)
+        except Exception as e:
+            name = getattr(fn, "__qualname__", "").split(".<locals>")[0].split(".")[-1]
+            _log(f"{name or 'an action'} failed", e)
+    return run
+
+
 def notify(title, msg):
     try:
         if shutil.which("notify-send"):
-            subprocess.run(["notify-send", "-a", "aht", title, str(msg)],
-                           capture_output=True, timeout=10)
-    except Exception:
-        pass
+            r = subprocess.run(["notify-send", "-a", "aht", title, str(msg)],
+                               capture_output=True, timeout=10)
+            if r.returncode != 0:
+                _log(f"a notice was not shown ({title}): notify-send ended with exit "
+                     f"{r.returncode}", level="warn")
+    except Exception as e:
+        _log(f"a notice was not shown ({title})", e, "warn")
 
 
 def desktop_arg(s) -> str:
@@ -215,10 +243,16 @@ class Tray:
         self.GLib.idle_add(lambda: (fn(*a) and False) or False)
 
     def in_thread(self, fn):
-        threading.Thread(target=fn, daemon=True).start()
+        threading.Thread(target=_guarded(fn), daemon=True).start()
 
     def _tick(self):
-        self.refresh()
+        try:
+            self.refresh()
+            self.tick_failed = False
+        except Exception as e:      # the timer keeps running; logged once until it works again
+            if not getattr(self, "tick_failed", False):
+                _log("the menu was not refreshed", e)
+            self.tick_failed = True
         return True
 
     def _notices(self):
@@ -282,7 +316,7 @@ class Tray:
                 item.set_active(bool(checked))
             item.set_sensitive(sensitive and cb is not None)
             if cb is not None:
-                item.connect("activate", cb)
+                item.connect("activate", _guarded(cb))
             parent.append(item)
             return item
 
@@ -432,9 +466,10 @@ class Tray:
                     msg = "Changes found — answered via dialog or deferred"
                 else:
                     msg = "Nothing to do — every history is in place"
-            except Exception:
+            except Exception as e:
                 msg = "Reconcile finished" if r.returncode == 0 \
                     else f"Reconcile failed (exit {r.returncode})"
+                _log(f"reconcile's answer was not read (exit {r.returncode})", e)
             notify("Reconcile", msg)
             self.ui(self.refresh)
         self.in_thread(work)
@@ -453,7 +488,8 @@ class Tray:
             r = run_cli("adopt", "--json")
             try:
                 d = json.loads(r.stdout or "{}")
-            except Exception:
+            except Exception as e:
+                _log(f"adopt's answer was not read (exit {r.returncode})", e)
                 self.ui(self.dialog, "Adopt", "Could not scan: "
                         + (r.stderr or f"exit {r.returncode}")[:400])
                 return
@@ -492,9 +528,10 @@ class Tray:
                 counts = json.loads(r.stdout or "{}").get("counts", {})
                 msg = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) \
                     or "nothing to back up"
-            except Exception:
+            except Exception as e:
                 msg = "Backup finished" if r.returncode == 0 \
                     else f"Backup failed (exit {r.returncode})"
+                _log(f"backup's answer was not read (exit {r.returncode})", e)
             notify("History backup", msg)
         self.in_thread(work)
 

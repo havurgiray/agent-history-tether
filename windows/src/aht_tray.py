@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 if os.name == "nt":
@@ -68,8 +69,9 @@ NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 0x1, 0x2, 0x4, 0x10
 NIIF_INFO = 0x1
 MB_OK, MB_YESNO, MB_ICONINFORMATION, MB_ICONQUESTION = 0x0, 0x4, 0x40, 0x20
+MB_OKCANCEL, MB_YESNOCANCEL, MB_ICONWARNING = 0x1, 0x3, 0x30
 MB_SETFOREGROUND, MB_TOPMOST = 0x10000, 0x40000
-IDYES = 6
+IDOK, IDCANCEL, IDYES = 1, 2, 6
 ERROR_ALREADY_EXISTS = 183
 
 LRESULT = ctypes.c_ssize_t
@@ -231,7 +233,8 @@ def tray_add():
 def _tip(running):
     try:
         n = len(aht.load_registry().get("projects", {}))
-    except Exception:
+    except Exception as e:
+        tray_log("the tip could not read the registry", e)
         n = 0
     return (f"aht — watching ({n} project(s))" if running
             else "aht — paused")[:127]
@@ -267,7 +270,8 @@ def brought_here(copies=None):
     back from there, not with Send Back here."""
     try:
         copies = aht.read_copies() if copies is None else copies
-    except Exception:
+    except Exception as e:
+        tray_log("the menu could not read the projects brought here", e)
         return []
 
     def answers(c):
@@ -277,7 +281,7 @@ def brought_here(copies=None):
             spec = aht.remotes_config().get(c.get("remote") or "")
             return isinstance(spec, dict) and bool(aht.pc_answers(c["remote"], spec).get("answers"))
         except Exception:
-            return False
+            return False            # an older core (no pc_answers): no PC's project, as before
     rows = sorted(((str(c.get("at") or ""), p, str(c.get("from") or "the other machine"))
                    for p, c in copies.items()
                    if isinstance(c, dict) and c.get("kind") == "brought" and answers(c)), reverse=True)
@@ -303,7 +307,8 @@ def arrivals(rows=None):
     """The arrivals to offer, newest first, at most 10: [(name, label)]."""
     try:
         rows = aht.read_arrivals() if rows is None else rows
-    except Exception:
+    except Exception as e:
+        tray_log("the menu could not read the arrivals", e)
         return []
     out = []
     for r in rows if isinstance(rows, list) else []:
@@ -373,8 +378,8 @@ def check_notices():
     def work():
         try:
             _run_cli("notices", "--quiet")
-        except Exception:
-            pass
+        except Exception as e:
+            tray_log("looking for notices failed", e)
         finally:
             NOTICING[0] = False
     _in_thread(work)
@@ -434,8 +439,67 @@ def _run_cli(*args):
                           text=True, creationflags=winlayer.CREATE_NO_WINDOW)
 
 
+# ---- the tray's own problems, in aht's log ---------------------------------
+# An error the tray caught goes to aht's log through `aht _log --level error
+# --source tray -- MESSAGE` (the core masks it and caps its length), so `aht
+# logs --errors` and a problem report show it.  What was being done and the
+# error, never a file's contents; the same one once in ten minutes, at most
+# five a minute.
+
+LOGGED = {"at": [], "seen": {}}
+LOG_LOCK = threading.Lock()
+
+
+def _name(fn):
+    """A menu action's name for the log: act_reconcile, not its inner work()."""
+    return (getattr(fn, "__qualname__", "") or "an action").split(".<locals>.")[0]
+
+
+def tray_log(what, exc=None, level="error"):
+    """Note a problem of the tray's own in aht's log.  -> whether it was
+    sent (not when the same one was sent lately, or five this minute)."""
+    msg = f"{what}: {type(exc).__name__}: {exc}" if exc is not None else str(what or "")
+    msg = " ".join(msg.split())[:500]
+    if not msg:
+        return False
+    now = time.time()
+    with LOG_LOCK:
+        if now - LOGGED["seen"].get(msg, -1e9) < 600:
+            return False
+        LOGGED["at"] = [t for t in LOGGED["at"] if now - t < 60]
+        if len(LOGGED["at"]) >= 5:
+            return False
+        LOGGED["at"].append(now)
+        LOGGED["seen"][msg] = now
+
+    def send():
+        try:
+            _run_cli("_log", "--level", level, "--source", "tray", "--", msg)
+        except Exception:
+            pass                # the log is a help: it never becomes a new failure
+    threading.Thread(target=send, daemon=True).start()
+    return True
+
+
 def _in_thread(fn):
-    threading.Thread(target=fn, daemon=True).start()
+    """Run an action's work aside; an error it did not catch is logged."""
+    def guarded():
+        try:
+            fn()
+        except Exception as e:
+            tray_log(f"{_name(fn)} failed", e)
+    threading.Thread(target=guarded, daemon=True).start()
+
+
+def _run_action(fn):
+    """A menu item's action.  An error it did not catch is noted in aht's
+    log and said in a balloon, not lost."""
+    try:
+        fn()
+    except Exception as e:
+        tray_log(f"{_name(fn)} failed", e)
+        balloon("That did not work", f"{type(e).__name__}: {e}"[:180]
+                + " (noted in aht's log)")
 
 
 def _set_shared(key, value):
@@ -461,7 +525,9 @@ def act_reconcile():
                 msg = "Changes were found — answered via dialog or deferred"
             else:
                 msg = "Nothing to do — every history is in place"
-        except Exception:
+        except Exception as e:
+            if r.returncode == 0:
+                tray_log("reconcile gave no answer the tray could read", e)
             msg = ("Reconcile finished" if r.returncode == 0
                    else f"Reconcile failed (exit {r.returncode})")
         balloon("Reconcile", msg)
@@ -500,7 +566,9 @@ def act_adopt():
         r = _run_cli("adopt", "--json")
         try:
             d = json.loads(r.stdout or "{}")
-        except Exception:
+        except Exception as e:
+            if r.returncode == 0:
+                tray_log("adopt gave no answer the tray could read", e)
             msgbox("Adopt", "Could not scan for existing projects:\n"
                    + (r.stderr or r.stdout or f"exit {r.returncode}")[:800])
             return
@@ -551,8 +619,9 @@ def act_restart():
 def act_opendata():
     try:
         os.startfile(str(aht.aht_home()))
-    except Exception:
-        pass
+    except Exception as e:
+        tray_log("the data folder did not open", e)
+        balloon("The data folder did not open", f"{e}"[:200])
 
 
 def act_openlog():
@@ -561,8 +630,10 @@ def act_openlog():
         try:
             os.startfile(str(p))
             return
-        except Exception:
-            pass
+        except Exception as e:
+            tray_log("the log did not open", e)
+            balloon("The log did not open", f"{e}"[:200])
+            return
     balloon("Log", "No log entries yet")
 
 
@@ -571,6 +642,92 @@ def act_doctor():
         r = _run_cli("doctor")
         msgbox("Diagnostics", (r.stdout or r.stderr
                                or f"doctor failed (exit {r.returncode})")[:2000])
+    _in_thread(work)
+
+
+REPORT_HOLDS = ("It holds aht's version, this PC's Windows and Python, the version of "
+                "each agent, your settings (secret values, the phone topic, host and "
+                "user names replaced by the machine names you gave aht), how many "
+                "projects aht tracks (not where they are), and the recent warnings "
+                "and errors.")
+
+
+def _size(n):
+    n = float(n or 0)
+    for unit in ("bytes", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{int(n)} bytes" if unit == "bytes" else f"{n:.0f} {unit}" if n >= 10 else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _machines_set_up():
+    try:
+        return bool(aht.remotes_config())
+    except Exception as e:
+        tray_log("the machines set up could not be read", e)
+        return False
+
+
+def _report_file():
+    """Where the report goes: a readable .txt among aht's reports
+    (~/.aht/reports, which the core keeps to the newest few)."""
+    folder = aht.aht_home() / "reports"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        tray_log("the reports folder could not be made", e)
+    return str(folder / f"problem-{time.strftime('%Y%m%d-%H%M%S')}.txt")
+
+
+def act_problem_report():
+    """Make a Problem Report…: one readable file that shows what went wrong,
+    written by `aht report-problem --out <~/.aht/reports/problem-….txt>
+    --json` ({path, bytes, machines: [{machine, here, reachable, lines,
+    error}], errors: how many warnings and errors}) and shown in Explorer.
+    With machines set up, Yes adds their recent warnings and errors
+    (--everywhere)."""
+    text = ("aht writes one file that shows what went wrong, for you to read and "
+            "hand to whoever helps you. Nothing is sent anywhere.\n\n" + REPORT_HOLDS)
+    if _machines_set_up():
+        ans = msgbox("Make a Problem Report", text + "\n\nInclude the recent warnings "
+                     "and errors of your other machines? (aht asks each one)",
+                     MB_YESNOCANCEL | MB_ICONQUESTION)
+        if ans not in (IDYES, 7):                 # 7: No
+            return
+        everywhere = ans == IDYES
+    else:
+        if msgbox("Make a Problem Report", text, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK:
+            return
+        everywhere = False
+
+    def work():
+        r = _run_cli("report-problem", "--out", _report_file(),
+                     *(["--everywhere"] if everywhere else []), "--json")
+        try:
+            d = json.loads(r.stdout or "{}")
+        except ValueError:
+            d = {}
+        d = d if isinstance(d, dict) else {}
+        path = d.get("path")
+        if r.returncode != 0 or not path:
+            # a refusal says why; a crash, or an answer that is not one, is the tray's to note
+            crashed = "Traceback (most recent call last)" in (r.stderr or "")
+            kind = ((r.stderr or "").strip().splitlines()[-1:] or [""])[0].split(":")[0]
+            if r.returncode == 0 or crashed:
+                tray_log("report-problem failed unexpectedly: " + (
+                    f"it crashed ({kind})" if crashed else "its answer had no path"))
+            said = (f"aht stopped with an error ({kind}). It is noted in aht's log: "
+                    "Open log shows it." if crashed else
+                    str(d.get("error") or r.stderr or r.stdout or f"aht ended with {r.returncode}"))
+            msgbox("The report was not made", said.strip()[:900], MB_OK | MB_ICONWARNING)
+            return
+        subprocess.Popen(["explorer", "/select,", path])
+        missed = [str(m.get("machine")) for m in d.get("machines") or []
+                  if isinstance(m, dict) and not m.get("here")
+                  and (m.get("reachable") is False or m.get("error"))]
+        name = os.path.basename(str(path).replace("\\", "/"))
+        balloon("Problem report saved", f"{name}, {_size(d.get('bytes'))}. Nothing was sent anywhere."
+                + (f" Not answered: {', '.join(missed)}." if missed else ""))
     _in_thread(work)
 
 
@@ -617,7 +774,9 @@ def act_backup_now():
             counts = d.get("counts", {})
             msg = (", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
                    or "nothing to back up")
-        except Exception:
+        except Exception as e:
+            if r.returncode == 0:
+                tray_log("backup gave no answer the tray could read", e)
             msg = ("Backup finished" if r.returncode == 0
                    else f"Backup failed (exit {r.returncode})")
         balloon("History backup", msg)
@@ -640,7 +799,7 @@ def _browse_folder(title):
     try:
         ctypes.WinDLL("ole32").CoInitialize(None)
     except Exception:
-        pass
+        pass                    # COM is set up already on this thread: the picker works
     disp = ctypes.create_unicode_buffer(260)
     bi = BROWSEINFOW(HWND, None, ctypes.cast(disp, wintypes.LPWSTR), title,
                      BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE, None, 0, 0)
@@ -653,7 +812,7 @@ def _browse_folder(title):
     try:
         ctypes.WinDLL("ole32").CoTaskMemFree(ctypes.c_void_p(pidl))
     except Exception:
-        pass
+        pass                    # a few bytes not given back; the path is read already
     return buf.value if ok and buf.value else None
 
 
@@ -783,7 +942,8 @@ def build_menu():
                   if not os.path.isdir(e["real_path"]))
     try:
         orphans = len(aht.orphan_history_dirs(reg))   # as doctor, status, tidy
-    except Exception:
+    except Exception as e:
+        tray_log("the menu could not count the orphan histories", e)
         orphans = 0
     hook = winlayer.hook_installed()
 
@@ -904,6 +1064,7 @@ def build_menu():
     add(root, "Run diagnostics", act_doctor)
     add(root, "Open data folder (.aht)", act_opendata)
     add(root, "Open log", act_openlog)
+    add(root, "Make a Problem Report…", act_problem_report)
     if not hook:
         add(root, "Repair install (hook + watcher)", act_repair)
     sep(root)
@@ -929,7 +1090,7 @@ def show_menu():
         pt.x, pt.y, 0, HWND, None)
     user32.PostMessageW(HWND, WM_NULL, 0, 0)
     user32.DestroyMenu(root)                   # destroys submenus recursively
-    actions.get(cmd, lambda: None)()
+    _run_action(actions.get(cmd, lambda: None))
 
 
 WM_TASKBARCREATED = user32.RegisterWindowMessageW("TaskbarCreated")
@@ -943,12 +1104,15 @@ def wnd_proc(hwnd, msg, wparam, lparam):
             notice_clicked()                      # (an arrival's: Continue here)
         return 0
     if msg == WM_TIMER:
-        if wparam == 2:
-            check_notices()
-        elif wparam == 3:
-            pump_notices()
-        else:
-            refresh()
+        try:
+            if wparam == 2:
+                check_notices()
+            elif wparam == 3:
+                pump_notices()
+            else:
+                refresh()
+        except Exception as e:                    # the next tick tries again
+            tray_log(f"timer {wparam} failed", e)
         return 0
     if msg == WM_TASKBARCREATED:        # explorer restarted: re-add the icon
         tray_add()

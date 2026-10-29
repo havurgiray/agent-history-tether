@@ -123,22 +123,113 @@ const post = (path, body) => talk(path, { method: "POST", headers: { "Content-Ty
   body: JSON.stringify(body || {}) });
 const get = (path) => talk(path, { headers: { "X-AHT": KEY } });
 /** One aht command -> {ok, code, out, err, json}. */
-const run = (args) => post("/api/run", { args });
+const run = async (args) => failedHow(args, await post("/api/run", { args }));
 /** One aht command's JSON answer ({} if none). */
 async function J(...args) { const a = await run(args); return a.json || {}; }
 
 /** A long command: started, then followed until done (with its progress). */
 async function job(args, label, follow) {
-  const { job: id } = await post("/api/start", { args, follow: !!follow });
-  if (!id) return { ok: false, out: "", err: "could not start", json: null };
+  const started = await post("/api/start", { args, follow: !!follow });
+  if (!started.job) return failedHow(args, { ok: false, out: "", err: started.error || "could not start", json: null, refused: started.error });
   for (;;) {
     await new Promise((r) => setTimeout(r, 600));
-    const j = await get("/api/job?id=" + id);
+    const j = await get("/api/job?id=" + started.job);
     if (LOST) return gone();
     if (j.error) return { ok: false, out: "", err: j.error, json: null };
     if (j.progress) setBusy(`${j.progress.stage || label}${j.progress.percent != null ? ` — ${Math.round(j.progress.percent)} %` : ""}`);
-    if (j.done) return j.answer || {};
+    if (j.done) return failedHow(args, j.answer || {});
   }
+}
+
+// ---- the window's own problems, into aht's log ------------------------------------
+// An error the page did not catch, and a command that failed in a way no
+// refusal of the core explains (it crashed, took too long, could not start,
+// was not understood, or gave no answer), go to aht's log through POST
+// /api/log, so `aht logs --errors` and a problem report show them.  Never a
+// secret or a file's contents: the error's message and where in app.js it
+// happened; a command's name and its flags (no paths, no values, no words
+// typed) and why it failed in a few words.  At most five a minute, and the
+// same one once in ten minutes.
+const LOGGED = { at: [], seen: new Map() };
+function logProblem(level, message) {
+  if (LOST || !KEY) return false;
+  let m = String(message || "").replace(/\s+/g, " ").trim();
+  if (!m) return false;
+  m = m.split(location.origin + "/").join("").split(KEY).join("…");
+  try {
+    const home = S.status.home;
+    if (home && home.length > 2) m = m.split(home).join("~");
+  } catch (e) { /* before the state exists: nothing to replace yet */ }
+  m = m.slice(0, 600);
+  const now = Date.now();
+  if (now - (LOGGED.seen.get(m) || -Infinity) < 10 * 60e3) return false;
+  LOGGED.at = LOGGED.at.filter((t) => now - t < 60e3);
+  if (LOGGED.at.length >= 5) return false;
+  LOGGED.at.push(now);
+  LOGGED.seen.set(m, now);
+  // not through talk(): a server without /api/log, or one that just stopped,
+  // is no reason to say the window lost its connection
+  fetch("/api/log", { method: "POST", headers: { "Content-Type": "application/json", "X-AHT": KEY },
+    body: JSON.stringify({ level, source: "window", message: m }) }).catch(() => {});
+  return true;
+}
+/** Where in the page an error happened: "app.js:123:45 in drawTop". */
+function errorWhere(err, file, line, col) {
+  const frame = String((err && err.stack) || "").split("\n").map((s) => s.trim()).find((s) => /\.js:\d+:\d+/.test(s)) || "";
+  const fn = (/^at ([\w$.<>]+) \(/.exec(frame) || /^([\w$.<>]+)@/.exec(frame) || [])[1];
+  const pos = (/([\w.-]+\.js:\d+:\d+)/.exec(frame) || [])[1]
+    || (file ? `${String(file).split(/[?#]/)[0].split("/").pop()}:${line || 0}:${col || 0}` : "");
+  return [pos, fn ? "in " + fn : ""].filter(Boolean).join(" ");
+}
+window.addEventListener("error", (e) => {
+  if (!e.error && !e.message) return;
+  const what = e.error && e.error.name ? `${e.error.name}: ${e.error.message}` : e.message;
+  const at = errorWhere(e.error, e.filename, e.lineno, e.colno);
+  logProblem("error", `uncaught ${what}${at ? ` (${at})` : ""}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const r = e.reason;
+  const what = r && r.message ? `${r.name || "Error"}: ${r.message}` : String(r);
+  const at = errorWhere(r);
+  logProblem("error", `unhandled promise rejection: ${what}${at ? ` (${at})` : ""}`);
+});
+// the commands whose second word is a subcommand, not a path or words typed
+const SUBCOMMANDS = new Set(["remote", "autostart", "relays", "night-shift", "secrets", "rules", "backends"]);
+/** A command as the log may name it: its name, a subcommand, its flags. */
+function commandName(args) {
+  const keep = [args[0]];
+  if (SUBCOMMANDS.has(args[0]) && /^[a-z][a-z-]{0,20}$/.test(args[1] || "")) keep.push(args[1]);
+  for (const x of args.slice(1)) if (/^--?[a-z][\w-]*$/i.test(x)) keep.push(x);
+  return keep.join(" ");
+}
+/** Why a command failed when no refusal of the core explains it, or null. */
+function unexpected(args, a) {
+  if (!a || LOST || a.code === -1) return null;
+  if (a.refused !== undefined || a.code === undefined) {
+    return a.refused || a.error ? `the window's server did not run it (${a.refused || a.error})` : null;
+  }
+  const err = String(a.err || ""), out = String(a.out || "");
+  // a crash: Python's traceback on stderr (an answer may quote one, from the log)
+  if (!a.ok && /Traceback \(most recent call last\)/.test(err)) {
+    const last = err.split("\n").map((l) => l.trim()).filter((l) => /^[A-Za-z_][\w.]*(Error|Exception|Interrupt|Exit|Warning)\b/.test(l)).pop();
+    return `it crashed${last ? ` (${last.split(":")[0]})` : ""}`;
+  }
+  if (a.code === 124) return "it took too long";
+  if (a.code === 127) return "it could not be started";
+  if (a.code === 2 && /^usage: /m.test(err)) {
+    const m = /error: ([^:\n]*)/.exec(err);                    // never what was given
+    return `aht did not understand it${m ? ` (${m[1].trim()})` : ""}`;
+  }
+  if (a.code < 0 || a.code >= 126) return `it was stopped (code ${a.code})`;
+  if (a.ok && args.includes("--json") && out.trim() && a.json == null) return "its answer was not JSON";
+  if (!a.ok && !out.trim() && !err.trim()) return `it ended with code ${a.code} and said nothing`;
+  return null;
+}
+/** A command's answer, after noting in aht's log a failure nothing explains. */
+function failedHow(args, a) {
+  const why = unexpected(args, a);
+  if (why) logProblem(/crashed/.test(why) ? "error" : "warn", `aht ${commandName(args)} failed unexpectedly: ${why}`);
+  return a;
 }
 
 let busyCount = 0;
@@ -350,7 +441,8 @@ async function openGuide(topic) {
   };
   topics.forEach((t) => nav.append(h("button", { text: t.title, onclick: () => show(t) })));
   s.body.append(h("div", { class: "guide" }, nav, art));
-  s.foot.append(h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+  s.foot.append(h("button", { text: "Recent Problems…", onclick: showProblems }), h("button", { text: "Make a Problem Report…", onclick: showProblemReport }),
+    h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
   show(pick);
 }
 const helpBtn = (topic) => h("button", { class: "help icon", text: "?", title: `How this works (guide: ${topic})`,
@@ -3498,8 +3590,11 @@ function drawSettings(m) {
       h("button", { text: "Adopt This Computer's Projects…", onclick: adopt }),
       h("button", { text: "Restart Watcher", onclick: () => busy("restarting the watcher…", () => run(["reload"])) })),
     h("div", { class: "row" }, h("button", { text: "Run Diagnostics", onclick: doctor }),
+      h("button", { text: "Recent Problems…", onclick: showProblems }),
       h("button", { text: "Open Log", onclick: () => post("/api/reveal", { path: st.log && st.log.path }) }),
-      h("button", { text: "Open Data Folder", onclick: () => post("/api/reveal", { path: st.aht_home }) })),
+      h("button", { text: "Open Data Folder", onclick: () => post("/api/reveal", { path: st.aht_home }) }),
+      h("button", { text: "Make a Problem Report…", onclick: showProblemReport }), helpBtn(TROUBLE)),
+    recentProblems() ? h("div", { class: "dim small recent-problems", text: `${problemsText(recentProblems())} in aht's log in the last day: Recent Problems… shows ${recentProblems() === 1 ? "it" : "them"}.` }) : null,
     h("div", { class: "dim small", text: "aht keeps every AI coding agent's per-project history connected to its folder. History is never deleted or overwritten. Data: " + tilde(st.aht_home || "") })));
 }
 /** Settings ▸ Permissions: the level the next agent starts in
@@ -3617,6 +3712,166 @@ async function adopt() {
 async function doctor() {
   const d = await busy("checking…", () => J("doctor", "--json"));
   tell(d.ok ? "Everything checks out" : "Something needs a look", (d.checks || []).map((c) => `${c.ok ? "✓" : "✗"} ${c.check}${c.detail && !c.ok ? " — " + c.detail : ""}`).join("\n"));
+}
+
+// ---- Recent problems and the problem report ---------------------------------------
+
+/** The guide's section on what to do when something goes wrong. */
+const TROUBLE = "When something";
+/** The warnings and errors in this computer's log in the last day (status). */
+const problemsText = (n) => (n === 1 ? "1 warning or error" : `${n} warnings or errors`);
+const recentProblems = () => Number(((S.status || {}).log || {}).recent_problems) || 0;
+/** Whether the other machines can be asked too: some set up, and ssh here. */
+const otherMachines = () => Object.keys((S.status.handover || {}).remotes || {}).length > 0 && CAN_REACH();
+const THIS = () => (ON_WINDOWS() ? "this PC" : "this computer");
+const isHere = (m) => m === null || m === undefined || m === "" || m === "here" || m === "local" || m === "this";
+/** A machine that did not answer, or answered with an error, in a line. */
+const missedLine = (m) => (m.why.startsWith(m.machine + " ") ? m.why : m.reachable ? `${m.machine}: ${m.why}` : `${m.machine} did not answer: ${m.why}`);
+/** One line of aht's log as written ("[2026-10-28 14:10:00] [WARN ] …"). */
+function logLine(s) {
+  const m = /^\[(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)\] \[(\w+)\s*\] ?(.*)$/.exec(String(s));
+  return m ? { t: m[1].replace(" ", "T"), level: m[2].toLowerCase(), text: m[3] } : { t: null, level: "", text: String(s) };
+}
+/** `aht logs --errors [--everywhere] --json` ({hours, entries: [{t, at,
+ * level, text, machine, here}] oldest first, machines: [{machine, here,
+ * reachable, lines, error}]}) → {rows: [{t, machine, level, text}] newest
+ * first, missed: [{machine, why, reachable}]}: each entry with the machine
+ * it came from (null: this one), and the machines that did not answer or
+ * answered with an error, with why.  An UNCAUGHT error's text carries its
+ * traceback on the lines after the first. */
+function problemRows(d) {
+  d = d || {};
+  // the core's entries; lines as the log writes them, from an older core
+  const rows = arr(d.entries || d.lines).map((x) => {
+    const e = typeof x === "string" ? logLine(x) : x && typeof x === "object" ? x : { text: String(x) };
+    return { t: e.t || e.at || null, machine: e.here || isHere(e.machine) ? null : e.machine,
+      level: e.level === "error" ? "error" : "warn", text: String(e.text || "") };
+  });
+  const stamp = (r) => { const v = typeof r.t === "number" ? r.t * 1000 : Date.parse(r.t || ""); return isNaN(v) ? 0 : v; };
+  rows.sort((a, b) => stamp(b) - stamp(a));
+  const missed = [];
+  const add = (machine, why, reachable = false) => {
+    if (!isHere(machine) && !missed.some((x) => x.machine === machine)) missed.push({ machine, why: String(why || "it did not answer"), reachable });
+  };
+  for (const m of arr(d.machines)) {
+    if (m && typeof m === "object" && !m.here && (m.reachable === false || m.error)) add(m.machine, m.error, m.reachable !== false);
+  }
+  return { rows, missed };
+}
+/** An entry's text: its first line; the rest (an UNCAUGHT error's
+ * traceback) folded under it. */
+function whatHappened(text) {
+  const [first, ...rest] = String(text || "").split("\n");
+  return rest.length ? h("details", { class: "trace" }, h("summary", { text: first }), h("pre", { text: rest.join("\n") })) : first;
+}
+async function showProblems() {
+  const everywhere = otherMachines();
+  const s = sheet("Recent problems", TROUBLE, 920);
+  const body = h("div", { class: "problems" }, h("p", { class: "dim", text: everywhere ? "Asking every machine…" : "Reading the log…" }));
+  s.body.append(body);
+  s.foot.append(h("button", { text: "Open Log", onclick: () => post("/api/reveal", { path: (S.status.log || {}).path }) }),
+    h("button", { text: "Make a Problem Report…", onclick: showProblemReport }), h("span", { class: "spacer" }),
+    h("button", { text: "Look Again", onclick: showProblems }), h("button", { class: "primary", text: "Close", onclick: closeSheet }));
+  const a = await busy(everywhere ? "asking every machine for its recent problems…" : "reading the log…",
+    () => job(["logs", "--errors", ...(everywhere ? ["--everywhere"] : []), "--json"], "reading the logs"));
+  if (LOST) return;
+  clear(body);
+  if (!a.json) return body.append(h("p", { class: "warn", style: "white-space:pre-wrap", text: ((a.err || "") + (a.out || "")).trim() || "aht gave no answer." }));
+  const { rows, missed } = problemRows(a.json);
+  const where = everywhere ? "on any machine" : `on ${THIS()}`;
+  body.append(h("p", { class: "dim small", text: everywhere
+    ? "The recent warnings and errors of every machine, newest first. aht replaced secrets, host and user names in them."
+    : "The recent warnings and errors of aht on " + THIS() + ", newest first." }));
+  for (const m of missed) body.append(h("p", { class: "warn small missed", text: missedLine(m) }));
+  if (!rows.length) return body.append(h("p", { class: "okc", text: `No recent warnings or errors ${where}.` }));
+  const t = h("table", { class: "list problems" }, h("thead", {}, h("tr", {}, h("th", { text: "When" }), everywhere ? h("th", { text: "Machine" }) : null,
+    h("th", { text: "" }), h("th", { text: "What happened" }))));
+  const tb = h("tbody");
+  for (const r of rows) {
+    tb.append(h("tr", { class: r.level === "error" ? "lvl-error" : "lvl-warn" },
+      h("td", { class: "dim nowrap", text: r.t ? clock(r.t) : "" }),
+      everywhere ? h("td", { class: "machine nowrap", text: r.machine || THIS() }) : null,
+      h("td", { class: "lvl" }, h("span", { class: "badge " + (r.level === "error" ? "bad" : "warning"), text: r.level === "error" ? "error" : "warning" })),
+      h("td", { class: "what" }, whatHappened(r.text))));
+  }
+  t.append(tb);
+  body.append(h("div", { class: "problem-list" }, t));
+}
+
+/** What a problem report holds, as the report itself says at its top. */
+const REPORT_HOLDS = ["aht's version, this computer's system and Python, and the version of each agent",
+  "your settings, with secret values, the phone topic, host and user names replaced by the machine names you gave aht",
+  "how many projects aht tracks (not where they are)",
+  "the recent warnings and errors"];
+/** The machines a report covers, from `report-problem --json` (`machines`:
+ * [{machine, here, reachable, lines, error}]): the names of those that
+ * answered (this one first), and those that did not, or answered with an
+ * error. */
+function reportMachines(d) {
+  const names = [], missed = [];
+  for (const m of arr(d.machines)) {
+    if (typeof m === "string" || isHere(m)) names.push(isHere(m) ? THIS() : m);
+    else if (m && typeof m === "object") {
+      const here = m.here || isHere(m.machine), n = here ? THIS() : m.machine;
+      if (m.reachable !== false) names.push(n);
+      if (!here && (m.reachable === false || m.error)) missed.push({ machine: n, why: String(m.error || "it did not answer"), reachable: m.reachable !== false });
+    }
+  }
+  return { names, missed };
+}
+/** Where the report goes: a readable .txt among aht's reports (the core
+ * keeps the newest few there); with --json and no --out the file would be
+ * JSON. */
+function reportOut() {
+  const home = String(S.status.aht_home || "").replace(/[\\/]+$/, "");
+  if (!home) return [];
+  const sep = home.includes("\\") && !home.includes("/") ? "\\" : "/";
+  const n = (x) => String(x).padStart(2, "0"), d = new Date();
+  const stamp = `${d.getFullYear()}${n(d.getMonth() + 1)}${n(d.getDate())}-${n(d.getHours())}${n(d.getMinutes())}${n(d.getSeconds())}`;
+  return ["--out", [home, "reports", `problem-${stamp}.txt`].join(sep)];
+}
+function showProblemReport() {
+  const many = otherMachines();
+  const s = sheet("Make a Problem Report", TROUBLE, 640);
+  const every = many ? h("input", { type: "checkbox", checked: true }) : null;
+  const said = h("div", { class: "report-said" });
+  s.body.append(h("p", { text: "aht writes one file that shows what went wrong, for you to read and hand to whoever helps you. Nothing is sent anywhere." }),
+    h("div", { class: "dim small", text: "It holds:" }), h("ul", { class: "small holds" }, REPORT_HOLDS.map((x) => h("li", { text: x }))),
+    many ? h("label", { class: "check" }, every, "Include the other machines' recent warnings and errors (aht asks each one)") : null, said);
+  const make = h("button", { class: "primary", text: "Make the Report", onclick: async () => {
+    make.disabled = true;
+    const everywhere = !!(every && every.checked);
+    const a = await busy(everywhere ? "making the problem report, asking every machine…" : "making the problem report…",
+      () => job(["report-problem", ...reportOut(), ...(everywhere ? ["--everywhere"] : []), "--json"], "making the problem report"));
+    if (LOST) return;
+    make.disabled = false;
+    const d = a.json || {};
+    if (!d.path) {
+      clear(said).append(h("p", { class: "warn", style: "white-space:pre-wrap", text: "The report was not made:\n\n" + (problems(d) || ((a.err || "") + (a.out || "")).trim() || "aht gave no answer.") }));
+      return;
+    }
+    reportMade(s, d, everywhere);
+  } });
+  s.foot.append(h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), make);
+}
+/** The report is written: where, how big, what it covers; Show and Copy. */
+function reportMade(s, d, everywhere) {
+  const { names, missed } = reportMachines(d);
+  const lines = typeof d.errors === "number" ? d.errors : null;      // how many warnings and errors it holds
+  const fact = (k, v) => [h("span", { class: "dim", text: k }), v];
+  clear(s.body).append(h("p", { class: "okc", text: "The problem report is saved. Nothing was sent anywhere." }),
+    h("div", { class: "facts report-facts" },
+      fact("File", h("span", { class: "mono report-path", text: d.path })),
+      fact("Size", h("span", { text: bytes(d.bytes) })),
+      everywhere || names.some((n) => n !== THIS()) ? fact("Machines", h("span", { class: "report-machines", text: names.length ? names.join(", ") : THIS() })) : null,
+      lines !== null ? fact("Problems", h("span", { text: lines ? problemsText(lines) : "no recent warnings or errors" })) : null),
+    missed.map((m) => h("p", { class: "warn small missed", text: missedLine(m) })),
+    h("div", { class: "dim small", text: "It holds:" }), h("ul", { class: "small holds" },
+      REPORT_HOLDS.map((x, i) => h("li", { text: i === REPORT_HOLDS.length - 1 && everywhere ? x + ", here and on the other machines" : x }))),
+    h("p", { class: "dim small", text: "Read it before you hand it on." }));
+  clear(s.foot).append(h("button", { text: ON_WINDOWS() ? "Show in Explorer" : "Show in Files", onclick: () => post("/api/reveal", { path: parent(d.path) }) }),
+    h("button", { text: "Copy Path", onclick: () => copyText(d.path) }), h("span", { class: "spacer" }),
+    h("button", { class: "primary", text: "Done", onclick: closeSheet }));
 }
 
 // ---- Getting started, new versions, welcome ----------------------------------------------

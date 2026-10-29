@@ -64,7 +64,7 @@ COMMANDS = {
     "night-shift", "backup", "restore", "icons", "backends", "adopt", "setup", "update",
     "getting-started", "doctor", "reconcile", "reload", "version", "notices", "limits",
     "logs", "checkup", "forget", "orphans", "prune", "guide", "bind", "autostart",
-    "attach",
+    "attach", "report-problem",
 }
 
 # commands the window may run only in one of these ways: `attach` would
@@ -444,6 +444,19 @@ class Handler(BaseHTTPRequestHandler):
                 follow = str(aht.aht_home() / "run" / ("window-" + secrets.token_hex(6) + ".json"))
                 args = args + ["--status-file", follow]
             return self._json(200, {"job": self.server.start(args, follow)})
+        if path == "/api/log":
+            # the page's own uncaught errors and failed commands, into aht's
+            # log: masked, cut short and rate-limited there (aht.app_log)
+            body = body if isinstance(body, dict) else {}
+            level, msg = body.get("level"), body.get("message")
+            if level not in ("warn", "error") or body.get("source", "window") != "window" \
+                    or not isinstance(msg, str):
+                return self._json(400, {"error": "level: warn or error; source: window; "
+                                                 "message: text"})
+            try:
+                return self._json(200, {"ok": True, "logged": aht.app_log(level, "window", msg)})
+            except (OSError, ValueError) as e:
+                return self._json(200, {"ok": False, "error": aht._errmsg(e)})
         if path == "/api/reveal":
             return self._json(200, {"ok": reveal(str(body.get("path") or ""))})
         if path == "/api/pick-folder":
@@ -932,6 +945,13 @@ def selftest() -> int:
        f"{ans.get('err', '').strip()[:200]})")
     st, body, _ = call("/api/guide", ok, cookie=cookie)
     ck(st == 200 and b"aht guide" in body, "the guide is there")
+    st, body, _ = call("/api/log", ok, {"level": "error", "source": "window",
+                                        "message": "selftest: a failed command"}, cookie)
+    ck(st == 200 and json.loads(body or b"{}").get("ok"), "the page's errors go into aht's log")
+    st, _, _ = call("/api/log", ok, {"level": "info", "message": "x"}, cookie)
+    ck(st == 400, "/api/log takes only warnings and errors")
+    ck(call("/api/log", {"X-AHT": "1"}, {"level": "error", "message": "x"}, cookie)[0] == 403,
+       "/api/log has the same doors as the rest of the API")
     for asset in ("app.js", "app.css"):
         ck(call("/" + asset, cookie=cookie)[0] == 200, f"{asset} is there")
     ck(call("/../aht.py", cookie=cookie)[0] in (403, 404), "nothing outside the page's folder")

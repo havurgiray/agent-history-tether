@@ -1,0 +1,42 @@
+{
+  "path": "/Users/me/.aht/reports/problem-20261028-120000.txt",
+  "bytes": 4451,
+  "machines": [
+    {
+      "machine": "this machine",
+      "here": true,
+      "reachable": true,
+      "lines": 27,
+      "error": null
+    },
+    {
+      "machine": "box",
+      "reachable": true,
+      "lines": 1,
+      "error": null,
+      "here": false
+    },
+    {
+      "machine": "gone",
+      "reachable": false,
+      "lines": 0,
+      "error": "cannot reach gone ([gone]): ssh: Could not resolve hostname [gone]: nodename nor servname provided, or not known",
+      "here": false
+    },
+    {
+      "machine": "old",
+      "reachable": false,
+      "lines": 0,
+      "error": "the aht there is older and cannot send its log: update aht on old (aht 0.13.0 or newer can)",
+      "here": false
+    },
+    {
+      "machine": "pc",
+      "reachable": true,
+      "lines": 3,
+      "error": null,
+      "here": false
+    }
+  ],
+  "errors": 27
+}

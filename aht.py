@@ -71,7 +71,7 @@ except ImportError:
                 try:
                     msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
                 except OSError:
-                    pass
+                    pass        # not locked by this process: nothing to undo
                 return
             while True:
                 try:
@@ -489,17 +489,100 @@ def log(msg: str, level: str = "info") -> None:
             if p.stat().st_size > LOG_MAX_BYTES:
                 os.replace(p, p.with_suffix(".log.1"))
         except OSError:
-            pass
-        with open(p, "a") as fh:
-            fh.write(f"[{ts}] [{level.upper():<5}] {msg}\n")
+            pass                # the log itself: it goes on unrotated, nowhere else to say so
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(f"[{ts}] [{level.upper():<5}] {_log_text(msg)}\n")
     except Exception:
-        pass
+        pass                    # logging never stops a command, and has nowhere else to say so
+
+# a line of the log: [time] [LEVEL] text.  The readers below take a line for
+# an entry only when it starts so
+_LOG_HEAD = re.compile(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[([A-Z]+) *\] ?(.*)")
+
+def _log_text(msg) -> str:
+    """What log() writes of `msg`: one line, every kind of line break in it
+    (\\r, \\v, U+0085, U+2028, U+2029 too: what str.splitlines() splits
+    on) written " ⏎ ", so a text from outside (an app's message, another
+    machine's answer, an error's message) cannot add a line that reads as
+    an entry of its own.  An UNCAUGHT error keeps its traceback on the
+    lines after it; one of those that starts as an entry would is indented."""
+    lines = str(msg).splitlines() or [""]
+    if not lines[0].startswith("UNCAUGHT"):
+        return " ⏎ ".join(lines)
+    return "\n".join(lines[:1] + [("  " + ln) if _LOG_HEAD.match(ln) else ln
+                                  for ln in lines[1:]])
 
 def warn(msg: str) -> None:
     log(msg, "warn")
 
 def error(msg: str) -> None:
     log(msg, "error")
+
+def _errmsg(e: BaseException) -> str:
+    """An error as the log gives it: its type and its message on one line,
+    any key in it masked, cut short.  Never a file's contents."""
+    try:
+        return _clip(" ".join(f"{type(e).__name__}: {redact(str(e))}".splitlines()), 300)
+    except Exception:               # the masker failed: the type alone says enough
+        return type(e).__name__
+
+_WARNED = {}                        # key -> when it was last logged (time.time())
+WARN_EVERY = 3600                   # s: a warn_once key is logged again after this
+WARNED_KEEP = 300                   # keys run/warned.json holds at most
+
+def warned_path() -> Path:
+    return aht_home() / "run" / "warned.json"
+
+def _warn_due(key: str, now: float) -> bool:
+    """Whether any aht process of this machine logged `key` within the
+    last WARN_EVERY s (run/warned.json, locked as app-log.json is); if
+    none did, now is noted as its time.  The Mac app and the window run
+    `aht status --json` every 20 s, each a new process: an hour must hold
+    across them.  Keys older than WARN_EVERY are pruned.  A file that
+    cannot be read or written: this process alone decides."""
+    try:
+        p = warned_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(p) + ".lock", "a") as lk:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+            except OSError:
+                pass            # a disk without locks: two processes may each log it once
+            try:
+                st = json.loads(p.read_text())
+                st = st if isinstance(st, dict) else {}
+            except (OSError, ValueError):
+                st = {}         # none yet (or a broken one): it starts again
+            last = st.get(key)
+            if isinstance(last, (int, float)) and 0 <= now - last < WARN_EVERY:
+                _WARNED[key] = float(last)
+                return False
+            # a time ahead of the clock (the clock was set back) counts as old
+            st = {k: v for k, v in st.items()
+                  if isinstance(v, (int, float)) and 0 <= now - v < WARN_EVERY}
+            st[key] = now
+            if len(st) > WARNED_KEEP:
+                st = dict(sorted(st.items(), key=lambda kv: kv[1])[-WARNED_KEEP:])
+            _write_json(p, st)
+    except Exception:
+        pass                    # not kept: this process's own memory still holds it an hour
+    _WARNED[key] = now
+    return True
+
+def warn_once(key: str, msg: str) -> None:
+    """warn(), at most once an hour per `key` on this machine, across every
+    aht process: for what runs per file, per process or per poll, so one
+    cause cannot fill the log."""
+    try:
+        now = time.time()
+        last = _WARNED.get(key)
+        if last is not None and 0 <= now - last < WARN_EVERY:
+            return
+        if not _warn_due(key, now):
+            return
+    except Exception:
+        pass                    # the check failed: better the line twice than not at all
+    warn(msg)
 
 def new_uuid() -> str:
     return _uuid.uuid4().hex
@@ -586,8 +669,9 @@ class Backend:
             cfg = cfg_get("backend_roots") or {}
             if cfg.get(self.name):
                 return Path(_expand(str(cfg[self.name])))
-        except Exception:
-            pass
+        except Exception as _x:
+            warn_once("backend-roots", f"CONFIG backend_roots is not readable; {self.name} "
+                                       f"uses its default place: {_errmsg(_x)}")
         return Path(self._root_default() if callable(self._root_default)
                     else self._root_default).expanduser()
 
@@ -598,7 +682,7 @@ class Backend:
             if (cfg_get("backend_roots") or {}).get(self.name):
                 return "config"
         except Exception:
-            pass
+            pass                # root() above reads the same setting and warns
         return "default"
 
     def available(self) -> bool:
@@ -728,8 +812,9 @@ class KimiCodeBackend(DirBackend):
             for s in sessions:
                 try:
                     (dirty / f"{s.name}.{ms}").touch()
-                except OSError:
-                    pass
+                except OSError as _x:
+                    warn_once("index-dirty", f"[{self.name}] the index-dirty mark was not "
+                                             f"written: {_errmsg(_x)}")
 
     def _recatalog(self, old_real, new_real, old_key, new_key, bdir) -> bool:
         """Rename the project's entry in workspaces.json.  Only when the file
@@ -1014,8 +1099,9 @@ def detect_stores(real_path: str, include_files: bool = False) -> dict:
             try:
                 if b.scan(real_path):
                     out[b.name] = FILE_STORE_SENTINEL
-            except Exception:
-                pass
+            except Exception as _x:
+                warn_once(f"scan-{b.name}", f"[{b.name}] looking for this project's history "
+                                            f"failed: {_errmsg(_x)}")
     return out
 
 STORES_SCAN_INTERVAL = 600      # s between sweeps of the cwd-keyed session stores
@@ -1207,14 +1293,14 @@ def queue_notice(path, record: dict) -> None:
             try:
                 fcntl.flock(lk, fcntl.LOCK_EX)
             except OSError:
-                pass
+                pass            # a disk without locks: written unlocked (one line, appended)
             with open(p, "ab+") as fh:
                 fh.seek(0)
                 if fh.read().count(b"\n") >= NOTICE_QUEUE_MAX:
                     fh.truncate(0)
                 fh.write(line)
-    except OSError:
-        pass
+    except OSError as _x:
+        warn(f"NOTICE not queued in {p.name}: {_errmsg(_x)}")
 
 def notify_user(title: str, message: str, info: dict = None) -> None:
     try:
@@ -1239,8 +1325,8 @@ def notify_user(title: str, message: str, info: dict = None) -> None:
         elif IS_LINUX and _have("notify-send") and _linux_has_display():
             subprocess.run(["notify-send", "-a", "aht", title, message],
                            capture_output=True, timeout=15)
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"NOTICE not shown ({title}): {_errmsg(_x)}")
 
 class Lock:
     def __init__(self, timeout=None):
@@ -1269,7 +1355,7 @@ class Lock:
                 fcntl.flock(self.fh, fcntl.LOCK_UN)
                 self.fh.close()
             except Exception:
-                pass
+                pass            # the lock goes with its file when this process ends
 
 # --------------------------------------------------------------------------- #
 # Registry
@@ -1296,8 +1382,8 @@ def save_registry(reg: dict) -> None:
     if p.exists():
         try:
             shutil.copy2(p, p.with_suffix(".json.bak"))
-        except Exception:
-            pass
+        except Exception as _x:
+            warn(f"REGISTRY its backup copy (registry.json.bak) was not made: {_errmsg(_x)}")
     reg.pop("_dirty", None)
     tmp = p.with_suffix(".json.tmp")
     with open(tmp, "w") as fh:
@@ -1359,8 +1445,8 @@ def read_marker(folder: str) -> str | None:
                 val = mp.read_text().strip()
                 if val:
                     return val
-        except Exception:
-            pass
+        except Exception as _x:
+            warn_once("marker", f"MARKER not readable: {mp}: {_errmsg(_x)}")
     return None
 
 def write_marker(folder: str, uid: str) -> None:
@@ -1774,16 +1860,12 @@ def _badge_tool():
                              aht_home() / "tools/agent-history-tether/badge_icon")
                  if c.exists()), None)
 
-_BADGE_TOOL_WARNED = False
-
 def _badge_macos(path, marks) -> None:
-    global _BADGE_TOOL_WARNED
     b = _badge_tool()
     if b is None:
-        if not _BADGE_TOOL_WARNED:
-            _BADGE_TOOL_WARNED = True
-            warn("badge tool missing; folder badges are not applied — "
-                 "run:  aht install")
+        # once an hour, not once per folder or per watcher run
+        warn_once("badge-tool", "badge tool missing; folder badges are not applied — "
+                                "run:  aht install")
         return
     cmd = [str(b), "set", str(path)] + list(marks) if marks \
         else [str(b), "clear", str(path)]
@@ -1792,10 +1874,9 @@ def _badge_macos(path, marks) -> None:
         rc, err = r.returncode, (r.stderr or "").strip()
     except OSError as e:                # macOS refused to run it (Gatekeeper)
         rc, err = -1, str(e)
-    if rc != 0 and not _BADGE_TOOL_WARNED:
-        _BADGE_TOOL_WARNED = True       # once per run, not once per folder
-        warn(f"badge tool failed (exit {rc}) on {path}: {err[:160]} — "
-             f"if macOS blocked it, run:  aht install")
+    if rc != 0:                         # once an hour, not once per folder or run
+        warn_once("badge-tool", f"badge tool failed (exit {rc}) on {path}: {err[:160]} — "
+                                f"if macOS blocked it, run:  aht install")
 
 def _badge_linux(path, marks) -> None:
     method = cfg_get("linux_emblem_method", "auto")
@@ -1839,8 +1920,9 @@ def _badge_linux(path, marks) -> None:
                 dotdir.write_text(f"[Desktop Entry]\nIcon={icon}\n")
             elif dotdir.is_file() and "Icon=folder-favorites" in dotdir.read_text():
                 dotdir.unlink()
-        except Exception:
-            pass
+        except Exception as _x:
+            warn_once("badge-linux", "BADGE the folder's .directory file was not written: "
+                                     f"{_errmsg(_x)}")
 
 def apply_badge(path, marks) -> None:
     if os.environ.get("AHT_NO_ICONS") or not cfg_get("icons_enabled", True):
@@ -1851,7 +1933,7 @@ def apply_badge(path, marks) -> None:
         elif IS_LINUX:
             _badge_linux(path, marks)
     except Exception as e:
-        warn(f"badge failed for {path}: {e}")
+        warn_once(f"badge-{type(e).__name__}", f"BADGE not updated for {path}: {_errmsg(e)}")
 
 def find_git_repos(roots: list) -> set:
     found = set()
@@ -1899,8 +1981,9 @@ def _touch_backup_stamp() -> None:
     try:
         backups_root().mkdir(parents=True, exist_ok=True)
         _backup_stamp_file().write_text(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
-    except OSError:
-        pass
+    except OSError as _x:
+        warn("BACKUP its time stamp was not written (the next backup may come early): "
+             f"{_errmsg(_x)}")
 
 def _project_sources(entry: dict) -> list:
     """[(abs_file, arcname)] across every enabled backend, arc =
@@ -1954,8 +2037,11 @@ def _snapshots(uid: str) -> list:
             meta["zip_bytes"] = 0
         try:
             meta.update(json.loads(z.with_suffix(".meta.json").read_text()))
-        except Exception:
-            pass
+        except FileNotFoundError:
+            pass                # an older backup without its meta file: the zip alone counts
+        except Exception as _x:
+            warn_once("snapshot-meta", f"BACKUP {z.name}: its meta file is not readable: "
+                                       f"{_errmsg(_x)}")
         out.append(meta)
     return out
 
@@ -1970,8 +2056,10 @@ def _prune_snapshots(uid: str) -> int:
         for p in (Path(m["zip"]), Path(m["zip"]).with_suffix(".meta.json")):
             try:
                 p.unlink()
-            except OSError:
-                pass
+            except FileNotFoundError:
+                pass            # a backup without its meta file
+            except OSError as _x:
+                warn(f"BACKUP an old backup was not removed: {p.name}: {_errmsg(_x)}")
     if drop:
         log(f"BACKUP pruned {len(drop)} old snapshot(s) for {uid}")
     return len(drop)
@@ -2020,8 +2108,8 @@ def _snapshot_project(uid: str, entry: dict) -> dict:
             "file_refs": refs}
     try:
         z.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
-    except OSError:
-        pass
+    except OSError as _x:
+        warn(f"BACKUP the meta file of {z.name} was not written: {_errmsg(_x)}")
     _prune_snapshots(uid)
     res.update(status="backed-up", stamp=z.stem, files=len(sources), bytes=total)
     log(f"BACKUP {entry.get('real_path')} -> {uid}/{z.name} "
@@ -2072,8 +2160,8 @@ def _spawn_auto_backup() -> None:
         else:
             kw["start_new_session"] = True
         subprocess.Popen(cmd, **kw)
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"BACKUP the automatic backup did not start: {_errmsg(_x)}")
 
 def match_snapshots(folder: str, limit: int = 8) -> list:
     folder = os.path.realpath(folder)
@@ -2223,8 +2311,9 @@ def backup_status() -> dict:
                         n_proj += 1
                         n_zip += len(zips)
                         size += sum(z.stat().st_size for z in zips)
-    except OSError:
-        pass
+    except OSError as _x:
+        warn_once("backup-status", "BACKUP the backups folder could not be listed: "
+                                   f"{_errmsg(_x)}")
     try:
         last = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(
             _backup_stamp_file().stat().st_mtime))
@@ -2255,7 +2344,7 @@ def safe_merge(old: Path, new: Path) -> list:
         if not any(old.iterdir()):
             old.rmdir()
     except Exception:
-        pass
+        pass                    # the old folder stays when it is not empty: nothing is lost
     return conflicts
 
 def safe_relink(old_store: Path, new_store: Path) -> str:
@@ -2267,7 +2356,7 @@ def safe_relink(old_store: Path, new_store: Path) -> str:
         try:                        # one store, two spellings (a Mac ignores case):
             os.rename(str(old_store), str(new_store))   # take the new one, merge nothing
         except OSError:
-            pass
+            pass                # one folder, two spellings: the old one stays
         return "same"
     if not new_store.exists():
         new_store.parent.mkdir(parents=True, exist_ok=True)
@@ -2532,8 +2621,9 @@ def apply_copies(reg: dict, copies: list, copy_history: bool = True) -> list:
                         try:
                             comp_tgt.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(comp_src, comp_tgt)
-                        except OSError:
-                            pass
+                        except OSError as _x:
+                            warn(f"COPY {comp_src.name} was not copied with the project's "
+                                 f"history: {_errmsg(_x)}")
                     if fresh:
                         try:
                             note = b.after_copy(nu, src_real, new_real, tgt)
@@ -3222,8 +3312,8 @@ def cmd_hook(args):
     try:
         if cwd != home:
             apply_badge(cwd, desired_marks(cwd, True))
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"BADGE not updated for {cwd}: {_errmsg(_x)}")
     source = str(data.get("source") or "startup")
     sid = data.get("session_id")
     notes = [_hook_notes(cwd, sid if isinstance(sid, str) else None)]
@@ -3346,7 +3436,7 @@ def stop_watcher() -> list:
             os.kill(pid, signal.SIGTERM)
             done.append(f"the watcher (pid {pid}) was asked to end")
         except OSError:
-            pass
+            pass                # it ended already
     if done:
         log("WATCHER off (watcher_owner=none): " + "; ".join(done))
     return done
@@ -3410,8 +3500,11 @@ def hook_installed(event: str = "SessionStart") -> bool:
                 c = h.get("command", "")
                 if "aht.py" in c or "aht.exe" in c.lower():
                     return True
-    except Exception:
-        pass
+    except FileNotFoundError:
+        pass                    # no settings file: no hook
+    except Exception as _x:
+        warn_once("hook-settings", "HOOK Claude Code's settings are not readable: "
+                                   f"{_errmsg(_x)}")
     return False
 
 def _hist_stats(entry: dict) -> dict:
@@ -3752,8 +3845,11 @@ def cmd_forget(args):
                     for rel in (MARKER_REL, LEGACY_MARKER_REL):
                         try:
                             (Path(e["real_path"]) / rel).unlink()
-                        except Exception:
-                            pass
+                        except FileNotFoundError:
+                            pass  # no marker of that kind there
+                        except Exception as _x:
+                            warn(f"FORGET a marker was not removed from {e['real_path']}: "
+                                 f"{_errmsg(_x)}")
                 log(f"FORGET {e['real_path']}")
             save_registry(reg)
     for _u, e in hits:
@@ -3887,7 +3983,7 @@ def cmd_doctor(args):
                 try:
                     out.unlink()
                 except OSError:
-                    pass
+                    pass        # the badge test's own file: gone with the folder
         ck("folder badge tool runs", ok, detail)
     if handover_supported() and remotes_config():
         rs, forced = find_rsync(), transfer_setting() == "rsync"
@@ -4109,29 +4205,44 @@ def cmd_restore(args):
     return 0
 
 def cmd_logs(args):
-    """Show recent log lines; --errors filters to warnings + errors."""
+    """Show recent log lines; --errors filters to warnings + errors.  With
+    --everywhere, --hours or --errors --json: the warnings and errors of the
+    last hours as entries (an UNCAUGHT error with its traceback), with
+    --everywhere those of every other machine set up as well."""
+    if getattr(args, "everywhere", False) or getattr(args, "hours", None) is not None \
+            or (args.errors and getattr(args, "json", False)):
+        return logs_problems(args)
     lines = []
     for f in (log_path().with_suffix(".log.1"), log_path()):
         try:
             lines += f.read_text(errors="replace").splitlines()
         except OSError:
-            pass
+            pass                # no log yet
     if args.watcher:
         try:
             lines += [f"[watcher-stream] {ln}" for ln in
                       (aht_home() / "aht-watcher.log")
                       .read_text(errors="replace").splitlines()[-args.lines:]]
         except OSError:
-            pass
+            pass                # no watcher log yet
     if args.errors:
-        lines = [ln for ln in lines if "[WARN " in ln or "[ERROR" in ln]
+        lines = [ln for ln in lines if _problem_line(ln.removeprefix("[watcher-stream] "))]
     out = lines[-args.lines:]
+    if getattr(args, "json", False):
+        print(json.dumps({"path": str(log_path()), "lines": out}, indent=2))
+        return 0
     if not out:
         print("no matching log lines" + (" — the log is clean" if args.errors
                                          else f" yet ({log_path()})"))
     for ln in out:
         print(ln)
     return 0
+
+def _problem_line(ln: str) -> bool:
+    """A line of the log that starts a warning or an error (not one that
+    only names one, nor a line of a traceback)."""
+    m = _LOG_HEAD.match(ln)
+    return bool(m) and m.group(2) in ("WARN", "ERROR")
 
 def recent_log_problems(hours: float = 24.0) -> int:
     """warn+error lines younger than `hours` (doctor + status surface this)."""
@@ -4143,7 +4254,7 @@ def recent_log_problems(hours: float = 24.0) -> int:
         except OSError:
             continue
         for ln in text.splitlines():
-            if "[WARN " not in ln and "[ERROR" not in ln:
+            if not _problem_line(ln):
                 continue
             try:
                 ts = time.mktime(time.strptime(ln[1:20], "%Y-%m-%d %H:%M:%S"))
@@ -4152,6 +4263,563 @@ def recent_log_problems(hours: float = 24.0) -> int:
             except Exception:
                 n += 1
     return n
+
+# ---- diagnostics: the warnings and errors, here and on the other machines --- #
+#
+# Every machine keeps its own log (~/.aht/aht.log).  `logs --everywhere` and
+# `report-problem` read this machine's and ask every other machine set up for
+# the warnings and errors of its own (`log-tail`: read only, masked there and
+# again here, at most LOG_TAIL_MAX lines).  aht's apps put their own errors
+# in through `aht _log` (the Mac app, the tray) and the window's /api/log.
+
+LOG_TAIL_MAX = 300          # lines one machine sends of its log at most
+LOG_TAIL_HOURS = 24.0
+LOG_FAR_WAIT = 30           # s: each other machine has this long to answer
+LOG_READ_MAX = 4 << 20      # bytes read from the end of each log file
+TRACEBACK_MAX = 40          # lines kept of one UNCAUGHT error's traceback
+
+def log_problems(hours: float = LOG_TAIL_HOURS, limit: int = LOG_TAIL_MAX) -> list:
+    """This machine's warnings and errors of the last `hours`, oldest first:
+    [{t, level, text}].  An UNCAUGHT error keeps its traceback (the lines
+    after it); every other entry is its one line.  At most `limit` lines in
+    all, the newest kept.  Read only, and not masked: what leaves this
+    machine goes through diag_masker() first."""
+    cutoff = time.time() - hours * 3600
+    entries = []
+    for f in (log_path().with_suffix(".log.1"), log_path()):
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - LOG_READ_MAX))
+                data = fh.read()
+        except OSError:
+            continue                # no log (yet), or not readable: nothing to tell
+        cur = None
+        for ln in data.decode("utf-8", "replace").splitlines():
+            m = _LOG_HEAD.match(ln)
+            if m:
+                cur = None
+                level = {"WARN": "warn", "ERROR": "error"}.get(m.group(2))
+                if not level:
+                    continue
+                try:
+                    t = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+                except (ValueError, OverflowError):
+                    continue
+                if t >= cutoff:
+                    cur = {"t": t, "level": level, "lines": [m.group(3)[:2000]]}
+                    entries.append(cur)
+            elif cur is not None and cur["lines"][0].startswith("UNCAUGHT") \
+                    and len(cur["lines"]) < TRACEBACK_MAX and ln.strip():
+                cur["lines"].append(ln[:2000])
+    # the same warning again and again is one entry, at its newest, with a
+    # count: a flood (a broken file read every 20 s) cannot push the rest out
+    newest, seen = [], {}
+    for e in reversed(entries):
+        k = (e["level"], tuple(e["lines"]))
+        if k in seen:
+            seen[k]["n"] += 1
+            seen[k]["first"] = min(seen[k]["first"], e["t"])
+        else:
+            seen[k] = dict(e, n=1, first=e["t"])
+            newest.append(seen[k])
+    out, n = [], 0
+    for e in newest:
+        if n + len(e["lines"]) > limit:
+            break
+        n += len(e["lines"])
+        lines = list(e["lines"])
+        if e["n"] > 1:
+            lines[0] += f" (×{e['n']} since {_since(e['first'], e['t'])})"
+        out.append({"t": e["t"], "level": e["level"], "text": "\n".join(lines)})
+    out.reverse()
+    return out
+
+def _since(first: float, last: float) -> str:
+    """When the first of repeated entries came: its time, with its day when
+    that is not the newest one's."""
+    a, b = time.localtime(first), time.localtime(last)
+    return time.strftime("%H:%M" if a[:3] == b[:3] else "%Y-%m-%d %H:%M", a)
+
+_IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)")
+_IPV6 = re.compile(r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:%[\w.-]+)?(?![\w:])")
+_USER_AT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.\[\]-]+")
+_PLAIN_WORDS = {"", "home", "user", "root", "users"}
+
+def diag_masker():
+    """A function that makes a text from a log fit to leave this machine:
+    every key masked (redact), no e-mail or network address, no home
+    folder (it reads ~), no user or host name, nothing of the phone
+    setting (notify_phone: its address, server, topic, number).  Another
+    machine is called by the name it has in aht, this one "this machine".
+    The same on every machine: the far end masks with it what it sends."""
+    pairs = []                              # (exact text, what it becomes)
+    users, hosts = set(), set()
+    home = str(Path.home())
+    real = os.path.realpath(home)
+    mine = {home, real, home.replace("\\", "/"), real.replace("\\", "/")}
+    mine |= {h.replace("\\", "\\\\") for h in mine}
+    for name, spec in remotes_config().items():
+        if not isinstance(spec, dict):
+            continue
+        tgt = str(spec.get("ssh") or "")
+        user, _, host = tgt.rpartition("@")
+        pairs += [(tgt, f"[{name}]"), (host, f"[{name}]")]
+        for k in ("home", "root", "sandbox"):
+            v = spec.get(k)
+            # a machine whose home is at this one's path (two Macs, one
+            # account name): this machine's paths stay this machine's ~
+            if isinstance(v, str) and v.rstrip("\\/") not in mine \
+                    and os.path.realpath(v) not in mine:
+                pairs += [(v, f"[{name}]~"), (v.replace("\\", "\\\\"), f"[{name}]~")]
+        users.add(user)
+    pairs += [(h, "~") for h in mine]
+    users |= {os.path.basename(home.rstrip("\\/")), os.environ.get("USER"),
+              os.environ.get("USERNAME"), os.environ.get("LOGNAME")}
+    node = platform.node()
+    hosts |= {node, node.split(".")[0]}
+    exact, phone = _phone_parts(cfg_get("notify_phone"))
+    pairs += [(x, "[phone]") for x in exact]
+    # the longest first: a home inside a sandbox before the sandbox; of two
+    # alike, this machine's ~ (never as the hash seed of the run falls)
+    pairs = sorted({(a, b) for a, b in pairs if a and len(a) > 2},
+                   key=lambda p: (-len(p[0]), p[1] != "~", p[1]))
+    phone_rx = [re.compile(rf"(?<![\w.-]){re.escape(w)}(?![\w-])", re.I)
+                for w in sorted(phone, key=len, reverse=True)]
+    words = [(re.compile(rf"(?<!\w){re.escape(w)}(?!\w)", re.I), by)
+             for ws, by in ((hosts, "[this machine]"), (users, "[user]"))
+             for w in sorted(x for x in ws if x and x.lower() not in _PLAIN_WORDS
+                             and len(x) > 1)]
+    def six(m):
+        s = m.group(0)
+        return "[address]" if "::" in s or s.count(":") >= 4 else s
+    def mask(text) -> str:
+        text = redact(str(text or ""))
+        for a, b in pairs:
+            text = text.replace(a, b)
+        for rx in phone_rx:
+            text = rx.sub("[phone]", text)
+        text = _USER_AT.sub(lambda m: m.group(0) if m.group(0).startswith("[")
+                            else "[user]@[host]", text)
+        text = _IPV4.sub("[address]", text)
+        text = _IPV6.sub(six, text)
+        for rx, by in words:
+            text = rx.sub(by, text)
+        return text
+    return mask
+
+def _agent_log_tail(req: dict) -> dict:
+    """Another machine asks for this one's warnings and errors: read only,
+    masked here (and again there), at most LOG_TAIL_MAX lines."""
+    try:
+        hours = min(max(float(req.get("hours") or LOG_TAIL_HOURS), 0.01), 24 * 31)
+        limit = min(max(int(req.get("limit") or LOG_TAIL_MAX), 1), LOG_TAIL_MAX)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "hours and limit: numbers"}
+    mask = diag_masker()
+    return {"ok": True, "entries": [dict(e, text=mask(e["text"]))
+                                    for e in log_problems(hours, limit)]}
+
+def _far_entries(rows, mask) -> list:
+    """What another machine sent, checked and masked once more here."""
+    out, n = [], 0
+    for e in rows if isinstance(rows, list) else []:
+        if not isinstance(e, dict) or e.get("level") not in ("warn", "error") \
+                or not isinstance(e.get("text"), str) \
+                or not isinstance(e.get("t"), (int, float)):
+            continue
+        # its lines as this machine splits them (U+2028 and the like too)
+        text = "\n".join(mask(e["text"][:16000]).splitlines())
+        n += text.count("\n") + 1
+        if n > LOG_TAIL_MAX:
+            break
+        out.append({"t": float(e["t"]), "level": e["level"], "text": text})
+    return out
+
+def logs_everywhere(hours: float = LOG_TAIL_HOURS) -> list:
+    """Every other machine set up, asked at once for its warnings and errors
+    (`log-tail`) -> [{machine, reachable, lines, error, entries}]; one that
+    does not answer says why.  Nothing is kept here."""
+    names = sorted(remotes_config())
+    mask = diag_masker()
+    found = {}
+    def ask(name):
+        row = {"machine": name, "reachable": False, "lines": 0, "error": None, "entries": []}
+        try:
+            if not can_reach_machines():
+                raise HandoverError(NO_SSH)
+            ans = get_remote(name).agent("log-tail", timeout=LOG_FAR_WAIT, hours=hours,
+                                         limit=LOG_TAIL_MAX)
+            row["entries"] = _far_entries(ans.get("entries"), mask)
+            row.update(reachable=True, lines=sum(e["text"].count("\n") + 1
+                                                 for e in row["entries"]))
+        except Exception as e:      # noqa: BLE001 (each machine says why, whatever it is)
+            why = str(e) if isinstance(e, HandoverError) else _errmsg(e)
+            if "unknown operation" in why:
+                why = (f"the aht there is older and cannot send its log: update aht on {name} "
+                       f"(aht {VERSION} or newer can)")
+            row["error"] = mask(why)
+        found[name] = row
+    ts = [threading.Thread(target=ask, args=(n,), daemon=True) for n in names]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=LOG_FAR_WAIT + 15)
+    return [found.get(n) or {"machine": n, "reachable": False, "lines": 0, "entries": [],
+                             "error": f"{n} did not answer within {LOG_FAR_WAIT} s"}
+            for n in names]
+
+def _hours_arg(h) -> float:
+    try:
+        h = float(h)
+    except (TypeError, ValueError):
+        return LOG_TAIL_HOURS
+    return min(h, 24 * 31) if h > 0 else LOG_TAIL_HOURS
+
+def _entry_lines(e: dict, label: str) -> list:
+    """An entry as the terminal and the report show it."""
+    first, *rest = e["text"].split("\n")
+    at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["t"]))
+    return [f"[{at}] [{e['level'].upper():<5}] {label}: {first}"] + ["    " + r for r in rest]
+
+def logs_problems(args) -> int:
+    """`logs --errors [--everywhere] [--hours H] [--json]`."""
+    hours = _hours_arg(args.hours if args.hours is not None else LOG_TAIL_HOURS)
+    here = _here()
+    mine = log_problems(hours, LOG_TAIL_MAX)
+    machines = [{"machine": here, "here": True, "reachable": True,
+                 "lines": sum(e["text"].count("\n") + 1 for e in mine), "error": None}]
+    rows = [dict(e, machine=here, here=True) for e in mine]
+    if args.everywhere:
+        for m in logs_everywhere(hours):
+            rows += [dict(e, machine=m["machine"], here=False) for e in m.pop("entries")]
+            machines.append(dict(m, here=False))
+    rows.sort(key=lambda e: e["t"])             # stable: one machine's order stays
+    for e in rows:
+        e["at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(e["t"]))
+    if args.json:
+        print(json.dumps({"hours": hours, "entries": rows, "machines": machines}, indent=2))
+        return 0
+    for e in rows:
+        for ln in _entry_lines(e, e["machine"]):
+            print(ln)
+    if not rows:
+        print(f"no warnings or errors in the last {hours:g} h"
+              + (" on any machine that answered" if args.everywhere else " — the log is clean"))
+    for m in machines:
+        if m["error"]:
+            print(f"{m['machine']}: no log from it — {m['error']}")
+    return 0
+
+# ---- the apps' own errors ---------------------------------------------------- #
+
+APP_LOG_SOURCES = ("window", "mac-app", "tray")
+APP_LOG_MAX = 1000          # characters of one message
+APP_LOG_BURST = 20          # lines one app may log in a minute; the rest are counted
+APP_LOG_SAME = 10           # s: the same message again this soon is counted, not logged
+
+def app_log(level: str, source: str, message: str) -> bool:
+    """One line from aht's own apps into this machine's log: masked, on one
+    line, cut to APP_LOG_MAX, and rate-limited (APP_LOG_BURST a minute per
+    app, the same message at most once in APP_LOG_SAME s) so an app in a
+    loop cannot fill the log; what is held back is counted and said once.
+    -> whether it was logged."""
+    if level not in ("warn", "error") or source not in APP_LOG_SOURCES:
+        raise ValueError("level: warn or error; source: " + ", ".join(APP_LOG_SOURCES))
+    # one line: every line break str.splitlines() knows (U+0085, U+2028 and
+    # U+2029 too, which the log's readers split on) becomes " ⏎ ", so a
+    # message cannot add a line that reads as an entry of its own
+    text = " ⏎ ".join(str(message or "").splitlines())
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]", " ", text)
+    text = _clip(_redact_head(text, APP_LOG_MAX), APP_LOG_MAX)
+    if not text:
+        return False
+    st_path = aht_home() / "run" / "app-log.json"
+    st_path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    now = time.time()
+    with open(str(st_path) + ".lock", "a") as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+        except OSError:
+            pass                # a disk without locks: the count may be off by one
+        try:
+            st = json.loads(st_path.read_text())
+            st = st if isinstance(st, dict) else {}
+        except (OSError, ValueError):
+            st = {}             # no count yet (or a broken one): it starts again
+        s = st.get(source) if isinstance(st.get(source), dict) else {}
+        if now - float(s.get("start") or 0) >= 60:
+            if s.get("held"):
+                warn(f"APP {source}: {s['held']} more line(s) were not logged "
+                     "(too many in a minute)")
+            s = {"start": now, "n": 0, "held": 0, "last": s.get("last"),
+                 "last_at": s.get("last_at") or 0}
+        ok = not ((s.get("last") == digest and now - float(s.get("last_at") or 0) < APP_LOG_SAME)
+                  or s["n"] >= APP_LOG_BURST)
+        if ok:
+            s["n"] += 1
+            s.update(last=digest, last_at=now)
+            log(f"APP {source}: {text}", level)
+            if s["n"] == APP_LOG_BURST:
+                warn(f"APP {source}: {APP_LOG_BURST} lines in a minute; more are counted, "
+                     "not logged")
+        else:
+            s["held"] += 1
+        st[source] = s
+        try:
+            _write_json(st_path, st)
+        except OSError as _x:
+            warn_once("app-log", f"APP the count of the apps' lines was not kept: "
+                                 f"{_errmsg(_x)}")
+    return ok
+
+def cmd_app_log(args):
+    """`aht _log --level warn|error --source window|mac-app|tray -- MESSAGE`."""
+    try:
+        app_log(args.level, args.source, " ".join(args.message or []))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    return 0
+
+# ---- a problem report: one masked file that shows the whole picture --------- #
+
+REPORTS_KEEP = 5
+
+def reports_dir() -> Path:
+    return aht_home() / "reports"
+
+def _agent_versions() -> dict:
+    """Each agent CLI aht runs: its version (`--version`, asked at once,
+    10 s each), "not found", or what went wrong."""
+    out = {}
+    def ask(a):
+        exe = agent_cli(a)
+        if not exe:
+            out[a] = "not found"
+            return
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10,
+                               cwd="/" if os.name != "nt" else None, stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DISABLE_AUTOUPDATER": "1"}, **_NO_WINDOW)
+            said = (r.stdout or r.stderr or "").strip().splitlines()
+            out[a] = _clip(said[0], 120) if said else f"no answer (exit {r.returncode})"
+        except subprocess.TimeoutExpired:
+            out[a] = "no answer within 10 s"
+        except OSError as e:
+            out[a] = _errmsg(e)
+    ts = [threading.Thread(target=ask, args=(a,), daemon=True) for a in SWITCH_TARGETS]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=20)
+    return {AGENT_NAMES.get(a, a): out.get(a, "no answer within 10 s") for a in SWITCH_TARGETS}
+
+REMOTE_SHOWN = ("system", "runner", "watch", "shell")    # the rest of a machine's entry: hidden
+
+def _report_settings(mask) -> dict:
+    """The settings changed from aht's defaults: secret values, the phone
+    or ntfy topic, the other machines' addresses, homes and user names
+    hidden; every other value masked."""
+    def walk(v):
+        if isinstance(v, str):
+            return mask(v)
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): ("[hidden]" if _secret_name(str(k)) and x else walk(x))
+                    for k, x in v.items()}
+        return v
+    out = {}
+    for k, v in sorted(load_config().items()):
+        if k == "remotes" and isinstance(v, dict):
+            out[k] = {n: ({x: walk(s.get(x)) for x in REMOTE_SHOWN if x in s}
+                          | {x: "[hidden]" for x in s if x not in REMOTE_SHOWN})
+                      if isinstance(s, dict) else "[hidden]" for n, s in v.items()}
+        elif k == "notify_phone" or _secret_name(k):
+            out[k] = "[hidden]" if v else v
+        else:
+            out[k] = walk(v)
+    return out
+
+def _registry_counts() -> dict:
+    reg = load_registry()
+    ps = [e for e in (reg.get("projects") or {}).values() if isinstance(e, dict)]
+    return {"projects": len(ps),
+            "folders_missing": sum(not os.path.isdir(str(e.get("real_path") or "")) for e in ps),
+            "handed_over": sum(bool(e.get("away")) for e in ps),
+            "kept_in_sync": sum(bool((e.get("mirror") or {}).get("enabled")) for e in ps),
+            "declined_moves": len(reg.get("declined_moves") or {}),
+            "forgotten": len(reg.get("forgotten") or {})}
+
+def _os_text() -> str:
+    if IS_MAC:
+        return f"macOS {platform.mac_ver()[0] or platform.release()} ({platform.machine()})"
+    if os.name == "nt":
+        return f"Windows {platform.release()} {platform.version()} ({platform.machine()})"
+    try:
+        rel = platform.freedesktop_os_release().get("PRETTY_NAME")
+    except (AttributeError, OSError):
+        rel = None              # an older Python, or no os-release: the kernel says enough
+    return f"{rel or platform.system()} (Linux {platform.release()}, {platform.machine()})"
+
+def problem_report(hours: float = LOG_TAIL_HOURS, everywhere: bool = False) -> dict:
+    """What `report-problem` writes: aht, the system, the agents, the
+    settings, the registry's counts, the health of the watcher, the hook and
+    the backups, and the warnings and errors, all masked."""
+    mask = diag_masker()
+    here = "this machine"
+    mine = [dict(e, text=mask(e["text"]), machine=here) for e in log_problems(hours)]
+    machines = [{"machine": here, "here": True, "reachable": True,
+                 "lines": sum(e["text"].count("\n") + 1 for e in mine), "error": None}]
+    entries = list(mine)
+    if everywhere:
+        for m in logs_everywhere(hours):
+            entries += [dict(e, machine=m["machine"]) for e in m.pop("entries")]
+            machines.append(dict(m, here=False))
+    entries.sort(key=lambda e: e["t"])
+    for e in entries:
+        e["at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(e["t"]))
+    w = _quiet_value(watcher_status) or {}
+    bk = _quiet_value(backup_status) or {}
+    return {
+        "about": REPORT_ABOUT,
+        "made": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "hours": hours,
+        "everywhere": bool(everywhere),
+        "aht": {"version": VERSION, "protocol": AGENT_PROTOCOL,
+                "core_id": _quiet_value(core_id), "installed": install_kind(),
+                "frozen": bool(getattr(sys, "frozen", False))},
+        "system": {"os": _os_text(), "python": platform.python_version(),
+                   "platform": sys.platform},
+        "agents": {k: mask(v) for k, v in _agent_versions().items()},
+        "settings": _report_settings(mask),
+        "registry": _registry_counts(),
+        "health": {"watcher": {k: w.get(k) for k in ("kind", "installed", "running")},
+                   "hook_installed": _quiet_value(hook_installed),
+                   "backups": {k: bk.get(k) for k in ("enabled", "projects", "snapshots",
+                                                      "last_run")},
+                   "machines_set_up": len(remotes_config())},
+        "machines": machines,
+        "problems": entries,
+    }
+
+REPORT_ABOUT = (
+    "aht's problem report. It holds aht's version, this computer's system and Python, each "
+    "agent CLI's version, the settings you changed (secret values, the phone or ntfy topic, "
+    "and your other machines' addresses and user names hidden: a machine is named by the "
+    "name you gave it in aht), how many projects aht tracks (no paths), and the warnings and "
+    "errors aht logged, with keys, network addresses, user and host names masked and your "
+    "home folder written as ~. Nothing was sent anywhere: aht only wrote this file. Read it "
+    "through before you send it with a bug report.")
+
+def report_text(rep: dict) -> str:
+    """The report as plain text: what it holds first."""
+    import textwrap
+    L = ["aht problem report", "==================", ""]
+    L += textwrap.wrap(rep["about"], 78) + [""]
+    a, s = rep["aht"], rep["system"]
+    L += [f"Made:      {rep['made']} by `aht report-problem`",
+          f"aht:       {a['version']} (protocol {a['protocol']}, core {a['core_id'] or '?'}, "
+          f"installed: {a['installed']}{', the app build' if a['frozen'] else ''})",
+          f"System:    {s['os']}, Python {s['python']}", "", "Agents"]
+    L += [f"  {k:<14} {v}" for k, v in rep["agents"].items()]
+    L += ["", "Settings you changed"]
+    L += ["  " + ln for ln in json.dumps(rep["settings"], indent=2).splitlines()] \
+        if rep["settings"] else ["  (none: aht's defaults)"]
+    r, h = rep["registry"], rep["health"]
+    L += ["", "Projects",
+          f"  {r['projects']} tracked ({r['folders_missing']} folder(s) missing), "
+          f"{r['handed_over']} handed over, {r['kept_in_sync']} kept in sync, "
+          f"{r['declined_moves']} declined move(s), {r['forgotten']} forgotten",
+          "", "Health",
+          f"  watcher: {h['watcher'].get('kind')}, installed {h['watcher'].get('installed')}, "
+          f"running {h['watcher'].get('running')}; Claude Code hook installed "
+          f"{h['hook_installed']}",
+          f"  backups: on {h['backups'].get('enabled')}, {h['backups'].get('snapshots')} "
+          f"of {h['backups'].get('projects')} project(s), last {h['backups'].get('last_run')}",
+          f"  other machines set up: {h['machines_set_up']}", "", "Machines asked"]
+    for m in rep["machines"]:
+        L.append(f"  {m['machine']}: " + (f"{m['lines']} line(s)" if m["reachable"]
+                                         else f"no log from it — {m['error']}"))
+    where = "this machine and the others" if rep["everywhere"] else "this machine"
+    L += ["", f"Warnings and errors, the last {rep['hours']:g} h on {where}: "
+          f"{len(rep['problems'])}"]
+    for e in rep["problems"]:
+        L += _entry_lines(e, e["machine"])
+    if not rep["problems"]:
+        L.append("  none")
+    return "\n".join(L) + "\n"
+
+def _prune_reports() -> None:
+    """The newest REPORTS_KEEP reports stay in ~/.aht/reports (aht's own
+    folder only: one written elsewhere with --out is the user's)."""
+    try:
+        fs = sorted((f for f in reports_dir().iterdir()
+                     if f.is_file() and f.name.startswith("problem-")),
+                    key=lambda f: (f.stat().st_mtime, f.name))
+    except OSError:
+        return                  # no folder: nothing to prune
+    for f in fs[:-REPORTS_KEEP]:
+        try:
+            f.unlink()
+        except OSError as _x:
+            warn(f"REPORT an older report was not removed: {f.name}: {_errmsg(_x)}")
+
+def cmd_report_problem(args):
+    """`report-problem [--out FILE] [--everywhere] [--hours H] [--json]`: one
+    masked file (text; JSON with --json, or an --out name that ends .json)."""
+    hours = _hours_arg(args.hours if args.hours is not None else LOG_TAIL_HOURS)
+    # --out: a file (its folder is made), or a folder (a name ending in a
+    # separator, or one that exists) that gets problem-<time> inside
+    out = args.out or ""
+    path = Path(out).expanduser() if out else None
+    folder = reports_dir() if not out else path if (
+        out.endswith(("/", os.sep)) or path.is_dir()) else None
+    as_json = bool(args.json) if folder else path.suffix.lower() == ".json"
+    ext = "json" if as_json else "txt"
+    try:
+        (folder or path.parent).mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"the report's folder was not made ({folder or path.parent}): {_errmsg(e)}",
+              file=sys.stderr)
+        return 1
+    if os.path.realpath(folder or path.parent) == os.path.realpath(reports_dir()):
+        try:
+            os.chmod(reports_dir(), 0o700)
+        except OSError:
+            pass                # a disk without modes: the folder stays as it is
+    if folder:
+        path, n = folder / f"problem-{_stamp()}.{ext}", 2
+        while path.exists():
+            path = folder / f"problem-{_stamp()}-{n}.{ext}"
+            n += 1
+    rep = problem_report(hours, args.everywhere)
+    body = (json.dumps(rep, indent=2) + "\n") if as_json else report_text(rep)
+    data = body.encode("utf-8")
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except OSError as e:
+        print(f"the report was not written to {path}: {_errmsg(e)}", file=sys.stderr)
+        return 1
+    _prune_reports()
+    log(f"REPORT written: {path.name} ({len(data)} bytes, {len(rep['problems'])} "
+        "warning(s) and error(s))")
+    out = {"path": str(path.resolve()), "bytes": len(data), "machines": rep["machines"],
+           "errors": len(rep["problems"])}
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    print(f"written: {out['path']}  ({len(data)} bytes)")
+    print(f"  {out['errors']} warning(s) and error(s) of the last {hours:g} h from "
+          f"{sum(m['reachable'] for m in rep['machines'])} machine(s)")
+    for m in rep["machines"]:
+        if not m["reachable"]:
+            print(f"  {m['machine']}: no log from it — {m['error']}")
+    print("Nothing was sent anywhere. Read it through, then attach it to your bug report.")
+    return 0
 
 def cmd_backends(args):
     """Where each agent CLI's history store lives — and how to point aht at it
@@ -4709,7 +5377,7 @@ def _can_link(folder: str) -> bool:
     try:
         os.unlink(p)
     except OSError:
-        pass
+        pass                    # the test link: gone, or goes with its folder
     return True
 
 def _long_paths() -> bool:
@@ -4885,7 +5553,7 @@ def write_there(uid: str, real: str, rem, ours: dict, theirs: dict, how: str,
         try:                # an earlier version's file: this machine's own has it now
             (handover_dir(uid) / "there.json").unlink()
         except OSError:
-            pass
+            pass                # an earlier version's file: usually not there
 
 def name_problems(manifest: dict, far: dict, root: str = None) -> list:
     """Names in `manifest` (tree_manifest) the disk on the other side cannot
@@ -4995,8 +5663,10 @@ def machine_id(create: bool = False):
         d = json.loads(machine_path().read_text())
         if re.fullmatch(r"[0-9a-f]{12}", str(d.get("id") or "")):
             return d["id"]
-    except (OSError, ValueError, AttributeError):
-        pass
+    except FileNotFoundError:
+        pass                    # no id yet: one is made below when asked for
+    except (OSError, ValueError, AttributeError) as _x:
+        warn_once("machine-id", f"MACHINE its id file is not readable: {_errmsg(_x)}")
     if not create:
         return None
     d = {"id": os.urandom(6).hex(), "name": _here(), "created": _now()}
@@ -5103,7 +5773,7 @@ def running_sessions(inside: str = None, home: Path = None) -> list:
             if min(off, 900 - off) > 5:
                 continue
         except Exception:
-            pass
+            pass                # a start time that does not parse: the record stands
         cwd = str(rec.get("cwd") or "")
         if inside and not _inside(os.path.realpath(cwd), inside):
             continue
@@ -5423,8 +6093,9 @@ def git_note(real: str, systems: tuple, settings: dict, there: str) -> dict:
          "how": None}
     try:
         g["is_git"] = bool(real) and os.path.isdir(real) and is_git(real)
-    except Exception:
-        pass
+    except Exception as _x:
+        warn_once("is-git", f"GIT whether {real} is a repository could not be told: "
+                            f"{_errmsg(_x)}")
     if g["is_git"]:
         g["gitattributes"] = os.path.isfile(os.path.join(real, ".gitattributes"))
         if "Windows" in systems and not g["gitattributes"]:
@@ -5496,7 +6167,7 @@ def restyle(path: str, style: str) -> bool:
         try:
             os.unlink(tmp)
         except OSError:
-            pass
+            pass                # the temporary copy: gone already
         return False
     return True
 
@@ -5661,8 +6332,9 @@ def _ssh_opts() -> list:
     try:
         run.mkdir(parents=True, exist_ok=True)
         os.chmod(run, 0o700)
-    except OSError:
-        pass
+    except OSError as _x:
+        warn_once("ssh-run", "SSH the folder for shared connections was not made: "
+                             f"{_errmsg(_x)}")
     opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
     # Windows' ssh stops with "getsockname failed: Not a socket" when any of
@@ -6344,7 +7016,7 @@ class Remote:
                 try:
                     os.unlink(tmp)
                 except OSError:
-                    pass
+                    pass        # the temporary file: gone already
         text = text.decode("utf-8", "replace")
         res = {k: _num(m.group(1)) if (m := rx.search(text)) else 0
                for k, rx in _STAT_RE.items()}
@@ -6405,7 +7077,7 @@ class Remote:
                 try:
                     e["mode"] = stat.S_IMODE(os.stat(os.path.join(local_root, e["src"])).st_mode)
                 except OSError:
-                    pass
+                    pass        # gone meanwhile: it gets the default mode there
             if add_only:
                 e["add"] = True
         # a file there that is a shorter copy of ours (a transcript that went on
@@ -6422,7 +7094,7 @@ class Remote:
                             os.path.join(local_root, e["src"]), e["expect"][0]):
                         e["append_from"] = e["expect"][0]
                 except OSError:
-                    pass
+                    pass        # not readable now: it goes whole
         comp = bool(cfg_get("handover_compress", True))
         ents = plan["files"] + plan["links"]
         meter = self._meter(sum(e["size"] - (e.get("append_from") or 0)
@@ -6639,13 +7311,13 @@ class Remote:
                     st["sent"] += len(c)
                     alive()
             except (OSError, ValueError):           # the pipe: the far end is gone
-                pass
+                pass            # the reader below reports the far end's answer
             except BaseException as e:              # noqa: BLE001
                 st["werr"] = e
             try:
                 p.stdin.close()
             except (OSError, ValueError):
-                pass
+                pass            # closed already, or the far end is gone (reported below)
             if st["werr"] is not None:
                 p.kill()
         def watch():
@@ -7128,7 +7800,7 @@ class _Partial:
                 try:
                     os.unlink(self.lock)    # that copy was cut off
                 except OSError:
-                    pass
+                    pass        # gone already: the next try takes the lock
                 continue
             os.write(fd, str(os.getpid()).encode())
             os.close(fd)
@@ -7184,7 +7856,7 @@ def _place_entries(root: str, req: dict, inp=None, tick=None) -> dict:
             try:
                 os.rmdir(_dest_path(root, real, d))    # only an empty one
             except (ValueError, OSError):
-                pass
+                pass            # not empty, or gone: it stays
         for d in req.get("dirs") or []:
             try:
                 os.makedirs(_dest_path(root, real, d), exist_ok=True)
@@ -7221,7 +7893,7 @@ def _receive(inp, ents, root, real, part, aside, compress, out, problem, settled
             try:
                 os.unlink(tmp)
             except OSError:
-                pass
+                pass            # the temporary file: gone already
     def index(i):
         if i >= len(ents):
             raise ValueError("this is not aht's copy (an unknown file)")
@@ -7279,7 +7951,7 @@ def _receive(inp, ents, root, real, part, aside, compress, out, problem, settled
                 try:
                     os.unlink(tmp)
                 except OSError:
-                    pass
+                    pass        # the temporary file: gone already
             elif kind in (b"X", b"S"):
                 i, n = struct.unpack(">II", _read_exact(inp, 8))
                 why = _read_exact(inp, sized(kind, n, FRAME_NOTE_MAX)).decode("utf-8", "replace")
@@ -7325,7 +7997,7 @@ def _place_one(root, real, e, tmp, aside, out) -> None:
                 try:
                     mode = stat.S_IMODE(os.stat(p).st_mode)
                 except OSError:
-                    pass
+                    pass        # gone meanwhile: the default mode
             if aside:
                 old = _put_aside(p, aside, e["name"])
         try:
@@ -7334,8 +8006,8 @@ def _place_one(root, real, e, tmp, aside, out) -> None:
             if old:                         # the old one goes back where it was
                 try:
                     _move(old, p)
-                except OSError:
-                    pass
+                except OSError as _x:
+                    warn(f"COPY the earlier {e['name']} stays set aside at {old}: {_errmsg(_x)}")
             raise
         if old:
             out["set_aside"] += 1
@@ -7382,7 +8054,7 @@ def _agent_pack(req: dict, inp, out) -> dict:
             if pre and 0 < int(pre[0]) < st.st_size and file_sha256(p, int(pre[0])) == pre[1]:
                 meta["append_from"] = int(pre[0])
         except OSError:
-            pass
+            pass                # not readable now: it goes whole
         out.write(_frame_meta(i, meta))
         for fr in _file_frames(i, p, meta.get("append_from") or 0, st.st_size, comp):
             out.write(fr)
@@ -7604,8 +8276,8 @@ def pane_pids(name: str) -> list:
             w = line.split()
             if len(w) == 2 and w[0].isdigit() and w[1].isdigit():
                 kids.setdefault(int(w[1]), []).append(int(w[0]))
-    except Exception:
-        pass
+    except Exception as _x:
+        warn_once("ps-tree", f"PROCESS ps did not list the processes: {_errmsg(_x)}")
     out, todo = [], [root]
     while todo and len(out) < 500:
         p = todo.pop()
@@ -7697,7 +8369,7 @@ def _can_write(folder: str) -> bool:
     try:
         os.unlink(p)
     except OSError:
-        pass
+        pass                    # the test file: gone, or goes with its folder
     return True
 
 def far_is_pc() -> bool:
@@ -7755,7 +8427,7 @@ def _agent_probe(req: dict) -> dict:
         try:
             info["free_bytes"] = shutil.disk_usage(str(anc)).free
         except OSError:
-            pass
+            pass                # free space unknown: the far end checks nothing on it
         # which folder is there: its project id, how full it is, and whose
         info["path_marker"] = read_marker(path) if info["path_exists"] else None
         info["path_entries"] = _entries_in(path) if info["path_exists"] else 0
@@ -7836,7 +8508,7 @@ def _agent_written_by(req: dict) -> dict:
                     if len(v) == 3 and (best is None or v > best):
                         best = v
         except OSError:
-            pass
+            pass                # gone meanwhile: its version is unknown
         out[f["key"]] = ".".join(map(str, best)) if best else None
     return {"ok": True, "versions": out}
 
@@ -7860,7 +8532,7 @@ def _agent_udp_echo(req: dict) -> dict:
                 s.sendto(b"aht-pong", peer)
                 return {"ok": True, "heard": True, "port": port}
         except OSError:
-            pass
+            pass                # nothing arrived in time: not heard
         finally:
             s.close()
         return {"ok": True, "heard": False, "port": port}
@@ -8067,7 +8739,7 @@ def _queue_arrival(req: dict) -> dict:
         try:
             old.unlink()
         except OSError:
-            pass
+            pass                # gone already
     if re.fullmatch(r"[0-9A-Za-z-]{1,40}", str(req.get("attempt") or "")):
         (run / f"attempt-{req['attempt']}").write_text(_now() + "\n")
     log(f"ARRIVAL {proj} from {frm}: {ARRIVAL_ACTION} is offered ({name})")
@@ -8104,7 +8776,7 @@ def read_arrivals(prune: bool = True) -> list:
                 try:
                     f.unlink()
                 except OSError:
-                    pass
+                    pass        # gone already
             continue
         rows.append(rec)
     return sorted(rows, key=lambda r: -float(r.get("at") or 0))
@@ -8127,7 +8799,7 @@ def drop_arrivals(path: str) -> int:
                 f.unlink()
                 n += 1
             except OSError:
-                pass
+                pass            # gone already
     if n:
         log(f"ARRIVAL {path}: no longer offered (it left)")
     return n
@@ -8247,7 +8919,7 @@ def _agent_start(req: dict) -> dict:
         try:
             (run / old).unlink()
         except OSError:
-            pass
+            pass                # gone already
     began, session = time.time(), None
     if agent == "claude":
         (run / "note.txt").write_text(req.get("note") or "")
@@ -8311,7 +8983,7 @@ def _agent_start(req: dict) -> dict:
         try:
             old.unlink()
         except OSError:
-            pass
+            pass                # gone already
     if re.fullmatch(r"[0-9A-Za-z-]{1,40}", str(req.get("attempt") or "")):
         (run / f"attempt-{req['attempt']}").write_text(_now() + "\n")
     started, attention, screen = False, None, []
@@ -8475,7 +9147,7 @@ def _agent_close(req: dict) -> dict:
             try:
                 (run_dir(name) / f).unlink()
             except OSError:
-                pass
+                pass            # gone already
     return {"ok": True, "closed": had}
 
 # ---- keeping this machine awake while a handed-over agent works ------------- #
@@ -8578,7 +9250,7 @@ def _end_awake(name: str) -> bool:
             os.kill(pid, 15)
             ended = True
         except OSError:
-            pass
+            pass                # it ended already
         for _ in range(30):                 # it lets go of the tool, then ends
             if not _pid_alive(pid):
                 break
@@ -8586,7 +9258,7 @@ def _end_awake(name: str) -> bool:
     try:
         f.unlink()
     except OSError:
-        pass
+        pass                    # gone already
     return ended
 
 def _spawn_awake(path: str, name: str):
@@ -8667,7 +9339,7 @@ def cmd_awake(args):
             if pidf and json.loads(pidf.read_text()).get("pid") == os.getpid():
                 pidf.unlink()
         except (OSError, ValueError):
-            pass
+            pass                # gone already, or another one's
     return 0
 
 def _stop_proc(p) -> None:
@@ -8676,12 +9348,12 @@ def _stop_proc(p) -> None:
         try:
             os.killpg(p.pid, sig)
         except OSError:
-            pass
+            pass                # it ended already
         try:
             p.wait(timeout=5)
             return
         except Exception:
-            pass
+            pass                # still running: the next signal follows
 
 def _agent_peek(req: dict) -> dict:
     """The window a handover opened, looked at: its last screen lines (only
@@ -8710,7 +9382,7 @@ def _stamp_time(name: str, path=None):
         try:
             return time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))
         except ValueError:
-            pass
+            pass                # not this form: the next one is tried
     try:
         return os.stat(path).st_mtime if path else None
     except OSError:
@@ -8814,8 +9486,9 @@ def _path_owner(path: str, marker) -> str:
         if e and not e.get("away") and _same_dir(str(e.get("real_path") or ""),
                                                  os.path.realpath(path)):
             return "own"
-    except Exception:
-        pass
+    except Exception as _x:
+        warn_once("path-owner", f"REGISTRY whose folder {path} is could not be told: "
+                                f"{_errmsg(_x)}")
     return "none"
 
 # ---- the far end of Bring Here and Send Back: at the project's home -------- #
@@ -8960,7 +9633,7 @@ def _agent_mark_away(req: dict) -> dict:
             try:
                 sums[k] = [v[0], file_sha256(Path(store) / k, v[0])]
             except OSError:
-                pass
+                pass            # not readable now: compared whole later
     away = {k: v for k, v in h.items() if k not in HANDING_ONLY}
     try:
         with ProjectLock(uid):
@@ -8980,8 +9653,8 @@ def _agent_mark_away(req: dict) -> dict:
     log(f"BRING {real} -> {away.get('holder')}: it is there (attempt {away.get('attempt')})")
     try:
         apply_badge(real, desired_marks(real, True))
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"BADGE not updated for {real}: {_errmsg(_x)}")
     return {"ok": True, "away": away}
 
 def _agent_unmark(req: dict) -> dict:
@@ -9239,8 +9912,9 @@ def _agent_return_apply(req: dict, inp, out) -> dict:
                     rem.pin(real, a.get("remote_path"))
                     write_there(uid, real, rem, _our_trees(real)[0], theirs, "send-back",
                                 sums={})
-                except HandoverError:
-                    pass
+                except HandoverError as _x:
+                    warn(f"SENDBACK where {real} is on {a['remote']} was not noted: "
+                         f"{_errmsg(_x)}")
             for r in read_relays(real):
                 if relay_row(r, real).get("open"):
                     close_relay(real, r["id"], "sent-back")
@@ -9270,8 +9944,8 @@ def _agent_return_apply(req: dict, inp, out) -> dict:
         f"{pd['deleted']} removed, {len(pd['conflicts'])} kept twice)")
     try:
         apply_badge(real, desired_marks(real, True))
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"BADGE not updated for {real}: {_errmsg(_x)}")
     notify_user("Sent back", f"{os.path.basename(real)} is on {_here()} again, from {holder}")
     return {"ok": True, "done": done, "set_aside": set_aside, "returned": back,
             "session": latest, "session_title": redact(session_title(store, latest))}
@@ -9288,6 +9962,7 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "offsite-prune": lambda req: _agent_offsite_prune(req),
              "offsite-adopt": lambda req: _agent_offsite_adopt(req),
              "search": lambda req: _agent_search(req),
+             "log-tail": lambda req: _agent_log_tail(req),
              "relay-info": lambda req: _agent_relay_info(req),
              "relay-note": lambda req: _agent_relay_note(req),
              "uncopy": _agent_uncopy,
@@ -9331,7 +10006,8 @@ def cmd_agent(args):
             res = fn(req) if fn else {"ok": False, "error": f"unknown operation {op!r}"}
     except Exception as e:
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        error(f"AGENT {e}")
+        import traceback
+        error(f"UNCAUGHT AGENT {_errmsg(e)}\n{traceback.format_exc()}")
     sys.stdout.flush()
     out.write(("\n" + AGENT_MARK + json.dumps(res) + "\n").encode("utf-8"))
     out.flush()
@@ -9506,7 +10182,7 @@ def prune_relays(d) -> int:
             try:
                 f.unlink()
             except OSError:
-                pass
+                pass            # gone already; else the next prune takes it
         n += 1
     return n
 
@@ -9642,8 +10318,9 @@ class Progress:
                 json.dump({"stage": self.stage, "percent": self.pct, "at": self.at}, fh)
             os.replace(tmp, self.path)
             Progress.written.add(str(self.path))
-        except OSError:
-            pass
+        except OSError as _x:
+            warn_once("progress", f"PROGRESS the status file {self.path} was not written: "
+                                  f"{_errmsg(_x)}")
 
     @classmethod
     def done(cls) -> None:
@@ -9653,7 +10330,7 @@ class Progress:
                 try:
                     os.unlink(f)
                 except OSError:
-                    pass
+                    pass        # gone already
         cls.written.clear()
 
 class ProjectLock:
@@ -9677,7 +10354,7 @@ class ProjectLock:
                 fcntl.flock(self.fh, fcntl.LOCK_UN)
                 self.fh.close()
             except Exception:
-                pass
+                pass            # the lock goes with its file when this process ends
 
 def _mux_name(real: str, uid: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", os.path.basename(real).lower()).strip("-")
@@ -9722,10 +10399,10 @@ def udp_reaches(rem: Remote) -> bool:
             try:
                 ok = s.recvfrom(64)[0] == b"aht-pong"
             except OSError:
-                pass
+                pass            # nothing came back in time: the loop asks again
         s.close()
     except OSError:
-        pass
+        pass                    # no socket: nothing gets there, which is the answer
     t.join(timeout=10)
     return ok
 
@@ -9938,8 +10615,9 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
     if not dry:
         try:
             rem.agent("prune", dir=posixpath.dirname(aside), keep=ASIDE_KEEP)
-        except HandoverError:
-            pass
+        except HandoverError as _x:
+            warn(f"HANDOVER the older set-aside copies on {rem.name} were not pruned: "
+                 f"{_errmsg(_x)}")
     return res
 
 # ---- mirror ------------------------------------------------------------------ #
@@ -10173,7 +10851,7 @@ def _copy_changes(rem: Remote, base: dict, ours: dict, theirs: dict, far: dict,
                     if h == file_sha256(_tree_file(near[t], ours[t], k)):
                         continue                # already what this side has
                 except OSError:
-                    pass
+                    pass        # not readable: listed as a change
             found[kind].append(_shown(t, k, theirs[t]))
     if fresh:
         for t, ks in _newer_there(rem, ours, theirs, far, near, fresh).items():
@@ -10422,8 +11100,8 @@ def _spawn_mirror() -> None:
         if not any(mirror_due(e) for e in reg.get("projects", {}).values()):
             return
         _spawn_aht(["mirror", "--run", "--due", "--quiet"])
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"MIRROR the background sync did not start: {_errmsg(_x)}")
 
 def mirror_all(on: bool, to: str = None, apply: bool = False) -> dict:
     """Switch "keep in sync" on (or off) for every tracked project at once.
@@ -10747,8 +11425,8 @@ def _retire_manifest(hd: Path) -> None:
             (hd / "manifest.json").replace(hd / f"manifest-{_stamp()}-{os.urandom(2).hex()}.json")
         for old in sorted(hd.glob("manifest-*.json"))[:-5]:
             old.unlink()
-    except OSError:
-        pass
+    except OSError as _x:
+        warn(f"HANDOVER an old manifest was not retired: {_errmsg(_x)}")
 
 def _unfinished_text(h: dict, real: str) -> str:
     return (f"a handover of this project to {h.get('remote')} has not finished; aht "
@@ -10888,8 +11566,8 @@ def resolve_handing(uid: str, force: bool = False) -> list:
         lock.__exit__(None, None, None)
     try:
         apply_badge(real, desired_marks(real, True))
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"BADGE not updated for {real}: {_errmsg(_x)}")
     return [{"kind": "handover", "title": title, "message": msg,
              "info": {"kind": "handover", "project": real, "remote": there}}]
 
@@ -11596,7 +12274,7 @@ def _ignores_case(folder: str) -> bool:
         try:
             p.unlink()
         except OSError:
-            pass
+            pass                # the test file: gone, or goes with its folder
 
 def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
                aside: Path, there: str, inert: bool, skip, progress: bool,
@@ -11648,7 +12326,7 @@ def _pull_tree(rem: Remote, plan: dict, src: str, dst: str, there_raw: dict,
                     if restyle(_dest_path(dst, real, k), style):
                         done["eol_kept"].append(k)
                 except ValueError:
-                    pass
+                    pass        # not text it can restyle: it stays as it came
     if unsafe:
         # kept aside under names this disk can hold; one that does not come
         # is named in `unsafe_failed`, and the rest goes on: by now files were
@@ -12131,7 +12809,7 @@ def cmd_reclaim(args):
                                 Path(real) / (ours["project"]["raw"].get(k) or k)):
                             plans["project"]["take"].remove(k)
                     except OSError:
-                        pass
+                        pass    # not readable: it stays in the plan
         # a take back never removes the project's id, nor anything else of
         # aht's in .aht/
         plans["project"]["delete"] = [k for k in plans["project"]["delete"]
@@ -12434,7 +13112,7 @@ def _home_projects() -> list:
             try:
                 upd = os.path.getmtime(Path(store) / f"{sid}.jsonl")
             except OSError:
-                pass
+                pass            # gone meanwhile: no time for it
         rows.append({"path": real, "name": os.path.basename(real), "uuid": uid, "state": state,
                      "away": {"holder": a.get("holder") or a.get("host"), "since": a.get("since"),
                               "driven_by": a.get("driven_by") or "here"} if a else None,
@@ -12708,8 +13386,8 @@ def cmd_bring(args):
             log(f"BRING {here} <- {rem.name}:{shown_far} (session {sid})")
             try:
                 apply_badge(here, desired_marks(here, True))
-            except Exception:
-                pass
+            except Exception as _x:
+                warn(f"BADGE not updated for {here}: {_errmsg(_x)}")
             lines.extend([f"brought here:  {rem.name}:{shown_far}  →  {here}",
                           f"   files     {out['fetched']['files']} "
                           f"({_human(out['fetched']['bytes'])}); "
@@ -12804,7 +13482,7 @@ def cmd_bring(args):
                 anc = anc.parent
             out["plan"]["free_bytes"] = shutil.disk_usage(str(anc)).free
         except OSError:
-            pass
+            pass                # free space unknown: no check on it
         need = out["plan"]["bytes"] + out["plan"]["history_bytes"]
         if out["plan"]["free_bytes"] is not None and need > out["plan"]["free_bytes"]:
             out["blockers"].append(f"this machine has {_human(out['plan']['free_bytes'])} free, "
@@ -13103,8 +13781,8 @@ def cmd_send_back(args):
                 try:
                     _agent_close({"path": real,
                                   "name": _mux_name(c.get("from_path") or real, uid)})
-                except Exception:
-                    pass
+                except Exception as _x:
+                    warn(f"SENDBACK the agent's window for {real} was not closed: {_errmsg(_x)}")
             for r in read_relays(real):
                 if r.get("kind") in ("bring", "handover") and r.get("closed") is None:
                     close_relay(real, r["id"], "sent-back")
@@ -13291,7 +13969,7 @@ def discover_machines(notes: list = None) -> list:
                     rows[h] = {"name": h, "host": h, "system": None,
                                "online": None, "via": "ssh config"}
     except OSError:
-        pass
+        pass                    # no ssh config: nothing found there
     known = {str(s.get("ssh") or "").split("@")[-1]: n
              for n, s in remotes_config().items()}
     for r in rows.values():
@@ -13974,8 +14652,8 @@ def open_terminal(command: str, name: str, cwd: str = None, echo: bool = True,
                              env=dict(os.environ, **env) if env else None,
                              creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
             return 0
-        except OSError:
-            pass
+        except OSError as _x:
+            warn(f"TERMINAL cmd.exe did not start: {_errmsg(_x)}")
     else:
         sh = ["/bin/sh", "-c", full]
         # how each one takes a command: the words after a flag, or (tilix) one
@@ -14913,7 +15591,7 @@ def list_sessions(project: str = None, agents=None) -> list:
                 if first.get("type") == "session_meta":
                     meta = first.get("payload") or {}
             except Exception:
-                pass
+                pass            # no first line to read: the id is the file's name
             out.append({"agent": "codex", "id": meta.get("id") or Path(f).stem,
                         "project": meta.get("cwd"), "file": str(f), "updated": st.st_mtime})
     if "agy" in want:
@@ -15357,8 +16035,8 @@ def _spawn_search_update() -> None:
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, close_fds=True,
                          start_new_session=True, cwd="/")
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"SEARCH the index update did not start: {_errmsg(_x)}")
 
 def _when_text(t) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "?"
@@ -17638,7 +18316,7 @@ def _agent_proc_rows() -> list:
                 raw = Path(f"/proc/{pid}/cmdline").read_bytes()     # the words exactly
                 argv[pid] = [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
             except OSError:
-                pass
+                pass            # it ended meanwhile
     else:
         lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
         try:
@@ -17650,8 +18328,8 @@ def _agent_proc_rows() -> list:
                     pid = int(line[1:])
                 elif line.startswith("n") and pid:
                     cwd[pid] = line[1:]
-        except Exception:
-            pass
+        except Exception as _x:
+            warn_once("lsof", f"PROCESS lsof did not tell the agents' folders: {_errmsg(_x)}")
     return [{"pid": pid, "agent": agent, "cwd": cwd[pid],
              "argv": argv.get(pid) or _split_args(args)}
             for pid, (agent, args, _c) in pids.items() if pid in cwd]
@@ -17664,7 +18342,7 @@ def _argv_of(pid: int) -> list:
             raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
             return [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
         except (OSError, ValueError):
-            pass
+            pass                # ended, or not readable: ps is asked below
     line = _cmdline(pid)
     return _split_args(line) if line else []
 
@@ -18759,15 +19437,15 @@ def _far_sessions(folder: str, most: int = 8) -> list:
     run = {}
     try:
         run = {s.get("session"): s.get("status") for s in running_sessions(inside=folder)}
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"BOARD the open sessions in {folder} could not be told: {_errmsg(_x)}")
     procs = set()
     if os.name != "nt":
         try:
             procs = {p["agent"] for p in agent_processes()
                      if _inside(os.path.realpath(p["project"]), folder)}
-        except Exception:
-            pass
+        except Exception as _x:
+            warn(f"BOARD the agents running in {folder} could not be told: {_errmsg(_x)}")
     rows, marked = [], set()
     for s in list_sessions(folder):
         if s["agent"] == "claude" and _is_scripted(s["file"]):
@@ -19380,7 +20058,7 @@ def cmd_leave_note(args):
             try:
                 (d / f).unlink()
             except OSError:
-                pass
+                pass            # gone already
         out["error"] = f"the note could not be left on {rem.name}: {e}"
         return _emit(args, out, lines)
     for x in closed:
@@ -19672,22 +20350,24 @@ def _mark_install() -> None:
         if json.loads(p.read_text()) == want:
             return
     except (OSError, ValueError):
-        pass
+        pass                    # not written yet: written below
     if not aht_home().is_dir():
         return                          # nothing of aht's here yet
     try:
         _write_json(p, want)
-    except OSError:
-        pass
+    except OSError as _x:
+        warn_once("install-mark", "INSTALL the note of this install was not written: "
+                                  f"{_errmsg(_x)}")
 
 # a server on this very machine: plain http to it never crosses the network
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
-def phone_refusal(target) -> str | None:
+def phone_refusal(target, name: str = None) -> str | None:
     """Why notify_phone would send notices in the clear: ntfy over plain http
     to another machine (a notice names projects, sessions and machines).
     None for https, a topic on ntfy.sh, http to a server on this machine
-    (localhost, 127.0.0.1, [::1]), or anything else."""
+    (localhost, 127.0.0.1, [::1]), or anything else.  `name`: what the
+    reason calls the address (the log names only the setting)."""
     t = str(target or "").strip()
     if not t.lower().startswith("ntfy:"):
         return None
@@ -19701,9 +20381,47 @@ def phone_refusal(target) -> str | None:
         host = ""
     if host in _LOCAL_HOSTS:
         return None
-    return (f"{url} is plain http, so the notices would cross the network unencrypted — "
+    return (f"{name or url} is plain http, so the notices would cross the network unencrypted — "
             "use https://, or http:// only for a server on this computer (localhost, "
             "127.0.0.1 or [::1])")
+
+PHONE_HOSTS = ("ntfy.sh",)   # the public server: a topic there is the secret, not it
+
+def _phone_parts(target) -> tuple:
+    """(exact, words): what of a notify_phone value names the phone, for the
+    problem report's masker.  `exact`: the value, an ntfy URL with and
+    without its scheme; `words` (whole words only, at least 4 characters):
+    the server, the topic, the number or address."""
+    t = str(target or "").strip()
+    kind, _, rest = t.partition(":")
+    rest = rest.strip()
+    if kind.lower() not in ("ntfy", "imessage") or not rest:
+        return ({t} if len(t) > 3 else set()), set()
+    exact, words = {t}, set()
+    if kind.lower() == "imessage":
+        words.add(rest)
+    elif "://" in rest:
+        import urllib.parse
+        exact |= {rest, rest.split("://", 1)[1]}
+        try:
+            sp = urllib.parse.urlsplit(rest)
+            words |= {sp.hostname or "", sp.netloc,
+                      next((x for x in reversed(sp.path.split("/")) if x), "")}
+        except ValueError:
+            pass                # not a URL after all: the value and its rest stay masked
+    else:
+        words.add(rest)
+        exact.add("ntfy.sh/" + rest)
+    return ({x for x in exact if len(x) > 3},
+            {w for w in words if len(w) > 3 and w.lower() not in PHONE_HOSTS})
+
+def _phone_hidden(text: str, target) -> str:
+    """`text` with every part of the phone setting written "the phone setting"."""
+    exact, words = _phone_parts(target)
+    for x in sorted(exact | words, key=len, reverse=True):
+        text = re.sub(rf"(?<![\w.-]){re.escape(x)}(?![\w-])" if x in words else re.escape(x),
+                      "the phone setting", text, flags=re.I)
+    return text
 
 def send_to_phone(title: str, message: str, target: str = None) -> str:
     """Pass a notice on to the phone, if the user set that up:
@@ -19712,9 +20430,10 @@ def send_to_phone(title: str, message: str, target: str = None) -> str:
     before aht refused it, or written into config.json by hand) gets
     nothing, and the log says why."""
     target = str(cfg_get("notify_phone") or "") if target is None else target
-    why = phone_refusal(target)
+    why = phone_refusal(target, "the phone setting (notify_phone)")
     if why:
-        warn(f"NOTICE not sent to the phone: {why}")
+        # the log names the setting, not its address: the log may be sent
+        warn_once("phone-refused", f"NOTICE not sent to the phone: {why}")
         if os.environ.get("AHT_NOTIFY_LOG"):             # tests: note that nothing went
             with open(os.environ["AHT_NOTIFY_LOG"], "a") as fh:
                 fh.write(json.dumps({"title": title, "message": message, "phone": "",
@@ -19732,7 +20451,8 @@ def send_to_phone(title: str, message: str, target: str = None) -> str:
                   ' end tell\nend run')
         r = subprocess.run(["osascript", "-e", script, f"{title}: {message}", who],
                            capture_output=True, text=True, timeout=30)
-        return "sent" if r.returncode == 0 else "failed: " + (r.stderr or "").strip()[-160:]
+        return "sent" if r.returncode == 0 else \
+            "failed: " + _phone_hidden(" ".join((r.stderr or "").split())[-160:], target)
     if target.startswith("ntfy:"):
         topic = target.split(":", 1)[1].strip()
         url = topic if topic.startswith("http") else "https://ntfy.sh/" + topic
@@ -19743,7 +20463,7 @@ def send_to_phone(title: str, message: str, target: str = None) -> str:
             urllib.request.urlopen(req, timeout=15).read()
             return "sent"
         except Exception as e:
-            return f"failed: {e}"
+            return "failed: " + _phone_hidden(_errmsg(e), target)
     return "off"
 
 def app_running() -> bool:
@@ -19764,7 +20484,8 @@ def _notify(title: str, message: str, info: dict = None, phone: bool = True) -> 
     if phone and cfg_get("notify_phone"):
         r = send_to_phone(title, message)
         if r.startswith("failed"):
-            warn(f"NOTICE to the phone {r}")
+            warn_once("phone-failed", "NOTICE to the phone "
+                      + _phone_hidden(r, cfg_get("notify_phone")))
 
 HOLDER_EVERY = 55       # s: a machine that holds a project of this one is asked
 WATCH_EVERY = 120       # s: a watched machine is asked every 2 minutes
@@ -20030,7 +20751,7 @@ def install_kind() -> str:
             if any(d.name.lower().startswith("havurgiray.aht") for d in pk.iterdir()):
                 return "winget"
         except OSError:
-            pass
+            pass                # no WinGet packages folder: not installed by winget
         return "download"
     return "source"
 
@@ -20065,7 +20786,7 @@ def _upgrade_with_installer(version: str) -> int:
         try:
             old.unlink()
         except OSError:
-            pass
+            pass                # an older installer still open: the next upgrade removes it
 
     def get(url: str) -> bytes:
         req = urllib.request.Request(url, headers={"User-Agent": f"aht/{VERSION}"})
@@ -20505,7 +21226,7 @@ def _bin_settings(path: Path) -> tuple:
         if k32.GetDiskFreeSpaceExW(mount.value, None, ctypes.byref(total), None):
             return nuke, _bin_default_cap(total.value)
     except Exception:
-        pass
+        pass                    # the disk's size unknown: no cap
     return nuke, None
 
 def _bin_items(path: Path):
@@ -20596,7 +21317,7 @@ def _freedesktop_trash(path: Path) -> bool:
                     fd = os.open(str(info), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     break
                 except FileExistsError:
-                    pass
+                    pass        # taken: the next name is tried
             n += 1
             name = f"{path.name}.{n}"
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -20632,7 +21353,7 @@ def _to_trash(path: Path) -> str:
                 subprocess.run(["gio", "trash", str(path)], capture_output=True, timeout=120,
                                cwd="/")
             except (OSError, subprocess.SubprocessError):
-                pass
+                pass            # the next way is tried below
             if not path.exists():
                 return "trash"
         return "trash" if _freedesktop_trash(path) else ""
@@ -20669,7 +21390,7 @@ def _history_entry(root: Path, name: str, links: bool = False):
                     return None
                 return root / e.name
     except OSError:
-        pass
+        pass                    # no such folder
     return None
 
 LINK_ENTRY = "it is a link to a folder elsewhere, not a history folder: aht leaves it alone"
@@ -20803,8 +21524,8 @@ def _backup_files(root: Path) -> dict:
                         f = Path(dp) / n
                         if f.is_file() and not f.is_symlink():
                             out[f.relative_to(root).as_posix()] = f.stat().st_size
-    except OSError:
-        pass
+    except OSError as _x:
+        warn(f"OFFSITE the backups could not all be listed: {_errmsg(_x)}")
     return out
 
 def _is_snapshot(rel: str) -> bool:
@@ -20878,7 +21599,7 @@ def _agent_offsite_adopt(req: dict) -> dict:
             try:
                 d.rmdir()                   # empty folders only
             except OSError:
-                pass
+                pass            # not empty: it stays
     return {"ok": True, "adopted": adopted}
 
 def _agent_offsite_prune(req: dict) -> dict:
@@ -20901,8 +21622,10 @@ def _agent_offsite_prune(req: dict) -> dict:
         for f in (base / proj / fname, base / proj / (fname[:-4] + ".meta.json")):
             try:
                 f.unlink()
-            except OSError:
-                pass
+            except FileNotFoundError:
+                pass            # a backup without its meta file
+            except OSError as _x:
+                warn(f"OFFSITE a kept backup was not removed: {f.name}: {_errmsg(_x)}")
         removed.append(rel)
     return {"ok": True, "removed": removed}
 
@@ -20970,7 +21693,7 @@ def offsite_push() -> dict:
     try:
         (aht_home() / "run" / "offsite.json").unlink()      # where older versions kept it
     except OSError:
-        pass
+        pass                    # where older versions kept it: usually not there
     log(f"OFFSITE copied to {rem.name}: {res['files']} backup(s), {_human(res['bytes'])}"
         + (f"; {res['removed']} removed there" if res["removed"] else ""))
     res["at"] = st["at"]
@@ -21085,8 +21808,8 @@ def _spawn_offsite() -> None:
                 or not can_reach_machines():
             return
         _spawn_aht(["backup", "--offsite", "--quiet"])
-    except Exception:
-        pass
+    except Exception as _x:
+        warn(f"OFFSITE the copy of the backups did not start: {_errmsg(_x)}")
 
 # ---- what a session changed ------------------------------------------------- #
 
@@ -21594,7 +22317,7 @@ def _session_title(s: dict):
                         continue
                     title = e.get("aiTitle") or e.get("customTitle") or title
     except OSError:
-        pass
+        pass                    # gone meanwhile: no title
     return redact(str(title)) if title else None
 
 # ---- every session starts informed (USES TOKENS: off unless turned on) ------ #
@@ -22413,7 +23136,7 @@ def _opinion_answer(agent: str, out: Path) -> dict:
                         "input_tokens", "output_tokens", "cache_creation_input_tokens",
                         "cache_read_input_tokens"))}
         except Exception:
-            pass
+            pass                # not JSON: the plain answer is used
     return {"answer": _masked(raw, 6000)}
 
 def run_second_opinion(rid: str) -> None:
@@ -22454,7 +23177,7 @@ def run_second_opinion(rid: str) -> None:
                     err = (base / f"{a}.err").read_text(errors="replace").strip()
                     ans["answer"] = redact(err[-(1 << 20):])[-600:]
                 except OSError:
-                    pass
+                    pass        # no error output: the answer says it failed
             meta["state"][a] = dict(ans, state="done" if rc == 0 else "failed", exit=rc,
                                     seconds=int(time.time() - t0))
             del procs[a]
@@ -22716,7 +23439,7 @@ def night_shift_tick() -> list:
             if changed:
                 _write_json(night_jobs_path(), jobs)
     except TimeoutError:
-        pass
+        pass                    # another tick holds the jobs: the next tick goes on
     return out
 
 def _update_job(jid: str, **fields) -> dict:
@@ -23090,7 +23813,7 @@ def iterm_tabs(max_age: float = TABS_FRESH) -> dict:
         if time.time() - float(c.get("at") or 0) < max_age:
             return c.get("tabs") or {}
     except Exception:
-        pass
+        pass                    # no fresh copy: iTerm2 is asked
     if not IS_MAC or not _iterm_running():
         return {}
     try:
@@ -23134,7 +23857,7 @@ def _note_tab_title(tty: str, title: str, override: bool) -> None:
             c["tabs"][tty].update(title=title, override=override)
             _write_json(tabs_cache_path(), c)
     except Exception:
-        pass
+        pass                    # no copy yet: nothing to update
 
 def iterm_tab(tty: str):
     """One iTerm2 tab, asked for now (about 0.15 s, where all tabs take
@@ -23352,7 +24075,7 @@ def iterm_api(request: bytes, timeout: float = 5) -> dict:
         try:
             _ws_send(sock, (1000).to_bytes(2, "big"), 8)    # goodbye
         except OSError:
-            pass
+            pass                # the socket closed already
         return answer
     finally:
         sock.close()
@@ -23657,8 +24380,8 @@ def _ttys() -> dict:
             f = line.split()
             if len(f) == 2 and f[0].isdigit() and f[1] not in ("??", "-"):
                 out[int(f[0])] = "/dev/" + f[1]
-    except Exception:
-        pass
+    except Exception as _x:
+        warn_once("ps-tty", f"PROCESS ps did not list the terminals: {_errmsg(_x)}")
     return out
 
 def session_names(fresh: bool = False, masked: bool = True) -> list:
@@ -23969,7 +24692,7 @@ def installed_claude_version() -> str:
         if c.get("exe") == real and c.get("mtime") == os.stat(real).st_mtime:
             return c.get("version") or ""
     except Exception:
-        pass
+        pass                    # no note yet: the CLI is asked
     try:
         out = subprocess.run([exe, "--version"], capture_output=True, text=True,
                              timeout=20, cwd="/").stdout
@@ -24178,7 +24901,7 @@ def _cwds(pids) -> dict:
             try:
                 out[p] = os.readlink(f"/proc/{p}/cwd")
             except OSError:
-                pass
+                pass            # it ended meanwhile
         return out
     lsof = next((c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
     try:
@@ -24190,8 +24913,8 @@ def _cwds(pids) -> dict:
                 pid = int(line[1:])
             elif line.startswith("n") and pid:
                 out[pid] = line[1:]
-    except Exception:
-        pass
+    except Exception as _x:
+        warn_once("lsof", f"PROCESS lsof did not tell the sessions' folders: {_errmsg(_x)}")
     return out
 
 def _iterm_state_path() -> Path:
@@ -24357,7 +25080,7 @@ def save_workspace(snap: dict):
                 _write_json(files[-1], last)
                 return files[-1]
         except Exception:
-            pass
+            pass                # not readable: a new one is written
     f = d / f"{_stamp()}.json"
     if f.exists():
         f = d / f"{_stamp()}-{len(files)}.json"
@@ -24399,8 +25122,8 @@ def iterm_started():
             if line.strip().endswith(" iTerm2"):
                 return time.mktime(time.strptime(" ".join(line.split()[:5]),
                                                  "%a %b %d %H:%M:%S %Y"))
-    except Exception:
-        pass
+    except Exception as _x:
+        warn_once("ps-iterm", f"PROCESS when iTerm2 started could not be told: {_errmsg(_x)}")
     return None
 
 def list_workspaces() -> list:
@@ -24435,7 +25158,7 @@ def _just_opened() -> dict:
         if time.time() - float(o.get("at") or 0) < OPENED_FRESH:
             return o
     except Exception:
-        pass
+        pass                    # no note: none was opened
     return {}
 
 def restore_plan(w: dict, tabs: dict = None) -> dict:
@@ -24617,7 +25340,7 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
         try:
             workspace_opened_path().unlink()
         except OSError:
-            pass
+            pass                # gone already
     else:
         log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)"
             + (", iTerm2 started first" if started else ""))
@@ -24787,7 +25510,7 @@ def _linux_tray_runs(tray: Path) -> bool:
         if c.get("key") == key and (c.get("ok") or time.time() - c.get("at", 0) < 60):
             return bool(c.get("ok"))
     except (OSError, ValueError, AttributeError):
-        pass
+        pass                    # no note yet: it is asked
     try:
         ok = subprocess.run([sys.executable, str(tray), "--check"], capture_output=True,
                             stdin=subprocess.DEVNULL, timeout=30).returncode == 0
@@ -24796,7 +25519,7 @@ def _linux_tray_runs(tray: Path) -> bool:
     try:
         _write_json(f, {"key": key, "ok": ok, "at": time.time()})
     except OSError:
-        pass
+        pass                    # only a note: it is asked again next time
     return ok
 
 def cmd_autostart(args):
@@ -25111,7 +25834,28 @@ def build_parser():
     s.add_argument("--errors", action="store_true")
     s.add_argument("--watcher", action="store_true",
                    help="include the watcher's stream log")
+    s.add_argument("--everywhere", action="store_true",
+                   help="the warnings and errors of every other machine set up as well, "
+                        "by time, each with its machine's name (asked read only, masked)")
+    s.add_argument("--hours", type=float, metavar="H",
+                   help=f"warnings and errors of the last H hours (default {LOG_TAIL_HOURS:g})")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("report-problem", help="one masked file for a bug report: aht's and "
+                       "the agents' versions, the system, the settings (secrets, addresses and "
+                       "names hidden), the registry's counts and the recent warnings and "
+                       "errors; nothing is sent anywhere")
+    s.add_argument("--out", metavar="FILE", help="where to write it (default "
+                   "~/.aht/reports/problem-<time>.txt; the newest 5 are kept there)")
+    s.add_argument("--everywhere", action="store_true",
+                   help="the other machines' warnings and errors as well")
+    s.add_argument("--hours", type=float, metavar="H",
+                   help=f"how far back (default {LOG_TAIL_HOURS:g})")
+    s.add_argument("--json", action="store_true",
+                   help="print {path, bytes, machines, errors} as JSON; the file is JSON "
+                   "too, unless --out names a file that does not end in .json")
+    s.set_defaults(fn=cmd_report_problem)
 
     s = sub.add_parser("backends",
                        help="each agent CLI's store location (override with "
@@ -25656,6 +26400,12 @@ def build_parser():
                    help="with --continue: open it although it was continued before")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_arrival)
+
+    s = sub.add_parser("_log")             # the apps' own errors into the log
+    s.add_argument("--level", choices=("warn", "error"), default="error")
+    s.add_argument("--source", choices=APP_LOG_SOURCES, required=True)
+    s.add_argument("message", nargs="*")
+    s.set_defaults(fn=cmd_app_log)
 
     s = sub.add_parser("_core")            # the core this build carries
     s.add_argument("--id", action="store_true", help="its checksum id")

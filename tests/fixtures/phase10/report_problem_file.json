@@ -1,0 +1,87 @@
+{
+  "about": "aht's problem report. It holds aht's version, this computer's system and Python, each agent CLI's version, the settings you changed (secret values, the phone or ntfy topic, and your other machines' addresses and user names hidden: a machine is named by the name you gave it in aht), how many projects aht tracks (no paths), and the warnings and errors aht logged, with keys, network addresses, user and host names masked and your home folder written as ~. Nothing was sent anywhere: aht only wrote this file. Read it through before you send it with a bug report.",
+  "made": "2026-10-28T23:03:28+0100",
+  "hours": 24.0,
+  "everywhere": false,
+  "aht": {
+    "version": "0.13.0",
+    "protocol": 3,
+    "core_id": "0123456789ab",
+    "installed": "brew",
+    "frozen": false
+  },
+  "system": {
+    "os": "macOS 26.5.2 (arm64)",
+    "python": "3.9.6",
+    "platform": "darwin"
+  },
+  "agents": {
+    "Claude Code": "1.2.6 (claude)",
+    "Kimi Code": "1.2.4 (kimi)",
+    "Codex": "1.2.5 (codex)",
+    "Antigravity": "1.2.3 (agy)",
+    "Mistral Vibe": "1.2.4 (vibe)"
+  },
+  "settings": {
+    "notify_phone": "[hidden]",
+    "remotes": {
+      "box": {
+        "root": "[hidden]"
+      },
+      "pc": {
+        "system": "Windows",
+        "runner": "aht",
+        "ssh": "[hidden]"
+      },
+      "old": {
+        "system": "Windows",
+        "runner": "aht",
+        "ssh": "[hidden]"
+      },
+      "gone": {
+        "ssh": "[hidden]"
+      }
+    }
+  },
+  "registry": {
+    "projects": 1,
+    "folders_missing": 0,
+    "handed_over": 0,
+    "kept_in_sync": 0,
+    "declined_moves": 0,
+    "forgotten": 0
+  },
+  "health": {
+    "watcher": {
+      "kind": "launchagent",
+      "installed": false,
+      "running": false
+    },
+    "hook_installed": false,
+    "backups": {
+      "enabled": true,
+      "projects": 0,
+      "snapshots": 0,
+      "last_run": null
+    },
+    "machines_set_up": 4
+  },
+  "machines": [
+    {
+      "machine": "this machine",
+      "here": true,
+      "reachable": true,
+      "lines": 28,
+      "error": null
+    }
+  ],
+  "problems": [
+    {
+      "t": 1793217699.0,
+      "level": "warn",
+      "text": "MIRROR the background sync did not start: OSError: [Errno 24] Too many open files",
+      "machine": "this machine",
+      "at": "2026-10-28T21:01:39"
+    }
+  ]
+}

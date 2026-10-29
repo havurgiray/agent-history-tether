@@ -12,7 +12,8 @@ happens in a throwaway home.  On Windows it also holds a target file open
 during an unpack: aht tries again 5 times, 0.2 s apart, then reports that
 one file and places the rest.
 
-A PC that answers (phase 9): `start` queues Continue here (the arrival
+Its warnings and errors for another machine (phase 10): `log-tail`, read
+only and masked.  A PC that answers (phase 9): `start` queues Continue here (the arrival
 record, which `_arrival --json` lists) instead of a session, with the level's
 flags and the note the handover named, which `_arrival --continue` starts
 Claude Code with (once: again only with --again); `stop` and `close` say
@@ -188,6 +189,37 @@ def pc_checks(cmd, env, tmp: Path, exe) -> None:
        "taken back (its copy note is no longer a handover's): the arrival is gone")
     if os.name == "nt":
         through_cmd(exe, env, tmp)
+
+def log_tail_checks(cmd, env, tmp: Path) -> None:
+    """Phase 10: another machine asks for this one's warnings and errors
+    (`log-tail`): read only, masked here, an UNCAUGHT error with its
+    traceback, info lines and older ones left out."""
+    home = Path(env["HOME"])
+    logf = home / ".aht" / "aht.log"
+    key = "ghp_" + "R4nd0mT0k3nV4lu3Xy9Zq8Wp7Lm6Kj5Hg4Fd3"
+    at = lambda ago: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - ago))
+    with open(logf, "a", encoding="utf-8") as fh:
+        fh.write(f"[{at(9000)}] [WARN ] FAR an old warning\n"
+                 f"[{at(60)}] [WARN ] FAR not copied: {home}{os.sep}code{os.sep}a.py "
+                 f"from 203.0.113.9 with {key}\n"
+                 f"[{at(50)}] [INFO ] FAR an ordinary line\n"
+                 f"[{at(40)}] [ERROR] UNCAUGHT Traceback (most recent call last):\n"
+                 f"  File \"{home}{os.sep}aht.py\", line 3, in main\n"
+                 "ValueError: a planted failure\n")
+    before = logf.read_bytes()
+    res, _ = ask(cmd, env, {"op": "log-tail", "hours": 1, "limit": 300})
+    es = res.get("entries") or []
+    text = "\n".join(e.get("text", "") for e in es)
+    ck(res.get("ok") and [e.get("level") for e in es][-2:] == ["warn", "error"]
+       and "FAR not copied" in text and "old warning" not in text and "ordinary" not in text
+       and "ValueError: a planted failure" in text,
+       f"log-tail: the last hour's warnings and errors, an UNCAUGHT one with its traceback "
+       f"({[e.get('text', '')[:40] for e in es]})")
+    ck(key not in text and "203.0.113.9" not in text and str(home) not in text
+       and "[address]" in text and "[GitHub token" in text and "~" in text,
+       f"log-tail: masked where it is read (no key, address or home folder) ({text[:300]})")
+    ck(logf.read_bytes() == before, "log-tail: read only, the log stays as it was")
+
 
 def through_cmd(exe, env, tmp: Path) -> None:
     """The lines as Windows' ssh server runs them: `cmd.exe /c <line>`, the
@@ -429,6 +461,7 @@ def main(argv) -> int:
                and held.read_bytes() == b"open elsewhere",
                f"a file held open: 5 tries in {took:.1f} s, then reported "
                f"({probs.get('held.txt')}); the rest is placed")
+        log_tail_checks(cmd, env, tmp)
         pc_checks(cmd, env, tmp, exe)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

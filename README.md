@@ -518,7 +518,8 @@ explains each.
 `forget` · `backup` / `backup --list` / `restore` · `backends
 [--set-root]` · `config` · `roots` / `reload` · `icons --refresh` · `logs
 [--errors]` (leveled `[WARN]`/`[ERROR]` lines, size-rotated at
-`~/.aht/aht.log`) · `tag` · `keys <path>` (each backend's store key for a
+`~/.aht/aht.log`; `--everywhere`: every machine's, masked) · `report-problem`
+(one masked file to send with a bug report; nothing is sent) · `tag` · `keys <path>` (each backend's store key for a
 path) · `encode` · `hook` · `version` · `remote` (also `remote paths`,
 `remote watch`) · `mirror` · `handover` · `attach` · `reclaim` · `bring` ·
 `send-back` · `resume-here` · `search` · `board` · `switch` · `relays` ·

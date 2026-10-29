@@ -51,7 +51,7 @@ def ck(ok, what):
 
 
 T = Path(tempfile.mkdtemp(prefix="aht-tray-test-"))
-shown, clis, boxes, opened, warned = [], [], [], [], []
+shown, clis, boxes, opened, warned, trayed = [], [], [], [], [], []
 answer = [0, None]                       # _arrival's exit code and error
 
 
@@ -80,6 +80,7 @@ ns = {
     "_run_cli": run_cli, "_in_thread": lambda fn: fn(),
     "msgbox": lambda t, m, *a: boxes.append((t, m)),
     "act_open_window": lambda *a, **k: opened.append(a),
+    "tray_log": lambda what, exc=None, level="error": trayed.append(f"{what}: {type(exc).__name__}" if exc else what),
 }
 exec(compile(mod, str(SRC), "exec"), ns)
 LAST = ns["LAST_NOTICE"]
@@ -173,7 +174,8 @@ try:
                                 ("n1", "web came from studio — Continue here")],
        f"the menu offers what was not continued yet ({ns['arrivals'](rows)})")
     ns["aht"].read_arrivals = lambda: (_ for _ in ()).throw(OSError("unreadable"))
-    ck(ns["arrivals"]() == [], "the core's reader fails: no items, no error")
+    ck(ns["arrivals"]() == [] and trayed[-1:] == ["the menu could not read the arrivals: OSError"],
+       f"the core's reader fails: no items, no error box; noted in aht's log ({trayed[-1:]})")
     fx = ROOT / "tests" / "fixtures" / "phase9" / "arrival.json"
     if fx.exists():
         one = json.loads(fx.read_text(encoding="utf-8"))
@@ -210,7 +212,7 @@ try:
     W = T / "wl"
     (W / "run").mkdir(parents=True)
     wns = {"os": types.SimpleNamespace(environ={}), "time": time, "json": json, "CREATE_NO_WINDOW": 0, "_TOAST_PS": "",
-           "subprocess": types.SimpleNamespace(run=lambda *a, **k: toasts.append(a)),
+           "subprocess": types.SimpleNamespace(run=lambda *a, **k: toasts.append(a) or types.SimpleNamespace(returncode=0)),
            "aht": types.SimpleNamespace(cfg_get=lambda k, d=None: d, aht_home=lambda: W,
                                         queue_notice=lambda path, rec: handed.append((path, rec)))}
     exec(compile(ast.Module(body=[n for n in wl.body if isinstance(n, ast.FunctionDef) and n.name == "notify_user"],
@@ -230,6 +232,57 @@ try:
     wns["notify_user"]("shop is done", "Claude Code finished.")
     ck(len(toasts) == 1 and len(lines) == len((W / "run" / "tray-notices.jsonl").read_text(encoding="utf-8").splitlines()),
        "no tray: a toast, nothing queued")
+
+    # ---- P10 fix: a toast or a badge that fails is the core's warning, once an hour ----
+    # (winlayer's notify_user and apply_badge, with the real core's warn_once and
+    # _errmsg: the core's own "NOTICE not shown" and "BADGE not updated")
+    sys.path.insert(0, str(ROOT))
+    os.environ["AHT_HOME"] = str(T / "core" / ".aht")
+    import aht as core
+    key = "ghp_" + "R4nd0mT0k3nV4lu3Xy9Zq8Wp7Lm6Kj5Hg4Fd3"
+    infos, toast_fail = [], [None]
+
+    def toast_run(*a, **k):
+        if isinstance(toast_fail[0], Exception):
+            raise toast_fail[0]
+        return types.SimpleNamespace(returncode=toast_fail[0] or 0)
+
+    def badge_apply(path, marks):
+        raise PermissionError(13, f"Access is denied ({key})", path)
+    WB = T / "wb"
+    (WB / "run").mkdir(parents=True)
+    bns = {"os": types.SimpleNamespace(environ={}), "time": time, "json": json, "CREATE_NO_WINDOW": 0, "_TOAST_PS": "",
+           "subprocess": types.SimpleNamespace(run=toast_run),
+           "aht": types.SimpleNamespace(cfg_get=lambda k, d=None: d, aht_home=lambda: WB, warn_once=core.warn_once,
+                                        _errmsg=core._errmsg, warn=core.warn, log=lambda m, *a: infos.append(m))}
+    exec(compile(ast.Module(body=[n for n in wl.body if isinstance(n, ast.FunctionDef)
+                                  and n.name in ("notify_user", "_warn_once", "apply_badge")],
+                            type_ignores=[]), "winlayer.py", "exec"), bns)
+    sys.modules["winbadge"] = types.SimpleNamespace(apply=badge_apply)
+    try:
+        for i in range(3):
+            bns["apply_badge"](f"C:\\Users\\me\\code\\shop{i}", ["agent:claude"])
+        toast_fail[0] = 1
+        for i in range(3):
+            bns["notify_user"](f"shop{i} is done", "Claude Code finished.")
+        toast_fail[0] = FileNotFoundError(2, "The system cannot find the file specified", "powershell")
+        bns["notify_user"]("web is done", "Claude Code finished.")
+        bns["notify_user"]("api is done", "Claude Code finished.")
+    except Exception as e:                       # noqa: BLE001 (an older winlayer: said below)
+        infos.append(f"raised {e!r}")
+    finally:
+        sys.modules.pop("winbadge", None)
+    clog = core.log_path().read_text(encoding="utf-8") if core.log_path().is_file() else ""
+    warns = [ln.split("] ", 2)[-1] for ln in clog.splitlines() if "] [WARN ] " in ln]
+    ck(warns[:1] and warns[0].startswith("BADGE not updated for C:\\Users\\me\\code\\shop0: PermissionError: [Errno 13] "
+                                         "Access is denied ([GitHub token: ghp_…d3])")
+       and sum(w.startswith("BADGE") for w in warns) == 1 and key not in clog and not infos,
+       f"P10 fix: a badge that fails is a warning (not INFO), its key masked, once an hour, not once per folder ({warns[:1]}, {infos})")
+    ck([w for w in warns if w.startswith("NOTICE")]
+       == ["NOTICE not shown (shop0 is done): RuntimeError: PowerShell's toast ended with exit 1",
+           "NOTICE not shown (web is done): FileNotFoundError: [Errno 2] The system cannot find the file specified: 'powershell'"],
+       f"P10 fix: a toast that fails (an exit code, or no PowerShell) is the core's NOTICE not shown, once an hour per kind "
+       f"({[w for w in warns if w.startswith('NOTICE')]})")
 
     # ---- the tray after the core started the queue over (past 500 lines) --------------
     queue(*[{"title": f"old {i}", "message": "x", "at": 1.0 + i} for i in range(5)])
@@ -333,6 +386,151 @@ try:
     owner[0] = "agent"
     did.clear()
     ck(tv["start_watcher_if_wanted"]() is True and did == ["start"], "agent: the tray keeps a watcher running, as before")
+    # ---- phase 10: the tray's own errors in aht's log; Make a Problem Report… ----------
+    import threading
+
+    class SyncThread:                    # runs at start(): the checks see what it did
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+
+        def start(self):
+            self.target()
+    clock = [1000.0]
+    sent10, boxes10, balloons10, popened, answers10, cli10 = [], [], [], [], [], {}
+    remotes = [{"box": {}, "mini": {}}]
+
+    def cli(*a):
+        sent10.append(a)
+        how = cli10.get(a[0])
+        if isinstance(how, Exception):
+            raise how
+        code, out, err = how or (0, "", "")
+        return types.SimpleNamespace(returncode=code, stdout=out, stderr=err)
+
+    LOGF = T / "aht.log"
+    LOGF.write_text("[2026-10-28 14:10:00] [WARN ] x\n", encoding="utf-8")
+
+    def startfile(p):
+        raise OSError(f"[WinError 1155] No application is associated with the file: '{p}'")
+    pv = {"json": json, "threading": types.SimpleNamespace(Lock=threading.Lock, Thread=SyncThread),
+          "time": types.SimpleNamespace(time=lambda: clock[0], strftime=lambda f: "20261028-141000"),
+          "os": types.SimpleNamespace(path=os.path, startfile=startfile),
+          "subprocess": types.SimpleNamespace(Popen=lambda a, **k: popened.append(a)),
+          "_run_cli": cli, "msgbox": lambda t, m, f=0: (boxes10.append((t, m, f)), answers10.pop(0) if answers10 else 0)[1],
+          "balloon": lambda t, m: balloons10.append((t, m)),
+          "aht": types.SimpleNamespace(remotes_config=lambda: remotes[0], aht_home=lambda: T,
+                                       log_path=lambda: LOGF)}
+    t10 = ast.parse(SRC.read_text(encoding="utf-8"))
+    consts = [n for n in t10.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
+              and {getattr(e, "id", "") for e in n.targets[0].elts} & {"MB_OK", "MB_OKCANCEL", "IDOK"}]
+    exec(compile(ast.Module(body=consts, type_ignores=[]), str(SRC), "exec"), pv)
+    lift(SRC, {"LOGGED", "LOG_LOCK", "REPORT_HOLDS", "_name", "tray_log", "_in_thread", "_run_action", "_size",
+               "_machines_set_up", "_report_file", "act_problem_report", "act_openlog"}, pv)
+    logs = lambda: [a for a in sent10 if a[0] == "_log"]
+    ck(pv["tray_log"]("the tip could not read the registry", KeyError("projects")) is True
+       and logs() == [("_log", "--level", "error", "--source", "tray", "--",
+                       "the tip could not read the registry: KeyError: 'projects'")],
+       f"P10: a caught error goes to `aht _log --level error --source tray -- …` ({logs()})")
+    ck(pv["tray_log"]("the tip could not read the registry", KeyError("projects")) is False and len(logs()) == 1,
+       "P10: …the same one again: not sent")
+    clock[0] += 601
+    ck(pv["tray_log"]("the tip could not read the registry", KeyError("projects")) is True and len(logs()) == 2,
+       "P10: …ten minutes later: sent again")
+    clock[0] += 61
+    sent10.clear()
+    got = [pv["tray_log"](f"problem {i}") for i in range(7)]
+    ck(got == [True] * 5 + [False] * 2 and len(logs()) == 5, f"P10: at most five a minute ({got})")
+    clock[0] += 61
+    ck(pv["tray_log"]("problem 6") is True, "P10: …a minute later, more")
+    sent10.clear()
+    pv["tray_log"]("a  long\n line " + "x" * 900)
+    ck(len(logs()[0][-1]) == 500 and "\n" not in logs()[0][-1] and "  " not in logs()[0][-1], "P10: …one line, at most 500 characters")
+    cli10["_log"] = OSError("aht.exe is gone")
+    try:
+        ok = pv["tray_log"]("aht.exe could not be run")
+    except Exception as e:                       # noqa: BLE001
+        ok = e
+    ck(ok is True, f"P10: …a log that cannot be written is no new failure ({ok!r})")
+    del cli10["_log"]
+    sent10.clear()
+
+    def act_reconcile():
+        def work():
+            raise KeyError("applied_moves")
+        pv["_in_thread"](work)
+    act_reconcile()
+    ck(logs() == [("_log", "--level", "error", "--source", "tray", "--", "act_reconcile failed: KeyError: 'applied_moves'")],
+       f"P10: an action's work that fails is logged with the action's name ({logs()})")
+    sent10.clear()
+
+    def act_about():
+        raise RuntimeError("MessageBoxW failed")
+    pv["_run_action"](act_about)
+    ck(logs()[-1][-1] == "act_about failed: RuntimeError: MessageBoxW failed"
+       and balloons10[-1] == ("That did not work", "RuntimeError: MessageBoxW failed (noted in aht's log)"),
+       f"P10: a menu item that fails is logged and said ({balloons10[-1:]})")
+    clock[0] += 61                       # each check below in a minute of its own
+    sent10.clear()
+    balloons10.clear()
+    pv["act_openlog"]()
+    ck(logs() and logs()[-1][-1].startswith("the log did not open: OSError: [WinError 1155]")
+       and balloons10 and balloons10[-1][0] == "The log did not open", f"P10: Open log that fails: logged and said ({balloons10})")
+    # Make a Problem Report…
+    OUT = str(T / "reports" / "problem-20261028-141000.txt")
+    RP = "C:\\Users\\me\\.aht\\reports\\problem-20261028-141000.txt"
+    good = json.dumps({"path": RP, "bytes": 18432, "errors": 7, "machines": [
+        {"machine": "DESKTOP-B", "here": True, "reachable": True, "lines": 4, "error": None},
+        {"machine": "box", "here": False, "reachable": True, "lines": 3, "error": None},
+        {"machine": "mini", "here": False, "reachable": False, "lines": 0, "error": "ssh: timed out"}]})
+    sent10.clear()
+    cli10["report-problem"] = (0, good, "")
+    answers10[:] = [pv["IDYES"]]
+    pv["act_problem_report"]()
+    asked = boxes10[-1]
+    ck(asked[0] == "Make a Problem Report" and "Nothing is sent anywhere" in asked[1] and "how many projects aht tracks (not where they are)" in asked[1]
+       and asked[2] & 0xF == pv["MB_YESNOCANCEL"], "P10: Make a Problem Report… says what it holds and asks about the other machines")
+    ck(sent10 == [("report-problem", "--out", OUT, "--everywhere", "--json")] and (T / "reports").is_dir(),
+       f"P10: …Yes: report-problem --out <aht's reports>/problem-<time>.txt --everywhere --json, its folder made ({sent10})")
+    ck(popened == [["explorer", "/select,", RP]], f"P10: …the folder opens with the report selected ({popened})")
+    ck(balloons10[-1] == ("Problem report saved", "problem-20261028-141000.txt, 18 KB. Nothing was sent anywhere. Not answered: mini."),
+       f"P10: …and a balloon says so ({balloons10[-1]})")
+    sent10.clear()
+    answers10[:] = [7]
+    pv["act_problem_report"]()
+    ck(sent10 == [("report-problem", "--out", OUT, "--json")], f"P10: …No: this PC only ({sent10})")
+    sent10.clear()
+    answers10[:] = [pv["IDCANCEL"]]
+    pv["act_problem_report"]()
+    ck(sent10 == [], "P10: …Cancel: nothing runs")
+    remotes[0] = {}
+    answers10[:] = [pv["IDOK"]]
+    pv["act_problem_report"]()
+    ck(boxes10[-1][2] & 0xF == pv["MB_OKCANCEL"] and sent10 == [("report-problem", "--out", OUT, "--json")],
+       "P10: no machines set up: OK or Cancel, then report-problem --json")
+    # what the core refuses: its words, nothing logged; a crash: logged, said briefly
+    sent10.clear()
+    cli10["report-problem"] = (1, "", "aht: the report could not be written to ~\\Desktop: No space left on device\n")
+    answers10[:] = [pv["IDOK"]]
+    pv["act_problem_report"]()
+    ck(boxes10[-1][:2] == ("The report was not made", "aht: the report could not be written to ~\\Desktop: No space left on device")
+       and not logs(), f"P10: a refusal: the core's words, nothing logged ({boxes10[-1][:2]})")
+    clock[0] += 61
+    cli10["report-problem"] = (1, "", "Traceback (most recent call last):\n  File \"aht.py\", line 1\nKeyError: 'nope'\n")
+    answers10[:] = [pv["IDOK"]]
+    pv["act_problem_report"]()
+    ck(boxes10[-1][1] == "aht stopped with an error (KeyError). It is noted in aht's log: Open log shows it."
+       and logs()[-1][-1] == "report-problem failed unexpectedly: it crashed (KeyError)", f"P10: a crash: logged and said briefly ({logs()[-1:]})")
+    clock[0] += 61
+    cli10["report-problem"] = (0, "{}", "")
+    answers10[:] = [pv["IDOK"]]
+    pv["act_problem_report"]()
+    ck(logs()[-1][-1] == "report-problem failed unexpectedly: its answer had no path", "P10: an answer without a path: logged")
+    ck(pv["_size"](512) == "512 bytes" and pv["_size"](9216) == "9.0 KB" and pv["_size"](18432) == "18 KB"
+       and pv["_size"](3 * 1024 * 1024) == "3.0 MB", "P10: sizes in words")
+    tsrc = SRC.read_text(encoding="utf-8")
+    ck('add(root, "Make a Problem Report…", act_problem_report)' in tsrc and "_run_action(actions.get(cmd, lambda: None))" in tsrc
+       and 'tray_log(f"timer {wparam} failed", e)' in tsrc,
+       "P10: the menu offers Make a Problem Report…; menu actions and timers are guarded")
     ck(not warned, f"Windows showed every balloon ({warned})")
 finally:
     shutil.rmtree(T, ignore_errors=True)

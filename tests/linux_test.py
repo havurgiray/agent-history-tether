@@ -438,6 +438,45 @@ else:
     ck(asked(by_tray) == ["stop " + u, "reset-failed " + u, "start " + u],
        f"the tray's resume clears it too, its pause only stops ({asked(by_tray)})")
 
+print("\n[5b] the tray's own failures go to aht's log, as the Windows tray's and the Mac app's")
+# notify-send that cannot run or fails, a menu action's work that raises in
+# its thread, a menu item that raises: `APP tray: …` lines, keys masked
+tkey = "ghp_" + "R4nd0mT0k3nV4lu3Xy9Zq8Wp7Lm6Kj5Hg4Fd3"
+probe = ("import sys, threading, types; sys.path.insert(0, sys.argv[1]); import tray\n"
+         "tray.shutil = types.SimpleNamespace(which=lambda n: '/usr/bin/' + n)\n"
+         "def gone(*a, **k): raise FileNotFoundError(2, 'No such file or directory', 'notify-send')\n"
+         "tray.subprocess = types.SimpleNamespace(run=gone)\n"
+         "tray.notify('Reconcile', 'done')\n"
+         "tray.subprocess = types.SimpleNamespace(run=lambda *a, **k: types.SimpleNamespace(returncode=1))\n"
+         "tray.notify('History backup', 'done')\n"
+         "class Tray(tray.Tray):\n"
+         "    def __init__(self): pass\n"
+         "    def act_reconcile(self, _item):\n"
+         "        def work(): raise KeyError('applied_moves')\n"
+         "        self.in_thread(work)\n"
+         "    def act_about(self, _item): raise RuntimeError('no dialog: ' + sys.argv[2])\n"
+         "t = Tray()\nt.act_reconcile(None)\n"
+         "[x.join(5) for x in threading.enumerate() if x is not threading.current_thread()]\n"
+         "tray._guarded(t.act_about)(None)\n")
+r = subprocess.run([PY, "-c", probe, str(ROOT / "linux"), tkey], env=env,
+                   capture_output=True, text=True)
+tlog = (sb / ".aht" / "aht.log").read_text() if (sb / ".aht" / "aht.log").is_file() else ""
+tl = [l.split("] ", 2)[-1] for l in tlog.splitlines() if "APP tray: " in l]
+ck(r.returncode == 0 and "Traceback" not in r.stderr
+   and "[WARN ] APP tray: a notice was not shown (Reconcile): FileNotFoundError: [Errno 2] "
+       "No such file or directory: 'notify-send'" in tlog
+   and "[WARN ] APP tray: a notice was not shown (History backup): notify-send ended with "
+       "exit 1" in tlog
+   and "[ERROR] APP tray: act_reconcile failed: KeyError: 'applied_moves'" in tlog
+   and "[ERROR] APP tray: act_about failed: RuntimeError: no dialog: [GitHub token: ghp_" in tlog
+   and tkey not in tlog,
+   f"the tray logs its own failures: a notice not shown, an action's work and a menu "
+   f"item that raise (keys masked), not to stderr ({tl}, {r.stderr[-300:]})")
+src = (ROOT / "linux" / "tray.py").read_text()
+ck('item.connect("activate", _guarded(cb))' in src
+   and "threading.Thread(target=_guarded(fn), daemon=True)" in src,
+   "every menu item and every action's thread goes through _guarded")
+
 print("\n[6] the tray shows what became of a handover cut off halfway")
 # every 30 s the tray asks the core (`aht notices --quiet`), which shows what
 # it finds with notify-send when there is a screen: on Linux a stand-in

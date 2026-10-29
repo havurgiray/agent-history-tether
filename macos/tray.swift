@@ -114,13 +114,127 @@ func shWithStderr(_ exe: String, _ args: [String]) -> (ok: Bool, out: String, er
 
 @discardableResult
 func aht(_ args: [String]) -> (ok: Bool, out: String) {
-    return sh(PY, [ahtScript()] + args)
+    let r = ahtFull(args)
+    return (r.ok, r.out)
+}
+
+/// One core command with what it said on stderr too.  A failure no refusal
+/// explains (a crash, arguments it did not understand) is noted in aht's
+/// log, with the command's name and flags only.  stderr goes to a file read
+/// after the command ends, not a pipe: a program the core leaves running
+/// (an ssh master, say) may hold it open, and nothing here waits for that.
+func ahtFull(_ args: [String]) -> (ok: Bool, out: String, err: String) {
+    let fm = FileManager.default
+    let errFile = fm.temporaryDirectory.appendingPathComponent("aht-stderr-\(UUID().uuidString)")
+    fm.createFile(atPath: errFile.path, contents: nil, attributes: [.posixPermissions: 0o600])
+    defer { try? fm.removeItem(at: errFile) }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: PY)
+    p.arguments = [ahtScript()] + args
+    let out = Pipe()
+    p.standardOutput = out
+    let errHandle = try? FileHandle(forWritingTo: errFile)
+    p.standardError = errHandle ?? FileHandle.nullDevice
+    do { try p.run() } catch {
+        try? errHandle?.close()
+        return (false, "", error.localizedDescription)
+    }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    try? errHandle?.close()
+    let err = (try? String(contentsOf: errFile, encoding: .utf8)) ?? ""
+    let r = (ok: p.terminationStatus == 0, out: String(data: data, encoding: .utf8) ?? "", err: err)
+    if let why = coreFailure(args, ok: r.ok, err: r.err) {
+        AppLog.shared.note("aht \(commandName(args)) failed unexpectedly: \(why)",
+                           level: why.hasPrefix("it crashed") ? "error" : "warn")
+    }
+    return r
 }
 
 func ahtJSON(_ args: [String]) -> [String: Any]? {
     let r = aht(args)
     guard let d = r.out.data(using: .utf8) else { return nil }
-    return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    if j == nil, r.ok, args.contains("--json"),
+       !r.out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        AppLog.shared.note("aht \(commandName(args)) failed unexpectedly: its answer was not JSON",
+                           level: "warn")
+    }
+    return j
+}
+
+// ---- the app's own errors, into aht's log -------------------------------------
+// An error of the Mac app's own goes to aht's log through `aht _log --level
+// error --source mac-app -- MESSAGE` (the core masks it, keeps it to one line
+// and caps it), so `aht logs --errors` and a problem report show it.  What
+// was being done and the error; never a secret or a file's contents.  The
+// same message once in ten minutes, at most five a minute.
+
+final class AppLog {
+    static let shared = AppLog()
+    var now: () -> Date = { Date() }
+    /// How a line is sent: in the background, never through aht() (whose own
+    /// failures come here).
+    var send: ([String]) -> Void = { args in
+        DispatchQueue.global(qos: .utility).async { _ = shWithStderr(PY, [ahtScript()] + args) }
+    }
+    private var at: [Date] = []
+    private var seen: [String: Date] = [:]
+    private let lock = NSLock()
+
+    /// -> whether the line was sent (not when the same one was lately, or
+    /// five were this minute).
+    @discardableResult
+    func note(_ message: String, level: String = "error") -> Bool {
+        let m = String(message.split(whereSeparator: { $0.isWhitespace })
+                       .joined(separator: " ").prefix(500))
+        guard !m.isEmpty else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        let t = now()
+        if let s = seen[m], t.timeIntervalSince(s) < 600 { return false }
+        at = at.filter { t.timeIntervalSince($0) < 60 }
+        guard at.count < 5 else { return false }
+        at.append(t)
+        seen[m] = t
+        send(["_log", "--level", level, "--source", "mac-app", "--", m])
+        return true
+    }
+}
+
+/// A command as the log may name it: its name, a subcommand, its flags;
+/// never a path, a value or words typed.
+func commandName(_ args: [String]) -> String {
+    guard let first = args.first else { return "" }
+    var keep = [first]
+    let subs: Set<String> = ["remote", "autostart", "relays", "night-shift", "secrets", "rules",
+                             "backends", "workspace", "tab-names"]
+    if subs.contains(first), args.count > 1,
+       args[1].range(of: "^[a-z][a-z-]{0,20}$", options: .regularExpression) != nil {
+        keep.append(args[1])
+    }
+    keep += args.dropFirst().filter { $0.range(of: "^--?[A-Za-z][\\w-]*$", options: .regularExpression) != nil }
+    return keep.joined(separator: " ")
+}
+
+/// Why a core command failed when no refusal explains it, or nil: Python's
+/// traceback on stderr (an answer may quote one from the log), or argparse's
+/// usage (only up to its colon: never what was given).
+func coreFailure(_ args: [String], ok: Bool, err: String) -> String? {
+    guard !ok, args.first != "_log" else { return nil }
+    if err.contains("Traceback (most recent call last)") {
+        let kind = err.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { $0.range(of: "^[A-Za-z_][\\w.]*(Error|Exception|Interrupt|Exit|Warning)\\b",
+                             options: .regularExpression) != nil }
+        return "it crashed" + (kind.map { " (" + ($0.split(separator: ":").first.map(String.init) ?? $0) + ")" } ?? "")
+    }
+    if err.range(of: "(?m)^usage: ", options: .regularExpression) != nil {
+        if let r = err.range(of: "error: [^:\n]*", options: .regularExpression) {
+            return "aht did not understand it (" + err[r].dropFirst(7).trimmingCharacters(in: .whitespaces) + ")"
+        }
+        return "aht did not understand it"
+    }
+    return nil
 }
 
 /// A notice from the app itself: a click on it opens aht, not Script Editor.
@@ -129,7 +243,11 @@ func notifyUser(_ title: String, _ msg: String) {
     c.title = title
     c.body = msg
     UNUserNotificationCenter.current().add(
-        UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { _ in }
+        UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { err in
+        if let err = err {
+            AppLog.shared.note("a notice was not shown: \(err.localizedDescription)", level: "warn")
+        }
+    }
 }
 
 func watcherRunning() -> Bool {
@@ -3395,6 +3513,7 @@ final class AppModel: ObservableObject {
     @Published var showGettingStarted = false
     @Published var sessionList: SessionListView?
     @Published var showUpdate = false
+    @Published var problems: ProblemsView?      // Recent problems
     @Published var offsite: OffsiteView?        // Fetch Backups From…
     @Published var pickup: PickupView?          // Pick Up from M, Leave a Note on M
     @Published var bring: BringView?            // Bring Here from M
@@ -5833,6 +5952,90 @@ final class AppModel: ObservableObject {
     func openData() { sh("/usr/bin/open", [HOME + "/.aht"]) }
     func openLog() { sh("/usr/bin/open", ["-t", HOME + "/.aht/aht.log"]) }
 
+    /// Whether the other machines can be asked too: some are set up.
+    var machinesToAsk: Bool {
+        !(((status["handover"] as? [String: Any])?["remotes"] as? [String: Any]) ?? [:]).isEmpty
+    }
+
+    /// The warnings and errors in this Mac's log in the last day (status).
+    var recentProblems: Int {
+        ((status["log"] as? [String: Any])?["recent_problems"] as? NSNumber)?.intValue ?? 0
+    }
+
+    /// Recent problems: this Mac's warnings and errors, and every other
+    /// machine's when some are set up, newest first.
+    func showProblems() {
+        let everywhere = machinesToAsk
+        let v = ProblemsView(everywhere: everywhere)
+        problems = v
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = ahtFull(["logs", "--errors"] + (everywhere ? ["--everywhere"] : []) + ["--json"])
+            let d = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]
+            DispatchQueue.main.async {
+                guard self.problems?.id == v.id else { return }     // closed, or asked again
+                var done = v
+                done.loading = false
+                if let d = d {
+                    (done.rows, done.missed) = parseProblems(d)
+                } else {
+                    let said = (r.err + r.out).trimmingCharacters(in: .whitespacesAndNewlines)
+                    done.error = said.isEmpty ? "aht gave no answer." : said
+                }
+                self.problems = done
+            }
+        }
+    }
+
+    /// Make a Problem Report…: one readable file, saved among aht's reports
+    /// and shown in Finder.  With machines set up, a box adds their recent
+    /// warnings and errors (--everywhere).
+    func makeProblemReport() {
+        let a = NSAlert()
+        a.messageText = "Make a Problem Report"
+        a.informativeText = REPORT_INTRO
+        a.addButton(withTitle: "Make the Report")
+        a.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+        var box: NSButton?
+        if machinesToAsk {
+            let b = NSButton(checkboxWithTitle: "Include the other machines' recent warnings and "
+                             + "errors (aht asks each one)", target: nil, action: nil)
+            b.state = .on
+            a.accessoryView = b
+            box = b
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let everywhere = box?.state == .on
+        let out = problemReportFile(status["aht_home"] as? String ?? HOME + "/.aht")
+        busy(everywhere ? "making the problem report, asking every machine…"
+                        : "making the problem report…") {
+            let r = ahtFull(problemReportArgs(everywhere: everywhere, out: out))
+            let d = ((try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any]) ?? [:]
+            DispatchQueue.main.async {
+                guard let rep = parseReport(d) else {
+                    if r.ok { AppLog.shared.note("report-problem failed unexpectedly: its answer had no path") }
+                    let crashed = r.err.contains("Traceback (most recent call last)")
+                    let said = crashed ? "aht stopped with an error. It is noted in aht's log: Settings → "
+                        + "Recent Problems… shows it."
+                        : ((d["error"] as? String) ?? (r.err + r.out)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    _ = alert("The report was not made", said.isEmpty ? "aht gave no answer." : said)
+                    return
+                }
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: rep.path)])
+                let b = NSAlert()
+                b.messageText = "The problem report is saved"
+                b.informativeText = reportSavedText(rep, everywhere: everywhere)
+                b.addButton(withTitle: "OK")
+                b.addButton(withTitle: "Copy Path")
+                NSApp.activate(ignoringOtherApps: true)
+                if b.runModal() == .alertSecondButtonReturn {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(rep.path, forType: .string)
+                }
+            }
+        }
+    }
+
     func setLoginItem(_ on: Bool, note: Bool = true) {
         let fm = FileManager.default
         if !on {
@@ -5841,7 +6044,11 @@ final class AppModel: ObservableObject {
         } else {
             // whichever tray this is: the app bundle's executable or the bare binary
             let bin = Bundle.main.executablePath ?? (TOOLS + "/aht-tray")
-            try? loginItemPlist(bin)?.write(to: URL(fileURLWithPath: TRAY_PLIST), options: .atomic)
+            do {
+                try loginItemPlist(bin)?.write(to: URL(fileURLWithPath: TRAY_PLIST), options: .atomic)
+            } catch {
+                AppLog.shared.note("the login item was not written: \(error.localizedDescription)")
+            }
         }
         loginItem = fm.fileExists(atPath: TRAY_PLIST)
         // the switch answers the tray-at-login question (status's
@@ -5974,6 +6181,7 @@ struct MainView: View {
         .sheet(isPresented: $m.showGettingStarted) { GettingStartedSheet() }
         .sheet(item: $m.sessionList) { v in SessionListSheet(v: v) }
         .sheet(isPresented: $m.showUpdate) { UpdateSheet() }
+        .sheet(item: $m.problems) { _ in ProblemsSheet() }
         .sheet(item: $m.offsite) { _ in FetchBackupsSheet() }
         .sheet(item: $m.pickup) { _ in PickupSheet() }
         .sheet(item: $m.bring) { _ in BringSheet() }
@@ -9136,7 +9344,10 @@ func registerHotKey(_ spec: String, _ action: @escaping () -> Void) {
         }, 1, &spec, nil, nil)
     }
     let id = EventHotKeyID(signature: OSType(0x41485431), id: 1)     // "AHT1"
-    RegisterEventHotKey(UInt32(code), UInt32(mods), id, GetApplicationEventTarget(), 0, &HOTKEY_REF)
+    let st = RegisterEventHotKey(UInt32(code), UInt32(mods), id, GetApplicationEventTarget(), 0, &HOTKEY_REF)
+    if st != noErr {            // another app has it, most often
+        AppLog.shared.note("the search shortcut \(spec) was not registered (error \(st))", level: "warn")
+    }
 }
 
 struct MachinesView: View {
@@ -9420,6 +9631,235 @@ struct SetupList: View {
                 }
             }
         }
+    }
+}
+
+// ---- Recent problems and the problem report ---------------------------------------
+// `aht logs --errors [--everywhere] --json` → {hours, entries: [{t, at, level,
+// text, machine, here}] oldest first, machines: [{machine, here, reachable,
+// lines, error}]}; `aht report-problem --out FILE [--everywhere] --json` →
+// {path, bytes, machines: (the same rows), errors: how many warnings and
+// errors it holds}.
+
+/// The guide's section on what to do when something goes wrong.
+let TROUBLE = "When something"
+
+struct ProblemRow: Identifiable {
+    let id: Int
+    let t: Date?
+    let machine: String?        // nil: this Mac
+    let level: String           // "error" or "warn"
+    let text: String            // an UNCAUGHT error: its traceback on the lines after the first
+}
+
+/// A machine that did not answer, or answered with an error.
+struct MissedMachine: Identifiable {
+    var id: String { machine }
+    let machine: String
+    let why: String
+    let reachable: Bool
+    var line: String {
+        why.hasPrefix(machine + " ") ? why
+            : reachable ? "\(machine): \(why)" : "\(machine) did not answer: \(why)"
+    }
+}
+
+/// The machines that did not answer, or answered with an error (never this Mac).
+func missedMachines(_ rows: Any?) -> [MissedMachine] {
+    ((rows as? [[String: Any]]) ?? []).compactMap { m in
+        guard m["here"] as? Bool != true, let name = m["machine"] as? String else { return nil }
+        let reachable = m["reachable"] as? Bool ?? true
+        let why = m["error"] as? String
+        guard !reachable || !(why ?? "").isEmpty else { return nil }
+        return MissedMachine(machine: name, why: why ?? "it did not answer", reachable: reachable)
+    }
+}
+
+/// The recent problems, newest first, and the machines that did not answer.
+/// Lines as the log writes them ("[2026-10-28 14:10:00] [WARN ] …") from an
+/// older core that answers with `lines`.
+func parseProblems(_ d: [String: Any]) -> (rows: [ProblemRow], missed: [MissedMachine]) {
+    var rows: [ProblemRow] = []
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    for (i, x) in (((d["entries"] as? [Any]) ?? (d["lines"] as? [Any])) ?? []).enumerated() {
+        if let e = x as? [String: Any] {
+            let here = e["here"] as? Bool == true || e["machine"] == nil || e["machine"] is NSNull
+            rows.append(ProblemRow(id: i, t: moment(e["t"]) ?? moment(e["at"]),
+                                   machine: here ? nil : e["machine"] as? String,
+                                   level: e["level"] as? String == "error" ? "error" : "warn",
+                                   text: e["text"] as? String ?? ""))
+        } else if let line = x as? String {
+            var t: Date?, level = "warn", text = line
+            if let r = line.range(of: #"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[(\w+)\s*\] ?"#,
+                                  options: .regularExpression) {
+                t = f.date(from: String(line.dropFirst().prefix(19)))
+                level = line[r].contains("[ERROR") ? "error" : "warn"
+                text = String(line[r.upperBound...])
+            }
+            rows.append(ProblemRow(id: i, t: t, machine: nil, level: level, text: text))
+        }
+    }
+    rows.sort { ($0.t ?? .distantPast) > ($1.t ?? .distantPast) }
+    return (rows, missedMachines(d["machines"]))
+}
+
+struct ProblemReport {
+    let path: String
+    let bytes: Int64
+    let names: [String]         // the machines that answered, this Mac first
+    let missed: [MissedMachine]
+    let problems: Int?          // how many warnings and errors it holds
+}
+
+func parseReport(_ d: [String: Any]) -> ProblemReport? {
+    guard let path = d["path"] as? String, !path.isEmpty else { return nil }
+    let rows = (d["machines"] as? [[String: Any]]) ?? []
+    let names = rows.filter { $0["reachable"] as? Bool != false }
+        .map { $0["here"] as? Bool == true ? "this Mac" : ($0["machine"] as? String ?? "?") }
+    return ProblemReport(path: path, bytes: (d["bytes"] as? NSNumber)?.int64Value ?? 0, names: names,
+                         missed: missedMachines(rows), problems: (d["errors"] as? NSNumber)?.intValue)
+}
+
+/// Where a report goes: a readable .txt among aht's reports (the core keeps
+/// the newest few there; with --json and no --out its file would be JSON).
+/// The folder is made, for this user only, if it is not there yet.
+func problemReportFile(_ ahtHome: String, at: Date = Date()) -> String {
+    let dir = ahtHome + "/reports"
+    if !FileManager.default.fileExists(atPath: dir) {
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            AppLog.shared.note("the reports folder could not be made: \(error.localizedDescription)")
+        }
+    }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyyMMdd-HHmmss"
+    return dir + "/problem-\(f.string(from: at)).txt"
+}
+
+func problemReportArgs(everywhere: Bool, out: String) -> [String] {
+    ["report-problem", "--out", out] + (everywhere ? ["--everywhere"] : []) + ["--json"]
+}
+
+let REPORT_INTRO = "aht writes one file that shows what went wrong, for you to read and hand to "
+    + "whoever helps you. Nothing is sent anywhere.\n\nIt holds aht's version, this Mac's macOS "
+    + "and Python, the version of each agent, your settings (secret values, the phone topic, host "
+    + "and user names replaced by the machine names you gave aht), how many projects aht tracks "
+    + "(not where they are), and the recent warnings and errors."
+
+/// What the saved report's alert says.
+func reportSavedText(_ r: ProblemReport, everywhere: Bool) -> String {
+    var lines = [(r.path as NSString).abbreviatingWithTildeInPath + "  (" + byteText(NSNumber(value: r.bytes)) + ")"]
+    if let n = r.problems {
+        lines.append(n == 0 ? "No recent warnings or errors." : n == 1 ? "1 warning or error."
+                     : "\(n) warnings or errors.")
+    }
+    if everywhere || r.names.contains(where: { $0 != "this Mac" }) {
+        lines.append("From " + r.names.joined(separator: ", ") + ".")
+    }
+    lines += r.missed.map { $0.line }
+    lines.append("Nothing was sent anywhere. Read it before you hand it on.")
+    return lines.joined(separator: "\n")
+}
+
+struct ProblemsView: Identifiable {
+    let id = UUID()
+    let everywhere: Bool
+    var loading = true
+    var rows: [ProblemRow] = []
+    var missed: [MissedMachine] = []
+    var error: String?
+}
+
+struct ProblemsSheet: View {
+    @EnvironmentObject var m: AppModel
+
+    var body: some View {
+        let v = m.problems ?? ProblemsView(everywhere: false, loading: false)
+        VStack(alignment: .leading, spacing: 10) {
+            headed("Recent problems", TROUBLE)
+            if v.loading {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(v.everywhere ? "Asking every machine…" : "Reading the log…")
+                        .foregroundColor(.secondary)
+                }
+            } else if let e = v.error {
+                Text(e).foregroundColor(.orange).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(v.everywhere ? "The recent warnings and errors of every machine, newest first. "
+                     + "aht replaced secrets, host and user names in them."
+                     : "The recent warnings and errors of aht on this Mac, newest first.")
+                    .font(.caption).foregroundColor(.secondary)
+                ForEach(v.missed) { Text($0.line).font(.callout).foregroundColor(.orange) }
+                if v.rows.isEmpty {
+                    Text("No recent warnings or errors \(v.everywhere ? "on any machine" : "on this Mac").")
+                        .foregroundColor(.green)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(v.rows) { r in
+                                ProblemRowView(r: r, everywhere: v.everywhere)
+                                Divider()
+                            }
+                        }
+                        .padding(.trailing, 12)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+            HStack {
+                Button("Open Log") { m.openLog() }
+                Button("Make a Problem Report…") {
+                    m.problems = nil
+                    DispatchQueue.main.async { m.makeProblemReport() }
+                }
+                Spacer()
+                Button("Look Again") { m.showProblems() }.disabled(v.loading)
+                Button("Close") { m.problems = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20).frame(width: 780, height: 540)
+    }
+}
+
+struct ProblemRowView: View {
+    let r: ProblemRow
+    let everywhere: Bool
+    @State private var open = false
+
+    var body: some View {
+        let lines = r.text.components(separatedBy: "\n")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(clock(r.t)).monospacedDigit().foregroundColor(.secondary)
+                    .frame(width: 96, alignment: .leading)
+                if everywhere {
+                    Text(r.machine ?? "this Mac").lineLimit(1).frame(width: 110, alignment: .leading)
+                }
+                Text(r.level == "error" ? "error" : "warning").font(.caption)
+                    .foregroundColor(r.level == "error" ? .red : .orange)
+                    .frame(width: 56, alignment: .leading)
+                Text(lines.first ?? "").textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            if lines.count > 1 {
+                DisclosureGroup("Traceback", isExpanded: $open) {
+                    Text(lines.dropFirst().joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.caption)
+                .padding(.leading, everywhere ? 292 : 172)
+            }
+        }
+        .padding(.vertical, 5)
     }
 }
 
@@ -10637,9 +11077,21 @@ struct SettingsView: View {
                         }
                         HStack(spacing: 10) {
                             Button("Run Diagnostics") { m.doctor() }
+                            Button("Recent Problems…") { m.showProblems() }
                             Button("Open Log") { m.openLog() }
                             Button("Open Data Folder") { m.openData() }
                             Button("Edit Config File") { m.editConfig() }
+                            Spacer()
+                        }
+                        HStack(spacing: 10) {
+                            Button("Make a Problem Report…") { m.makeProblemReport() }
+                            HelpButton(TROUBLE)
+                            if m.recentProblems > 0 {
+                                Text(m.recentProblems == 1
+                                     ? "1 warning or error in aht's log in the last day."
+                                     : "\(m.recentProblems) warnings or errors in aht's log in the last day.")
+                                    .font(.callout).foregroundColor(.secondary)
+                            }
                             Spacer()
                         }
                         Text("aht keeps every AI coding agent's per-project history "
@@ -10861,7 +11313,12 @@ final class CornerModel: ObservableObject {
     private func save() {
         guard let d = try? JSONSerialization.data(withJSONObject: ["last": last, "done": done])
         else { return }
-        try? d.write(to: URL(fileURLWithPath: CORNER_STATE), options: .atomic)
+        do {
+            try d.write(to: URL(fileURLWithPath: CORNER_STATE), options: .atomic)
+        } catch {
+            AppLog.shared.note("the session corner's marks were not saved: \(error.localizedDescription)",
+                               level: "warn")
+        }
     }
 }
 
@@ -11489,6 +11946,13 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     var window: NSWindow?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // an Objective-C exception nobody caught ends the app: its name and
+        // reason go to aht's log first (at once: there is no later)
+        NSSetUncaughtExceptionHandler { e in
+            let msg = "uncaught \(e.name.rawValue): \(e.reason ?? "")"
+            _ = shWithStderr(PY, [ahtScript(), "_log", "--level", "error", "--source", "mac-app", "--",
+                                  String(msg.prefix(500))])
+        }
         // with no window open macOS takes the app for idle and quits it
         // ("automatic termination"); the menu bar app is meant to stay
         ProcessInfo.processInfo.disableAutomaticTermination("aht lives in the menu bar")
@@ -11992,6 +12456,15 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         showGuideWindow(nil)
     }
 
+    @objc func openProblems() {
+        openWindow()
+        model.showProblems()
+    }
+
+    @objc func makeProblemReport() {
+        model.makeProblemReport()
+    }
+
     @objc func openWindow() {
         if window == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
@@ -12049,6 +12522,13 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         let g = NSMenuItem(title: "aht Guide", action: #selector(openGuide), keyEquivalent: "?")
         g.target = self
         help.addItem(g)
+        help.addItem(.separator())
+        for (title, sel) in [("Recent Problems…", #selector(openProblems)),
+                             ("Make a Problem Report…", #selector(makeProblemReport))] {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            i.target = self
+            help.addItem(i)
+        }
         helpItem.submenu = help
         bar.addItem(helpItem)
         NSApp.helpMenu = help
@@ -12058,6 +12538,9 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
 
 // selftest: everything that can run headless (used by CI/dev boxes)
 if CommandLine.arguments.contains("--selftest") {
+    // the app's own error lines stay here: a selftest writes nothing to aht's log
+    var selfLogged: [[String]] = []
+    AppLog.shared.send = { selfLogged.append($0) }
     let r = aht(["version"])
     print("TRAY SELFTEST \(r.ok ? "OK" : "FAIL") — core: \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))")
     let bad = Chimes.own.filter { n in                // each chime sounds, softly, no click
@@ -14224,6 +14707,101 @@ if CommandLine.arguments.contains("--selftest") {
     let step = ((inTmp(["getting-started", "--json"])["steps"] as? [[String: Any]]) ?? [])
         .first { $0["id"] as? String == "login" }
     loginOK = loginOK && said["answered"] as? Bool == true && step?["optional"] as? Bool == true
+    // phase 10: the app's own errors into aht's log (its limits), the core's
+    // answers as the app reads them (Recent problems, the report), the file
+    // it asks for; then the bundle's core in the throwaway home: a readable
+    // report where the app said, and a line of the app's own in its log
+    var p10: [String] = []
+    var t10 = Date(timeIntervalSince1970: 1_800_000_000)
+    var sent10: [[String]] = []
+    let lg = AppLog()
+    lg.now = { t10 }
+    lg.send = { sent10.append($0) }
+    if !lg.note("the corner's marks  were not\nsaved")
+        || sent10 != [["_log", "--level", "error", "--source", "mac-app", "--", "the corner's marks were not saved"]] {
+        p10.append("log line \(sent10)")
+    }
+    if lg.note("the corner's marks were not saved") { p10.append("the same line again was sent") }
+    t10 += 601
+    if !lg.note("the corner's marks were not saved") { p10.append("ten minutes later it was not") }
+    t10 += 61
+    let burst = (0..<7).map { lg.note("problem \($0)") }
+    if burst != [true, true, true, true, true, false, false] { p10.append("five a minute: \(burst)") }
+    t10 += 61
+    lg.note(String(repeating: "x", count: 900), level: "warn")
+    if sent10.last?.last?.count != 500 || sent10.last?[2] != "warn" { p10.append("500 characters") }
+    let trace10 = "Traceback (most recent call last):\n  File \"aht.py\", line 1, in main\nKeyError: 'nope'\n"
+    let usage10 = "usage: aht journal [-h] [--json]\naht: error: unrecognized arguments: --x /Users/me/secret\n"
+    let fails10 = [coreFailure(["doctor", "--json"], ok: false, err: trace10),
+                   coreFailure(["logs", "--json"], ok: true, err: trace10),
+                   coreFailure(["handover", "/p", "--json"], ok: false, err: "box does not answer\n"),
+                   coreFailure(["journal", "/Users/me/secret", "--json"], ok: false, err: usage10),
+                   coreFailure(["_log", "--level", "error"], ok: false, err: trace10)]
+    if fails10.map({ $0 ?? "-" }) != ["it crashed (KeyError)", "-", "-",
+                                       "aht did not understand it (unrecognized arguments)", "-"] {
+        p10.append("failures \(fails10)")
+    }
+    if commandName(["search", "my secret words", "--json"]) != "search --json"
+        || commandName(["remote", "check", "box", "--json"]) != "remote check --json"
+        || commandName(["config", "--set", "notify_phone=ntfy:topic"]) != "config --set" {
+        p10.append("names \(commandName(["search", "my secret words", "--json"]))")
+    }
+    let rows10: [[String: Any]] = [
+        ["machine": "studio", "here": true, "reachable": true, "lines": 1, "error": NSNull()],
+        ["machine": "box", "here": false, "reachable": true, "lines": 3, "error": NSNull()],
+        ["machine": "mini", "here": false, "reachable": false, "lines": 0, "error": "mini did not answer within 30 s"],
+        ["machine": "pc", "here": false, "reachable": true, "lines": 0, "error": "aht on pc is too old to send its log"]]
+    let logs10 = parseProblems(["hours": 24, "machines": rows10, "entries": [
+        ["t": 1_800_000_000.0, "at": "2027-01-15T09:00:00", "level": "warn", "text": "RECONCILE skipped ~/code/old",
+         "machine": "studio", "here": true],
+        ["t": 1_800_000_600.0, "level": "error", "machine": "box", "here": false,
+         "text": "UNCAUGHT Traceback (most recent call last):\n  File \"aht.py\"\nKeyError: 'a'"]]])
+    if logs10.rows.map({ "\($0.machine ?? "here") \($0.level) \($0.text.components(separatedBy: "\n").count)" })
+        != ["box error 3", "here warn 1"]
+        || logs10.missed.map({ $0.line }) != ["mini did not answer within 30 s", "pc: aht on pc is too old to send its log"] {
+        p10.append("recent problems \(logs10.rows.map { $0.text }) \(logs10.missed.map { $0.line })")
+    }
+    let raw10 = parseProblems(["lines": ["[2026-10-28 09:00:00] [WARN ] a", "[2026-10-28 10:30:00] [ERROR] b"]]).rows
+    if raw10.map({ "\($0.level) \($0.text)" }) != ["error b", "warn a"] { p10.append("log lines \(raw10.map { $0.text })") }
+    if let rep = parseReport(["path": "/x/problem-1.txt", "bytes": 18432, "machines": rows10, "errors": 7]) {
+        let said10 = reportSavedText(rep, everywhere: true)
+        if rep.names != ["this Mac", "box", "pc"] || rep.problems != 7 || rep.missed.count != 2
+            || !said10.contains("7 warnings or errors.") || !said10.contains("From this Mac, box, pc.")
+            || !said10.contains("mini did not answer within 30 s") || !said10.contains("Nothing was sent anywhere") {
+            p10.append("report \(rep.names) \(said10)")
+        }
+    } else { p10.append("no report read") }
+    if parseReport(["error": "x"]) != nil { p10.append("a report without a path") }
+    let out10 = problemReportFile(tmp + "/.aht", at: Date(timeIntervalSince1970: 1_800_000_000))
+    var isDir: ObjCBool = false
+    let mode10 = ((try? FileManager.default.attributesOfItem(atPath: tmp + "/.aht/reports"))?[.posixPermissions]
+                  as? NSNumber)?.intValue
+    if out10.range(of: "/\\.aht/reports/problem-\\d{8}-\\d{6}\\.txt$", options: .regularExpression) == nil
+        || !FileManager.default.fileExists(atPath: tmp + "/.aht/reports", isDirectory: &isDir) || !isDir.boolValue
+        || mode10 != 0o700 {
+        p10.append("report file \(out10) \(String(mode10 ?? 0, radix: 8))")
+    }
+    if problemReportArgs(everywhere: true, out: out10) != ["report-problem", "--out", out10, "--everywhere", "--json"]
+        || problemReportArgs(everywhere: false, out: out10) != ["report-problem", "--out", out10, "--json"] {
+        p10.append("report args")
+    }
+    var core10 = "not asked"
+    if let rep = parseReport(inTmp(problemReportArgs(everywhere: false, out: out10))) {
+        let real = URL(fileURLWithPath: out10).resolvingSymlinksInPath().path
+        let body = (try? String(contentsOfFile: rep.path, encoding: .utf8)) ?? ""
+        core10 = "report \(rep.bytes) bytes"
+        if URL(fileURLWithPath: rep.path).resolvingSymlinksInPath().path != real || body.isEmpty
+            || body.hasPrefix("{") || Int64(body.utf8.count) != rep.bytes || rep.names != ["this Mac"] {
+            p10.append("the core's report \(rep.path) \(body.prefix(40))")
+        }
+    } else { p10.append("the core made no report"); core10 = "no report" }
+    _ = inTmp(["_log", "--level", "error", "--source", "mac-app", "--", "selftest: the app's own error"])
+    let log10 = (try? String(contentsOfFile: tmp + "/.aht/aht.log", encoding: .utf8)) ?? ""
+    if !log10.contains("[ERROR] APP mac-app: selftest: the app's own error") { p10.append("the core's _log") }
+    else { core10 += ", _log" }
+    if !selfLogged.isEmpty { core10 += "; the app noted \(selfLogged.count) problem(s) of its own" }
+    let problemOK = p10.isEmpty
+    print("PROBLEM REPORT \(problemOK ? "OK" : "FAIL — " + p10.joined(separator: "; ")) — core: \(core10)")
     try? FileManager.default.removeItem(atPath: tmp)
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
@@ -14231,7 +14809,7 @@ if CommandLine.arguments.contains("--selftest") {
          && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
          && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK
          && pause5OK && phase5OK && transferOK && phase6OK && bringOK && phase7OK && fix7OK
-         && perm7bOK && phase7bOK && kimi7bOK && opDryOK ? 0 : 1)
+         && perm7bOK && phase7bOK && kimi7bOK && opDryOK && problemOK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them

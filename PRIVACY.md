@@ -313,7 +313,7 @@ encrypt it.
 | `install.json` | the version of aht installed here, the protocol number it speaks with your other machines and the names of the operations it answers.  Written by aht's own commands here, never by the copy another machine runs here.  A machine that asks this one learns them, to tell whether this one keeps the records Bring Here and Send Back need | rewritten when aht is updated |
 | `offsite.json` | which backups went to which machine (`offsite_backup`), when the last copy ran and how much it sent, and from which computer's folder backups were last fetched (older versions kept this in `run/offsite.json`, which aht removes) | rewritten at each copy and fetch |
 | `registry.json` (and `.bak`) | the projects aht tracks (see [below](#the-registry)) | until you delete it, or `aht uninstall --purge` |
-| `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session ids, your other machines' names (and the Tailscale address aht reached one by), the notices it showed, warnings and errors; no conversations | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one: about 10 MB at most |
+| `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session ids, your other machines' names (and the Tailscale address aht reached one by), the notices it showed, warnings and errors (what aht was doing and the error's type and message, keys masked; for an error aht did not expect, its traceback: the lines of aht's code it went through); the Mac app's, the trays' and the window's own errors (`APP …`: the message they give, keys masked, on one line, at most 1,000 characters, at most 20 lines a minute from each).  Every line is one line: a line break in what aht logs is written ` ⏎ ` (only an unexpected error's traceback takes the lines after it).  A notice that did not reach the phone names *the phone setting*, not its address, server, topic or number; no conversations and no file contents | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one: about 10 MB at most |
 | `aht-watcher.log` (macOS, Windows), `aht-watcher.err` and `aht-notices.err` (macOS) | the background watcher's and the notices check's own output and errors, which can name project folders; on Linux this goes to your user journal (`journalctl --user -u aht-watcher`) | not rotated; delete them any time |
 | `backups/` | see [Backups](#backups) | the newest 10 snapshots per project |
 | `search.db` | a search index: the text of messages (up to 4,000 characters each), what each tool call worked on (its command, file path, web address or search, up to 400 characters) and session titles, with keys masked whole before anything is cut (see [Security](#security)), plus agents, project paths and times | until you delete it; rebuilt when needed.  An index made by an earlier version is built anew once, keeping none of its old rows; a session whose history file is gone and that no backup holds then drops out |
@@ -327,6 +327,7 @@ encrypt it.
 | `night-shift.json` | the night shifts you planned: the project's path, the task, the machine, the times, and what happened (a cancelled one stays, marked so) | until you delete it; when you plan a new one, those that ended more than 30 days ago are dropped |
 | `run/` | short-lived state (see [below](#short-lived-state)) | overwritten as aht runs |
 | `aht-icons/` | Linux: the tray's two icons, written by the tray and by `tray.py --check` | rewritten each time the tray starts or is checked |
+| `reports/` | the problem reports you make (`aht report-problem`, or *Make a Problem Report…* in the apps): what [Files you choose to send](#5-files-you-choose-to-send) lists.  Readable only by your user account | the newest 5; a report you write elsewhere (`--out`) stays until you delete it |
 | `tools/agent-history-tether/` | macOS and Linux: aht's own program files (the core, the watcher, the installers, the guide and that system's helpers: the badge tool on macOS, the tray and aht's window on Linux) | until you delete it; on Linux `aht uninstall --purge` removes it |
 
 ### The registry
@@ -417,6 +418,8 @@ These files in `run/` are kept longer:
 | `window.json` | Windows and Linux: the process id and port of aht's window server, when it started, and the key a second `aht window` uses to reach it | removed when the server stops (on Linux also at logout); one left by a server that was ended at once is replaced by the next `aht window` |
 | `window-<id>.json` | Windows and Linux: the progress of a job started in aht's window (a handover, a take-back, Keep in sync, Bring Here, Send Back) | deleted when the job ends; one left behind is removed after 6 hours, when the window next starts |
 | `aht-setup-<version>-windows-<arch>.exe` | Windows, installed with aht's installer: the installer *Upgrade* downloaded | the latest only |
+| `warned.json` | for each warning aht logs at most once an hour (a cause that can come back with every file, process or poll), its name (such as `hook-settings`) and when it was last logged, so that every aht process of this computer keeps to the hour | names older than an hour are dropped at each new warning; at most 300 names |
+| `app-log.json` | for each of aht's apps (the Mac app, the tray, the window), the minute its error lines are counted in: when it began, how many were logged and held back, and a fingerprint (part of a SHA-256) of the last line and when it came, so the same line is not logged again within seconds | rewritten with each line an app logs |
 | `tray-check.json` | Linux: whether the tray can run here, with the tray's path and modification time, the Python that runs it, and when it was checked | rewritten when one of those changes; a "no" is checked again after a minute |
 
 ### Backups
@@ -744,6 +747,22 @@ you use.
   is open, its rank and up to three excerpts with who said them, masked
   there and again here, and when that index was last brought up to date.
   Nothing of it is kept here.
+- *Warnings and errors:* when you run `aht logs --everywhere` or `aht
+  report-problem --everywhere` (or choose that in the apps), aht asks each
+  machine for the warnings and errors in its own log (the `log-tail`
+  operation, which only reads it) of the last 24 hours, or the hours you
+  chose.  Each machine sends at most 300 lines, each with its time and
+  whether it is a warning or an error, masked there and again here: keys
+  and passwords as under [Security](#security), network addresses, e-mail
+  addresses and user@host pairs, its user and host names, and its home
+  folder written as `~` (also when a machine set up there has its home at
+  the same path); the addresses and user names of the machines set up
+  there are replaced by the names they have in aht, and its phone setting
+  for notices (the number or address, the ntfy server and topic) by
+  `[phone]`.  The same warning many times is sent as one line with its
+  count.  This computer
+  answers the same way when one of your machines asks.  Nothing of it is
+  kept here, unless you write it into a problem report.
 - *Pick Up and Leave a Note* (`aht pickup`, `aht leave-note`), when you
   open either for a project:
   - *Sent, so that machine can find its copy:* the project's id, its git
@@ -1042,6 +1061,23 @@ and the IPv6 ones in fd00::/8 and fe80::/10), your home folder's path and
 your user and computer names removed.  Paths outside your home folder (an
 external disk, `/opt/…`) stay, and masking is best effort, so the page
 says under its title to look it through before you share it.
+
+A problem report (`aht report-problem`, or *Make a Problem Report…* in
+the apps) is a file aht writes to `~/.aht/reports/` (or where you name)
+and never sends: you send it yourself, with a bug report, if you want to.
+It says at its top what it holds: aht's version, protocol, the id of its
+core and how it was installed; your system, its version and Python's; each agent's version (as
+`--version` says it); the settings you changed, with the phone number or
+ntfy address and topic for notices (also where a warning names them),
+values whose names say they are secret, and your
+other machines' addresses, home folders and user names hidden (a machine
+is named by the name you gave it in aht, this one *this machine*); how
+many projects aht tracks, are missing, handed over, kept in sync, declined
+or forgotten (no paths); whether the watcher, the Claude Code hook and
+backups run; and the warnings and errors of the last 24 hours (or the
+hours you chose), this computer's and with `--everywhere` your other
+machines', masked as above.  Masking is best effort, so read it before
+you send it.
 
 ### 6. Looking for new versions
 

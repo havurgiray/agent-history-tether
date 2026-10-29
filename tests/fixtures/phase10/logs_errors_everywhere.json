@@ -1,0 +1,59 @@
+{
+  "hours": 1.0,
+  "entries": [
+    {
+      "t": 1793224698.0,
+      "level": "warn",
+      "text": "BOX the copy into ~/code/shop failed for [user]@[host] (from [address]) with [GitHub token: ghp_\u2026d3]",
+      "machine": "box",
+      "here": false,
+      "at": "2026-10-28T22:58:18"
+    },
+    {
+      "t": 1793224798.0,
+      "level": "error",
+      "text": "UNCAUGHT Traceback (most recent call last):\n  File \"~\\aht.py\", line 7, in <module>\nOSError: [WinError 5] Access is denied: 'C:\\\\Users\\\\[user]\\\\code'",
+      "machine": "pc",
+      "here": false,
+      "at": "2026-10-28T22:59:58"
+    }
+  ],
+  "machines": [
+    {
+      "machine": "mac",
+      "here": true,
+      "reachable": true,
+      "lines": 4,
+      "error": null
+    },
+    {
+      "machine": "box",
+      "reachable": true,
+      "lines": 1,
+      "error": null,
+      "here": false
+    },
+    {
+      "machine": "gone",
+      "reachable": false,
+      "lines": 0,
+      "error": "cannot reach gone ([gone]): ssh: Could not resolve hostname [gone]: nodename nor servname provided, or not known",
+      "here": false
+    },
+    {
+      "machine": "old",
+      "reachable": false,
+      "lines": 0,
+      "error": "the aht there is older and cannot send its log: update aht on old (aht 0.13.0 or newer can)",
+      "here": false
+    },
+    {
+      "machine": "pc",
+      "reachable": true,
+      "lines": 3,
+      "error": null,
+      "here": false
+    }
+  ],
+  "_rc": 0
+}

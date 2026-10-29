@@ -2825,8 +2825,8 @@ and act only with `--apply`; `install`, `uninstall`, `config`, `roots`,
   runs, such as `perm.json` with the levels it started sessions in),
   `remote/` (what another machine sent here: copies, sessions, and
   `copies.json`), `offsite/` (backups other computers keep here),
-  `arrivals/` (a PC's *Continue here*) and `tools/` (the installed copy
-  of aht).
+  `arrivals/` (a PC's *Continue here*), `reports/` (problem reports, the
+  newest 5) and `tools/` (the installed copy of aht).
 - Inside each project, `.aht/.project-id` is the folder's identity; it
   travels with the folder when you move or copy it. `.aht/handover/` and
   `.aht/journal/` hold summaries and journals; git ignores both.
@@ -2838,14 +2838,60 @@ and act only with `--apply`; `install`, `uninstall`, `config`, `roots`,
 - A machine shows as not reachable: is it switched on, and is Tailscale
   connected here? When only its name stops working, aht reaches it at its
   Tailscale address by itself.
-- The log: **Settings → Open Log**.
+- The log: **Settings → Open Log**. Each computer keeps its own,
+  `~/.aht/aht.log`. aht writes a warning there whenever something did not
+  work and it went on anyway (a badge not updated, a backup's time stamp
+  not written, a notice that could not be shown), with what it was doing
+  and the error. What can happen again and again (a file read every few
+  seconds) is logged at most once an hour. An error aht did not expect is
+  there with its traceback, as `UNCAUGHT`. The Mac app, the trays (Windows
+  and Linux) and the window put their own errors there too, as `APP
+  mac-app`, `APP tray` and `APP window` (at most 20 lines a minute from
+  each, keys masked, one line each).
 
 **In the terminal:**
 
 - `aht doctor` — check every part of aht and say what is wrong.
 - `aht install` — set aht up again (watcher, Claude hook, command).
 - `aht logs --errors` — show the recent warnings and errors.
+- `aht logs --errors --everywhere` — the warnings and errors of the last
+  24 hours on this computer and on every other machine you set up, by
+  time, each line with its machine's name. The other machines are asked
+  for theirs read only, and send them masked: no keys, network
+  addresses, user or host names, and their home folder as `~`. The same
+  warning many times is one line with its count, *(×300 since 10:00)*. A
+  machine that does not answer is named, with why; one with an older aht
+  says to update it. `--hours 4` looks back 4 hours instead; `--json` for scripts.
 - `aht logs -n 200` — the last 200 lines of the log; `--watcher` adds the
   watcher's own log.
 - `aht guide` — this guide, in the terminal; `--path` says where its file
   is.
+
+### Reporting a problem
+
+When something does not work as it should, make a problem report and send
+it with your bug report:
+
+- `aht report-problem` writes one text file, `~/.aht/reports/problem-<time>.txt`,
+  and says where. Add `--everywhere` to have your other machines' warnings
+  and errors in it too.
+- It starts by saying what it holds: aht's version, your system and
+  Python, each agent's version, the settings you changed, how many
+  projects aht tracks, and the warnings and errors of the last 24 hours
+  (`--hours 72` for more).
+- It keeps out what is yours: keys, tokens and passwords are masked; the
+  phone setting for notices (the number or address, the ntfy server and
+  topic: `[phone]` where a warning names them), your other machines'
+  addresses and user names are hidden (a machine is called by the name you gave it in
+  aht, this one *this machine*); network addresses, your user and host
+  name are masked, your home folder reads `~`; of your projects only the
+  number. Read it through before you send it all the same.
+- Nothing is sent anywhere: aht only writes the file. The newest 5 reports
+  stay in `~/.aht/reports/`; `--out ~/Desktop/report.txt` writes one
+  where you like (a folder: a report inside it; a name that ends in
+  `.json`: JSON). `--json` writes JSON when `--out` names no file, and
+  says where it went as JSON.
+
+What to send with a bug report: what you did, what you expected, what
+happened instead, and the report (with `--everywhere` when another machine
+was involved).

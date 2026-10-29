@@ -232,3 +232,16 @@ details.eol ul.files li { overflow-wrap: anywhere; }
 .in-window .hint { font-style: italic; }
 /* Peek: the agent's window there, its last lines */
 pre.peek { max-height: 60vh; white-space: pre; }
+/* Recent problems: the warnings and errors of every machine, newest first */
+.nowrap { white-space: nowrap; }
+.badge.bad { color: var(--bad); }
+.badge.warning { color: var(--warn); }
+.problem-list { max-height: 58vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+table.list.problems td { vertical-align: top; }
+table.list.problems td.nowrap, table.list.problems td.lvl { width: 1%; }
+table.list.problems td.what { overflow-wrap: anywhere; }
+table.list.problems details.trace > summary { cursor: pointer; }
+table.list.problems details.trace pre { margin: 4px 0 0; max-height: 220px; white-space: pre; }
+/* the problem report: what it holds, where it is */
+ul.holds { margin: 2px 0 8px; padding-left: 20px; }
+.report-facts { margin: 6px 0 10px; }

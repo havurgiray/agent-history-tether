@@ -548,6 +548,10 @@ def _warn_due(key: str, now: float) -> bool:
                 fcntl.flock(lk, fcntl.LOCK_EX)
             except OSError:
                 pass            # a disk without locks: two processes may each log it once
+            # the time once the lock is held: one read before waiting for it
+            # can be older than what the process ahead just wrote, which
+            # would then look ahead of the clock, and the line come twice
+            now = time.time()
             try:
                 st = json.loads(p.read_text())
                 st = st if isinstance(st, dict) else {}

@@ -301,6 +301,19 @@ def phase10_suite():
     D("status", "--json")
     ck(mark().count(hook_line) - n0 == 2, "…an hour later it is logged once more")
     (hm / ".claude" / "settings.json").unlink()
+    # a process that read the clock before it waited for the lock: what the
+    # one ahead of it wrote meanwhile still counts, not as ahead of the clock
+    try:
+        held = json.loads(wf.read_text())
+    except (OSError, ValueError):
+        held = {}
+    wf.write_text(json.dumps(dict(held, **{"slow-key": time.time() - 1})))
+    probe = ("import sys, json, time; sys.path.insert(0, sys.argv[1]); import aht\n"
+             "print(json.dumps(aht._warn_due('slow-key', time.time() - 5)))\n")
+    r = subprocess.run([PY, "-c", probe, str(HERE.parent)], env=de, capture_output=True, text=True)
+    ck(r.stdout.strip() == "false",
+       f"warn_once: a process that waited for the lock does not log it again "
+       f"({r.stdout.strip()} {r.stderr.strip()[-200:]})")
 
     # a flood of one warning after an error: the error stays, the flood is one line
     plant(ml, 3000, "ERROR", "BACKUP failed for shop: OSError: [Errno 28] No space left on device")

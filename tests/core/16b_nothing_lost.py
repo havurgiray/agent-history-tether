@@ -34,8 +34,9 @@ ck(".git/refs/heads" in m["dirs"] and "bin/run.sh" in m["files"]
 # set-asides: the newest 5, and everything younger than 30 days (faked times)
 def aside_names(base):
     return sorted(p.name for p in base.iterdir())
+NOW = time.time()      # one reading: the names made and the names expected agree
 def stamp(days):
-    return time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - days * 86400))
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(NOW - days * 86400))
 sa = sb / "aside-a"
 for days in (31, 32, 33, 34, 35, 36, 37, 1, 2):
     (sa / stamp(days) / "project").mkdir(parents=True)

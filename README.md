@@ -151,19 +151,26 @@ everything else aht kept.
 
 ## Supported agents
 
-**History that follows the folder** (the watcher, the hook, backups and
-badges):
+**Relink** is what aht does to an agent's history when its folder moves
+(the watcher, the hook, backups and badges).  **Across agents** is
+search, the session board, Switch Agent and Hand Back, another agent on
+another machine, and Pick Up.
 
-| backend | agent CLI | storage model | relink | confidence |
-|---|---|---|---|---|
-| `claude` | Claude Code | `~/.claude/projects/<encoded-path>` | rename dir | **verified** (+ SessionStart hook backstop) |
-| `gemini` | Gemini CLI | `~/.gemini/tmp/<sha256(path)>` | rename dir | high |
-| `cursor` | Cursor Agent CLI | `~/.cursor/chats/<hash(path)>` | rename dir | best-effort |
-| `opencode` | OpenCode | `$XDG_DATA_HOME/opencode/project/<enc>` | rename dir | best-effort |
-| `codex` | OpenAI Codex CLI | `~/.codex/sessions/**/*.jsonl` (cwd inside) | rewrite cwd, **backup-first** | high (layout confirmed on a real install) |
-| `copilot` | GitHub Copilot CLI | `~/.copilot/history-session-state/**` | rewrite cwd, **backup-first** | best-effort |
-| `kimi-code` | Kimi Code 2.x | `~/.kimi-code/sessions/wd_<slug>_<sha256[:12]>` (+ prompt-history and file-history companions, the workspace catalog) | rename bucket + companions, re-point `cwd`, **backup-first** | **verified** (key function ported from the CLI's own source) |
-| `kimi` | Kimi CLI 1.x | `~/.kimi/sessions/<md5(path)>` (+ `user-history/<md5>.jsonl`) | rename dir + companion | **verified** (for machines the 2.x migration has not reached) |
+| backend | agent CLI | storage model | relink | confidence | across agents |
+|---|---|---|---|---|---|
+| `claude` | Claude Code | `~/.claude/projects/<encoded-path>` | rename dir | **verified** (+ SessionStart hook backstop) | ✓ |
+| `gemini` | Gemini CLI | `~/.gemini/tmp/<sha256(path)>` | rename dir | high | — |
+| `agy` | Antigravity CLI | `~/.gemini/antigravity-cli` (a SQLite file of conversations, a transcript each) | none: only read | high (layout confirmed on a real install) | ✓ |
+| `cursor` | Cursor Agent CLI | `~/.cursor/chats/<hash(path)>` | rename dir | best-effort | — |
+| `opencode` | OpenCode | `$XDG_DATA_HOME/opencode/project/<enc>` | rename dir | best-effort | — |
+| `codex` | OpenAI Codex CLI | `~/.codex/sessions/**/*.jsonl` (cwd inside) | rewrite cwd, **backup-first** | high (layout confirmed on a real install) | ✓ |
+| `copilot` | GitHub Copilot CLI | `~/.copilot/history-session-state/**` | rewrite cwd, **backup-first** | best-effort | — |
+| `kimi-code` | Kimi Code 2.x | `~/.kimi-code/sessions/wd_<slug>_<sha256[:12]>` (+ prompt-history and file-history companions, the workspace catalog) | rename bucket + companions, re-point `cwd`, **backup-first** | **verified** (key function ported from the CLI's own source) | ✓ |
+| `kimi` | Kimi CLI 1.x | `~/.kimi/sessions/<md5(path)>` (+ `user-history/<md5>.jsonl`) | rename dir + companion | **verified** (for machines the 2.x migration has not reached) | — |
+| `vibe` | Mistral Vibe | `$VIBE_HOME`, else `~/.vibe` (`logs/session/unified/<id>`) | none: only read | high (layout confirmed on a real install) | ✓ |
+
+Gemini CLI (`gemini`) and Antigravity (`agy`) are two different Google
+programs, though both keep their data under `~/.gemini`.
 
 **Why "best-effort" is still safe:** dir-rename backends are
 *self-verifying*: aht acts only when `key(old_path)` names a directory
@@ -171,15 +178,14 @@ that exists, which proves the key formula matches that tool; otherwise it
 does nothing.  Metadata-rewrite backends copy every file they touch into
 the backup store first.  `kimi` and `kimi-code` both count as *Kimi*;
 Kimi Code's transcripts are never edited, and its workspace trust is not
-carried to the new place (Kimi asks again).  Turn a backend off with
+carried to the new place (Kimi asks again).  Turn relinking off for an
+agent by listing only the ones to keep, from the eight that relink:
 `aht config --set backends=claude,gemini,…`.
 
-**Work across agents** (search, the session board, Switch Agent and Hand
-Back, another agent on another machine, Pick Up): Claude Code, Codex,
-Kimi Code, Antigravity (`agy`) and Mistral Vibe.  aht reads their
-sessions to search them and to write summaries.  Antigravity's and
-Mistral Vibe's own stores are only read: when a folder moves, aht does
-not relink them as it does the stores above.
+For the five agents marked under **across agents**, aht reads their
+sessions to search them and to write summaries.  It never changes
+Antigravity's or Mistral Vibe's stores, so their histories do not follow
+a moved folder.
 
 ## How it works
 

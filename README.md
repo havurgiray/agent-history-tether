@@ -177,7 +177,9 @@ carried to the new place (Kimi asks again).  Turn a backend off with
 **Work across agents** (search, the session board, Switch Agent and Hand
 Back, another agent on another machine, Pick Up): Claude Code, Codex,
 Kimi Code, Antigravity (`agy`) and Mistral Vibe.  aht reads their
-sessions to search them and to write summaries.
+sessions to search them and to write summaries.  Antigravity's and
+Mistral Vibe's own stores are only read: when a folder moves, aht does
+not relink them as it does the stores above.
 
 ## How it works
 

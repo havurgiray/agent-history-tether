@@ -1,10 +1,12 @@
 # aht guide
 
 aht keeps the history of your AI coding agents connected to your project
-folders: Claude Code, Kimi Code, Codex, Gemini CLI, Cursor, OpenCode and
-Copilot. Once it does that, it can search those histories, continue a
-project in another agent, or hand a project over to another machine of
-yours.
+folders when a folder moves: Claude Code, Kimi Code, Codex, Gemini CLI,
+Cursor, OpenCode and Copilot. With five agents (Claude Code, Codex, Kimi
+Code, Antigravity (`agy`) and Mistral Vibe) it also searches their
+sessions and continues a project in another agent; Antigravity's and
+Vibe's own stores are only read, never relinked. And it hands a project
+over to another machine of yours.
 
 This guide shows aht on macOS, with its window. On Windows and Linux the
 window opens from the tray (**Open aht…**) or with `aht window`: the same

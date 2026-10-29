@@ -20,6 +20,8 @@ let AGENT_COLORS: [String: (CGFloat, CGFloat, CGFloat)] = [
     "codex":    ( 16/255.0, 163/255.0, 127/255.0),
     "copilot":  (110/255.0,  64/255.0, 201/255.0),
     "kimi":     (124/255.0,  58/255.0, 237/255.0),
+    "agy":      (219/255.0,  39/255.0, 119/255.0),
+    "vibe":     (202/255.0, 138/255.0,   4/255.0),
     // handed over to another machine: shown instead of the agents' marks
     "away":     ( 37/255.0,  99/255.0, 235/255.0),
 ]
@@ -49,6 +51,8 @@ func glyphFor(_ agent: String) -> String {
     case "codex": return "ring"
     case "copilot": return "bar"
     case "kimi": return "crescent"
+    case "agy": return "chevron"
+    case "vibe": return "wave"
     case "claude": return "asterisk"
     case "away": return "arrow"
     default: return "infinity"          // the neutral mark
@@ -126,6 +130,23 @@ func drawDisc(_ ctx: CGContext, cx: CGFloat, cy: CGFloat, d: CGFloat,
         ctx.setFillColor(color)
         ctx.fillEllipse(in: CGRect(x: cx - d * 0.24 + d * 0.14, y: cy - d * 0.24 + d * 0.08,
                                    width: d * 0.44, height: d * 0.44))
+    case "chevron":                     // points up
+        ctx.setLineWidth(d * 0.13)
+        ctx.setLineJoin(.round)
+        ctx.move(to: CGPoint(x: cx - d * 0.21, y: cy - d * 0.10))
+        ctx.addLine(to: CGPoint(x: cx, y: cy + d * 0.12))
+        ctx.addLine(to: CGPoint(x: cx + d * 0.21, y: cy - d * 0.10))
+        ctx.strokePath()
+    case "wave":                        // one period of a sine: a crest, then a trough
+        ctx.setLineWidth(d * 0.13)
+        ctx.setLineJoin(.round)
+        for i in 0...32 {
+            let t = Double(i) / 32
+            let p = CGPoint(x: cx + d * CGFloat(-0.24 + 0.48 * t),
+                            y: cy + d * CGFloat(0.09 * sin(2 * Double.pi * t)))
+            if i == 0 { ctx.move(to: p) } else { ctx.addLine(to: p) }
+        }
+        ctx.strokePath()
     default:
         break
     }

@@ -54,7 +54,7 @@ def make_sandbox():
     roots = sb / "roots"
     tools = sb / "tools"
     for d in ("claude", "gemini", "cursor", "opencode", "codex", "copilot",
-              "kimi/sessions", "kimi/user-history", "kimi-code/sessions", "vibe"):
+              "kimi/sessions", "kimi/user-history", "kimi-code/sessions", "vibe", "agy"):
         (tools / d).mkdir(parents=True)
     (roots / "projA").mkdir(parents=True)
     env = dict(os.environ)
@@ -70,6 +70,7 @@ def make_sandbox():
         "AHT_ROOT_KIMI": str(tools / "kimi" / "sessions"),
         "AHT_ROOT_KIMI_CODE": str(tools / "kimi-code" / "sessions"),
         "AHT_ROOT_VIBE": str(tools / "vibe"),       # never $VIBE_HOME, never ~/.vibe
+        "AHT_ROOT_AGY": str(tools / "agy"),         # never ~/.gemini/antigravity-cli
         "AHT_NO_ICONS": "1", "AHT_NO_NOTIFY": "1", "AHT_NO_BACKUP": "1",
         "AHT_NO_CHECKPOINT": "1",       # the checkpoint test turns it back on
     })
@@ -901,6 +902,9 @@ snippet = (
     "  'none': aht.desired_marks('x', False),\n"
     "  'disc': len(aht.badge_disc_rgba(24, 'codex')),\n"
     "  'count_disc': len(aht.badge_disc_rgba(24, 5)),\n"
+    "  'read_art': [aht.badge_disc_rgba(24, n) != aht.badge_disc_rgba(24, 'aht')"
+    " for n in aht.READ_AGENTS],\n"
+    "  'art': {n: [list(c), g] for n, (c, g) in aht.AGENT_BADGES.items()},\n"
     "  'agents': aht.agents_of({'codex': '@sessions', 'claude': 'd',"
     " 'kimi': 'x'}),\n"
     "}))\n" % str(HERE.parent))
@@ -916,6 +920,19 @@ ck(d["disc"] == 24 * 24 * 4 and d["count_disc"] == 24 * 24 * 4,
    "shared disc rasteriser produces agent and count art")
 ck(d["agents"] == ["claude", "codex", "kimi"],
    "agents_of orders names stably (feeds the relink prompt)")
+ck(d["read_art"] == [True, True],
+   "Antigravity and Mistral Vibe have discs of their own, not the neutral one")
+# the Mac's badge tool draws the same colours and symbols as the core
+import re as _re
+swift = (HERE.parent / "badge_icon.swift").read_text()
+mac = {n: [[round(float(v)) for v in c], None] for n, *c in _re.findall(
+    r'"(\w+)":\s*\(\s*([\d.]+)/255\.0,\s*([\d.]+)/255\.0,\s*([\d.]+)/255\.0\)', swift)}
+for n, g in _re.findall(r'case "(\w+)": return "(\w+)"', swift):
+    mac.setdefault(n, [None, None])[1] = g
+core_art = {n: v for n, v in d["art"].items() if n != "aht"}
+ck(all(mac.get(n) == v for n, v in core_art.items()),
+   f"badge_icon.swift draws every agent as the core does "
+   f"({[n for n, v in core_art.items() if mac.get(n) != v]})")
 # Linux: the git "+" is aht's own emblem, made with the agents' (the theme's
 # link emblem made every git folder look like a link), unless the config
 # names another
@@ -1222,6 +1239,32 @@ shutil.rmtree(tools / "claude" / enc(late))
 r = run("icons", "--refresh")
 ck(sorted(stores_of(late)) == ["codex", "kimi-code"],
    "icons --refresh drops a store that no longer exists")
+# Antigravity and Mistral Vibe are only read: their sessions in the folder
+# show on its badge, and their stores never enter the store map
+import fake_agy, fake_vibe
+aroot = Path(env["AHT_ROOT_AGY"])
+fake_agy.close_cleanly(fake_agy.build(aroot, late, "LATE-AGY"), aroot)
+fake_vibe.build(env["AHT_ROOT_VIBE"], late, str(roots / "elsewhere"), "LATE-VIBE")
+def late_entry():
+    reg = json.loads((sb / ".aht" / "registry.json").read_text())
+    return next(e for e in reg["projects"].values() if e["real_path"] == late)
+r = run("reconcile", "--apply")
+le = late_entry()
+r = subprocess.run([PY, "-c", marks_probe, str(HERE.parent), late], env=env,
+                   capture_output=True, text=True)
+ck(le.get("read_agents") == ["agy", "vibe"] and sorted(le.get("stores") or {}) == ["codex", "kimi-code"]
+   and "'agent:kimi', 'agent:agy', 'agent:vibe']" in r.stdout,
+   f"Antigravity's and Vibe's sessions show on the badge, after the relinked agents, "
+   f"and stay out of the store map ({le.get('read_agents')}, {r.stdout.strip()})")
+shutil.rmtree(aroot)
+aroot.mkdir()
+r = run("icons", "--refresh")
+ck(late_entry().get("read_agents") == ["vibe"],
+   f"icons --refresh drops an agent only read whose sessions are gone ({late_entry().get('read_agents')})")
+shutil.rmtree(Path(env["AHT_ROOT_VIBE"]))
+Path(env["AHT_ROOT_VIBE"]).mkdir()
+r = run("icons", "--refresh")
+ck("read_agents" not in late_entry(), "and drops the field when none is left")
 r = run("logs", "-n", "400")
 ck("STORES " in r.stdout, "agent-list changes are logged")
 

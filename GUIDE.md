@@ -641,7 +641,8 @@ A folder that aht tracks shows small discs on its icon, one per agent that
 has history there.
 
 - Claude ✳ coral · Kimi ☾ violet · Codex ○ teal · Gemini ◆ blue ·
-  Cursor ▲ black · OpenCode ■ orange · Copilot ▬ purple
+  Antigravity ⌃ magenta · Cursor ▲ black · OpenCode ■ orange ·
+  Copilot ▬ purple · Mistral Vibe ∿ amber
 - Four agents or more: one disc with the number.
 - Grey ∞: tracked, but no agent has history there yet.
 - Blue →: the project is handed over to another machine right now.

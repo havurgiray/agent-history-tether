@@ -1078,6 +1078,27 @@ def agents_of(stores: dict) -> list:
             out.append(BY_NAME[n].agent)
     return out
 
+READ_AGENTS = ("agy", "vibe")   # agents aht only reads: badged, never relinked
+
+def read_agents_of(entry: dict) -> list:
+    """The agents aht only reads (Antigravity, Mistral Vibe) that a project
+    has sessions with, as the last store sweep found them: for the badges."""
+    got = (entry or {}).get("read_agents") or []
+    return [a for a in READ_AGENTS if a in got]
+
+def read_agent_cwds() -> dict:
+    """Agent -> the folders its sessions ran in, for the agents aht only
+    reads: one read of each store per sweep.  An agent whose store could not
+    be read is left out, so its recorded folders stay as they were."""
+    out = {}
+    for name, sessions in (("agy", agy_conversations), ("vibe", vibe_sessions)):
+        try:
+            out[name] = {os.path.realpath(s["project"]) for s in sessions()
+                         if isinstance(s.get("project"), str) and _is_abs(s["project"])}
+        except Exception as e:
+            warn_once("read-agent-" + name, f"READ {name}: {_errmsg(e)}")
+    return out
+
 def claude_backend() -> DirBackend:
     return BY_NAME["claude"]
 
@@ -1138,10 +1159,11 @@ def refresh_stores(reg: dict, only_paths=None, include_files: bool = False) -> l
     a folder long after it was registered).  Returns the folders whose AGENT
     list changed — the ones whose badge is now wrong.  Caller holds the lock
     and saves the registry when the result (or reg['_dirty']) says so."""
-    cwds = None
+    cwds = reads = None
     if include_files:
         cwds = {b.name: b.collect_cwds() for b in enabled_backends()
                 if b.kind == "files" and b.available()}
+        reads = read_agent_cwds()
     want = {os.path.realpath(p) for p in only_paths} if only_paths else None
     rebadge = []
     for entry in reg.get("projects", {}).values():
@@ -1150,13 +1172,24 @@ def refresh_stores(reg: dict, only_paths=None, include_files: bool = False) -> l
             continue
         old = entry.get("stores") or {}
         new = current_stores(entry, real, cwds)
+        old_r = read_agents_of(entry)
+        new_r = old_r if reads is None else [
+            a for a in READ_AGENTS
+            if (any(c == real or c.startswith(real + os.sep) for c in reads[a])
+                if a in reads else a in old_r)]
         if new != old:
             entry["stores"] = new
             reg["_dirty"] = True
-            if agents_of(new) != agents_of(old):
-                rebadge.append(real)
-                log(f"STORES {real}: {agents_of(old) or 'none'} -> "
-                    f"{agents_of(new) or 'none'}")
+        if new_r != old_r:
+            if new_r:
+                entry["read_agents"] = new_r
+            else:
+                entry.pop("read_agents", None)
+            reg["_dirty"] = True
+        if agents_of(new) != agents_of(old) or new_r != old_r:
+            rebadge.append(real)
+            log(f"STORES {real}: {agents_of(old) + old_r or 'none'} -> "
+                f"{agents_of(new) + new_r or 'none'}")
     return rebadge
 
 # --------------------------------------------------------------------------- #
@@ -1598,7 +1631,8 @@ def desired_marks(path, tethered) -> list:
     per-backend stores up in the registry) or the stores dict itself.
 
     Agent marks are PER BACKEND — 'agent:claude', 'agent:codex', … in stable
-    BACKENDS order — so the renderers can show one symbol, 2–3 smaller ones
+    BACKENDS order, then the agents aht only reads ('agent:agy',
+    'agent:vibe') — so the renderers can show one symbol, 2–3 smaller ones
     side by side, or a count disc for 4+.  The git '+' is independent."""
     marks = []
     if is_git(path) and cfg_get("icons_git", True):
@@ -1606,7 +1640,7 @@ def desired_marks(path, tethered) -> list:
     if tethered and cfg_get("icons_agent", True):
         entry = _entry_for_path(path)
         stores = tethered if isinstance(tethered, dict) else entry.get("stores") or {}
-        agents = agents_of(stores)
+        agents = agents_of(stores) + read_agents_of(entry)
         if entry.get("away"):
             marks.append("agent:away")    # the live copy is on another machine
         elif agents:
@@ -1628,6 +1662,8 @@ AGENT_BADGES = {
     "codex":    ((16, 163, 127),  "ring"),
     "copilot":  ((110, 64, 201),  "bar"),
     "kimi":     ((124, 58, 237),  "crescent"),
+    "agy":      ((219, 39, 119),  "chevron"),
+    "vibe":     ((202, 138, 4),   "wave"),
     # tethered, but no agent has history here yet — deliberately unlike any
     # agent's mark, so a missing agent can never pass for a present one
     "aht":      ((124, 132, 142), "infinity"),
@@ -1656,6 +1692,12 @@ _DIGITS = {
 def _c01(v):
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
+def _seg_dist(px, py, ax, ay, bx, by) -> float:
+    """Distance from (px, py) to the segment from a to b."""
+    vx, vy = bx - ax, by - ay
+    t = _c01(((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy))
+    return ((px - ax - t * vx) ** 2 + (py - ay - t * vy) ** 2) ** 0.5
+
 def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
     """d×d straight-alpha RGBA: a white-ringed disc for one agent (name), a
     slate count disc with the number drawn in (int, for 4+ agents), or the
@@ -1673,6 +1715,10 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
     r_in = d * 0.42                 # colored disc
     import math
     loop = _infinity_cov(d, 0.27, 0.06) if glyph == "infinity" else None
+    wave = None
+    if glyph == "wave":                 # one period of a sine: a crest, then a trough
+        wave = [(d * (-0.24 + 0.03 * i), -d * 0.09 * math.sin(math.pi * i / 8))
+                for i in range(17)]
     for y in range(d):
         for x in range(d):
             dx, dy = x - c, y - c
@@ -1718,6 +1764,13 @@ def badge_disc_rgba(d: int, agent_or_count) -> bytearray:
                         g = _c01(d * 0.065 - abs(dy) + 0.5)
                     if d * 0.02 <= dx <= d * 0.28:      # head
                         g = max(g, _c01((d * 0.28 - dx) * 0.85 - abs(dy) + 0.5))
+                elif glyph == "chevron":                # points up
+                    for ex in (-1.0, 1.0):
+                        g = max(g, _c01(d * 0.065 - _seg_dist(
+                            dx, dy, 0.0, -d * 0.12, ex * d * 0.21, d * 0.10) + 0.5))
+                elif wave is not None:
+                    g = _c01(d * 0.065 - min(_seg_dist(dx, dy, *wave[i], *wave[i + 1])
+                                             for i in range(16)) + 0.5)
                 elif loop is not None:
                     g = loop[y * d + x]
                 elif glyph in _DIGITS:
@@ -1824,7 +1877,7 @@ def app_icon_png(d: int) -> bytes:
     return _png_bytes(d, infinity_rgba(d, (255, 255, 255), bg=APP_ICON_RGB,
                                        span=0.34, thickness=0.058))
 
-EMBLEM_VERSION = 4
+EMBLEM_VERSION = 5                  # 5: Antigravity's and Mistral Vibe's discs
 
 def _ensure_linux_emblems() -> bool:
     """Generate the per-agent, count and git "+" emblems into the user icon

@@ -31,7 +31,9 @@ run_case() {
     for b in GEMINI CURSOR OPENCODE CODEX COPILOT KIMI KIMI_CODE; do
         export "AHT_ROOT_$b=$WT\\tools\\nope"
     done
-    export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1 AHT_ASSUME=Relink
+    # no search index: its background update would hold search.db open, and
+    # Windows will not remove an open file when the next case starts over
+    export AHT_NO_NOTIFY=1 AHT_NO_ICONS=1 AHT_NO_BACKUP=1 AHT_NO_SEARCH_INDEX=1 AHT_ASSUME=Relink
 
     ENCA=$(W encode "$WT\\roots\\projA")
     mkdir -p "$T/tools/claude/$ENCA"

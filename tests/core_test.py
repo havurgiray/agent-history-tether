@@ -8,6 +8,11 @@ env overrides, so the suite never touches real agent data and runs on any OS:
   hook backstop -> conflict refusal -> backup/restore -> adoption.
 """
 import hashlib, json, os, shutil, subprocess, sys, tempfile
+
+# a Windows console or pipe in cp1252 cannot print every character a check
+# names (an NFD name, ✓, →): print them escaped there rather than stop
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="backslashreplace")
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -225,9 +230,9 @@ def transport_suite():
            f"{', the link' if links else ''}; nothing left in .aht-partial ({r})")
 
         # a dry run counts and sends nothing
-        (here / "a.txt").write_text("a2, longer\n")
+        (here / "a.txt").write_bytes(b"a2, longer\n")    # bytes: no CRLF on Windows
         r = rem.send(str(here), str(far), delete=True, dry=True)
-        ck(r["ok"] and r["files"] == 1 and r["bytes"] == len("a2, longer\n")
+        ck(r["ok"] and r["files"] == 1 and r["bytes"] == len(b"a2, longer\n")
            and (far / "a.txt").read_text() == "a1\n",
            f"send, dry run: what would go, counted as rsync counts it ({r})")
 

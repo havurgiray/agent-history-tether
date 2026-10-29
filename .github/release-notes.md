@@ -9,7 +9,7 @@
 | `aht-<version>-windows-arm64.zip` | the same for Windows 11 on ARM |
 | `SHA256SUMS.txt` | checksums of the above |
 
-Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget install havurgiray.aht` (Windows, the installer above), `scoop install aht` (Windows, after adding the `havurgiray/scoop-bucket` bucket). Linux installs from the checkout (`linux/install.sh`).
+Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget install havurgiray.aht` (Windows, the zip above, then `aht install`), `scoop install aht` (Windows, after adding the `havurgiray/scoop-bucket` bucket). Linux installs from the checkout (`linux/install.sh`).
 
 ### In short
 

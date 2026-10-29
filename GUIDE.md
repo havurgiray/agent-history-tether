@@ -237,7 +237,9 @@ welcome window and Getting started.
   in*. An upgrade (the installer, **Upgrade**, Scoop, winget or `aht
   install`) keeps what you set. Start menu → **aht** opens the window
   again. Settings → Apps → **aht** → *Uninstall* removes it and leaves
-  your history as it is.
+  your history as it is. `winget install havurgiray.aht` installs the
+  zip instead, with `aht` on your PATH: run `aht install` after it, and
+  `aht uninstall` before `winget uninstall havurgiray.aht`.
 - **Installing on Linux:** from a checkout, `cd linux && ./install.sh`
   (the `install.py` at the top of the checkout is the Mac's); the tray is
   `python3 linux/tray.py`.
@@ -520,11 +522,12 @@ itself. Since that means asking GitHub, it is off until you say yes: in the
   and why.
 - **Upgrade** goes the way you installed aht: Homebrew on a Mac (`brew
   upgrade --cask aht`), Scoop on Windows (`scoop update aht`, then `aht
-  install --here`), each in a terminal window. With aht's Windows
-  installer (or winget, which runs it), Upgrade downloads the new
-  installer from GitHub, checks it against the release's checksums and
-  runs it; aht starts again when it is done, and its window opens again
-  if it was open. A copy downloaded from the releases page opens that page
+  install --here`) or winget (`winget upgrade --id havurgiray.aht`, then
+  `aht install`), each in a terminal window. With aht's Windows
+  installer, Upgrade downloads the new installer from GitHub, checks it
+  against the release's checksums and runs it; aht starts again when it
+  is done, and its window opens again if it was open. A copy downloaded
+  from the releases page opens that page
   instead (**Open the Download Page**). On Linux, which installs from a
   checkout, the button opens the release page too, and the update says
   what to do: `git pull` in your copy of aht, then `linux/install.sh`

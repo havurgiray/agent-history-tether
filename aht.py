@@ -20788,8 +20788,8 @@ def _version_tuple(v) -> tuple:
 
 def install_kind() -> str:
     """How this aht was installed, which says how to upgrade it: "brew",
-    "scoop", "winget", "installer" (aht's Windows installer, also what winget
-    runs now), "download" (a zip from the releases page) or "source" (a
+    "scoop", "winget" (winget installs the zip), "installer" (aht's Windows
+    installer), "download" (a zip from the releases page) or "source" (a
     checkout)."""
     if os.environ.get("AHT_INSTALL_KIND"):              # tests: a stand-in
         return os.environ["AHT_INSTALL_KIND"]

@@ -1087,9 +1087,8 @@ asks once each time you press *Check Now* or run `aht update --now` or
 `--upgrade`.  GitHub receives your computer's IP address, the time, and the text
 `aht/<version>` naming the version you run; aht sends nothing else and
 uses no account.  *Upgrade* then runs your package manager (Homebrew,
-Scoop, or winget for an install winget made from the zip), which
-downloads the new version from GitHub.  Installed with aht's Windows
-installer (as winget now installs it), *Upgrade* downloads the new
+Scoop or winget), which downloads the new version from GitHub.
+Installed with aht's Windows installer, *Upgrade* downloads the new
 installer and the release's checksum file from GitHub (`github.com`,
 which sees the same as above), checks the one against the other and runs
 the installer; only the latest download is kept in `~/.aht/run`.  A

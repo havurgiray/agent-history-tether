@@ -86,7 +86,7 @@ or a package manager:
 | platform | how |
 |---|---|
 | **macOS 13+** (Apple Silicon and Intel) | `brew install --cask havurgiray/tap/aht`, then `aht install`.  Or download `aht-<version>-macos-universal.zip`, drag `aht.app` to Applications, open it and choose *Quick Setup* in the welcome window.  The app is the menu bar tray and carries the core, the watcher and the badge tool prebuilt, so no compiler is needed. |
-| **Windows 11** (x64 and ARM64) | run `aht-setup-<version>-windows-<x64\|arm64>.exe`, or `winget install havurgiray.aht` (the same installer).  It installs for you only (no admin prompt), sets up the hook and the watcher (which starts at sign-in), offers to put `aht` on your PATH, asks once whether to show the tray at sign-in, and opens aht's window.  Or `scoop bucket add havurgiray https://github.com/havurgiray/scoop-bucket`, then `scoop install aht`; or the zip for your CPU, then `aht install`. |
+| **Windows 11** (x64 and ARM64) | run `aht-setup-<version>-windows-<x64\|arm64>.exe`.  It installs for you only (no admin prompt), sets up the hook and the watcher (which starts at sign-in), offers to put `aht` on your PATH, asks once whether to show the tray at sign-in, and opens aht's window.  Or `winget install havurgiray.aht` (the zip for your CPU, with `aht` on your PATH), then `aht install`; or `scoop bucket add havurgiray https://github.com/havurgiray/scoop-bucket`, then `scoop install aht`; or the zip for your CPU, then `aht install`. |
 | **Linux** | from a checkout: `cd linux && ./install.sh` (systemd user watcher, hook and `aht`).  The tray: `python3 linux/tray.py` (needs PyGObject and AppIndicator; GNOME also needs the AppIndicator shell extension). |
 
 **From source** (Python 3.9+): clone the repo, then `./install.sh` on
@@ -141,7 +141,7 @@ history:
 |---|---|
 | macOS | `aht uninstall` (or `./uninstall.sh` from a checkout), then drag `aht.app` to the Trash, or `brew uninstall --cask aht` |
 | Linux | `aht uninstall` (or `cd linux && ./uninstall.sh` from a checkout) |
-| Windows | Settings → Apps → aht → *Uninstall* (it runs `aht uninstall` first), or `winget uninstall havurgiray.aht`; Scoop: `aht uninstall`, then `scoop uninstall aht`; the zip: `aht uninstall`, then delete the exe folder yourself |
+| Windows | the installer: Settings → Apps → aht → *Uninstall* (it runs `aht uninstall` first); winget: `aht uninstall`, then `winget uninstall havurgiray.aht`; Scoop: `aht uninstall`, then `scoop uninstall aht`; the zip: `aht uninstall`, then delete the exe folder yourself |
 
 `--remove-icons` also clears the folder badges (on Linux also the emblem
 images aht drew); `--purge` also removes the `.aht/.project-id` markers

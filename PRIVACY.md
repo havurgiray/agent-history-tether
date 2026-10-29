@@ -1,6 +1,6 @@
 # Privacy policy
 
-**agent-history-tether (aht)** · effective 2026-10-28
+**agent-history-tether (aht)** · effective 2026-10-29
 
 This policy applies to every version of aht on macOS, Windows and Linux,
 however it was installed: from source, from the release downloads, or
@@ -62,6 +62,12 @@ what it finds) reads each history file whole, as it is on disk: for
 Codex and Antigravity that includes the parts the table says aht does not
 use.  You can switch agents off (`backends`) or point aht at other
 folders (`backend_roots`).
+
+For the folder badges, aht also looks at which folders Antigravity's
+conversations and Mistral Vibe's sessions ran in (from the files the
+table names), when it checks your folders for changes, at most every ten
+minutes, and with `aht icons --refresh`.  It keeps only which of the two
+have sessions in each project it tracks.
 
 ### Also
 
@@ -335,7 +341,8 @@ encrypt it.
 `registry.json` holds, for each project aht tracks:
 
 - an id, the folder's path, where each agent keeps that project's
-  history, and when it was last updated;
+  history, whether Antigravity or Mistral Vibe has sessions there (for
+  the badges), and when it was last updated;
 - for a project on another machine or on its way there: which machine
   (its name in aht, its host name, its system and aht's random id there),
   the folder's path there, whether this computer handed it over or that

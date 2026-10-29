@@ -22794,6 +22794,9 @@ def list_checkpoints(project: str) -> list:
         except Exception:
             continue
         out.append(dict(meta, id=d.name, path=str(d / "files")))
+    # newest first by when each was taken: two in the same second have the
+    # same stamp, and their names then sort by who took them
+    out.sort(key=lambda c: (c.get("at") or 0, c["id"]), reverse=True)
     if out:
         sess = {s["id"]: s for s in list_sessions(real)}
         for c in out:

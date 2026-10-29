@@ -144,6 +144,17 @@ run("config", "--unset", "checkpoint_excludes")
 dd = JS("undo", projK, "--json")
 ck(dd.get("added") == 0 and dd.get("changed") == 0,
    "undo compares with the names left out when the copy was made, not today's")
+# two copies in the same second: the newest is the one taken last, whatever
+# their names say (an undo compares with it)
+ckey = core.checkpoints_root() / core._project_key(os.path.realpath(projK))
+for name, at in (("20261029-120000-zzzz", 100.0), ("20261029-120000-aaaa", 200.0)):
+    (ckey / name / "files").mkdir(parents=True)
+    (ckey / name / "meta.json").write_text(json.dumps({"at": at, "files": 0}))
+order = [c["id"] for c in core.list_checkpoints(projK) if c["id"].startswith("20261029-120000-")]
+ck(order == ["20261029-120000-aaaa", "20261029-120000-zzzz"],
+   f"checkpoints taken in the same second: the one taken last comes first ({order})")
+for name in ("20261029-120000-zzzz", "20261029-120000-aaaa"):
+    shutil.rmtree(ckey / name)
 shutil.rmtree(projK + "/results")
 
 # loose ends: work not committed, and a session that ended on a question

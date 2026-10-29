@@ -2574,7 +2574,9 @@ The groups of the Settings tab. In aht's window on Windows and Linux,
   else aht's own copy*, *rsync* or *aht's own copy*), with **Ask the
   Machines** and a line that says which one each machine gets.
 - **Where each agent keeps its history:** **Choose…** when aht did not find
-  an agent's history folder itself; **Reset All to Defaults**.
+  an agent's history folder itself; **Reset All to Defaults**. Antigravity
+  (`agy`) and Mistral Vibe (`vibe`) come last, marked *only read*: aht
+  reads their sessions from there but never relinks them.
 - **This Mac:** **Start aht in the menu bar at login**; *Tell me when a new
   version of aht is out* and **Check Now** (see *New versions*); **Open
   session windows in** (iTerm or Terminal; automatic picks iTerm when it is

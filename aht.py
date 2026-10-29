@@ -3589,10 +3589,21 @@ def backend_status() -> list:
                       if (e.get("stores") or {}).get(b.name))
         rows.append({"name": b.name, "label": b.label, "kind": b.kind,
                      "confidence": b.confidence, "enabled": b.name in names,
+                     "relinks": True,
                      "available": b.available(), "root": str(b.root()),
                      "root_source": b.root_source(),
                      "tracked_stores": tracked,
                      **({"note": b.note} if b.note else {})})
+    # agy and Vibe: aht only reads their data folders, which can be pointed
+    # elsewhere like a store (backend_roots); nothing there is ever relinked
+    for b, on in ((AGY_STORE, agy_reader_on()), (VIBE_STORE, vibe_reader_on())):
+        tracked = sum(1 for e in reg.get("projects", {}).values()
+                      if b.name in read_agents_of(e))
+        rows.append({"name": b.name, "label": b.label, "kind": "read",
+                     "confidence": b.confidence, "enabled": on, "relinks": False,
+                     "available": b.available(), "root": str(b.root()),
+                     "root_source": b.root_source(),
+                     "tracked_stores": tracked})
     return rows
 
 def cmd_status(args):
@@ -4914,7 +4925,8 @@ def cmd_backends(args):
         for r in rows:
             mark = "✓" if r["available"] else "✗"
             src = "" if r["root_source"] == "default" else f"  [{r['root_source']}]"
-            print(f"  {mark} {r['name']:<9} {r['root']}{src}")
+            ro = "" if r.get("relinks", True) else "  (only read)"
+            print(f"  {mark} {r['name']:<9} {r['root']}{src}{ro}")
             if not r["available"]:
                 print(f"        not found — installed elsewhere?  "
                       f"aht backends --set-root {r['name']}=/path/to/store")

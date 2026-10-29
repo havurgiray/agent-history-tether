@@ -391,6 +391,8 @@ class Tray:
             t = f"{brow['name']} — {'found' if brow['available'] else 'NOT FOUND'}"
             if brow.get("root_source", "default") != "default":
                 t += f"  [{brow['root_source']}]"
+            if not brow.get("relinks", True):
+                t += "  (only read)"
             add(t, self._pick_backend_root_cb(brow["name"]), parent=locations)
         sep(locations)
         add("Reset all to defaults", self.act_reset_backend_roots,

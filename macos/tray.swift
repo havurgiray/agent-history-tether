@@ -1977,7 +1977,20 @@ struct Backend: Identifiable, Hashable {
     let found: Bool
     let root: String
     let source: String
+    let relinks: Bool          // false: agy and Vibe, whose sessions aht only reads
     var id: String { name }
+}
+
+/// Settings → Where each agent keeps its history, from `status --json` (or
+/// `backends --json`).
+func backendRows(_ status: [String: Any]) -> [Backend] {
+    ((status["backends"] as? [[String: Any]]) ?? []).map {
+        Backend(name: $0["name"] as? String ?? "?",
+                found: $0["available"] as? Bool ?? false,
+                root: $0["root"] as? String ?? "",
+                source: $0["root_source"] as? String ?? "default",
+                relinks: $0["relinks"] as? Bool ?? true)
+    }
 }
 
 struct BoardRow: Identifiable, Hashable {
@@ -3637,14 +3650,7 @@ final class AppModel: ObservableObject {
     func checkedMover(_ name: String) -> String? {
         movers[name].flatMap { $0.mode == transferMode ? $0.transfer : nil }
     }
-    var backends: [Backend] {
-        ((status["backends"] as? [[String: Any]]) ?? []).map {
-            Backend(name: $0["name"] as? String ?? "?",
-                    found: $0["available"] as? Bool ?? false,
-                    root: $0["root"] as? String ?? "",
-                    source: $0["root_source"] as? String ?? "default")
-        }
-    }
+    var backends: [Backend] { backendRows(status) }
     var shown: [Project] {
         let s = search.trimmingCharacters(in: .whitespaces).lowercased()
         return projects.filter { s.isEmpty || $0.path.lowercased().contains(s) }
@@ -11018,6 +11024,9 @@ struct SettingsView: View {
                                 if b.source != "default" {
                                     Text(b.source).font(.caption).foregroundColor(.secondary)
                                 }
+                                if !b.relinks {
+                                    Text("only read").font(.caption).foregroundColor(.secondary)
+                                }
                                 Spacer()
                                 Button("Choose…") { m.pickRoot(b) }.controlSize(.small)
                             }
@@ -12557,6 +12566,12 @@ if CommandLine.arguments.contains("--selftest") {
     let setupOK = steps.contains { $0["id"] as? String == "iterm" }
     print("GETTING STARTED \(setupOK ? "OK" : "FAIL") — \(steps.count) steps, "
           + "control of iTerm2: \(itermControlState(ask: false))")
+    // Settings' history folders: agy and Vibe last, as only read
+    let bj = sh(PY, [core, "backends", "--json"]).out
+    let brows = backendRows((try? JSONSerialization.jsonObject(with: Data(bj.utf8))) as? [String: Any] ?? [:])
+    let readOK = brows.count > 2 && brows.suffix(2).map { $0.name } == ["agy", "vibe"]
+        && brows.suffix(2).allSatisfy { !$0.relinks } && brows.dropLast(2).allSatisfy { $0.relinks }
+    print("ONLY-READ AGENTS IN SETTINGS \(readOK ? "OK" : "FAIL \(brows.map { "\($0.name):\($0.relinks)" })")")
     // stdout and stderr apart (the welcome's setup), neither stuck behind the other
     let two = shWithStderr(PY, ["-c", "import sys; sys.stderr.write('e' * 200000); print('{}')"])
     let apartOK = two.ok && two.out == "{}\n" && two.err.count == 200000

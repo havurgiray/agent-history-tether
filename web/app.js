@@ -3568,6 +3568,7 @@ function drawSettings(m) {
     be.append(h("div", { class: "row small" }, h("span", { class: b.available ? "okc" : "dim", text: b.available ? "✓" : "·", style: "width:14px" }),
       h("span", { style: "width:90px", text: b.name }), h("span", { class: "dim mono grow ellipsis", text: tilde(b.root) }),
       b.root_source !== "default" ? h("span", { class: "dim", text: b.root_source }) : null,
+      b.relinks === false ? h("span", { class: "dim", text: "only read" }) : null,
       h("button", { class: "small", text: "Choose…", onclick: async () => {
         const p = await pickFolder(`Where does ${b.label} keep its history?`);
         if (p) { await run(["backends", "--set-root", `${b.name}=${p}`]); refresh(); }

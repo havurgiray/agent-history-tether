@@ -1040,6 +1040,8 @@ def build_menu():
         title = f"{b['name']} — {'found' if b['available'] else 'NOT FOUND'}"
         if b.get("root_source", "default") != "default":
             title += f"  [{b['root_source']}]"
+        if not b.get("relinks", True):
+            title += "  (only read)"
         add(locations, title, _pick_backend_root(b["name"]))
     sep(locations)
     add(locations, "Reset all to defaults", act_reset_backend_roots)

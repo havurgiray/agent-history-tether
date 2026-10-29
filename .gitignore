@@ -25,3 +25,4 @@ macos/aht-tray
 Icon?
 ._*
 nohup.out
+tests/.unit-times.json

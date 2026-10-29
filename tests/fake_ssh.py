@@ -100,8 +100,11 @@ def main(argv):
                              "operable program or batch file.\r\n")
             return 1
         return windows_line(machine, home, cmd, powershell=False)
+    # no agent of this computer's runs there (a test that wants some names
+    # them in the machine's env file)
     env = {"HOME": str(home), "USER": "far", "LOGNAME": "far", "SHELL": "/bin/sh",
-           "PATH": (machine / "path").read_text().strip(), "LANG": "en_US.UTF-8"}
+           "PATH": (machine / "path").read_text().strip(), "LANG": "en_US.UTF-8",
+           "AHT_AGENT_PROCS": "[]"}
     if (machine / "env").is_file():
         for line in (machine / "env").read_text().splitlines():
             k, _, v = line.partition("=")
@@ -217,7 +220,8 @@ def windows_line(machine, home, cmd, powershell):
     env = {"HOME": str(home), "USERPROFILE": str(home), "USERNAME": "far",
            "PYTHONDONTWRITEBYTECODE": "1",
            "PATH": (machine / "path").read_text().strip() if (machine / "path").is_file()
-           else os.environ.get("PATH", ""), "LANG": "en_US.UTF-8", "AHT_TEST_FAR_NT": "1"}
+           else os.environ.get("PATH", ""), "LANG": "en_US.UTF-8", "AHT_TEST_FAR_NT": "1",
+           "AHT_AGENT_PROCS": "[]"}
     if (machine / "env").is_file():
         for l in (machine / "env").read_text().splitlines():
             k, _, v = l.partition("=")

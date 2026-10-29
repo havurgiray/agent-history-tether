@@ -542,7 +542,8 @@ a stable machine interface (it's what the trays use).
 ## Tests
 
 ```sh
-tests/run_tests.sh        # multi-backend core + the masker + Linux layer + Windows badge cache and entry point (any OS, fake stores)
+tests/run_tests.sh        # every suite at once: the core units, the masker, the Linux layer, the Windows badge cache and entry point (any OS, fake stores)
+tests/core_test.py --only 17b,16c   # some core units (--list names them, --jobs N sets how many run at once)
 windows/build.sh          # builds the exes, then runs the smoke suites under wine
 macos/build_app.sh --test # builds aht.app, then runs the tray's headless selftest
 windows/tests/vm_check.sh USER@HOST [-i KEY] [--installer]   # a real Windows machine over ssh
@@ -553,7 +554,10 @@ The suites fake every agent's store via `AHT_ROOT_*` env overrides, so
 they never touch real agent data.  The other machine is a folder with a
 stand-in `ssh` (`tests/fake_ssh.py`, which can also answer like a Windows
 PC), and the agents and tmux are stand-ins too (`tests/fake_*.py`), so no
-test opens a window or spends a token.  The handover suite runs once with
+test opens a window or spends a token.  The core suite is a set of units
+in `tests/core/`: each is a file that runs alone, in a sandbox of its own
+(`python tests/core/17b_one_machine.py`), so `tests/core_test.py` runs
+them side by side, the slowest first.  The handover suite runs once with
 rsync and once with aht's own copy; `tests/core_test.py --transport` runs
 just aht's own copy, also on Windows.  `tests/redact_test.py` checks the
 masker: keys masked whole, ordinary lines left as they are, and with

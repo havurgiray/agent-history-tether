@@ -22332,6 +22332,12 @@ def _aht_argv() -> list:
         cli = exe.with_name("aht.exe")
         return [str(cli) if exe.stem.lower() != "aht" and cli.is_file() else sys.executable]
     me = Path(__file__).resolve()
+    # the tests' own launcher (tests/aht_launch.py): aht from its compiled
+    # cache, where this file is compiled whole on every start.  Only for the
+    # checkout it belongs to: a copy of aht elsewhere (a far end's) runs itself
+    launch = os.environ.get("AHT_TEST_LAUNCHER")
+    if launch and Path(launch).resolve().parent.parent == me.parent:
+        return [sys.executable or "python3", launch]
     if os.name == "nt" and (me.parent / "windows" / "src" / "aht_main.py").is_file():
         return [sys.executable, str(me.parent / "windows" / "src" / "aht_main.py")]
     return [sys.executable or "python3", str(me)]

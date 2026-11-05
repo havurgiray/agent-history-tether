@@ -2356,12 +2356,20 @@ off.
 - **Saving is automatic.** While the aht app runs and iTerm2 is open, aht
   looks at the layout every 10 minutes, and also when a session gets a
   prompt. A layout that did not change is not saved again; its "last seen"
-  time moves on. **Save Now** in the same sheet keeps it at once. The last
-  40 layouts are kept; click one on the left to see what it would open.
-  Settings → Restore my workspace changes both numbers.
+  time moves on. **Save Now** in the same sheet keeps it at once. For three
+  minutes after **Open Them** the timer does not save: the sessions are
+  still starting. Click a layout on the left to see what it would open.
+  Settings → Restore my workspace changes how often.
+- **Older layouts thin out:** all from the last two hours are kept, then
+  one an hour for a day, one a day for a week, one a week for a month and
+  one a month for a year. Of each hour, day, week or month the layout
+  with the most sessions stays, so the one from before sessions closed or
+  ended is not lost to the ones after.
 - **What opens:** every Claude session that is not open now (resumed by its
   id, with the options it had — permissions, model, effort, extra folders,
-  never a first prompt again), Kimi Code with its last session in that
+  never a first prompt again; in the folder its conversation belongs to,
+  even when Claude had moved to another folder or the folder was renamed
+  since), Kimi Code with its last session in that
   folder, and every titled tab with its folder. Untitled plain tabs, tabs
   open now and folders that are gone are skipped.
 - **Tab titles:** iTerm2 does not let a script set the title you set with
@@ -2558,8 +2566,7 @@ The groups of the Settings tab. In aht's window on Windows and Linux,
   whether Remote Control is on for every session.
 - **Safety nets (no tokens):** a copy of the folder at each session start,
   the usage-limit notice, Spotlight.
-- **Restore my workspace:** how often the iTerm2 layout is saved, and how
-  many are kept.
+- **Restore my workspace:** how often the iTerm2 layout is saved.
 - **Uses tokens (off until you turn it on):** informed sessions, the offer
   of another agent at the usage limit, going on by itself when the limit
   resets (Mac), second opinions, the night shift.
@@ -2722,10 +2729,10 @@ all of them can be set with `aht config --set name=value` and put back with
 - `hotkey` (ctrl+opt+cmd+a) — the shortcut that opens the search.
 - `spotlight` (on) — session titles in Spotlight.
 - `tab_names` (on) — name each Claude session after its iTerm2 tab.
-- `workspace_save_minutes` (10), `workspace_keep` (40) — how often the app
-  saves the iTerm2 layout for *Restore my workspace* (it also saves when a
-  session gets a prompt, while `tab_names` is on; 0 saves only then), and
-  how many layouts are kept.
+- `workspace_save_minutes` (10) — how often the app saves the iTerm2
+  layout for *Restore my workspace* (it also saves when a session gets a
+  prompt, while `tab_names` is on; 0 saves only then). Older layouts thin
+  out by themselves (see *Restore my workspace*).
 - `terminal_app` (automatic: iTerm when installed, else Terminal) — on a
   Mac, the app that opens session windows; Settings → This Mac → *Open
   session windows in*. Another app name works only if that app runs the

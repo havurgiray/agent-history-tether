@@ -2,6 +2,8 @@
 """[22] workspace, go to a tab, a checkup of open sessions, tidy, the usage limit."""
 from common import *  # noqa: F401,F403  (this unit's sandbox, ck, run, ...)
 
+import shlex
+
 import later_kit
 
 # what earlier sections left: [17]'s project "Across" (projX, tagged) and
@@ -139,18 +141,99 @@ ck(d.get("applied") and "set w to current window" in script
    "workspace: tabs open with their profile and colour, in the window iTerm2 opened as it started")
 (sb / ".aht" / "run" / "workspace-opened.json").unlink()
 
-# saved every few minutes by the app, the last workspace_keep kept
-run("config", "--set", "workspace_keep=2", "--no-reload")
+# a session whose Claude moved to another folder is kept, and opened again,
+# in the folder its conversation belongs to: --resume finds it only there
+elsewhere = sb / "elsewhere"
+elsewhere.mkdir(exist_ok=True)
+pm = fake_claude("wm")
+(rec / f"{pm.pid}.json").write_text(json.dumps({"pid": pm.pid, "cwd": str(elsewhere),
+                                                "sessionId": "wm", "status": "idle"}))
+loose = sb / "loose folder"            # not tracked: found from the conversation itself
+loose.mkdir(exist_ok=True)
+(tools / "claude" / enc(str(loose))).mkdir(exist_ok=True)
+(tools / "claude" / enc(str(loose)) / "wl.jsonl").write_text(
+    json.dumps({"type": "user", "cwd": str(elsewhere)}) + "\n"
+    + json.dumps({"type": "user", "cwd": str(loose)}) + "\n")
+menv = dict(wenv, AHT_TTYS=json.dumps({str(pm.pid): "/dev/ttysW1"}),
+            AHT_TTY_PROCS=json.dumps({"/dev/ttysW1": [[pm.pid, "claude --resume wm"]]}),
+            AHT_CMDLINES=json.dumps({str(pm.pid): "claude --resume wm"}))
+tabs_file.write_text(json.dumps({"/dev/ttysW1": {"title": "Moved", "override": True, "pane": 1,
+                                                 "panes": 1, "window": 1, "tab": 1}}))
+moved = Path(JS("workspace", "--save", "--json", extra_env=menv).get("saved") or "missing")
+em = next((e for e in json.loads(moved.read_text())["tabs"] if e.get("session") == "wm"), {})
+pm.kill(); pm.wait()
+(rec / f"{pm.pid}.json").unlink()
+old = dict(json.loads(moved.read_text()), tabs=[
+    dict(em, cwd=str(elsewhere)),
+    dict(em, session="wl", cwd=str(elsewhere), tab=2, title="Loose")])
+(sb / ".aht" / "workspaces" / "20200101-000000.json").write_text(json.dumps(old))
+tabs_file.write_text(json.dumps({"/dev/ttysW3": {"title": "", "override": False, "pane": 1,
+                                                 "panes": 1, "window": 1, "tab": 1}}))
+d = JS("workspace", "--restore", "20200101-000000", "--apply", "--json", extra_env=wenv)
+script = [x["script"] for x in ilines() if x.get("what") == "restore"][-1]
+ck(em.get("cwd") == projX and d.get("applied") and d["plan"]["opens"] == 2
+   and f"cd {shlex.quote(projX)} && " in script and "--resume wm" in script
+   and f"cd {shlex.quote(str(loose))} && " in script and "--resume wl" in script
+   and str(elsewhere) not in script,
+   f"workspace: a session is kept and opened in its conversation's folder, not where "
+   f"Claude moved to ({em.get('cwd')}, {d.get('plan')})")
+(sb / ".aht" / "workspaces" / "20200101-000000.json").unlink()
+moved.unlink()
+(sb / ".aht" / "run" / "workspace-opened.json").unlink()
+
+# saved every few minutes by the app; not while a restore's sessions start
 a1 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
 a2 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
+(sb / ".aht" / "run" / "workspace-autosave").unlink()
+(sb / ".aht" / "run" / "workspace-opened.json").write_text(json.dumps({"at": time.time()}))
+a4 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
+(sb / ".aht" / "run" / "workspace-opened.json").unlink()
 run("config", "--set", "workspace_save_minutes=0", "--no-reload")
 a3 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
-kept = len(list((sb / ".aht" / "workspaces").glob("*.json")))
+r = run("config", "--set", "workspace_keep=2", "--no-reload")
 ck(a1.get("saved") and not a2.get("saved") and "ago" in str(a2.get("skipped"))
-   and a3.get("skipped") == "off" and kept == 2,
-   f"workspace: saved on a timer, not more often, and only the last 2 kept ({a1}, {a2}, {a3}, {kept})")
-run("config", "--unset", "workspace_keep")
+   and a4.get("skipped") == "a restore is starting its sessions"
+   and a3.get("skipped") == "off" and r.returncode == 0 and "no longer used" in r.stderr,
+   f"workspace: saved on a timer, not more often, not while a restore starts, and "
+   f"workspace_keep is retired ({a1}, {a2}, {a4}, {a3}, {r.stderr!r})")
 run("config", "--unset", "workspace_save_minutes")
+
+# older layouts thin out: all from the last two hours, then one an hour, a
+# day, a week and a month, the one with the most sessions; none over a year
+thin = sb / "thin"
+thin.mkdir()
+def at(y, mo, dd, h, mi):
+    return time.mktime((y, mo, dd, h, mi, 0, 0, 0, -1))
+now = at(2026, 6, 17, 12, 0)
+laid = {}
+for name, seen, agents, tabs in (
+        ("a", at(2025, 5, 1, 9, 0), 5, 5),         # over a year: goes
+        ("m1", at(2026, 2, 10, 9, 0), 2, 2), ("m2", at(2026, 2, 20, 9, 0), 1, 3),
+        ("w1", at(2026, 6, 3, 9, 0), 1, 1), ("w2", at(2026, 6, 4, 9, 0), 1, 1),
+        ("d1", at(2026, 6, 14, 9, 0), 2, 2), ("d2", at(2026, 6, 14, 18, 0), 2, 2),
+        ("h1", at(2026, 6, 17, 7, 10), 3, 3), ("h2", at(2026, 6, 17, 7, 40), 1, 1),
+        ("n1", at(2026, 6, 17, 11, 0), 1, 1), ("n2", at(2026, 6, 17, 11, 30), 0, 1),
+        ("n3", at(2026, 6, 17, 11, 55), 1, 1)):
+    f = thin / (time.strftime("%Y%m%d-%H%M%S", time.localtime(seen)) + ".json")
+    f.write_text(json.dumps({"at": seen, "seen": seen, "tabs": [
+        {"window": 1, "tab": i + 1, "pane": 1, "agent": "claude" if i < agents else None}
+        for i in range(tabs)]}))
+    laid[f.name] = name
+core.thin_workspaces(thin, now=now)
+left = sorted(laid[f.name] for f in thin.glob("*.json"))
+ck(left == ["d2", "h1", "m1", "n1", "n2", "n3", "w2"],
+   f"workspace: older layouts thin out by hour, day, week and month, keeping the one "
+   f"with the most sessions ({left})")
+for f in thin.glob("*.json"):
+    f.unlink()
+for name, seen, agents in (("x1", at(2026, 6, 14, 9, 0), 3), ("x2", at(2026, 6, 14, 18, 0), 1)):
+    (thin / (time.strftime("%Y%m%d-%H%M%S", time.localtime(seen)) + ".json")).write_text(
+        json.dumps({"at": seen, "seen": seen, "tabs": [
+            {"window": 1, "tab": i + 1, "pane": 1, "agent": "claude"} for i in range(agents)]}))
+core.thin_workspaces(thin, now=now)
+ck(len(list(thin.glob("*.json"))) == 2,
+   "workspace: the newest layout always stays (the next save is compared with it)")
+shutil.rmtree(thin)
 
 # go to a session's tab; a background session has none
 p2 = fake_claude("w2")

@@ -1,6 +1,6 @@
 # Privacy policy
 
-**agent-history-tether (aht)** · effective 2026-10-29
+**agent-history-tether (aht)** · effective 2026-11-05
 
 This policy applies to every version of aht on macOS, Windows and Linux,
 however it was installed: from source, from the release downloads, or
@@ -324,7 +324,7 @@ encrypt it.
 | `backups/` | see [Backups](#backups) | the newest 10 snapshots per project |
 | `search.db` | a search index: the text of messages (up to 4,000 characters each), what each tool call worked on (its command, file path, web address or search, up to 400 characters) and session titles, with keys masked whole before anything is cut (see [Security](#security)), plus agents, project paths and times | until you delete it; rebuilt when needed.  An index made by an earlier version is built anew once, keeping none of its old rows; a session whose history file is gone and that no backup holds then drops out |
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`: on by default on macOS, where the copies take no room, off elsewhere), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`), none older than 30 days |
-| `workspaces/` | macOS: saved iTerm2 layouts: this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session ids, each Claude session's name (keys masked), and the options it was started with that it keeps when it starts again (permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, `--verbose`; never a first prompt).  Tab titles are kept as iTerm2 has them, so that restoring a layout sets them back | the newest 40 (`workspace_keep`) |
+| `workspaces/` | macOS: saved iTerm2 layouts: this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session ids, each Claude session's name (keys masked), and the options it was started with that it keeps when it starts again (permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, `--verbose`; never a first prompt).  Tab titles are kept as iTerm2 has them, so that restoring a layout sets them back | all from the last two hours, then one an hour for a day, one a day for a week, one a week for a month and one a month for a year; older ones are removed |
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
 | `handover/<project id>/` | the lists and set-asides of handovers, syncs and returns (see [below](#handovers-and-syncs)) | see below |
 | `remote/copies.json` | the folders on this computer that are copies of another machine's projects: for each, the kind of copy (`sync`, `handover`, `brought`, `returned`), the project's id, the machine it came from (its name and aht's random id there), the project's path and system there, whether git converts line endings there (`autocrlf`), the attempt it came with, and since when.  Written when you bring a project here, and when another machine syncs a project here or hands one over to this computer | until you delete it; a later copy into the same folder replaces that folder's note |
@@ -1122,7 +1122,7 @@ over them.
   | `offsite_backup` | which of your machines keeps a copy of the backups (none by default) |
   | `checkpoints`, `checkpoint_keep`, `checkpoint_excludes` | folder copies at session start |
   | `icons_enabled`, `icons_agent`, `icons_git` | folder badges, for the projects aht tracks and for git folders |
-  | `tab_names`, `spotlight`, `workspace_save_minutes`, `workspace_keep` | session names from iTerm2 tabs, Spotlight entries, saved layouts (macOS) |
+  | `tab_names`, `spotlight`, `workspace_save_minutes` | session names from iTerm2 tabs, Spotlight entries, saved layouts (macOS) |
   | `session_corner`, `chimes` | the Mac app's list of open sessions and its sounds (both off by default) |
   | `backends`, `backend_roots`, `watch_roots` | which agents and folders aht looks at, and where each agent keeps its history |
   | `notifications`, `notify_waiting`, `notify_finished`, `notify_limit` | notices on this computer, and which kinds |

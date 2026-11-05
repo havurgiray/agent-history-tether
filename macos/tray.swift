@@ -4309,17 +4309,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func applyWorkspaceSaving(_ every: String, _ keep: String) {
-        guard let e = Int(every.filter { $0.isNumber }), let k = Int(keep.filter { $0.isNumber }),
-              k >= 1 else {
+    func applyWorkspaceSaving(_ every: String) {
+        guard let e = Int(every.filter { $0.isNumber }) else {
             _ = alert("Not a number", "Enter how many minutes between saves (0 saves only when "
-                      + "a session gets a prompt) and how many layouts to keep (at least 1).")
+                      + "a session gets a prompt).")
             return
         }
         set("workspace_save_minutes", String(e))
-        set("workspace_keep", String(k))
         config["workspace_save_minutes"] = e
-        config["workspace_keep"] = k
     }
 
     func pickWorkspace(_ id: String?) {
@@ -9187,10 +9184,11 @@ struct WorkspaceSheet: View {
 
     func savingRule() -> String {
         let every = m.config["workspace_save_minutes"] as? Int ?? 10
-        let keep = m.config["workspace_keep"] as? Int ?? 40
         return (every > 0 ? "Saved every \(every) minutes while iTerm2 is open, and" : "Saved")
             + " when a session gets a prompt; a layout that did not change is not saved "
-            + "again. The last \(keep) are kept (Settings → Restore my workspace)."
+            + "again. All from the last two hours are kept, then one an hour for a day, "
+            + "one a day for a week, one a week for a month and one a month for a year: "
+            + "the one with the most sessions."
     }
 
     func row(_ w: [String: Any]) -> some View {
@@ -10588,7 +10586,6 @@ struct SettingsView: View {
     @State private var maxFiles = ""
     @State private var excludes = ""
     @State private var wsEvery = ""
-    @State private var wsKeep = ""
     @State private var chimeVolume = 70.0
     @State private var phone = ""
 
@@ -10875,15 +10872,15 @@ struct SettingsView: View {
                             Text("Save the iTerm2 layout every")
                             TextField("10", text: $wsEvery)
                                 .textFieldStyle(.roundedBorder).frame(width: 50)
-                            Text("minutes, keep the last")
-                            TextField("40", text: $wsKeep)
-                                .textFieldStyle(.roundedBorder).frame(width: 50)
-                            Button("Apply") { m.applyWorkspaceSaving(wsEvery, wsKeep) }
+                            Text("minutes")
+                            Button("Apply") { m.applyWorkspaceSaving(wsEvery) }
                             Spacer()
                         }
                         Text("While this app runs and iTerm2 is open; a layout that did not "
                              + "change is not saved again. It is also saved when a session gets "
-                             + "a prompt. 0 minutes: only then. No tokens.")
+                             + "a prompt. 0 minutes: only then. Older layouts thin out: all "
+                             + "from the last two hours, then one an hour, a day, a week and a "
+                             + "month, for a year. No tokens.")
                             .font(.caption).foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         if !m.itermInstalled {
@@ -11118,7 +11115,6 @@ struct SettingsView: View {
         .onAppear {
             maxFiles = String(m.config["checkpoint_max_files"] as? Int ?? 20000)
             wsEvery = String(m.config["workspace_save_minutes"] as? Int ?? 10)
-            wsKeep = String(m.config["workspace_keep"] as? Int ?? 40)
             chimeVolume = Double(m.number("chime_volume", 70))
             excludes = ((m.config["checkpoint_excludes"] as? [String]) ?? []).joined(separator: ", ")
             phone = m.text("notify_phone", "")

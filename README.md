@@ -492,7 +492,7 @@ explains each.
   `hotkey`
 - **Before and after a session:** `checkpoints`, `checkpoint_keep`,
   `checkpoint_max_files`, `checkpoint_excludes`, `spotlight`, `tab_names`,
-  `workspace_save_minutes`, `workspace_keep`
+  `workspace_save_minutes`
 - **Off by default because they use tokens:** `informed_sessions`,
   `limit_switch`, `limit_switch_to`, `second_opinion`, `night_shift`
 

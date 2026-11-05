@@ -256,8 +256,8 @@ CONFIG_DEFAULTS = {
     "tab_names":        True,        # a Claude session is named after its iTerm2
                                      #   tab (what the Claude app shows)
     "workspace_save_minutes": 10,    # the app saves the iTerm2 layout this often
-                                     #   (0: only when a session gets a prompt)
-    "workspace_keep":   40,          #   the last this many layouts are kept
+                                     #   (0: only when a session gets a prompt);
+                                     #   older layouts thin out (WORKSPACE_TIERS)
     "session_corner":   False,       # the app lists the open Claude sessions in
                                      #   the screen's top-right corner
     "chimes":           False,       # the app chimes when a session here is done
@@ -276,7 +276,9 @@ POLICY_CHOICES = {
 
 # settings aht no longer has: an old config may still hold them, and they
 # are ignored and not shown; `config --set` says why and goes on
-RETIRED_KEYS = {"new_policy": "aht always takes on a new project"}
+RETIRED_KEYS = {"new_policy": "aht always takes on a new project",
+                "workspace_keep": "saved layouts thin out with age instead: all from the "
+                                  "last two hours, then one an hour, a day, a week, a month"}
 
 def cfg_get(key, default=None):
     cfg = load_config()
@@ -24287,6 +24289,47 @@ def _transcript_of(cwd: str, sid: str):
             return f
     return None
 
+def conversation_folder(sid: str, cwd: str = None):
+    """The folder a Claude conversation belongs to: the one its history is
+    kept for, where `claude --resume` finds it.  Claude Code records the
+    folder it is in now, which moves when the agent changes directory; the
+    conversation stays with the folder it started in, or that folder's
+    new path after aht moved the history along with it.  `cwd` when the
+    history is there; None when it is nowhere."""
+    if not sid or re.search(r"[/\\]", sid) or sid.startswith("."):
+        return None             # a session id names a file: never a path
+    if cwd and _transcript_of(cwd, sid):
+        return cwd
+    root = claude_backend().root()
+    try:
+        found = sorted(d / f"{sid}.jsonl" for d in root.iterdir()
+                       if (d / f"{sid}.jsonl").is_file())
+    except OSError:
+        return None
+    projects = load_registry().get("projects", {}).values() if found else []
+    for f in found:
+        key = f.parent.name
+        for e in projects:              # a tracked project: its path now
+            st = (e.get("stores") or {}).get("claude")
+            if (key == st or (isinstance(st, list) and key in st)) \
+                    and os.path.isdir(e.get("real_path") or ""):
+                return e["real_path"]
+        try:                            # else a folder it ran in, by that name
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"cwd"' not in line:
+                        continue
+                    try:
+                        c = json.loads(line).get("cwd")
+                    except ValueError:
+                        continue
+                    if isinstance(c, str) and key in (_key_claude(c),
+                                                      _key_claude(os.path.realpath(c))):
+                        return c
+        except OSError:
+            continue
+    return None
+
 def _is_fork(transcript) -> bool:
     try:
         with open(transcript, "rb") as fh:
@@ -24604,7 +24647,8 @@ def cmd_tab_names(args):
     if args.refresh:
         tabs = iterm_tabs(max_age=0)
         try:
-            save_workspace(workspace_snapshot(tabs))
+            if not _just_opened():      # not while a restore's sessions start
+                save_workspace(workspace_snapshot(tabs))
         except Exception as e:
             warn(f"WORKSPACE not saved: {e}")
         if not args.quiet:
@@ -25113,8 +25157,11 @@ def workspace_snapshot(tabs: dict = None) -> dict:
                      os.path.basename(a.split()[0]).lstrip("-") in _SHELLS), default=None)
         if cl:
             s = sessions[cl[0]]
-            tr = _transcript_of(s["cwd"], s["session"]) if s.get("session") else None
-            e.update(agent="claude", session=s.get("session"), cwd=s["cwd"],
+            # the conversation's own folder, not the one Claude moved to:
+            # --resume finds it only there
+            home = conversation_folder(s.get("session"), s["cwd"]) or s["cwd"]
+            tr = _transcript_of(home, s["session"]) if s.get("session") else None
+            e.update(agent="claude", session=s.get("session"), cwd=home,
                      args=_claude_flags(cl[1]),
                      name=_current_title(tr) or _auto_title(tr) or None)
         elif other:
@@ -25142,9 +25189,69 @@ def _ws_files(d: Path) -> list:
         return (f.stem.split("-")[0], stamp, int(n) if n.isdigit() else 0)
     return sorted(d.glob("*.json"), key=key) if d.is_dir() else []
 
+# saved layouts thin out with age, by when each was last seen: every one
+# from the last two hours, then one an hour for a day, one a day for a week,
+# one a week for a month and one a month for a year; older ones go
+WORKSPACE_TIERS = ((2 * 3600, None), (86400, "hour"), (7 * 86400, "day"),
+                   (31 * 86400, "week"), (366 * 86400, "month"))
+
+def _ws_bucket(seen: float, now: float):
+    """The tier a layout last seen at `seen` falls in: "all" (each kept),
+    a bucket to keep one of, or None (too old: it goes)."""
+    import datetime
+    age = now - seen
+    t = datetime.datetime.fromtimestamp(max(0.0, seen))
+    for most, unit in WORKSPACE_TIERS:
+        if age < most:
+            if unit is None:
+                return "all"
+            return {"hour": ("hour", t.strftime("%Y-%m-%d %H")),
+                    "day": ("day", t.date().isoformat()),
+                    "week": ("week",) + tuple(t.isocalendar()[:2]),
+                    "month": ("month", t.year, t.month)}[unit]
+    return None
+
+def thin_workspaces(d: Path = None, now: float = None) -> list:
+    """Thin the saved layouts out (WORKSPACE_TIERS).  Of each hour, day, week
+    or month the layout with the most agent sessions stays (then the most
+    tabs, then the last seen), so a layout from before sessions closed or
+    ended is not lost to the ones after; the newest always stays, since the
+    next save is compared with it.  The files removed."""
+    d = workspaces_dir() if d is None else d
+    files = _ws_files(d)
+    now = time.time() if now is None else now
+    keep, best = set(files[-1:]), {}
+    for f in files:
+        try:
+            w = json.loads(f.read_text())
+            seen = float(w.get("seen") or w.get("at") or 0)
+            tabs = list(w.get("tabs") or [])
+            rank = (sum(1 for e in tabs if e.get("agent")), len(tabs), seen)
+        except Exception:
+            try:                # not readable: its age from the file, ranked last
+                seen = f.stat().st_mtime
+            except OSError:
+                continue
+            rank = (-1, -1, seen)
+        bucket = _ws_bucket(seen, now)
+        if bucket == "all":
+            keep.add(f)
+        elif bucket is not None and (bucket not in best or rank > best[bucket][0]):
+            best[bucket] = (rank, f)
+    keep |= {f for _rank, f in best.values()}
+    gone = []
+    for f in files:
+        if f not in keep:
+            try:
+                f.unlink()
+                gone.append(f)
+            except OSError:
+                pass            # gone already, or not ours to remove: next time
+    return gone
+
 def save_workspace(snap: dict):
     """Keep the snapshot when the layout changed; a layout seen again only
-    gets its "seen" time renewed.  The last `workspace_keep` layouts are kept."""
+    gets its "seen" time renewed.  Older layouts thin out (WORKSPACE_TIERS)."""
     if not snap.get("tabs"):
         return None
     d = workspaces_dir()
@@ -25163,9 +25270,7 @@ def save_workspace(snap: dict):
     if f.exists():
         f = d / f"{_stamp()}-{len(files)}.json"
     _write_json(f, snap)
-    keep = max(1, int(cfg_get("workspace_keep", 40)))
-    for old in _ws_files(d)[:-keep]:
-        old.unlink()
+    thin_workspaces(d)
     return f
 
 def workspace_autosave_path() -> Path:
@@ -25186,6 +25291,10 @@ def autosave_workspace() -> dict:
         ago = None
     if ago is not None and ago < every * 60 - 5:
         return {"saved": None, "skipped": f"saved {int(ago)} s ago"}
+    if _just_opened():
+        # the sessions a restore opened are still starting: saved now, the
+        # layout would look as if most of them were not there
+        return {"saved": None, "skipped": "a restore is starting its sessions"}
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()
     f = save_workspace(workspace_snapshot(iterm_tabs(max_age=0)))
@@ -25253,6 +25362,13 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
                   | set(opened.get("titles") or [])) - {""}
     windows, skipped = {}, []
     for e in w.get("tabs", []):
+        if e.get("agent") == "claude" and e.get("session"):
+            # where the conversation is now: a layout saved while Claude was
+            # in another folder, or before its folder was renamed, names
+            # one --resume would not find it from
+            home = conversation_folder(e["session"], e.get("cwd"))
+            if home and home != e.get("cwd"):
+                e = dict(e, cwd=home)
         why = None
         if e.get("agent") == "claude" and e.get("session") in open_ids:
             why = "its session is open"

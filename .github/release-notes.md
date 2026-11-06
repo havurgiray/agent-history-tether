@@ -13,20 +13,26 @@ Package managers: `brew install --cask havurgiray/tap/aht` (macOS), `winget inst
 
 ### In short
 
-- **Badges for Antigravity and Mistral Vibe:** a folder where Antigravity (`agy`) or Mistral Vibe (`vibe`) worked now shows their disc too, a magenta ⌃ and an amber ∿, next to the agents aht relinks.
-- **Settings:** *Where each agent keeps its history* now also lists Antigravity and Mistral Vibe, marked *only read*, so *Choose…* and *Reset All to Defaults* reach their folders too; so do `aht backends`, `aht status` and the trays' *Agent CLI locations*.
-- **Fixes:** *Undo a Session* could compare with the older of two checkpoints taken in the same second; a warning could be logged twice when several aht processes met the same problem at once.
-- **winget:** the README and the guide now say what winget installs: the zip, with `aht` on your PATH; run `aht install` after it, and `aht uninstall` before `winget uninstall havurgiray.aht`.
+- **Restore Workspace on Windows:** the Sessions tab now has **Restore Workspace…** for Windows Terminal. While aht's tray runs it saves your windows, tabs and the sessions in them; after a restart it brings them back, each session where it left off, with the options it had. With Windows Terminal's *Open windows from a previous session* on, you also get your splits, tab colours and old screen text back. See *Restore my workspace* in the guide.
+- **Go to Tab and Restart in Its Tab on Windows:** both are in the Sessions tab now, for sessions in Windows Terminal.
+- **Restore Workspace on the Mac:** a session reopens in its conversation's own folder, even when Claude had moved to another folder or the folder was renamed since. Before, such a session could fail to resume. aht also no longer saves a half-opened layout in the minutes after a restore.
+- **Saved layouts thin out with age:** all from the last two hours, then one an hour for a day, one a day for a week, one a week for a month and one a month for a year, keeping the fullest of each. This replaces keeping a fixed number.
+- **Fix on Windows:** a closed session whose process number was reused could look open.
 
 ### Before you upgrade
 
 - **Upgrading from a version before 0.14.0?** Read *Before you upgrade* in the [0.14.0 notes](https://github.com/havurgiray/agent-history-tether/releases/tag/v0.14.0) first: on Windows, with Scoop, and on a Mac with `&` or `<` in a path, there is one step to take.
-- The new discs come with aht's next look at the agents' folders; `aht icons --refresh` draws them at once.
+- The setting `workspace_keep` is gone: aht tells you so if you set it. The first new save thins out the layouts you already have.
+- **Windows:** Restore Workspace needs Windows Terminal. So far it has been tried on Windows 11 on ARM. The x64 build is built and tested the same way, but the feature has not been tried on an x64 PC yet: tell us if something is off. Tabs run as administrator are out of aht's reach unless aht runs as administrator too.
+- On Windows, session names from tab titles remain Mac-only, and Go to Tab can land one tab off after you drag tabs around.
 
 ### Privacy policy
 
-- For the new badges, aht looks at which folders Antigravity's conversations and Mistral Vibe's sessions ran in, from the files it already read for search and summaries, at most every ten minutes, and keeps in `registry.json` only which of the two have sessions in each project.  [PRIVACY.md](https://github.com/havurgiray/agent-history-tether/blob/master/PRIVACY.md) says so (effective 2026-10-29).
+- On Windows, aht now reads window and tab titles through UI Automation, and each pane's id, title, folder and the command lines of the programs in it, for saved workspaces. From a program's environment it keeps only the pane id. It reads Windows Terminal's `state.json`, `elevated-state.json` and `settings.json`, never the files with your screen text, and it changes none of them. To bring a session back it types the command into that pane.
+- Saved layouts now exist on Windows too, and their retention changed to the thinning above.
 
 ### For contributors
 
-- The core test suite is now a set of units in `tests/core/`, each in a sandbox of its own, run side by side by `tests/core_test.py`: about 2 to 3 minutes instead of 18.  `python tests/core/<unit>.py` runs one; `tests/core_test.py --only 17b,16c` runs some.
+- Terminals now plug in like agents: the workspace code asks a small `Terminal` class in `aht.py`, iTerm2 is one subclass, and Windows Terminal another in `windows/src/winterminal.py`.
+- `windows/tests/winterminal_test.py` runs on any system; `windows/tests/vm_terminal.py` drives a real Windows Terminal with real sessions, from source or a built `aht.exe`.
+- On a busy machine run the suite with `--jobs 4`: two timing checks can fail when every core is taken.

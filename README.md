@@ -408,8 +408,8 @@ The guide's *The permission level follows the work* has the details.
 | Second opinion | `aht second-opinion <folder> --task "…"` | Claude Code and Kimi Code on the same task, each in its own copy; compare, then take one (`second_opinion = true`) |
 | Night shift | `aht night-shift <folder> --task "…" --start 22:00 --back 07:00 --apply` | a handover with a task at the start time, taken back when the session is done after the end time (`night_shift = true`; this computer has to be awake) |
 | iTerm2 tab names (Mac) | `aht tab-names` | a Claude Code session takes its iTerm2 tab's title as its name, which the Claude app and `/resume` show; a rename goes back to the tab |
-| Workspace (Mac) | `aht workspace --restore` | iTerm2's windows, tabs and sessions, saved while you work and opened again after a restart |
-| Go to a tab, checkup (Mac) | `aht goto`, `aht checkup` | brings a session's tab to the front; marks sessions open twice, stuck or outside the Claude app, and restarts one in its tab |
+| Workspace (Mac, Windows) | `aht workspace --restore` | the windows, tabs and sessions of iTerm2 or Windows Terminal, saved while you work and opened again after a restart |
+| Go to a tab, checkup (Mac, Windows) | `aht goto`, `aht checkup` | brings a session's tab to the front; marks sessions open twice, stuck or outside the Claude app, and restarts one in its tab |
 | Spotlight, links, Finder (Mac) | `aht://search?q=…` | session titles in Spotlight, `aht://` links from Shortcuts or a script, Finder Quick Actions, ⌃⌥⌘A for the search; whatever starts an agent or changes files asks first |
 
 ## Platforms
@@ -435,7 +435,9 @@ macOS-first: new features are built and tested there first.
 | The other machine stays awake while a handed-over agent works | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or GNOME's own inhibitor) | — |
 | Notices | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
-| iTerm2: session names from tabs, Go to Tab, workspace restore, restart in its tab | ✓ | — | — |
+| Restore Workspace | ✓ iTerm2 | ✓ Windows Terminal | — |
+| Go to Tab, restart in its tab | ✓ iTerm2 | ✓ Windows Terminal | — |
+| iTerm2: session names from tabs | ✓ | — | — |
 | Session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
 
 ## What uses tokens

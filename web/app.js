@@ -3106,6 +3106,7 @@ function drawSessions(m) {
   const head = h("div", { class: "row" }, h("span", { class: "dim", text: "Agent sessions that are open now, here and on your other machines." }),
     h("span", { class: "grow" }), S.boardLoading ? h("span", { class: "spin" }) : null,
     S.boardAt ? h("span", { class: "dim small", text: "updated " + ago(S.boardAt / 1000) }) : null,
+    S.status.terminal ? h("button", { text: "Restore Workspace…", onclick: openWorkspaces }) : null,
     h("button", { text: "Refresh", disabled: S.boardLoading, onclick: loadBoard }), helpBtn("Sessions: what runs right now"));
   m.append(head);
   for (const b of S.board || []) {
@@ -3130,6 +3131,16 @@ function drawSessions(m) {
         h("span", { class: "dim small", text: [AGENTS[s.agent] || s.agent, s.title || s.name, s.since ? ago(s.since) : ""].filter(Boolean).join(" · ") }),
         h("span", { class: "grow" }),
         (s.issues || []).length ? h("span", { class: "warn small", text: s.issues.join(", ") }) : null,
+        b.local && s.in_terminal ? h("button", { class: "small", text: "Go to Tab", onclick: async () => {
+          const a = await J("goto", String(s.pid), "--json");
+          if (!a.ok) ask("Could not go to its tab", a.why || "aht could not find its tab.", ["OK"]);
+        } }) : null,
+        b.local && s.can_restart ? h("button", { class: "small", text: "Restart in Its Tab…", onclick: async () => {
+          if (!(await confirmIt("Restart this session in its tab?", "aht ends it and starts it again in the same tab, with the options it had. Its conversation stays.", "Restart"))) return;
+          const a = await J("checkup", "--restart", String(s.pid), "--apply", "--json");
+          if (!a.applied) ask("Not restarted", (a.blockers || []).join("\n") || "aht could not restart it.", ["OK"]);
+          loadBoard();
+        } }) : null,
         b.local && s.pid && s.agent === "claude" ? h("button", { class: "small", text: "End Process…", onclick: async () => {
           if (!(await confirmIt("End this session's process?", "Its conversation stays; you can continue it later.", "End It"))) return;
           await run(["checkup", "--close", String(s.pid), "--apply"]); loadBoard();
@@ -3138,6 +3149,53 @@ function drawSessions(m) {
     if (list.childNodes.length) g.append(list);
     m.append(g);
   }
+}
+
+/** The saved layouts on the left, what the picked one would open on the right. */
+async function openWorkspaces() {
+  const d = await busy("reading the saved layouts…", () => J("workspace", "--json"));
+  const rows = d.workspaces || [];
+  const terminal = S.status.terminal;
+  const s = sheet("Restore Workspace", "Restore my workspace", 860);
+  s.body.append(h("p", { class: "dim", text: `${terminal}'s windows and tabs with the sessions in them, as they were. aht saves them while its tray runs and ${terminal} is open.` }));
+  const list = h("div", { class: "sessions", style: "width:300px;flex:none" });
+  const plan = h("div", { class: "grow", style: "min-width:0" });
+  let pick = null;
+  const open = h("button", { class: "primary", text: "Open Them", disabled: true, onclick: async () => {
+    const a = await busy(`opening them in ${terminal}…`, () => J("workspace", "--restore", pick, "--apply", "--json"));
+    if (a.applied) { toast("Opened."); closeSheet(); }
+    else ask("Not opened", (a.blockers || []).join("\n") || "aht could not open them.", ["OK"]);
+  } });
+  const show = async (id) => {
+    pick = id;
+    draw();
+    open.disabled = true;
+    clear(plan).append(h("span", { class: "spin" }));
+    const p = await J("workspace", "--restore", id, "--json");
+    if (pick !== id) return;
+    clear(plan);
+    const panes = ((p.plan || {}).windows || []).flat(2);
+    for (const e of panes) plan.append(h("div", { style: "margin-bottom:8px;min-width:0" }, h("div", { class: "ellipsis" }, h("strong", { text: e.title || e.name || "(no title)" })),
+      h("div", { class: "dim small ellipsis", text: [e.agent && (AGENTS[e.agent] || e.agent), e.cwd].filter(Boolean).join(" · ") })));
+    for (const e of (p.plan || {}).skipped || []) plan.append(h("div", { class: "dim small ellipsis", style: "margin-bottom:4px", text: `Skipped: ${e.title || e.name || "(no title)"} (${e.why})` }));
+    for (const b of p.blockers || []) plan.append(h("p", { class: "warn", text: b }));
+    open.disabled = !panes.length || (p.blockers || []).length > 0;
+  };
+  const draw = () => {
+    clear(list);
+    for (const r of rows) list.append(h("div", { class: "s" + (r.id === pick ? " picked" : ""), style: "cursor:pointer" + (r.id === pick ? ";outline:1px solid var(--line)" : ""), onclick: () => show(r.id) },
+      h("div", { class: "grow" }, h("strong", { text: when(r.seen) }),
+        h("div", { class: "dim small ellipsis", text: `${plural(r.tabs, "tab")}, ${plural(r.sessions, "session")}${r.titles.length ? ": " + r.titles.slice(0, 4).join(", ") : ""}` }))));
+    if (!rows.length) list.append(h("p", { class: "dim", text: "No saved layout yet." }));
+  };
+  s.body.append(h("div", { class: "row", style: "align-items:flex-start;gap:16px" }, list, plan));
+  draw();
+  s.foot.append(h("button", { text: "Save Now", onclick: async () => {
+    await busy("saving the layout…", () => J("workspace", "--save", "--json"));
+    closeSheet();
+    openWorkspaces();
+  } }), h("span", { class: "spacer" }), h("button", { text: "Close", onclick: closeSheet }), open);
+  if (d.default) show(d.default);
 }
 
 // ---- Search -----------------------------------------------------------------------

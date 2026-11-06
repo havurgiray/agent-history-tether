@@ -98,9 +98,9 @@ ck("a tab shows its pane's title",
    W.place(["a", "b"], {"a": "One", "b": "Two"}, ["One", "Two"]) == {"a": 0, "b": 1})
 ck("a renamed tab takes the pane left over",
    W.place(["a", "b"], {"a": "✳ Claude Code", "b": "Two"}, ["Paper", "Two"]) == {"a": 0, "b": 1})
-ck("the other pane of a split joins the pane before it (active one first in the tab)",
+ck("a tab mostly shows its newest pane: the pane between two tabs joins the later one",
    W.place(["a", "b", "c"], {"a": "One", "b": "x", "c": "Three"}, ["One", "Three"]) ==
-   {"a": 0, "b": 0, "c": 1})
+   {"a": 0, "b": 1, "c": 1})
 ck("…and the first pane of a split whose second is active",
    W.place(["a", "b", "c"], {"a": "x", "b": "Two", "c": "Three"}, ["Two", "Three"]) ==
    {"a": 0, "b": 0, "c": 1})

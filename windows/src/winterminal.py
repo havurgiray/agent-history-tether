@@ -163,9 +163,11 @@ def process_cmdline(pid: int) -> str:
         return p.cmdline() or ""
 
 
-def process_env(pid: int):
+def process_pane(pid: int) -> str:
+    """The Windows Terminal pane a process runs in; "" for none, or when it is
+    out of reach.  Only this one value is kept: an environment can hold keys."""
     with _Process(pid, _Process.READ) as p:
-        return p.env()
+        return ((p.env() or {}).get("WT_SESSION") or "").strip("{}").lower()
 
 
 def process_born(pid: int):
@@ -217,7 +219,7 @@ def live_panes(table: list = None) -> dict:
         for child, name in kids.get(pid, []):
             if name.lower() in CONSOLE_HOSTS:
                 continue
-            pane = ((process_env(child) or {}).get("WT_SESSION") or "").strip("{}").lower()
+            pane = process_pane(child)
             if pane:
                 out[pane] = {"pid": child, "exe": name, "born": process_born(child) or 0,
                              "busy": [n for _p, n in kids.get(child, [])
@@ -327,6 +329,18 @@ def _ask_helper(req: dict) -> dict:
 
 # ---- Windows and tabs, from UI Automation ------------------------------------ #
 
+UIA_SELECT = r"""
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$A = [System.Windows.Automation.AutomationElement]
+$tab = New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)
+$w = $A::FromHandle([IntPtr]%d)
+$w.FindAll('Descendants', $tab).Item(%d).GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+$p = $w.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
+if ($p.Current.WindowVisualState -eq 'Minimized') { $p.SetWindowVisualState('Normal') }
+$w.SetFocus()
+'ok'
+"""
+
 UIA_SCRIPT = r"""
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
@@ -343,14 +357,18 @@ ConvertTo-Json -Depth 4 -Compress -InputObject @($out)
 """
 
 
-def uia_windows() -> list:
-    """[{"hwnd", "tabs": [name, ...]}] for the windows this user can see."""
+def _powershell(script: str):
     # as one encoded argument: read from stdin, PowerShell takes line by line
     # and a block over several lines never runs
-    script = base64.b64encode(UIA_SCRIPT.encode("utf-16-le")).decode("ascii")
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", script],
-                       capture_output=True, text=True, encoding="utf-8", timeout=30,
-                       stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    code = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", code],
+                          capture_output=True, text=True, encoding="utf-8", timeout=30,
+                          stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+
+
+def uia_windows() -> list:
+    """[{"hwnd", "tabs": [name, ...]}] for the windows this user can see."""
+    r = _powershell(UIA_SCRIPT)
     try:
         return json.loads(r.stdout)
     except ValueError:
@@ -441,8 +459,11 @@ def place(keys: list, titles: dict, names: list) -> dict:
     title, which several tabs may share ("✳ Claude Code").  Panes open in tab
     order, so they are cut into runs, one run for each tab, so that as many
     tabs as can hold their name's pane.  A tab may have no pane (Settings); a
-    run of several is a split.  A tab dragged elsewhere can land a pane one
-    tab off: this tells where to reopen it, never where to type."""
+    run of several is a split, and a split takes the keyboard, so a tab
+    mostly shows its newest pane.  A tab dragged elsewhere, or a split beside
+    a renamed tab, can land a pane one tab off: nothing tells them apart.
+    This says where to reopen a pane and which tab to show, never where to
+    type: that goes by the pane's id."""
     if not names:
         return {k: 0 for k in keys}
     want = [clean_title(n) for n in names]
@@ -469,7 +490,8 @@ def place(keys: list, titles: dict, names: list) -> dict:
 def _run_worth(titles: list, name: str) -> float:
     if not titles:
         return 0.0
-    return 1.0 + (2.0 if name in titles else 0.0) - 0.01 * (len(titles) - 1)
+    newest = 0.05 if titles[-1] == name else 0.0
+    return 1.0 + (2.0 if name in titles else 0.0) + newest - 0.01 * (len(titles) - 1)
 
 
 def arrange(panes: dict, info: dict, wins: list, layouts: list, profiles: set = frozenset()) -> dict:
@@ -631,6 +653,54 @@ class WindowsTerminal(aht.Terminal):
         return {k: [(pid, bare_command(process_cmdline(pid)))
                     for pid in _descendants(p["pid"], kids)]
                 for k, p in live_panes(table).items()}
+
+    def steps(self, step) -> list:
+        if not shutil.which("wt") and not shutil.which("wt.exe"):
+            return []
+        on = saves_windows()
+        return [step("terminal_windows", on, "Windows Terminal brings its windows back",
+                     "On: after a restart it opens your windows, splits, tab colours and old "
+                     "screen text, and aht resumes each session in its own pane." if on else
+                     "Off: Restore Workspace brings your sessions and titled tabs back in new "
+                     "windows, without splits' sizes, tab colours or old screen text.",
+                     "Windows Terminal → Settings → Startup → When Terminal starts → Open "
+                     "windows from a previous session.", optional=True)]
+
+    def pane_of_pids(self, pids) -> dict:
+        return {p: k for p, k in ((p, process_pane(p)) for p in pids) if k}
+
+    def last_tabs(self) -> dict:
+        return live_panes()
+
+    def go_to(self, key) -> str:
+        panes = live_panes()
+        if key not in panes:
+            return "none"
+        info = _ask_helper({"info": [p["pid"] for p in panes.values()]})["info"]
+        rows = arrange(panes, info, uia_windows(), [])
+        hwnd = (info.get(str(panes[key]["pid"])) or {}).get("owner")
+        if not hwnd:
+            return "none"
+        r = _powershell(UIA_SELECT % (int(hwnd), rows[key]["tab"] - 1))
+        # by what it printed: PowerShell writes its progress to stderr
+        if r.stdout.strip() == "ok":
+            return "ok"
+        aht.warn(f"TABS could not go to a tab: {(r.stderr or '').strip()[-200:]}")
+        return "none"
+
+    def restart_line(self, row: dict, flags: list):
+        pane = live_panes().get(row["tty"])
+        if not pane:
+            return None
+        return resume_line({"agent": "claude", "session": row["session"], "cwd": row["project"],
+                            "args": flags}, shell_of(pane)) or None
+
+    def type_line(self, key, line: str) -> bool:
+        pane = live_panes().get(key)
+        if not pane:
+            return False
+        got = _ask_helper({"type": [{"pid": pane["pid"], "text": line + "\r"}]})["typed"]
+        return bool((got.get(str(pane["pid"])) or {}).get("ok"))
 
     def start(self, saved: dict = None) -> tuple:
         if self.running():

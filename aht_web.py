@@ -53,9 +53,8 @@ IDLE_EXIT = 15 * 60                     # seconds without a request, then the se
 LAUNCH_TTL = 120                        # seconds a launch code is good for
 JOB_KEEP = 600                          # seconds a finished job's answer is kept
 
-# the commands the window may run (Mac-only ones such as tab-names and
-# workspace stay out; so do install, uninstall, hook and the far end of a
-# handover)
+# the commands the window may run (Mac-only ones such as tab-names stay
+# out; so do install, uninstall, hook and the far end of a handover)
 COMMANDS = {
     "status", "config", "projects", "sessions", "search", "journal", "changes", "undo",
     "checkpoint", "rules", "secrets", "report", "share", "tidy", "loose-ends", "board",
@@ -64,7 +63,7 @@ COMMANDS = {
     "night-shift", "backup", "restore", "icons", "backends", "adopt", "setup", "update",
     "getting-started", "doctor", "reconcile", "reload", "version", "notices", "limits",
     "logs", "checkup", "forget", "orphans", "prune", "guide", "bind", "autostart",
-    "attach", "report-problem",
+    "attach", "report-problem", "workspace", "goto",
 }
 
 # commands the window may run only in one of these ways: `attach` would

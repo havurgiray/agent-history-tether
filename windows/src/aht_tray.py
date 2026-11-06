@@ -252,6 +252,16 @@ def refresh(force=False):
     shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
 
+def save_workspace():
+    """Every minute, as the Mac app does: the core saves the layout when
+    `workspace_save_minutes` have passed.  A process only while the terminal
+    is open."""
+    if aht.terminal().running():
+        subprocess.Popen(winlayer.self_cmd("workspace", "--save", "--auto", "--quiet"),
+                         creationflags=winlayer.CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
 def act_open_window(project=None, do="show"):
     """aht's window: a page aht.exe serves to this computer only, in an app
     window of Edge or Chrome.  `project`: the folder it opens on, and `do`
@@ -1111,6 +1121,8 @@ def wnd_proc(hwnd, msg, wparam, lparam):
                 check_notices()
             elif wparam == 3:
                 pump_notices()
+            elif wparam == 4:
+                save_workspace()
             else:
                 refresh()
         except Exception as e:                    # the next tick tries again
@@ -1207,6 +1219,7 @@ def main():
         pass
     pump_notices()
     user32.SetTimer(HWND, 3, 3000, None)
+    user32.SetTimer(HWND, 4, 60000, None)         # the workspace
 
     msg = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

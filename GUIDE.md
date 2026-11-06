@@ -205,8 +205,9 @@ welcome window and Getting started.
   machine menu, **Sync Now**, **Find Moved Folders** (the tray's
   **Reconcile now** does that) or *In sync* column; **Peek…** with **Open
   Its Window** stands in for Open Session, and **Release from box…** is
-  under **More**. The Sessions tab has **Refresh** and **End Process…**
-  only. A search
+  under **More**. The Sessions tab has **Refresh** and **End Process…**,
+  and with Windows Terminal **Restore Workspace…**, **Go to Tab** and
+  **Restart in Its Tab…**. A search
   result offers **Continue**, no Show Project. Tidy Up offers **Choose Its
   Folder…**, **That's It** and **Forget…**; reading or removing a history
   is done in the terminal (`aht tidy --show`, `--remove-history`).
@@ -790,9 +791,11 @@ waiting for you.
 > the Sessions tab shows *paper — waiting for you: approve Bash*; the other
 > two are still working. You answer the one that waits.
 
-- **Go to Tab** brings the iTerm2 tab of that session to the front. On
-  Windows and Linux the window offers **End Process…** on each Claude
-  session here instead of the buttons below.
+- **Go to Tab** brings the tab of that session to the front, in iTerm2 or
+  Windows Terminal. Windows Terminal does not tell which tab holds a pane,
+  so aht goes by the order the tabs opened in and their titles: after
+  dragging tabs around it can land one tab off. On Linux the window offers
+  **End Process…** on each Claude session here instead of the buttons below.
 - **Worth a look**, each with a reason: a session **open twice** (the same
   conversation runs in two processes, which both write to it; **End It…**
   closes one); one **working for hours with nothing written** (probably a
@@ -2386,6 +2389,33 @@ off.
   from a second click on Open Them. aht needs permission to control
   iTerm2 (see *Getting started*).
 
+**On Windows** the same works with Windows Terminal: Sessions tab →
+**Restore Workspace…**. While the tray runs, aht looks at the layout every
+10 minutes; there is no look at each prompt.
+
+- **With *Open windows from a previous session* on** (Windows Terminal →
+  Settings → Startup → When Terminal starts), Windows Terminal brings back
+  its windows, splits, tab colours and old screen text itself. aht then
+  types the command that resumes each session into that session's own
+  pane, in the background, whichever window is in front. Getting started
+  says whether it is on; aht only reads that setting.
+- **With it off, or when Windows Terminal has lost its windows,** aht opens
+  the sessions and titled tabs in new windows from its own layout, without
+  old screen text. Windows Terminal keeps only the last of several windows
+  closed one after the other, and nothing once every tab has ended, so
+  aht's layout is the one that always holds them all.
+- **aht types only into a shell that waits at its prompt.** A session whose
+  pane is busy opens in a new tab instead. Nothing stays behind: the
+  panes' start command remains the shell, so a later start of Windows
+  Terminal does not reopen a session you ended.
+- **Tabs run as administrator** are out of aht's reach, unless aht runs as
+  administrator too: Windows does not let it read or type into them.
+- **A plain PowerShell tab** reopens in the folder it started in: `cd` in
+  PowerShell does not show from outside. Claude sessions always reopen in
+  their conversation's folder.
+- **A folder Claude Code does not trust yet:** the session stops at Claude
+  Code's question, and waits for you.
+
 **In the terminal:**
 
 - `aht workspace` — list the saved layouts, with their tabs and sessions.
@@ -2393,7 +2423,7 @@ off.
   only if `workspace_save_minutes` have passed since the last time (what
   the app does every minute).
 - `aht workspace --restore` — show what opening the layout from before
-  iTerm2 last started would open; `--apply` opens it.
+  your terminal last started would open; `--apply` opens it.
 - `aht workspace --restore <id> --apply` — open an older layout from the
   list.
 

@@ -1,6 +1,6 @@
 # Privacy policy
 
-**agent-history-tether (aht)** · effective 2026-11-05
+**agent-history-tether (aht)** · effective 2026-11-06
 
 This policy applies to every version of aht on macOS, Windows and Linux,
 however it was installed: from source, from the release downloads, or
@@ -126,6 +126,15 @@ have sessions in each project it tracks.
   dark mode; and for *Getting started*, whether iTerm2's Python API and
   its new-output indicator are on and whether that saved state exists.
   aht never changes iTerm2's settings.
+- **Windows Terminal** (Windows): window and tab titles (through Windows'
+  UI Automation) and, for each pane, its id, title, folder and the command
+  lines of the programs in it, for saved workspaces. The pane id comes from the program's environment
+  (`WT_SESSION`); no other variable is kept. Tab colours and profiles, and
+  whether it brings its windows back, come from its `state.json`,
+  `elevated-state.json` and `settings.json`, read only; aht never reads or
+  copies the `buffer_*.txt` files that hold your screen text. To bring a
+  session back aht types the command into that pane's console. aht never
+  changes Windows Terminal's settings or files.
 - **Machines you could add,** only when you run `aht remote discover`, or
   open the Machines tab in the Mac app (or press *Look Again* there): your
   `~/.ssh/config` and the list of your machines from Tailscale.  The Mac
@@ -324,7 +333,7 @@ encrypt it.
 | `backups/` | see [Backups](#backups) | the newest 10 snapshots per project |
 | `search.db` | a search index: the text of messages (up to 4,000 characters each), what each tool call worked on (its command, file path, web address or search, up to 400 characters) and session titles, with keys masked whole before anything is cut (see [Security](#security)), plus agents, project paths and times | until you delete it; rebuilt when needed.  An index made by an earlier version is built anew once, keeping none of its old rows; a session whose history file is gone and that no backup holds then drops out |
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`: on by default on macOS, where the copies take no room, off elsewhere), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`), none older than 30 days |
-| `workspaces/` | macOS: saved iTerm2 layouts: this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session ids, each Claude session's name (keys masked), and the options it was started with that it keeps when it starts again (permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, `--verbose`; never a first prompt).  Tab titles are kept as iTerm2 has them, so that restoring a layout sets them back | all from the last two hours, then one an hour for a day, one a day for a week, one a week for a month and one a month for a year; older ones are removed |
+| `workspaces/` | macOS and Windows: saved iTerm2 or Windows Terminal layouts: this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session ids, each Claude session's name (keys masked), and the options it was started with that it keeps when it starts again (permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, `--verbose`; never a first prompt).  Tab titles are kept as iTerm2 has them, so that restoring a layout sets them back | all from the last two hours, then one an hour for a day, one a day for a week, one a week for a month and one a month for a year; older ones are removed |
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
 | `handover/<project id>/` | the lists and set-asides of handovers, syncs and returns (see [below](#handovers-and-syncs)) | see below |
 | `remote/copies.json` | the folders on this computer that are copies of another machine's projects: for each, the kind of copy (`sync`, `handover`, `brought`, `returned`), the project's id, the machine it came from (its name and aht's random id there), the project's path and system there, whether git converts line endings there (`autocrlf`), the attempt it came with, and since when.  Written when you bring a project here, and when another machine syncs a project here or hands one over to this computer | until you delete it; a later copy into the same folder replaces that folder's note |

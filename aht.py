@@ -3639,6 +3639,7 @@ def cmd_status(args):
         "prompt_hook_installed": hook_installed("UserPromptSubmit"),
         "claude_remote_control": claude_remote_control(),
         "iterm_api": iterm_api_on() if IS_MAC else None,
+        "terminal": terminal().name or None,
         "getting_started": getting_started("iTerm" in installed),
         "update": check_update(fetch=False),
         "claude_auto_continue": claude_auto_continue(),
@@ -20207,7 +20208,8 @@ def open_sessions_here(names: bool = False) -> list:
                      "session": s.get("session"), "name": s.get("name"),
                      "title": n.get("name"), "title_origin": n.get("origin"),
                      "tab": n.get("tab"), "pending_title": n.get("pending"),
-                     "in_iterm": c.get("in_iterm"), "background": c.get("background"),
+                     "in_terminal": c.get("in_terminal"), "in_iterm": c.get("in_iterm"),
+                     "background": c.get("background"),
                      "issues": c.get("issues") or [], "can_restart": c.get("can_restart"),
                      "version": c.get("version"), "installed": c.get("installed"),
                      "limit": {k: stop.get(k) for k in ("resets", "until", "auto")}
@@ -24749,12 +24751,14 @@ def goto_session(target: str) -> dict:
     s = _resolve_open(target)
     if s is None:
         return {"ok": False, "why": "no open Claude Code session matches"}
-    tty = _ttys().get(s["pid"])
+    tty = terminal().pane_of_pids([s["pid"]]).get(s["pid"])
     if not tty:
         return {"ok": False, "why": "it runs in the background, not in a terminal tab"}
-    got = _iterm_do(tty, "goto")
+    term = terminal()
+    got = term.go_to(tty)
     return {"ok": got == "ok", "tty": tty,
-            "why": {"ok": None, "refused": ITERM_REFUSED}.get(got, "it is not in an iTerm2 tab")}
+            "why": {"ok": None, "refused": term.refused}.get(
+                got, f"it is not in a tab of {term.name or 'a terminal aht can drive'}")}
 
 def cmd_goto(args):
     res = goto_session(args.target)
@@ -24889,8 +24893,9 @@ def session_checkup() -> list:
     for s in rows:
         if s.get("session"):
             count[s["session"]] = count.get(s["session"], 0) + 1
-    ttys = _ttys()
-    tabs = iterm_tabs(max_age=10 ** 9)
+    term = terminal()
+    ttys = term.pane_of_pids([s["pid"] for s in rows])
+    tabs = term.last_tabs()
     rc = claude_remote_control()
     have = installed_claude_version()
     out = []
@@ -24914,7 +24919,9 @@ def session_checkup() -> list:
                     "name": _current_title(tr) or _auto_title(tr) or None,
                     "version": rec.get("version"), "installed": have or None,
                     "tty": tty, "tab": redact((tabs.get(tty or "") or {}).get("title") or None),
-                    "in_iterm": bool(tty and tty in tabs), "in_app": bool(rec.get("bridgeSessionId")),
+                    "in_terminal": bool(tty and tty in tabs),
+                    "in_iterm": bool(tty and tty in tabs),      # the Mac app's name for it
+                    "in_app": bool(rec.get("bridgeSessionId")),
                     "background": not tty, "issues": issues,
                     "can_restart": bool(tty and tty in tabs and s.get("session")
                                         and (s.get("status") == "idle" or "stuck" in issues))})
@@ -24963,7 +24970,7 @@ def close_session(pid: int, apply: bool = False) -> dict:
     return res
 
 def restart_session(pid: int, apply: bool = False) -> dict:
-    """End an idle (or stuck) session and start it again in the same iTerm2
+    """End an idle (or stuck) session and start it again in the same terminal
     tab, with the options it had: it then runs the installed Claude Code and,
     with Remote Control on for every session, appears in the Claude app."""
     pid = int(pid)
@@ -24972,15 +24979,15 @@ def restart_session(pid: int, apply: bool = False) -> dict:
     if row is None:
         res["blockers"].append("no open Claude Code session has that process")
         return res
-    if not row["in_iterm"]:
-        res["blockers"].append("it is not in an iTerm2 tab, so aht cannot start it there again")
+    term = terminal()
+    if not row["in_terminal"]:
+        res["blockers"].append(f"it is not in a tab of {term.name or 'a terminal aht can drive'}, "
+                               "so aht cannot start it there again")
     elif not row["can_restart"]:
         res["blockers"].append("it is working or waiting for you; restart it once it is idle")
-    flags = _claude_flags(_cmdline(pid))
-    env = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 " if row.get("tab") and not \
-        (iterm_tabs(max_age=10 ** 9).get(row["tty"]) or {}).get("override") else ""
-    cmd = (f"cd {shlex.quote(row['project'])} && {env}claude "
-           + " ".join(shlex.quote(f) for f in flags + ["--resume", row["session"] or ""]))
+    cmd = term.restart_line(row, _claude_flags(_cmdline(pid))) if row["in_terminal"] else None
+    if row["in_terminal"] and cmd is None:
+        res["blockers"].append("its tab has no shell to start it from")
     res.update(session=row["session"], project=row["project"], tab=row.get("tab"),
                command=cmd, issues=row["issues"])
     if not apply or res["blockers"]:
@@ -24990,7 +24997,7 @@ def restart_session(pid: int, apply: bool = False) -> dict:
         res["blockers"] += done["blockers"]
         return res
     time.sleep(0.5)                     # the shell gets its prompt back
-    res["applied"] = _iterm_session(row["tty"], "write", cmd)
+    res["applied"] = term.type_line(row["tty"], cmd)
     if not res["applied"]:
         res["blockers"].append("the session ended, but its tab is gone; continue it with: "
                                + cmd)
@@ -25039,6 +25046,7 @@ class Terminal:
     subclass, and nothing outside it knows how that terminal is driven.  This
     base is "no terminal aht can drive": it has no tabs and opens nothing."""
     name = ""                   # as the user knows it; "" for none
+    refused = ""                # why the system will not let aht drive it
 
     def running(self) -> bool:
         return False
@@ -25059,6 +25067,32 @@ class Terminal:
     def pane_processes(self) -> dict:
         """{key: [(pid, command line)]}: what runs in each pane."""
         return {}
+
+    def steps(self, step) -> list:
+        """This terminal's lines in Getting started (made with `step`)."""
+        return []
+
+    def pane_of_pids(self, pids) -> dict:
+        """{pid: key} for the processes in a terminal."""
+        return _ttys()
+
+    def last_tabs(self) -> dict:
+        """The panes as last seen, quickly: this is asked on every look at
+        the sessions.  Only the keys and any "title" count."""
+        return {}
+
+    def go_to(self, key) -> str:
+        """Bring a pane to the front: "ok", "none" (no such pane) or "refused"."""
+        return "none"
+
+    def restart_line(self, row: dict, flags: list):
+        """What to type into the pane of the session in `row` to start it
+        again with `flags`; None when it cannot be started there."""
+        return None
+
+    def type_line(self, key, line: str) -> bool:
+        """Type a line into a pane, Enter included."""
+        return False
 
     def start(self, saved: dict = None) -> tuple:
         """Open the terminal if it is closed, for the layout `saved`: (aht
@@ -25603,6 +25637,7 @@ def _start_iterm() -> str:
 class ITerm2(Terminal):
     """Driven with AppleScript; a pane's key is its tty."""
     name = "iTerm2"
+    refused = ITERM_REFUSED
 
     def running(self) -> bool:
         return bool(os.environ.get("AHT_ITERM_TABS")) or (IS_MAC and _iterm_running())
@@ -25618,6 +25653,21 @@ class ITerm2(Terminal):
 
     def pane_processes(self) -> dict:
         return _tty_processes()
+
+    def last_tabs(self) -> dict:
+        return iterm_tabs(max_age=10 ** 9)
+
+    def go_to(self, key) -> str:
+        return _iterm_do(key, "goto")
+
+    def restart_line(self, row: dict, flags: list):
+        env = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 " if row.get("tab") and not \
+            (self.last_tabs().get(row["tty"]) or {}).get("override") else ""
+        return (f"cd {shlex.quote(row['project'])} && {env}claude "
+                + " ".join(shlex.quote(f) for f in flags + ["--resume", row["session"] or ""]))
+
+    def type_line(self, key, line: str) -> bool:
+        return _iterm_session(key, "write", line)
 
     def start(self, saved: dict = None) -> tuple:
         if os.environ.get("AHT_ITERM_LOG"):             # tests: nothing is started
@@ -25909,9 +25959,12 @@ def _other_steps(kind: str, step) -> list:
     if kind == "windows":
         wt = bool(shutil.which("wt"))
         out.append(step("terminal", wt, "Windows Terminal",
-                        "Windows Terminal is there for the sessions aht opens." if wt else
-                        "Sessions open in a plain console window.",
+                        "Windows Terminal is there for the sessions aht opens and for "
+                        "Restore Workspace." if wt else
+                        "Sessions open in a plain console window, and Restore Workspace "
+                        "needs Windows Terminal.",
                         "Install Windows Terminal from the Microsoft Store.", optional=True))
+        out += terminal().steps(step)
     rc = claude_remote_control()
     out.append(step("remote_control", rc, "Your sessions in the Claude app",
                     "Remote Control is on, so every session is in the Claude app on your "
@@ -26667,12 +26720,12 @@ def build_parser():
     s.add_argument("--close", metavar="PID", type=int, help="end that session's process "
                    "(its conversation stays)")
     s.add_argument("--restart", metavar="PID", type=int, help="end it and start it again "
-                   "in its iTerm2 tab")
+                   "in its terminal tab")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_sessions_checkup)
 
-    s = sub.add_parser("workspace", help="iTerm2's windows and tabs with their sessions: "
+    s = sub.add_parser("workspace", help="the terminal's windows and tabs with their sessions: "
                        "saved while you work, opened again after a restart")
     s.add_argument("--save", action="store_true", help="save it now")
     s.add_argument("--auto", action="store_true",

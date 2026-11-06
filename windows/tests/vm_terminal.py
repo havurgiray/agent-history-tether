@@ -168,7 +168,7 @@ def main():
 
     say("\n[saving a real layout]")
     subprocess.Popen(f'wt.exe -w t1 new-tab --title Paper --suppressApplicationTitle --tabColor "#ff8000" '
-                     f'-d "{DEMO}" ; split-pane -V -d C:\\ ; move-focus left ; new-tab -d "{DEMO}" ; '
+                     f'-d "{DEMO}" ; new-tab -d "{DEMO}" ; split-pane -V -d C:\\ ; '
                      f'new-tab --title Plain -d C:\\')
     time.sleep(7)
     subprocess.Popen('wt.exe -w t2 new-tab --title Notes -d C:\\Windows')
@@ -176,7 +176,7 @@ def main():
     time.sleep(2)
     panes = sorted(W.live_panes().items(), key=lambda kv: kv[1]["born"])
     ck("five panes, each found by its id", len(panes) == 5, panes)
-    p_paper, p_split, p_second, p_plain, p_notes = [k for k, _v in panes]
+    p_paper, p_second, p_split, p_plain, p_notes = [k for k, _v in panes]
     live = dict(panes)
     type_keys(live[p_paper]["pid"], f"claude --model haiku --resume {s1}\r")
     type_keys(live[p_second]["pid"], f"claude --resume {s2}\r")
@@ -193,23 +193,35 @@ def main():
     rows = {e.get("pane_id"): e for e in w["tabs"]}
     ck("every pane is in it", set(rows) == set(live), sorted(rows))
     ck("two windows", len({e["window"] for e in w["tabs"]}) == 2)
-    ck("a split is one tab, three tabs in all in its window",
-       rows[p_paper]["tab"] == rows[p_split]["tab"] and
-       len({e["tab"] for e in w["tabs"] if e["window"] == rows[p_paper]["window"]}) == 3,
+    # which of two neighbouring tabs holds a split beside a named tab cannot be
+    # told from outside; the count of tabs can
+    ck("three tabs in its window, one of them with a split",
+       len({e["tab"] for e in w["tabs"] if e["window"] == rows[p_paper]["window"]}) == 3 and
+       rows[p_plain]["pane"] == 1 and rows[p_split]["tab"] <= 2,
        [(e["window"], e["tab"], e["pane"], e["title"]) for e in w["tabs"]])
     ck("the session in its pane", rows[p_paper].get("session") == s1 and rows[p_second].get("session") == s2,
        rows[p_paper])
     ck("the conversation's folder", rows[p_paper].get("cwd") == str(DEMO), rows[p_paper].get("cwd"))
+    ck("a named tab with a session keeps its name", rows[p_paper].get("title") == "Paper", rows[p_paper])
     ck("its options", rows[p_paper].get("args") == ["--model", "haiku"], rows[p_paper].get("args"))
     ck("plain tabs keep their titles", rows[p_plain].get("title") == "Plain" and rows[p_notes].get("title") == "Notes",
        (rows[p_plain].get("title"), rows[p_notes].get("title")))
     lid = Path(res["saved"]).stem
     dry = js("workspace", "--restore", lid)
     ck("with everything open there is nothing to open", "everything in it is open already" in dry.get("blockers", []), dry)
+    auto = js("workspace", "--save", "--auto")
+    ck("the tray's minute: saved at most once in its time", "saved" in auto, auto)
+    st = js("status")
+    ck("the window is told the terminal", st.get("terminal") == "Windows Terminal", st.get("terminal"))
+    step = next((x for x in js("getting-started").get("steps", []) if x.get("id") == "terminal_windows"), None)
+    ck("Getting started says Windows Terminal brings its windows back", step and step.get("ok") is True, step)
     shot("1-open")
 
     say("\n[a restart: Windows Terminal closed, Open Them]")
     shutdown_message()
+    end = time.time() + 20                      # they end a moment after their terminal
+    while time.time() < end and sessions_now():
+        time.sleep(0.3)
     ck("Claude ended with the restart", not sessions_now(), sessions_now())
     t0 = time.time()
     res = js("workspace", "--restore", lid, "--apply")
@@ -222,7 +234,7 @@ def main():
     if s1 in now:
         ck("the session has its options again", "--model haiku" in W.process_cmdline(now[s1]),
            W.process_cmdline(now[s1]))
-        ck("the first session's pane", (W.process_env(now[s1]) or {}).get("WT_SESSION", "").lower() == p_paper)
+        ck("the first session's pane", W.process_pane(now[s1]) == p_paper)
     time.sleep(3)
     shot("2-restored")
     res = js("workspace", "--restore", lid, "--apply")
@@ -238,6 +250,23 @@ def main():
     now = wait_sessions([s1, s2])
     ck("both sessions are back, in the panes open now", s1 in now and s2 in now, now)
     ck("no pane more", set(W.live_panes()) == set(live))
+
+    say("\n[Go to Tab, Restart in Its Tab]")
+    now = sessions_now()
+    got = js("goto", str(now[s2]))
+    ck("Go to Tab", got.get("ok") is True, got)
+    time.sleep(1)
+    shot("3-go-to-tab")
+    old = now[s2]
+    res = js("checkup", "--restart", str(old), "--apply")
+    ck("restarted", res.get("applied") is True, res)
+    end = time.time() + 30
+    while time.time() < end and sessions_now().get(s2) in (None, old):
+        time.sleep(0.5)
+    fresh = sessions_now().get(s2)
+    ck("the session runs in a new process", fresh not in (None, old), sessions_now())
+    if fresh:
+        ck("in the same pane", W.process_pane(fresh) == p_second, W.process_pane(fresh))
 
     say("\n[nothing stays behind in a pane]")
     now = sessions_now()
@@ -264,7 +293,7 @@ def main():
     now = wait_sessions([s1, s2])
     ck("both sessions are back, in new panes", s1 in now and s2 in now, now)
     time.sleep(3)
-    shot("3-from-layout")
+    shot("4-from-layout")
     res2 = js("workspace", "--save")
     w2 = json.loads(Path(res2["saved"]).read_text(encoding="utf-8")) if res2.get("saved") else {"tabs": []}
     titles = sorted(e.get("title") or "" for e in w2["tabs"])

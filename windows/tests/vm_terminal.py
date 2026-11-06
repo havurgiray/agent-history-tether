@@ -4,7 +4,9 @@ Claude Code sessions.  Run it in the desktop session of a test machine (a
 scheduled task with /IT), never on a machine in use: it closes every Windows
 Terminal window.  It puts Windows Terminal's files back afterwards.
 
-    vm_terminal.py <folder Claude trusts> <folder for the results>
+    vm_terminal.py <folder Claude trusts> <folder for the results> [aht.exe]
+
+With aht.exe it drives that build instead of the source.
 
 Each session costs one very short prompt on the cheapest model.
 """
@@ -29,6 +31,7 @@ import winterminal as W  # noqa: E402
 import winlayer  # noqa: E402
 
 DEMO, OUT = Path(sys.argv[1]), Path(sys.argv[2])
+AHT = [sys.argv[3]] if len(sys.argv) > 3 else [sys.executable, str(SRC / "aht_main.py")]
 OUT.mkdir(parents=True, exist_ok=True)
 HOME = Path.home()
 TEMP = Path(tempfile.mkdtemp(prefix="aht-vmterm-"))
@@ -63,7 +66,7 @@ def shot(name):
 
 
 def cli(*args, timeout=180):
-    r = subprocess.run([sys.executable, str(SRC / "aht_main.py"), *args], env=ENV, text=True,
+    r = subprocess.run([*AHT, *args], env=ENV, text=True,
                        capture_output=True, timeout=timeout, encoding="utf-8", creationflags=NOWIN)
     return r.stdout or "", r.stderr or ""
 

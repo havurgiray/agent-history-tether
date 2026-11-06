@@ -24988,7 +24988,53 @@ def cmd_sessions_checkup(args):
               + ("   — can restart in its tab" if r["can_restart"] else ""))
     return 0
 
-# ---- the workspace: iTerm2's windows, tabs and the sessions in them --------- #
+# ---- the terminal app: what aht asks of it, one class for each terminal ------ #
+
+class Terminal:
+    """What the workspace needs from a terminal app.  Each terminal is a
+    subclass, and nothing outside it knows how that terminal is driven.  This
+    base is "no terminal aht can drive": it has no tabs and opens nothing."""
+    name = ""                   # as the user knows it; "" for none
+
+    def running(self) -> bool:
+        return False
+
+    def started(self):
+        """When the running terminal started (seconds since 1970), or None."""
+        return None
+
+    def tabs(self, max_age: float = None) -> dict:
+        """{key: {"title", "window", "tab", "pane", "profile", "color"}}, one
+        for each pane; a key names one pane for as long as it is open."""
+        return {}
+
+    def tab_colors(self) -> dict:
+        """{key: "#rrggbb"} for the panes whose tab has a colour."""
+        return {}
+
+    def pane_processes(self) -> dict:
+        """{key: [(pid, command line)]}: what runs in each pane."""
+        return {}
+
+    def start(self, saved: dict = None) -> tuple:
+        """Open the terminal if it is closed, for the layout `saved`: (aht
+        started it, "" or why not)."""
+        return False, "no terminal aht can drive here"
+
+    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> str:
+        """Open what restore_plan chose: "" when it did, else what went wrong."""
+        return "no terminal aht can drive here"
+
+TERMINAL = None         # a front end's own terminal (Windows sets its own)
+
+def terminal() -> Terminal:
+    if TERMINAL is not None:
+        return TERMINAL
+    if IS_MAC or os.environ.get("AHT_ITERM_TABS") or os.environ.get("AHT_ITERM_LOG"):
+        return ITerm2()
+    return Terminal()
+
+# ---- the workspace: a terminal's windows, tabs and the sessions in them ----- #
 
 _SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "csh"}
 
@@ -25137,11 +25183,12 @@ def iterm_tab_colors() -> dict:
     return out
 
 def workspace_snapshot(tabs: dict = None) -> dict:
-    """Every iTerm2 window, tab and pane: its title, its folder, and the agent
-    session that runs in it (with the options it was started with)."""
-    tabs = iterm_tabs() if tabs is None else tabs
-    colors = iterm_tab_colors() if tabs else {}
-    procs = _tty_processes()
+    """Every window, tab and pane of the terminal: its title, its folder, and
+    the agent session that runs in it (with the options it was started with)."""
+    term = terminal()
+    tabs = term.tabs() if tabs is None else tabs
+    colors = term.tab_colors() if tabs else {}
+    procs = term.pane_processes()
     sessions = {s["pid"]: s for s in running_sessions()}
     rows, want = [], {}
     for tty, t in tabs.items():
@@ -25150,6 +25197,8 @@ def workspace_snapshot(tabs: dict = None) -> dict:
              "pane": int(t.get("pane") or 1), "title": t.get("title") or "",
              "profile": t.get("profile") or None, "color": colors.get(tty) or t.get("color"),
              "cwd": None, "agent": None, "session": None, "args": [], "name": None}
+        if t.get("pane_id"):            # a terminal that names its panes itself
+            e["pane_id"] = t["pane_id"]
         cl = next(((pid, a) for pid, a in here if pid in sessions), None)
         other = next(((pid, m.group(1)) for pid, a in here
                       for m in [_AGENT_PROC.search(" ".join(a.split()[:2]))] if m), None)
@@ -25278,12 +25327,13 @@ def workspace_autosave_path() -> Path:
 
 def autosave_workspace() -> dict:
     """The app calls this every minute; it saves when `workspace_save_minutes`
-    have passed since the last time, iTerm2 is open, and that is switched on."""
+    have passed since the last time, the terminal is open, and that is switched on."""
     every = int(cfg_get("workspace_save_minutes", 10) or 0)
     if every <= 0:
         return {"saved": None, "skipped": "off"}
-    if not os.environ.get("AHT_ITERM_TABS") and not (IS_MAC and _iterm_running()):
-        return {"saved": None, "skipped": "iTerm2 is not open"}
+    term = terminal()
+    if not term.running():
+        return {"saved": None, "skipped": f"{term.name or 'no terminal'} is not open"}
     stamp = workspace_autosave_path()
     try:
         ago = time.time() - stamp.stat().st_mtime
@@ -25297,21 +25347,8 @@ def autosave_workspace() -> dict:
         return {"saved": None, "skipped": "a restore is starting its sessions"}
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.touch()
-    f = save_workspace(workspace_snapshot(iterm_tabs(max_age=0)))
+    f = save_workspace(workspace_snapshot(term.tabs(max_age=0)))
     return {"saved": str(f) if f else None}
-
-def iterm_started():
-    """When the running iTerm2 started (seconds since 1970), or None."""
-    try:
-        r = subprocess.run(["ps", "-Ac", "-o", "lstart=,comm="], capture_output=True,
-                           text=True, timeout=10, cwd="/")
-        for line in r.stdout.splitlines():
-            if line.strip().endswith(" iTerm2"):
-                return time.mktime(time.strptime(" ".join(line.split()[:5]),
-                                                 "%a %b %d %H:%M:%S %Y"))
-    except Exception as _x:
-        warn_once("ps-iterm", f"PROCESS when iTerm2 started could not be told: {_errmsg(_x)}")
-    return None
 
 def list_workspaces() -> list:
     rows = []
@@ -25328,9 +25365,9 @@ def list_workspaces() -> list:
     return rows
 
 def default_workspace(rows: list):
-    """The layout to offer: the last one seen before iTerm2 last started
+    """The layout to offer: the last one seen before the terminal last started
     (what a restart or an update closed), else the newest."""
-    start = None if os.environ.get("AHT_ITERM_TABS") else iterm_started()
+    start = terminal().started()
     before = [r for r in rows if start and (r["seen"] or 0) < start - 5]
     return (before or rows or [None])[0]
 
@@ -25354,8 +25391,8 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
     restore opened a moment ago counts as open (a session takes a few
     seconds to start)."""
     if tabs is None:
-        running = os.environ.get("AHT_ITERM_TABS") or not IS_MAC or _iterm_running()
-        tabs = iterm_tabs() if running else {}
+        term = terminal()
+        tabs = term.tabs() if term.running() else {}
     opened = _just_opened()
     open_ids = {s.get("session") for s in running_sessions()} | set(opened.get("sessions") or [])
     titles_now = ({str(t.get("title") or "") for t in tabs.values()}
@@ -25385,6 +25422,83 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
     plan = [[panes for _t, panes in sorted(tabs.items())] for _w, tabs in sorted(windows.items())]
     return {"windows": plan, "skipped": skipped,
             "opens": sum(len(p) for win in plan for p in win)}
+
+def restore_workspace(wid: str = None, apply: bool = False) -> dict:
+    rows = list_workspaces()
+    pick = next((r for r in rows if r["id"] == wid), None) if wid else default_workspace(rows)
+    res = {"applied": False, "blockers": [], "workspace": pick}
+    if pick is None:
+        res["blockers"].append("no saved workspace yet (aht saves one while you work in "
+                               f"{terminal().name or 'a terminal it can drive'} with Claude Code)")
+        return res
+    w = json.loads((workspaces_dir() / f"{pick['id']}.json").read_text())
+    plan = restore_plan(w)
+    res.update(plan=plan)
+    if not plan["opens"]:
+        res["blockers"].append("everything in it is open already")
+    if not apply or res["blockers"]:
+        return res
+    (aht_home() / "run").mkdir(parents=True, exist_ok=True)
+    lock = open(aht_home() / "run" / "workspace-restore.lock", "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        res["blockers"].append("a restore is opening tabs right now")
+        return res
+    try:
+        return _restore_now(res, pick, w)
+    finally:
+        lock.close()
+
+def _restore_now(res: dict, pick: dict, w: dict) -> dict:
+    term = terminal()
+    started, why = term.start(w)
+    if why:
+        res["blockers"].append(why)
+        return res
+    # a fresh look: what the terminal brought back itself when it started is
+    # not opened twice, and a double click finds the first restore's tabs
+    tabs = term.tabs(max_age=0)
+    plan = restore_plan(w, tabs)
+    res["plan"] = plan
+    if not plan["opens"]:
+        res["blockers"].append("everything in it is open already")
+        return res
+    _write_json(workspace_opened_path(), {
+        "at": time.time(), "workspace": pick["id"],
+        "sessions": [e["session"] for win in plan["windows"] for panes in win for e in panes
+                     if e.get("session")],
+        "titles": [e["title"] for win in plan["windows"] for panes in win for e in panes
+                   if e.get("title")]})
+    why = term.open_plan(plan, tabs, started, w)
+    res["applied"] = not why
+    if why:
+        res["blockers"].append(why)
+        warn(f"WORKSPACE not restored {pick['id']}: {why}")
+        try:
+            workspace_opened_path().unlink()
+        except OSError:
+            pass                # gone already
+    else:
+        log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)"
+            + (f", {term.name} started first" if started else ""))
+    return res
+
+# ---- iTerm2 as aht's terminal ------------------------------------------------ #
+
+def iterm_started():
+    """When the running iTerm2 started (seconds since 1970), or None."""
+    try:
+        r = subprocess.run(["ps", "-Ac", "-o", "lstart=,comm="], capture_output=True,
+                           text=True, timeout=10, cwd="/")
+        for line in r.stdout.splitlines():
+            if line.strip().endswith(" iTerm2"):
+                return time.mktime(time.strptime(" ".join(line.split()[:5]),
+                                                 "%a %b %d %H:%M:%S %Y"))
+    except Exception as _x:
+        warn_once("ps-iterm", f"PROCESS when iTerm2 started could not be told: {_errmsg(_x)}")
+    return None
 
 def _restore_command(e: dict) -> str:
     steps = []
@@ -25442,103 +25556,68 @@ def _start_iterm() -> str:
         time.sleep(0.5)
     return "iTerm2 started but did not answer in time; try again in a moment"
 
-def restore_workspace(wid: str = None, apply: bool = False) -> dict:
-    rows = list_workspaces()
-    pick = next((r for r in rows if r["id"] == wid), None) if wid else default_workspace(rows)
-    res = {"applied": False, "blockers": [], "workspace": pick}
-    if pick is None:
-        res["blockers"].append("no saved workspace yet (aht saves one while you work in "
-                               "iTerm2 with Claude Code)")
-        return res
-    w = json.loads((workspaces_dir() / f"{pick['id']}.json").read_text())
-    plan = restore_plan(w)
-    res.update(plan=plan)
-    if not plan["opens"]:
-        res["blockers"].append("everything in it is open already")
-    if not apply or res["blockers"]:
-        return res
-    (aht_home() / "run").mkdir(parents=True, exist_ok=True)
-    lock = open(aht_home() / "run" / "workspace-restore.lock", "a")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        lock.close()
-        res["blockers"].append("a restore is opening tabs right now")
-        return res
-    try:
-        return _restore_now(res, pick, w)
-    finally:
-        lock.close()
+class ITerm2(Terminal):
+    """Driven with AppleScript; a pane's key is its tty."""
+    name = "iTerm2"
 
-def _restore_now(res: dict, pick: dict, w: dict) -> dict:
-    testing = bool(os.environ.get("AHT_ITERM_LOG"))
-    started = bool(os.environ.get("AHT_ITERM_STARTED")) if testing else False
-    if not testing and not _iterm_running():
+    def running(self) -> bool:
+        return bool(os.environ.get("AHT_ITERM_TABS")) or (IS_MAC and _iterm_running())
+
+    def started(self):
+        return None if os.environ.get("AHT_ITERM_TABS") else iterm_started()
+
+    def tabs(self, max_age: float = None) -> dict:
+        return iterm_tabs() if max_age is None else iterm_tabs(max_age=max_age)
+
+    def tab_colors(self) -> dict:
+        return iterm_tab_colors()
+
+    def pane_processes(self) -> dict:
+        return _tty_processes()
+
+    def start(self, saved: dict = None) -> tuple:
+        if os.environ.get("AHT_ITERM_LOG"):             # tests: nothing is started
+            return bool(os.environ.get("AHT_ITERM_STARTED")), ""
+        if _iterm_running():
+            return False, ""
         why = _start_iterm()
-        if why:
-            res["blockers"].append(why)
-            return res
-        started = True
-    # a fresh look: what iTerm2 brought back itself when it started is not
-    # opened twice, and a double click finds the first restore's tabs
-    tabs = iterm_tabs(max_age=0)
-    plan = restore_plan(w, tabs)
-    res["plan"] = plan
-    if not plan["opens"]:
-        res["blockers"].append("everything in it is open already")
-        return res
-    # the empty window iTerm2 opens when it starts takes the first tab
-    reuse = started and len(tabs) == 1 and not next(iter(tabs.values())).get("title") and \
-        all(os.path.basename(a.split()[0]).lstrip("-") in _SHELLS | {"login"}
-            for _pid, a in _tty_processes().get(next(iter(tabs)), []) if a.split())
-    _write_json(workspace_opened_path(), {
-        "at": time.time(), "workspace": pick["id"],
-        "sessions": [e["session"] for win in plan["windows"] for panes in win for e in panes
-                     if e.get("session")],
-        "titles": [e["title"] for win in plan["windows"] for panes in win for e in panes
-                   if e.get("title")]})
-    L = ['tell application "iTerm2"', "activate"]
-    first = True
-    for win in plan["windows"]:
-        for ti, panes in enumerate(win):
-            if ti == 0 and first and reuse:
-                L += ["set w to current window", "set s to current session of w"]
-            elif ti == 0:
-                L += _with_profile("set w to (create window with {})", panes[0].get("profile"))
-                L += ["set s to current session of w"]
-            else:
-                L += _with_profile("tell w to set t to (create tab with {})", panes[0].get("profile"))
-                L += ["set s to current session of t"]
-            first = False
-            for pi, e in enumerate(panes):
-                if pi:
-                    L += _with_profile("tell s to set s2 to (split vertically with {})",
-                                       e.get("profile"))
-                    L += ["set s to s2"]
-                L.append("delay 0.3")
-                if e.get("title"):
-                    L.append(f'tell s to set variable named "user.ahtTitle" to {_as_text(e["title"])}')
-                L.append(f"tell s to write text {_as_text(_restore_command(e))}")
-    L.append("end tell")
-    if testing:                                         # tests: note it, open nothing
-        with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
-            fh.write(json.dumps({"what": "restore", "script": "\n".join(L)}) + "\n")
-        res["applied"] = True
-        return res
-    r = subprocess.run(["/usr/bin/osascript", "-"], input="\n".join(L), capture_output=True,
-                       text=True, timeout=120, cwd="/")
-    res["applied"] = r.returncode == 0
-    if r.returncode != 0:
-        res["blockers"].append("iTerm2 said: " + (r.stderr or "").strip()[-300:])
-        warn(f"WORKSPACE not restored {pick['id']}: {(r.stderr or '').strip()[-300:]}")
-        try:
-            workspace_opened_path().unlink()
-        except OSError:
-            pass                # gone already
-    else:
-        log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)"
-            + (", iTerm2 started first" if started else ""))
-    return res
+        return not why, why
+
+    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> str:
+        # the empty window iTerm2 opens when it starts takes the first tab
+        reuse = started and len(tabs) == 1 and not next(iter(tabs.values())).get("title") and \
+            all(os.path.basename(a.split()[0]).lstrip("-") in _SHELLS | {"login"}
+                for _pid, a in _tty_processes().get(next(iter(tabs)), []) if a.split())
+        L = ['tell application "iTerm2"', "activate"]
+        first = True
+        for win in plan["windows"]:
+            for ti, panes in enumerate(win):
+                if ti == 0 and first and reuse:
+                    L += ["set w to current window", "set s to current session of w"]
+                elif ti == 0:
+                    L += _with_profile("set w to (create window with {})", panes[0].get("profile"))
+                    L += ["set s to current session of w"]
+                else:
+                    L += _with_profile("tell w to set t to (create tab with {})", panes[0].get("profile"))
+                    L += ["set s to current session of t"]
+                first = False
+                for pi, e in enumerate(panes):
+                    if pi:
+                        L += _with_profile("tell s to set s2 to (split vertically with {})",
+                                           e.get("profile"))
+                        L += ["set s to s2"]
+                    L.append("delay 0.3")
+                    if e.get("title"):
+                        L.append(f'tell s to set variable named "user.ahtTitle" to {_as_text(e["title"])}')
+                    L.append(f"tell s to write text {_as_text(_restore_command(e))}")
+        L.append("end tell")
+        if os.environ.get("AHT_ITERM_LOG"):             # tests: note it, open nothing
+            with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
+                fh.write(json.dumps({"what": "restore", "script": "\n".join(L)}) + "\n")
+            return ""
+        r = subprocess.run(["/usr/bin/osascript", "-"], input="\n".join(L), capture_output=True,
+                           text=True, timeout=120, cwd="/")
+        return "" if r.returncode == 0 else "iTerm2 said: " + (r.stderr or "").strip()[-300:]
 
 def cmd_workspace(args):
     if args.save and args.auto:
@@ -25550,9 +25629,11 @@ def cmd_workspace(args):
                   f"not saved: {res.get('skipped') or 'nothing to save'}")
         return 0
     if args.save:
-        f = save_workspace(workspace_snapshot(iterm_tabs(max_age=0)))
+        term = terminal()
+        f = save_workspace(workspace_snapshot(term.tabs(max_age=0)))
         print(json.dumps({"saved": str(f) if f else None}) if args.json else
-              (f"saved: {f}" if f else "nothing to save (is iTerm2 running?)"))
+              (f"saved: {f}" if f else
+               f"nothing to save (is {term.name or 'a terminal aht can drive'} running?)"))
         return 0
     if args.restore is not None:
         res = restore_workspace(args.restore or None, args.apply)

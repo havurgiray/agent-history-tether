@@ -34,6 +34,7 @@ TIMES = HERE / ".unit-times.json"       # how long each unit took last (git-igno
 OTHER = [("masker", HERE / "redact_test.py"),
          ("linux", HERE / "linux_test.py"),
          ("winbadge", HERE.parent / "windows" / "tests" / "winbadge_test.py"),
+         ("winterminal", HERE.parent / "windows" / "tests" / "winterminal_test.py"),
          ("aht_main", HERE.parent / "windows" / "tests" / "aht_main_test.py"),
          ("aht_tray", HERE.parent / "windows" / "tests" / "aht_tray_test.py"),
          ("agent_smoke", HERE.parent / "windows" / "tests" / "agent_smoke.py")]

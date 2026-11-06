@@ -58,7 +58,7 @@ COMMON = dict(
 # checksum (`aht _core --id`), is that file byte for byte
 a = Analysis(
     [os.path.join(SPECPATH, 'src', 'aht_main.py')],
-    hiddenimports=['winlayer', 'win_fcntl', 'winbadge', 'aht_web'],
+    hiddenimports=['winlayer', 'winterminal', 'win_fcntl', 'winbadge', 'aht_web'],
     datas=[(os.path.join(SPECPATH, os.pardir, 'web'), 'web'),
            (os.path.join(SPECPATH, os.pardir, 'GUIDE.md'), '.'),
            (os.path.join(SPECPATH, os.pardir, 'aht.py'), 'core')],

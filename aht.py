@@ -5835,14 +5835,18 @@ def running_sessions(inside: str = None, home: Path = None) -> list:
         if not _pid_alive(pid):
             continue
         try:                                # same pid, other process: stale
-            born = time.mktime(time.strptime(" ".join(str(rec["procStart"]).split()),
-                                             "%a %b %d %H:%M:%S %Y"))
+            start = str(rec["procStart"])
             seen = _proc_started(pid)
-            # the record's clock may be UTC and ours local: equal start times
-            # differ by a whole number of quarter hours
-            off = abs(seen - born) % 900 if seen is not None else 0
-            if min(off, 900 - off) > 5:
-                continue
+            if start.isdigit():             # Windows: when it was created, exactly
+                if seen is not None and abs(seen - (int(start) - 116444736000000000) / 1e7) > 2:
+                    continue
+            else:
+                born = time.mktime(time.strptime(" ".join(start.split()), "%a %b %d %H:%M:%S %Y"))
+                # the record's clock may be UTC and ours local: equal start
+                # times differ by a whole number of quarter hours
+                off = abs(seen - born) % 900 if seen is not None else 0
+                if min(off, 900 - off) > 5:
+                    continue
         except Exception:
             pass                # a start time that does not parse: the record stands
         cwd = str(rec.get("cwd") or "")
@@ -24766,14 +24770,54 @@ KEEP_FLAGS = {"--dangerously-skip-permissions": 0, "--allow-dangerously-skip-per
               "--permission-mode": 1, "--settings": 1, "--model": 1, "--effort": 1, "--add-dir": 1,
               "--agent": 1, "--chrome": 0, "--no-chrome": 0, "--verbose": 0}
 
+def _windows_argv(line: str) -> list:
+    """A Windows command line as its arguments: a backslash is a plain
+    character there, unless quotes follow it."""
+    out, cur, quoted, have, i = [], [], False, False, 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\":
+            n = 0
+            while i + n < len(line) and line[i + n] == "\\":
+                n += 1
+            i += n
+            if i < len(line) and line[i] == '"':
+                cur.append("\\" * (n // 2))
+                if n % 2:
+                    cur.append('"')
+                    i += 1
+            else:
+                cur.append("\\" * n)
+            have = True
+            continue
+        if c == '"':
+            quoted, have = not quoted, True
+        elif c in " \t" and not quoted:
+            if have or cur:
+                out.append("".join(cur))
+            cur, have = [], False
+        else:
+            cur.append(c)
+            have = True
+        i += 1
+    if have or cur:
+        out.append("".join(cur))
+    return out
+
+def _argv(cmdline: str) -> list:
+    """A command line of this system as its arguments."""
+    if os.name == "nt":
+        return _windows_argv(cmdline)
+    try:
+        return shlex.split(cmdline)
+    except ValueError:
+        return cmdline.split()
+
 def _claude_flags(cmdline: str) -> list:
     """The options a session was started with that it keeps when it starts
     again (permissions, model, effort, extra folders); a first prompt and the
     session it resumed are left out."""
-    try:
-        parts = shlex.split(cmdline)
-    except ValueError:
-        parts = cmdline.split()
+    parts = _argv(cmdline)
     out, i = [], 1
     while i < len(parts):
         key = parts[i].split("=", 1)[0]

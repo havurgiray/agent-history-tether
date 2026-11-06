@@ -1245,6 +1245,8 @@ def activate() -> None:
     aht.stop_watcher = watcher_off      # watcher_owner=none (`aht config --set`)
     aht.hook_installed = hook_installed
     aht._default_watch_roots = _default_watch_roots
+    import winterminal
+    winterminal.activate()
     try:
         _rewrite_old_entry()
     except Exception as e:

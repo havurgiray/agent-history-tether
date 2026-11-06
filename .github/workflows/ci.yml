@@ -13,7 +13,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, python: "3.9" }
+          # the last Ubuntu with a Python 3.9, the Python macOS itself ships
+          - { os: ubuntu-24.04, python: "3.9" }
           - { os: ubuntu-latest, python: "3.12" }
           - { os: macos-latest, python: "3.12" }
     runs-on: ${{ matrix.os }}

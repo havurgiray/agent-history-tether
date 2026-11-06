@@ -245,11 +245,19 @@ def main():
     now = sessions_now()
     ck("/exit typed into each session", all(end_session(now[s]) for s in (s1, s2) if s in now))
     (TEMP / "aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
+    busy_line = W.live_panes()[p_second]["pid"]
+    type_keys(busy_line, "echo half-typed")     # no Enter
+    time.sleep(1)
     res = js("workspace", "--restore", lid, "--apply")
     ck("restored", res.get("applied") is True, res)
     now = wait_sessions([s1, s2])
-    ck("both sessions are back, in the panes open now", s1 in now and s2 in now, now)
-    ck("no pane more", set(W.live_panes()) == set(live))
+    ck("both sessions are back", s1 in now and s2 in now, now)
+    ck("the free pane took its session", W.process_pane(now[s1]) == p_paper if s1 in now else False)
+    ck("a half-typed line was left alone: its session opened in a new tab",
+       s2 in now and W.process_pane(now[s2]) not in live, sorted(W.live_panes()))
+    p_second = W.process_pane(now[s2]) if s2 in now else p_second
+    time.sleep(3)
+    shot("2b-half-typed")
 
     say("\n[Go to Tab, Restart in Its Tab]")
     now = sessions_now()

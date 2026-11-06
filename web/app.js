@@ -3163,8 +3163,10 @@ async function openWorkspaces() {
   let pick = null;
   const open = h("button", { class: "primary", text: "Open Them", disabled: true, onclick: async () => {
     const a = await busy(`opening them in ${terminal}…`, () => J("workspace", "--restore", pick, "--apply", "--json"));
-    if (a.applied) { toast("Opened."); closeSheet(); }
-    else ask("Not opened", (a.blockers || []).join("\n") || "aht could not open them.", ["OK"]);
+    const told = (a.blockers || []).join("\n");
+    if (a.applied) closeSheet();
+    if (a.applied && !told) toast("Opened.");
+    else ask(a.applied ? "Some did not open" : "Not opened", told || "aht could not open them.", ["OK"]);
   } });
   const show = async (id) => {
     pick = id;

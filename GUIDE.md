@@ -794,7 +794,8 @@ waiting for you.
 - **Go to Tab** brings the tab of that session to the front, in iTerm2 or
   Windows Terminal. Windows Terminal does not tell which tab holds a pane,
   so aht goes by the order the tabs opened in and their titles: after
-  dragging tabs around it can land one tab off. On Linux the window offers
+  dragging tabs around, or beside a split, it can land one tab off. On
+  Linux the window offers
   **End Process…** on each Claude session here instead of the buttons below.
 - **Worth a look**, each with a reason: a session **open twice** (the same
   conversation runs in two processes, which both write to it; **End It…**
@@ -2404,10 +2405,12 @@ off.
   old screen text. Windows Terminal keeps only the last of several windows
   closed one after the other, and nothing once every tab has ended, so
   aht's layout is the one that always holds them all.
-- **aht types only into a shell that waits at its prompt.** A session whose
-  pane is busy opens in a new tab instead. Nothing stays behind: the
-  panes' start command remains the shell, so a later start of Windows
-  Terminal does not reopen a session you ended.
+- **aht types only into a shell with nothing running in it**, and into a
+  pane that was already open only when its cursor sits right after a prompt
+  with nothing typed there. Otherwise, or with a prompt it does not know,
+  the session opens in a new tab. Nothing stays behind: the panes' start
+  command remains the shell, so a later start of Windows Terminal does not
+  reopen a session you ended.
 - **Tabs run as administrator** are out of aht's reach, unless aht runs as
   administrator too: Windows does not let it read or type into them.
 - **A plain PowerShell tab** reopens in the folder it started in: `cd` in

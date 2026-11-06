@@ -25,7 +25,9 @@ import shutil
 import subprocess
 import sys
 import time
+from ctypes import wintypes as W
 from pathlib import Path
+from types import SimpleNamespace
 
 import aht
 
@@ -38,34 +40,39 @@ POWERSHELLS = ("powershell", "pwsh")
 # ---- what Windows can tell about a process --------------------------------- #
 
 
+class _Entry(ctypes.Structure):          # PROCESSENTRY32W
+    _fields_ = [("size", W.DWORD), ("usage", W.DWORD), ("pid", W.DWORD),
+                ("heap", ctypes.c_void_p), ("mod", W.DWORD), ("threads", W.DWORD),
+                ("ppid", W.DWORD), ("pri", W.LONG), ("flags", W.DWORD),
+                ("exe", W.WCHAR * 260)]
+
+
+_KERNEL = None
+
+
 def _kernel():
-    from ctypes import wintypes as W
-    k = ctypes.WinDLL("kernel32", use_last_error=True)
-    k.OpenProcess.restype = W.HANDLE
-    k.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
-    k.CloseHandle.argtypes = [W.HANDLE]
-    k.CreateToolhelp32Snapshot.restype = W.HANDLE
-    k.ReadProcessMemory.argtypes = [W.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-                                    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-    k.GetProcessTimes.argtypes = [W.HANDLE] + [ctypes.POINTER(W.FILETIME)] * 4
-    return k
+    global _KERNEL
+    if _KERNEL is None:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = W.HANDLE
+        k.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
+        k.CloseHandle.argtypes = [W.HANDLE]
+        k.CreateToolhelp32Snapshot.restype = W.HANDLE
+        k.ReadProcessMemory.argtypes = [W.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        k.GetProcessTimes.argtypes = [W.HANDLE] + [ctypes.POINTER(W.FILETIME)] * 4
+        k.Process32FirstW.argtypes = [W.HANDLE, ctypes.POINTER(_Entry)]
+        k.Process32NextW.argtypes = [W.HANDLE, ctypes.POINTER(_Entry)]
+        _KERNEL = k
+    return _KERNEL
 
 
 def process_table() -> list:
     """[(pid, parent pid, exe name)] for every process."""
-    from ctypes import wintypes as W
-
-    class Entry(ctypes.Structure):
-        _fields_ = [("size", W.DWORD), ("usage", W.DWORD), ("pid", W.DWORD),
-                    ("heap", ctypes.c_void_p), ("mod", W.DWORD), ("threads", W.DWORD),
-                    ("ppid", W.DWORD), ("pri", W.LONG), ("flags", W.DWORD),
-                    ("exe", W.WCHAR * 260)]
     k = _kernel()
-    k.Process32FirstW.argtypes = [W.HANDLE, ctypes.POINTER(Entry)]
-    k.Process32NextW.argtypes = [W.HANDLE, ctypes.POINTER(Entry)]
     snap = k.CreateToolhelp32Snapshot(2, 0)     # TH32CS_SNAPPROCESS
-    e, out = Entry(), []
-    e.size = ctypes.sizeof(Entry)
+    e, out = _Entry(), []
+    e.size = ctypes.sizeof(_Entry)
     ok = k.Process32FirstW(snap, ctypes.byref(e))
     while ok:
         out.append((e.pid, e.ppid, e.exe))
@@ -92,7 +99,6 @@ class _Process:
             self.k.CloseHandle(self.h)
 
     def _nt(self, what: int, buf, size: int) -> bool:
-        from ctypes import wintypes as W
         n = W.ULONG(0)
         return ctypes.WinDLL("ntdll").NtQueryInformationProcess(
             W.HANDLE(self.h), what, buf, size, ctypes.byref(n)) == 0
@@ -148,7 +154,6 @@ class _Process:
         return folder_name(text)
 
     def born(self):
-        from ctypes import wintypes as W
         if not self.h:
             return None
         times = [W.FILETIME() for _ in range(4)]
@@ -238,8 +243,34 @@ def _descendants(pid: int, kids: dict) -> list:
 
 # ---- consoles: a process cannot leave its own, so a small helper does this ---- #
 
+class _Info(ctypes.Structure):           # CONSOLE_SCREEN_BUFFER_INFO
+    _fields_ = [("size", W._COORD), ("cursor", W._COORD), ("attributes", W.WORD),
+                ("window", W.SMALL_RECT), ("most", W._COORD)]
+
+
+def _cursor_line(k) -> str:
+    """The text left of the cursor in the attached console."""
+    k.CreateFileW.restype = W.HANDLE
+    k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, W.LPVOID, W.DWORD, W.DWORD, W.HANDLE]
+    k.GetConsoleScreenBufferInfo.argtypes = [W.HANDLE, ctypes.POINTER(_Info)]
+    k.ReadConsoleOutputCharacterW.argtypes = [W.HANDLE, W.LPWSTR, W.DWORD, W._COORD,
+                                              ctypes.POINTER(W.DWORD)]
+    k.CloseHandle.argtypes = [W.HANDLE]
+    h = k.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)
+    if h in (None, W.HANDLE(-1).value):
+        return ""
+    info, n = _Info(), W.DWORD(0)
+    text = ""
+    if k.GetConsoleScreenBufferInfo(h, ctypes.byref(info)) and info.cursor.X > 0:
+        buf = ctypes.create_unicode_buffer(info.cursor.X + 1)
+        if k.ReadConsoleOutputCharacterW(h, buf, info.cursor.X, W._COORD(0, info.cursor.Y),
+                                         ctypes.byref(n)):
+            text = buf.value[:n.value]
+    k.CloseHandle(h)
+    return text
+
+
 def _console_info(pid: int) -> dict:
-    from ctypes import wintypes as W
     k, u = ctypes.WinDLL("kernel32", use_last_error=True), ctypes.WinDLL("user32")
     k.GetConsoleWindow.restype = W.HWND
     u.GetWindow.restype = W.HWND
@@ -251,15 +282,37 @@ def _console_info(pid: int) -> dict:
     k.GetConsoleTitleW(title, 1024)
     hwnd = k.GetConsoleWindow()
     owner = int(u.GetWindow(hwnd, 4) or 0) if hwnd else 0   # GW_OWNER: its terminal window
+    line = _cursor_line(k)
     k.FreeConsole()
-    return {"pid": pid, "title": title.value, "owner": owner}
+    return {"pid": pid, "title": title.value, "owner": owner, "console": int(hwnd or 0),
+            "line": line}
+
+
+VK_PACKET = 0xE7                # a character on its own, without a key behind it
+
+
+def key_plan(text: str, scan) -> list:
+    """(virtual key, control state, UTF-16 unit) for each key of `text`.
+    `scan` is VkKeyScanW.  A character above U+FFFF is two units.  One this
+    keyboard layout has no key for, or that takes more than Shift (AltGr),
+    goes as VK_PACKET: holding AltGr down in the record would read as Ctrl+Alt."""
+    raw, out = text.encode("utf-16-le", "surrogatepass"), []
+    for i in range(0, len(raw), 2):
+        unit = int.from_bytes(raw[i:i + 2], "little")
+        if unit == 13:
+            out.append((0x0D, 0, unit))
+            continue
+        k = -1 if 0xD800 <= unit <= 0xDFFF else scan(chr(unit))
+        if k == -1 or (k >> 8) & 0xFE:
+            out.append((VK_PACKET, 0, unit))
+        else:
+            out.append((k & 0xFF, 0x10 if (k >> 8) & 1 else 0, unit))    # 0x10: SHIFT_PRESSED
+    return out
 
 
 def _console_type(pid: int, text: str, gap: float = 0.0) -> dict:
     """Put keys into the console of `pid`: only that pane gets them, in
     whichever tab or window it is, with or without the keyboard."""
-    from ctypes import wintypes as W
-
     class Key(ctypes.Structure):
         _fields_ = [("down", W.BOOL), ("repeat", W.WORD), ("vk", W.WORD), ("scan", W.WORD),
                     ("char", W.WCHAR), ("state", W.DWORD)]
@@ -275,6 +328,8 @@ def _console_type(pid: int, text: str, gap: float = 0.0) -> dict:
     k.WriteConsoleInputW.argtypes = [W.HANDLE, ctypes.POINTER(Record), W.DWORD,
                                      ctypes.POINTER(W.DWORD)]
     k.CloseHandle.argtypes = [W.HANDLE]
+    u.VkKeyScanW.argtypes = [W.WCHAR]
+    u.VkKeyScanW.restype = ctypes.c_short
     k.FreeConsole()
     if not k.AttachConsole(pid):
         code = ctypes.get_last_error()
@@ -283,34 +338,36 @@ def _console_type(pid: int, text: str, gap: float = 0.0) -> dict:
     if h in (None, W.HANDLE(-1).value):
         k.FreeConsole()
         return {"ok": False, "why": "no console input"}
-    done, n = 0, W.DWORD(0)
-    for ch in text:
-        if ch == "\r":
-            vk, shift = 0x0D, 0
-        else:
-            scan = u.VkKeyScanW(ch)
-            vk, shift = scan & 0xff, (scan >> 8) & 1
+    done, n, keys = 0, W.DWORD(0), key_plan(text, u.VkKeyScanW)
+    for vk, state, unit in keys:
         pair = (Record * 2)()
         for i, down in enumerate((1, 0)):
             pair[i].type = 1                                # KEY_EVENT
             key = pair[i].event.key
             key.down, key.repeat, key.vk = down, 1, vk
-            key.scan, key.char = u.MapVirtualKeyW(vk, 0), ch
-            key.state = 0x10 if shift else 0                # SHIFT_PRESSED
+            key.scan, key.char, key.state = u.MapVirtualKeyW(vk, 0), chr(unit), state
         if k.WriteConsoleInputW(h, pair, 2, ctypes.byref(n)):
             done += 1
         if gap:
             time.sleep(gap)
     k.CloseHandle(h)
     k.FreeConsole()
-    return {"ok": done == len(text), "why": "" if done == len(text) else "not all was typed"}
+    return {"ok": done == len(keys), "why": "" if done == len(keys) else "not all was typed"}
+
+
+def _safely(fn, *args) -> dict:
+    """One pane's trouble stays that pane's."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        return {"ok": False, "why": aht.redact(str(e))[:200]}
 
 
 def cmd_pane(argv) -> int:
     """`aht _pane`, for aht itself: a JSON request on stdin."""
     req = json.load(sys.stdin)
-    out = {"info": {str(p): _console_info(int(p)) for p in req.get("info", [])},
-           "typed": {str(t["pid"]): _console_type(int(t["pid"]), t["text"], t.get("gap", 0))
+    out = {"info": {str(p): _safely(_console_info, int(p)) for p in req.get("info", [])},
+           "typed": {str(t["pid"]): _safely(_console_type, int(t["pid"]), t["text"], t.get("gap", 0))
                      for t in req.get("type", [])}}
     print(json.dumps(out))
     return 0
@@ -318,18 +375,19 @@ def cmd_pane(argv) -> int:
 
 def _ask_helper(req: dict) -> dict:
     import winlayer
-    r = subprocess.run(winlayer.self_cmd("_pane"), input=json.dumps(req), capture_output=True,
-                       text=True, encoding="utf-8", timeout=60, creationflags=CREATE_NO_WINDOW)
     try:
+        r = subprocess.run(winlayer.self_cmd("_pane"), input=json.dumps(req), capture_output=True,
+                           text=True, encoding="utf-8", timeout=60, creationflags=CREATE_NO_WINDOW)
         return json.loads(r.stdout)
-    except ValueError:
-        aht.warn(f"WORKSPACE no answer about panes: {(r.stderr or '').strip()[-200:]}")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        aht.warn(f"WORKSPACE no answer about panes: {aht.redact(str(e))[-200:]}")
         return {"info": {}, "typed": {}}
 
 
 # ---- Windows and tabs, from UI Automation ------------------------------------ #
 
 UIA_SELECT = r"""
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 $A = [System.Windows.Automation.AutomationElement]
 $tab = New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, [System.Windows.Automation.ControlType]::TabItem)
@@ -337,7 +395,7 @@ $w = $A::FromHandle([IntPtr]%d)
 $w.FindAll('Descendants', $tab).Item(%d).GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 $p = $w.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
 if ($p.Current.WindowVisualState -eq 'Minimized') { $p.SetWindowVisualState('Normal') }
-$w.SetFocus()
+try { $w.SetFocus() } catch { }
 'ok'
 """
 
@@ -361,9 +419,12 @@ def _powershell(script: str):
     # as one encoded argument: read from stdin, PowerShell takes line by line
     # and a block over several lines never runs
     code = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", code],
-                          capture_output=True, text=True, encoding="utf-8", timeout=30,
-                          stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    try:
+        return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                               code], capture_output=True, text=True, encoding="utf-8", timeout=30,
+                              stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError) as e:
+        return SimpleNamespace(returncode=1, stdout="", stderr=str(e))
 
 
 def uia_windows() -> list:
@@ -436,19 +497,29 @@ def saves_windows(folders: list = None) -> bool:
 
 # ---- deciding: what is where, what goes where (no system calls) ---------------- #
 
+# what programs put on a tab: a program, a folder, user@host, a command running
 APP_TITLE = re.compile(r"^(windows powershell|powershell|command prompt|cmd|git bash|claude code"
-                       r"|.*\.(exe|cmd)|[a-z]:[\\/].*|~.*)$", re.I)
+                       r"|.*\.(exe|cmd)|.*[\\/].*|~.*|[\w.-]+@[\w.-]+.*|(mingw|msys|ucrt|clang)\d*:.*)$",
+                       re.I)
+# in lower case, as they are typed: "Go to market" is a name
+APP_COMMAND = re.compile(r"^(npm|npx|yarn|pnpm|node|python\d?|py|pip|git|ssh|sudo|vim?|nvim|nano"
+                         r"|emacs|htop|top|less|man|tail|watch|docker|kubectl|make|cargo|go)(\s.*)?$")
 
 
 def clean_title(name: str) -> str:
     return re.sub(r"^administrator:\s*", "", (name or "").strip(), flags=re.I)
 
 
+def shell_of(pane: dict) -> str:
+    return re.sub(r"\.exe$", "", pane["exe"], flags=re.I).lower()
+
+
 def own_title(name: str, profiles: set = frozenset()) -> str:
     """A tab's name when someone gave it one; "" when it is what a program or
     the profile put there (Claude's starts with its spinner or ✳)."""
     t = clean_title(name)
-    if not t or APP_TITLE.match(t) or t.lower() in profiles or not (t[0].isalnum() or t[0] in "_-("):
+    if not t or APP_TITLE.match(t) or APP_COMMAND.match(t) or t.lower() in profiles \
+            or not (t[0].isalnum() or t[0] in "_-("):
         return ""
     return t
 
@@ -527,7 +598,11 @@ def arrange(panes: dict, info: dict, wins: list, layouts: list, profiles: set = 
 
 
 def _quote_powershell(a: str) -> str:
-    return a if re.fullmatch(r"[\w@%+=:,./\\-]+", a) else "'" + a.replace("'", "''") + "'"
+    # PowerShell also ends a quoted string at a curly quote, and reads a comma
+    # as a list and @ as splatting
+    if re.fullmatch(r"[\w+=:./\\-]+", a):
+        return a
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", a) + "'"
 
 
 def _quote_cmd(a: str) -> str:
@@ -545,8 +620,10 @@ def resume_line(e: dict, shell: str):
         return ""
     cwd = e.get("cwd")
     if shell in POWERSHELLS:
-        go = f"Set-Location -LiteralPath {_quote_powershell(cwd)}; " if cwd else ""
-        return go + " ".join(_quote_powershell(a) for a in cmd)
+        line = " ".join(_quote_powershell(a) for a in cmd)
+        # a folder that cannot be entered stops it, as && does in the others
+        return (f"Set-Location -LiteralPath {_quote_powershell(cwd)}; if ($?) {{ {line} }}"
+                if cwd else line)
     if shell == "cmd":
         go = f"cd /d {_quote_cmd(cwd)} && " if cwd else ""
         return go + " ".join(_quote_cmd(a) for a in cmd)
@@ -556,10 +633,26 @@ def resume_line(e: dict, shell: str):
     return None
 
 
-def assign(plan: dict, live: dict) -> tuple:
+def at_prompt(line: str, shell: str) -> bool:
+    """The text left of the cursor ends in a prompt, so nothing typed waits
+    there and no program asks for input.  What aht types would else join a
+    half-typed command, or answer a script.  A prompt it does not know means
+    no: the session then opens in a new tab."""
+    t = (line or "").rstrip()
+    if t.endswith(">>"):                        # a continuation line
+        return False
+    return bool(t) and t[-1] in (">$#%❯➜λ»" if shell != "cmd" else ">")
+
+
+def can_take(pane: dict, e: dict) -> bool:
+    """A pane that came back and sits idle in a shell aht can type into."""
+    return not pane["busy"] and resume_line(e, shell_of(pane)) is not None
+
+
+def assign(plan: dict, live: dict, ready=lambda pane: True) -> tuple:
     """([(pane id, entry)], windows to open): an entry whose pane came back and
-    sits at its prompt takes that pane; the rest open as new tabs, each saved
-    window in a window of its own."""
+    can take it stays there; the rest open as new tabs, each saved window in
+    a window of its own.  `ready`: this pane may be typed into now."""
     into, windows = [], []
     for win in plan.get("windows") or []:
         fresh = []
@@ -567,7 +660,7 @@ def assign(plan: dict, live: dict) -> tuple:
             rest = []
             for e in panes:
                 p = live.get(str(e.get("pane_id") or "").lower())
-                if p and not p["busy"]:
+                if p and can_take(p, e) and ready(p):
                     into.append((e["pane_id"].lower(), e))
                 else:
                     rest.append(e)
@@ -576,6 +669,14 @@ def assign(plan: dict, live: dict) -> tuple:
         if fresh:
             windows.append(fresh)
     return into, windows
+
+
+def in_its_pane(pid: int, pane: dict, table: list, info: dict) -> bool:
+    """The process really runs in that pane's shell.  WT_SESSION is inherited:
+    a program started with Start-Process has it too, in a console of its own."""
+    parent = next((q for p, q, _e in table if p == pid), None)
+    consoles = [(info.get(str(p)) or {}).get("console") for p in (pid, pane["pid"])]
+    return parent == pane["pid"] and bool(consoles[0]) and consoles[0] == consoles[1]
 
 
 def _wt_text(s: str) -> str:
@@ -621,10 +722,6 @@ def wait_for(look, enough=None, limit: float = WAIT_PANES, pause: float = 0.5,
 
 # ---- Windows Terminal as aht's terminal ---------------------------------------- #
 
-def shell_of(pane: dict) -> str:
-    return re.sub(r"\.exe$", "", pane["exe"], flags=re.I).lower()
-
-
 class WindowsTerminal(aht.Terminal):
     """A pane's key is its id, WT_SESSION."""
     name = "Windows Terminal"
@@ -643,7 +740,10 @@ class WindowsTerminal(aht.Terminal):
         if not panes:
             return {}
         info = _ask_helper({"info": [p["pid"] for p in panes.values()]})["info"]
-        return arrange(panes, info, uia_windows(), saved_layouts(), profile_names())
+        wins = uia_windows()
+        if not info or not wins:        # a look that failed is not a layout
+            return {}
+        return arrange(panes, info, wins, saved_layouts(), profile_names())
 
     def pane_processes(self) -> dict:
         table = process_table()
@@ -689,15 +789,19 @@ class WindowsTerminal(aht.Terminal):
         return "none"
 
     def restart_line(self, row: dict, flags: list):
-        pane = live_panes().get(row["tty"])
+        table = process_table()
+        pane = live_panes(table).get(row["tty"])
         if not pane:
+            return None
+        info = _ask_helper({"info": [row["pid"], pane["pid"]]})["info"]
+        if not in_its_pane(row["pid"], pane, table, info):
             return None
         return resume_line({"agent": "claude", "session": row["session"], "cwd": row["project"],
                             "args": flags}, shell_of(pane)) or None
 
     def type_line(self, key, line: str) -> bool:
         pane = live_panes().get(key)
-        if not pane:
+        if not pane or pane["busy"]:
             return False
         got = _ask_helper({"type": [{"pid": pane["pid"], "text": line + "\r"}]})["typed"]
         return bool((got.get(str(pane["pid"])) or {}).get("ok"))
@@ -707,22 +811,27 @@ class WindowsTerminal(aht.Terminal):
             return False, ""
         if not shutil.which("wt.exe") and not shutil.which("wt"):
             return False, "Windows Terminal is not installed"
-        layouts = saved_layouts()
+        layouts = saved_layouts() if saves_windows() else []
         if not layouts:
             return False, ""    # nothing to bring back: `wt` opens just what is asked
         # with a saved layout any `wt` command opens those windows too, so
         # they come first, and what is in them is not opened a second time
         subprocess.Popen(["wt.exe"], creationflags=CREATE_NO_WINDOW)
         ids = saved_pane_ids(layouts)
-        want = ids & {str(e.get("pane_id")).lower() for e in (saved or {}).get("tabs", [])}
-        expect = want or ids
-        wait_for(lambda: live_panes().keys(), (lambda now: expect <= now) if expect else None)
+        wait_for(lambda: live_panes().keys(), (lambda now: ids <= now) if ids else None)
         return True, ""
 
-    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> str:
+    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> dict:
         live = live_panes()
-        into, windows = assign(plan, live)
-        jobs, why = [(live[k], e) for k, e in into], []
+        info = _ask_helper({"info": [p["pid"] for p in live.values()]})["info"]
+        for p in live.values():
+            p["line"] = (info.get(str(p["pid"])) or {}).get("line")
+        # panes aht just brought back hold nothing yet; a pane open before
+        # this may hold a half-typed line or a script's question
+        ready = (lambda p: True) if started else (lambda p: at_prompt(p["line"], shell_of(p)))
+        into, windows = assign(plan, live, ready)
+        owners = {(i or {}).get("owner") for i in info.values()}
+        jobs, why, opened = list(into), [], 0
         for i, window in enumerate(windows):
             before = set(live_panes())
             entries = [e for panes in window for e in panes]
@@ -731,22 +840,34 @@ class WindowsTerminal(aht.Terminal):
             wait_for(lambda: live_panes().keys(), lambda now: len(now - before) >= len(entries))
             now = live_panes()
             new = sorted((k for k in now if k not in before), key=lambda k: now[k]["born"])
+            seen = _ask_helper({"info": [now[k]["pid"] for k in new]})["info"]
+            # a tab someone opened meanwhile sits in a window that was there
+            new = [k for k in new
+                   if (seen.get(str(now[k]["pid"])) or {}).get("owner") not in owners]
+            owners |= {(x or {}).get("owner") for x in seen.values()}
             if len(new) < len(entries):
                 why.append(f"{len(entries) - len(new)} of the new tabs did not open")
-            jobs += [(now[k], e) for k, e in zip(new, entries)]
-        typing = []
-        for pane, e in jobs:
-            line = resume_line(e, shell_of(pane))
-            if line is None:
-                why.append(f"aht cannot type into {pane['exe']}")
+            jobs += list(zip(new, entries))
+        now, typing = live_panes(), []
+        for k, e in jobs:                       # as it is now, not as it was
+            pane = now.get(k)
+            line = resume_line(e, shell_of(pane)) if pane else None
+            if not pane or pane["busy"] or line is None:
+                why.append(f"{e.get('name') or e.get('title') or e.get('session')}: "
+                           "its tab was in use; open it again")
             elif line:
                 typing.append({"pid": pane["pid"], "text": line + "\r"})
+            else:
+                opened += 1                     # a plain tab: there it is
         if typing:
             done = _ask_helper({"type": typing})["typed"]
-            bad = [v.get("why") or "no answer" for v in
-                   (done.get(str(t["pid"])) or {} for t in typing) if not v.get("ok")]
-            why += bad
-        return "; ".join(why)
+            for t in typing:
+                got = done.get(str(t["pid"])) or {}
+                if got.get("ok"):
+                    opened += 1
+                else:
+                    why.append(got.get("why") or "no answer from a tab")
+        return {"opened": opened, "why": "; ".join(why)}
 
 
 def activate() -> None:

@@ -63,6 +63,17 @@ with tempfile.TemporaryDirectory() as td:
     ck("the same number on a newer process: it is not", aht.running_sessions(home=Path(td)) == [])
     aht._proc_started = lambda pid: None
     ck("no start time known: in doubt it stands", len(aht.running_sessions(home=Path(td))) == 1)
+    aht._proc_started = lambda pid: made_s + 3600
+    (d / "4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "s1", "cwd": "C:\\x",
+                                             "procStart": "638000000000000000"}))
+    ck("a number on another scale says nothing: it stands", len(aht.running_sessions(home=Path(td))) == 1)
+    (d / "4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "s1", "cwd": "C:\\x",
+                                             "procStart": "638000000000000000",
+                                             "procStartFt": str(made)}))
+    ck("procStartFt goes first: a reused number is seen", aht.running_sessions(home=Path(td)) == [])
+    (d / "4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "s1", "cwd": "C:\\x",
+                                             "procStartFt": str(made)}))
+    ck("…also with no procStart at all", aht.running_sessions(home=Path(td)) == [])
     aht._pid_alive, aht._proc_started = alive, started
 
 print("\n[Windows Terminal's files, read only]")
@@ -90,7 +101,9 @@ print("\n[titles]")
 for name, want in (("Paper", "Paper"), ("Administrator: Paper", "Paper"), ("Windows PowerShell", ""),
                    ("Administrator: Windows PowerShell", ""), ("✳ Claude Code", ""),
                    ("⠐ fixing the login", ""), (r"C:\WINDOWS\system32\cmd.exe", ""), ("", ""),
-                   ("Dev Box", "")):
+                   ("Dev Box", ""), ("MINGW64:/c/Users/me/proj", ""), ("npm run dev", ""),
+                   ("me@prod: ~/secrets", ""), ("htop", ""), ("vim notes.txt", ""), ("Topics", "Topics"),
+                   ("Notes", "Notes"), ("Go to market", "Go to market")):
     ck(f"{name!r} -> {want!r}", W.own_title(name, {"dev box"}) == want)
 
 print("\n[what is where]")
@@ -135,24 +148,52 @@ ck("a window UI Automation did not see keeps its panes",
 
 print("\n[what goes where]")
 sess = {"agent": "claude", "session": "s1", "cwd": r"C:\My Work", "args": ["--model", "haiku"]}
-ck("PowerShell",
+ck("PowerShell: a folder it cannot enter stops the line",
    W.resume_line(sess, "powershell") ==
-   r"Set-Location -LiteralPath 'C:\My Work'; claude --model haiku --resume s1")
+   r"Set-Location -LiteralPath 'C:\My Work'; if ($?) { claude --model haiku --resume s1 }")
 ck("cmd", W.resume_line(sess, "cmd") == r'cd /d "C:\My Work" && claude --model haiku --resume s1')
 ck("Git Bash", W.resume_line(sess, "bash") == "cd 'C:\\My Work' && claude --model haiku --resume s1")
 ck("a quote in a folder, PowerShell",
    "'C:\\it''s'" in W.resume_line(dict(sess, cwd="C:\\it's"), "pwsh"))
-ck("Kimi", W.resume_line({"agent": "kimi", "cwd": "C:\\x"}, "pwsh").endswith("kimi -c"))
+for name, quote in (("curly closing", "\u2019"), ("curly opening", "\u2018"), ("low", "\u201a"),
+                    ("high reversed", "\u201b")):
+    ck(f"a {name} quote in a folder cannot end PowerShell's string",
+       f"'C:\\x{quote}{quote};calc;{quote}{quote}'" in W.resume_line(dict(sess, cwd=f"C:\\x{quote};calc;{quote}"), "pwsh"))
+ck("a comma in a folder is quoted, not read as a list",
+   "-LiteralPath 'C:\\a,b'" in W.resume_line(dict(sess, cwd="C:\\a,b"), "pwsh"))
+ck("…and an at sign", "'@args'" in W.resume_line(dict(sess, args=["@args"]), "pwsh"))
+ck("Kimi", W.resume_line({"agent": "kimi", "cwd": "C:\\x"}, "pwsh").endswith("{ kimi -c }"))
 ck("a plain tab: nothing to type", W.resume_line({"cwd": "C:\\x"}, "pwsh") == "")
 ck("a shell aht does not know: said so, not guessed", W.resume_line(sess, "nu") is None)
-a = {"pane_id": "AA", "session": "1"}
-b = {"pane_id": "bb", "session": "2"}
-c = {"session": "3"}
-into, fresh = W.assign({"windows": [[[a], [b, c]]]}, {"aa": {"busy": []}, "bb": {"busy": ["node.exe"]}})
+a = {"pane_id": "AA", "session": "1", "agent": "claude"}
+b = {"pane_id": "bb", "session": "2", "agent": "claude"}
+c = {"session": "3", "agent": "claude"}
+PS = "powershell.exe"
+into, fresh = W.assign({"windows": [[[a], [b, c]]]}, {"aa": {"busy": [], "exe": PS},
+                                                      "bb": {"busy": ["node.exe"], "exe": PS}})
 ck("a pane that came back and is idle takes its session", into == [("aa", a)])
 ck("a busy pane is never typed into: its session opens anew", fresh == [[[b, c]]])
 ck("a window with nothing to open is no window",
-   W.assign({"windows": [[[a]]]}, {"aa": {"busy": []}})[1] == [])
+   W.assign({"windows": [[[a]]]}, {"aa": {"busy": [], "exe": PS}})[1] == [])
+ck("a pane in a shell aht cannot talk to: its session opens in a new tab",
+   W.assign({"windows": [[[a]]]}, {"aa": {"busy": [], "exe": "nu.exe"}}) == ([], [[[a]]]))
+ck("a pane that is not ready: its session opens in a new tab",
+   W.assign({"windows": [[[a]]]}, {"aa": {"busy": [], "exe": PS}}, lambda p: False) == ([], [[[a]]]))
+for line, shell, want in (("PS C:\\x> ", "powershell", True), ("C:\\x>", "cmd", True),
+                          ("me@pc MINGW64 ~ $ ", "bash", True), ("~/x ❯ ", "pwsh", True),
+                          ("PS C:\\x> Remove-Item -Recurse ", "powershell", False),
+                          (">> ", "powershell", False), ("Your name: ", "powershell", False),
+                          ("Press any key to continue . . . ", "cmd", False), ("", "cmd", False),
+                          (None, "powershell", False), ("cost in $", "cmd", False)):
+    ck(f"at a prompt? {line!r}: {want}", W.at_prompt(line, shell) is want)
+table = [(10, 1, "powershell.exe"), (20, 10, "claude.exe"), (30, 10, "claude.exe"), (40, 20, "x.exe")]
+same = {"10": {"console": 7}, "20": {"console": 7}, "30": {"console": 9}, "40": {"console": 7}}
+pane = {"pid": 10}
+ck("a session in its pane's shell", W.in_its_pane(20, pane, table, same))
+ck("a session in a console of its own only inherited the pane's id",
+   not W.in_its_pane(30, pane, table, same))
+ck("a session started further down is not typed for", not W.in_its_pane(40, pane, table, same))
+ck("no answer about consoles: no", not W.in_its_pane(20, pane, table, {}))
 cmd = W.wt_command([[{"title": "A;B", "color": "#ff8000", "cwd": r"C:\x", "profile": "Dev"},
                      {"cwd": r"C:\y"}], [{"cwd": "C:\\z"}]], "w1")
 ck("one command for a window: tab, split, tab",
@@ -160,6 +201,21 @@ ck("one command for a window: tab, split, tab",
            "--suppressApplicationTitle", "--tabColor", "#ff8000", "-d", r"C:\x",
            ";", "split-pane", "-V", "-d", r"C:\y", ";", "new-tab", "-d", "C:\\z"])
 ck("no pane is ever started with a session in its command", "claude" not in " ".join(cmd))
+
+print("\n[keys]")
+
+
+def layout(ch):
+    return {"a": 0x41, "A": 0x141, "\\": 0x0DC, "@": 0x651, "é": -1}.get(ch, -1)
+
+
+ck("a letter", W.key_plan("a", layout) == [(0x41, 0, 97)])
+ck("Shift is held for a capital", W.key_plan("A", layout) == [(0x41, 0x10, 65)])
+ck("Enter", W.key_plan("\r", layout) == [(0x0D, 0, 13)])
+ck("AltGr's character goes on its own, not as Ctrl+Alt", W.key_plan("@", layout) == [(W.VK_PACKET, 0, 64)])
+ck("no key on this layout: on its own", W.key_plan("é", layout) == [(W.VK_PACKET, 0, 233)])
+ck("above U+FFFF: two units, both on their own",
+   W.key_plan("\U0001F680", layout) == [(W.VK_PACKET, 0, 0xD83D), (W.VK_PACKET, 0, 0xDE80)])
 
 print("\n[waiting for panes]")
 looks = iter([{"a"}, {"a"}, {"a"}, {"a"}, {"a", "b"}, {"a", "b", "c"}])

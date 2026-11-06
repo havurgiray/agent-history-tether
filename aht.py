@@ -5836,10 +5836,13 @@ def running_sessions(inside: str = None, home: Path = None) -> list:
         if not _pid_alive(pid):
             continue
         try:                                # same pid, other process: stale
-            start = str(rec["procStart"])
+            start = str(rec.get("procStartFt") or rec["procStart"])
             seen = _proc_started(pid)
-            if start.isdigit():             # Windows: when it was created, exactly
-                if seen is not None and abs(seen - (int(start) - 116444736000000000) / 1e7) > 2:
+            if start.isdigit():
+                # Windows: when it was created, exactly, in FILETIME's scale;
+                # a number on another scale says nothing, so the record stands
+                ft = int(start)
+                if ft < 3e17 and seen is not None and abs(seen - (ft - 116444736000000000) / 1e7) > 2:
                     continue
             else:
                 born = time.mktime(time.strptime(" ".join(start.split()), "%a %b %d %H:%M:%S %Y"))
@@ -24987,7 +24990,7 @@ def restart_session(pid: int, apply: bool = False) -> dict:
         res["blockers"].append("it is working or waiting for you; restart it once it is idle")
     cmd = term.restart_line(row, _claude_flags(_cmdline(pid))) if row["in_terminal"] else None
     if row["in_terminal"] and cmd is None:
-        res["blockers"].append("its tab has no shell to start it from")
+        res["blockers"].append("it does not run directly in its tab's shell, so aht leaves it be")
     res.update(session=row["session"], project=row["project"], tab=row.get("tab"),
                command=cmd, issues=row["issues"])
     if not apply or res["blockers"]:
@@ -24999,8 +25002,8 @@ def restart_session(pid: int, apply: bool = False) -> dict:
     time.sleep(0.5)                     # the shell gets its prompt back
     res["applied"] = term.type_line(row["tty"], cmd)
     if not res["applied"]:
-        res["blockers"].append("the session ended, but its tab is gone; continue it with: "
-                               + cmd)
+        res["blockers"].append("the session ended, but aht could not type into its tab; "
+                               "continue it with: " + cmd)
     log(f"SESSION restarted pid {pid} in {row['tty']}: {cmd}")
     return res
 
@@ -25099,9 +25102,10 @@ class Terminal:
         started it, "" or why not)."""
         return False, "no terminal aht can drive here"
 
-    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> str:
-        """Open what restore_plan chose: "" when it did, else what went wrong."""
-        return "no terminal aht can drive here"
+    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> dict:
+        """Open what restore_plan chose: {"opened": how many, "why": what went
+        wrong, "" for nothing}.  Some can open and others not."""
+        return {"opened": 0, "why": "no terminal aht can drive here"}
 
 TERMINAL = None         # a front end's own terminal (Windows sets its own)
 
@@ -25549,18 +25553,21 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
                      if e.get("session")],
         "titles": [e["title"] for win in plan["windows"] for panes in win for e in panes
                    if e.get("title")]})
-    why = term.open_plan(plan, tabs, started, w)
-    res["applied"] = not why
-    if why:
-        res["blockers"].append(why)
-        warn(f"WORKSPACE not restored {pick['id']}: {why}")
+    got = term.open_plan(plan, tabs, started, w)
+    res["applied"] = got["opened"] > 0
+    if got["why"]:
+        res["blockers"].append(got["why"])
+        warn(f"WORKSPACE restored {got['opened']} of {plan['opens']} from {pick['id']}: {got['why']}")
+    if res["applied"]:
+        # what did open is starting: the note keeps a second click from
+        # opening it again, also when the rest did not open
+        log(f"WORKSPACE restored {pick['id']}: {got['opened']} tab(s)/pane(s)"
+            + (f", {term.name} started first" if started else ""))
+    else:
         try:
             workspace_opened_path().unlink()
         except OSError:
             pass                # gone already
-    else:
-        log(f"WORKSPACE restored {pick['id']}: {plan['opens']} tab(s)/pane(s)"
-            + (f", {term.name} started first" if started else ""))
     return res
 
 # ---- iTerm2 as aht's terminal ------------------------------------------------ #
@@ -25677,7 +25684,7 @@ class ITerm2(Terminal):
         why = _start_iterm()
         return not why, why
 
-    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> str:
+    def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> dict:
         # the empty window iTerm2 opens when it starts takes the first tab
         reuse = started and len(tabs) == 1 and not next(iter(tabs.values())).get("title") and \
             all(os.path.basename(a.split()[0]).lstrip("-") in _SHELLS | {"login"}
@@ -25708,10 +25715,12 @@ class ITerm2(Terminal):
         if os.environ.get("AHT_ITERM_LOG"):             # tests: note it, open nothing
             with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
                 fh.write(json.dumps({"what": "restore", "script": "\n".join(L)}) + "\n")
-            return ""
+            return {"opened": plan["opens"], "why": ""}
         r = subprocess.run(["/usr/bin/osascript", "-"], input="\n".join(L), capture_output=True,
                            text=True, timeout=120, cwd="/")
-        return "" if r.returncode == 0 else "iTerm2 said: " + (r.stderr or "").strip()[-300:]
+        if r.returncode == 0:
+            return {"opened": plan["opens"], "why": ""}
+        return {"opened": 0, "why": "iTerm2 said: " + (r.stderr or "").strip()[-300:]}
 
 def cmd_workspace(args):
     if args.save and args.auto:

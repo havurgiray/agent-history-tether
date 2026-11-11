@@ -288,14 +288,16 @@ def _console_info(pid: int) -> dict:
             "line": line}
 
 
-VK_PACKET = 0xE7                # a character on its own, without a key behind it
+NO_KEY = 0                      # a character on its own, without a key behind it
 
 
 def key_plan(text: str, scan) -> list:
     """(virtual key, control state, UTF-16 unit) for each key of `text`.
     `scan` is VkKeyScanW.  A character above U+FFFF is two units.  One this
-    keyboard layout has no key for, or that takes more than Shift (AltGr),
-    goes as VK_PACKET: holding AltGr down in the record would read as Ctrl+Alt."""
+    keyboard layout has no key for, or that takes more than Shift (AltGr, as
+    \\ { } [ ] @ ~ | on a German keyboard), goes with no key at all: AltGr
+    held in the record could read as Ctrl+Alt, and PSReadLine 2.0, the line
+    editor of Windows PowerShell 5.1, drops every VK_PACKET (0xE7) record."""
     raw, out = text.encode("utf-16-le", "surrogatepass"), []
     for i in range(0, len(raw), 2):
         unit = int.from_bytes(raw[i:i + 2], "little")
@@ -304,7 +306,7 @@ def key_plan(text: str, scan) -> list:
             continue
         k = -1 if 0xD800 <= unit <= 0xDFFF else scan(chr(unit))
         if k == -1 or (k >> 8) & 0xFE:
-            out.append((VK_PACKET, 0, unit))
+            out.append((NO_KEY, 0, unit))
         else:
             out.append((k & 0xFF, 0x10 if (k >> 8) & 1 else 0, unit))    # 0x10: SHIFT_PRESSED
     return out

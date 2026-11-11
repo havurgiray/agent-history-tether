@@ -209,13 +209,22 @@ def layout(ch):
     return {"a": 0x41, "A": 0x141, "\\": 0x0DC, "@": 0x651, "é": -1}.get(ch, -1)
 
 
+def german(ch):                 # VkKeyScanW on the German (0407) layout
+    return {"\\": 0x6DB, "{": 0x637, "}": 0x630, "$": 0x134, "?": 0x1DB}.get(ch, -1)
+
+
 ck("a letter", W.key_plan("a", layout) == [(0x41, 0, 97)])
 ck("Shift is held for a capital", W.key_plan("A", layout) == [(0x41, 0x10, 65)])
 ck("Enter", W.key_plan("\r", layout) == [(0x0D, 0, 13)])
-ck("AltGr's character goes on its own, not as Ctrl+Alt", W.key_plan("@", layout) == [(W.VK_PACKET, 0, 64)])
-ck("no key on this layout: on its own", W.key_plan("é", layout) == [(W.VK_PACKET, 0, 233)])
+ck("AltGr's character goes on its own, not as Ctrl+Alt", W.key_plan("@", layout) == [(W.NO_KEY, 0, 64)])
+ck("no key on this layout: on its own", W.key_plan("é", layout) == [(W.NO_KEY, 0, 233)])
 ck("above U+FFFF: two units, both on their own",
-   W.key_plan("\U0001F680", layout) == [(W.VK_PACKET, 0, 0xD83D), (W.VK_PACKET, 0, 0xDE80)])
+   W.key_plan("\U0001F680", layout) == [(W.NO_KEY, 0, 0xD83D), (W.NO_KEY, 0, 0xDE80)])
+ck("on a German keyboard, \\ { } go on their own and $ ? as Shift keys",
+   W.key_plan("\\{$?}", german) == [(0, 0, 92), (0, 0, 123), (0x34, 0x10, 36), (0xDB, 0x10, 63),
+                                     (0, 0, 125)])
+ck("never VK_PACKET, which PSReadLine 2.0 drops",
+   all(vk != 0xE7 for vk, _, _ in W.key_plan("\\{}@€\U0001F680é", german)))
 
 print("\n[waiting for panes]")
 looks = iter([{"a"}, {"a"}, {"a"}, {"a"}, {"a", "b"}, {"a", "b", "c"}])

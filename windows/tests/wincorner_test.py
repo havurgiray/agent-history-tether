@@ -141,6 +141,16 @@ with tempfile.TemporaryDirectory() as td:
     ck("a session on its way there has a row of its own, with the stage before data moves",
        (r.kind, C.right_text(r), C.transfer_text(r.transfer))
        == ("away", "→ homebox", "Checking homebox …"), (r, C.transfer_text(r.transfer)))
+    moving[0].update(stage="installing Claude Code 2.1.9 on homebox …", percent=30, eta=63)
+    m.poll()
+    ck("…a step that only takes time: how long it still takes, from the last time",
+       C.transfer_text(m.rows[0].transfer)
+       == "Installing Claude Code 2.1.9 on homebox … · 1 min left", C.transfer_text(m.rows[0].transfer))
+    moving[0].update(over=True, eta=None)
+    m.poll()
+    ck("…and when it takes longer than that, it says so",
+       C.transfer_text(m.rows[0].transfer).endswith("taking longer than before"))
+    moving[0].update(over=False)
     moving[0].update(stage="sending the project to homebox …", percent=45,
                      done_bytes=45 << 20, total_bytes=100 << 20, eta=95)
     m.poll()

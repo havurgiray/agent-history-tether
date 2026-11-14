@@ -216,7 +216,7 @@ class Model:
                     recent=1e12 + float(t.get("started") or now), kind="away",
                     machine=t.get("remote") or "?", can_open=False, status="moving")
             row.transfer = {k: t.get(k) for k in ("kind", "stage", "percent", "done_bytes",
-                                                  "total_bytes", "eta")}
+                                                  "total_bytes", "eta", "over")}
         self.done = {k: v for k, v in self.done.items() if k in status}
         if status != self.last:
             self.last = status
@@ -299,10 +299,13 @@ def transfer_text(t: dict) -> str:
     how much went, of how much, and how long it still takes; before any
     data moves, the stage."""
     done, total, eta = t.get("done_bytes"), t.get("total_bytes"), t.get("eta")
-    if done is None:
+    if done is None:                    # a step that only takes time (an install there)
         st = str(t.get("stage") or "").strip()
-        return (st[:1].upper() + st[1:]) if st else (
+        out = (st[:1].upper() + st[1:]) if st else (
             "Taking back …" if t.get("kind") == "reclaim" else "Sending …")
+        if t.get("over"):
+            return out + " · taking longer than before"
+        return out + (" · " + left_text(int(eta)) if isinstance(eta, (int, float)) else "")
     out = aht._human(done) + (f" of {aht._human(total)}" if total else "")
     return out + (" · " + left_text(int(eta)) if isinstance(eta, (int, float)) else "")
 

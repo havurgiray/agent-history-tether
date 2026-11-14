@@ -3718,12 +3718,17 @@ final class AppModel: ObservableObject {
                 else { return }
                 var stage = (j["stage"] as? String) ?? what
                 let pct = (j["percent"] as? NSNumber)?.doubleValue
+                let eta = (j["eta"] as? NSNumber)?.doubleValue, over = j["over"] as? Bool ?? false
                 if let done = (j["done_bytes"] as? NSNumber)?.doubleValue {
                     // once data moves: how much of how much, and how long it still takes
                     let t = Transfer(kind: "", stage: "", percent: nil, done: done,
                                      total: (j["total_bytes"] as? NSNumber)?.doubleValue,
-                                     eta: (j["eta"] as? NSNumber)?.doubleValue).text
+                                     eta: eta).text
                     stage += " · " + t
+                } else if eta != nil || over {      // an install there: the time it takes
+                    let t = Transfer(kind: "", stage: "x", percent: nil, done: nil, total: nil,
+                                     eta: eta, over: over).text
+                    stage += String(t.dropFirst(1))
                 }
                 DispatchQueue.main.async {
                     if self.working != nil {
@@ -5722,6 +5727,38 @@ final class AppModel: ObservableObject {
             // a PC: whether it answers, as the core now has it
             let said = ((d["machines"] as? [[String: Any]]) ?? []).first?["system"] as? String
             if m.system == "Windows" || said == "Windows" { self.refresh() }
+        }
+    }
+
+    /// Copy My Claude Setup: what `aht copy-setup` would do, a question, then
+    /// the copy; what it replaces there is set aside there.
+    func copySetup(_ mc: Machine) {
+        busy("comparing your Claude Code setup with \(mc.name)…") {
+            let d = ahtJSON(["copy-setup", mc.name, "--json"])
+                ?? ["blockers": ["aht gave no answer — see the log (Settings)"]]
+            DispatchQueue.main.async {
+                if let b = d["blockers"] as? [String], !b.isEmpty {
+                    _ = alert("aht could not compare it with \(mc.name)", b.joined(separator: "\n\n"))
+                    return
+                }
+                let (work, text) = setupPlan(d, mc.name)
+                guard work else { return _ = alert("\(mc.name) has your Claude Code setup", text) }
+                guard alert("Copy your Claude Code setup to \(mc.name)?", text, confirm: "Copy") else { return }
+                self.busy("copying your setup to \(mc.name)…") {
+                    let r = ahtJSON(["copy-setup", mc.name, "--apply", "--json"])
+                        ?? ["blockers": ["aht gave no answer — see the log (Settings)"]]
+                    DispatchQueue.main.async {
+                        if let b = r["blockers"] as? [String], !b.isEmpty {
+                            _ = alert("Not copied to \(mc.name)", b.joined(separator: "\n\n"))
+                        } else {
+                            _ = alert("Copied to \(mc.name)",
+                                      "What it replaced there is kept in \(r["set_aside"] as? String ?? "aht's folder there")."
+                                      + ((r["warnings"] as? [String] ?? []).isEmpty ? ""
+                                         : "\n\n" + (r["warnings"] as? [String] ?? []).joined(separator: "\n")))
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -9464,6 +9501,10 @@ struct MachinesView: View {
                                         .help("Bring a project aht keeps on \(mc.name) here, with its history")
                                 }
                                 Button("Check") { m.check(mc) }
+                                Button("Copy My Claude Setup…") { m.copySetup(mc) }
+                                    .disabled(!m.canReach || !mc.asks)
+                                    .help("Your global CLAUDE.md, skills, agents, commands and plugins "
+                                          + "to \(mc.name): a handover carries only the project's own")
                                 Button("Remove…") { m.remove(mc) }
                             }
                             .disabled(m.working != nil)
@@ -11212,6 +11253,7 @@ struct Transfer: Equatable {
     let done: Double?
     let total: Double?
     let eta: Double?
+    var over = false            // a step that only takes time ran longer than before
 
     static func human(_ n: Double) -> String {
         var v = n
@@ -11228,10 +11270,15 @@ struct Transfer: Equatable {
     /// How much went, of how much, and how long it still takes (its arrow
     /// says which way); before any data moves, the stage.
     var text: String {
-        guard let d = done else {
+        guard let d = done else {           // a step that only takes time (an install there)
             let st = stage.trimmingCharacters(in: .whitespaces)
-            return st.isEmpty ? (kind == "reclaim" ? "Taking back …" : "Sending …")
+            let t = st.isEmpty ? (kind == "reclaim" ? "Taking back …" : "Sending …")
                 : st.prefix(1).uppercased() + st.dropFirst()
+            if over { return t + " · taking longer than before" }
+            guard let e = eta.map({ Int($0) }) else { return t }
+            return t + " · " + (e < 60 ? "under a minute left" : e < 3600
+                                ? "\(Int((Double(e) / 60).rounded())) min left"
+                                : "\(e / 3600) h \(e % 3600 / 60) min left")
         }
         var t = Self.human(d) + (total.map { " of " + Self.human($0) } ?? "")
         if let e = eta.map({ Int($0) }) {
@@ -11309,6 +11356,41 @@ func sendFlow(pid: Int, name: String, to: String, checking: @escaping (Bool) -> 
             }
         }
     }
+}
+
+/// What Copy My Claude Setup would do, from `aht copy-setup --json`:
+/// (whether anything goes, the text that says it).
+func setupPlan(_ d: [String: Any], _ name: String) -> (Bool, String) {
+    var lines: [String] = []
+    let copy = d["copy"] as? [String: [String]] ?? [:], repl = d["replace"] as? [String: [String]] ?? [:]
+    if let md = d["claude_md"] as? String {
+        lines.append(md == "differs" ? "Your global CLAUDE.md (the one on \(name) is set aside first)"
+                     : "Your global CLAUDE.md")
+    }
+    for k in ["skills", "agents", "commands", "output-styles"] {
+        if let c = copy[k], !c.isEmpty { lines.append("\(k.capitalized): " + c.joined(separator: ", ")) }
+        if let r = repl[k], !r.isEmpty {
+            lines.append("\(k.capitalized) as they are here (those on \(name) set aside first): "
+                         + r.joined(separator: ", "))
+        }
+    }
+    if let p = d["plugins"] as? [String], !p.isEmpty {
+        lines.append("Plugins, installed on \(name): " + p.map { String($0.split(separator: "@")[0]) }
+            .joined(separator: ", "))
+    }
+    let work = !lines.isEmpty
+    let lo = d["left_out"] as? [String: Any] ?? [:]
+    var out: [String] = []
+    if let h = lo["hooks"] as? [String], !h.isEmpty { out.append("hooks for " + h.joined(separator: ", ")) }
+    if lo["status_line"] as? Bool == true { out.append("the status line") }
+    if let m = lo["mcp"] as? [String], !m.isEmpty { out.append("MCP servers " + m.joined(separator: ", ")) }
+    var text = work ? lines.joined(separator: "\n") : "Nothing of your setup is missing there."
+    if !out.isEmpty {
+        text += "\n\nLeft out, since they run programs of this Mac and may hold keys (set them up "
+            + "on \(name) yourself): " + out.joined(separator: "; ") + "."
+    }
+    for w in d["warnings"] as? [String] ?? [] { text += "\n\nNote: " + w }
+    return (work, text)
 }
 
 /// One line of text asked for in a small window: what was typed, or nil.
@@ -11479,7 +11561,8 @@ final class CornerModel: ObservableObject {
                               percent: (t["percent"] as? NSNumber)?.intValue,
                               done: (t["done_bytes"] as? NSNumber)?.doubleValue,
                               total: (t["total_bytes"] as? NSNumber)?.doubleValue,
-                              eta: (t["eta"] as? NSNumber)?.doubleValue)
+                              eta: (t["eta"] as? NSNumber)?.doubleValue,
+                              over: t["over"] as? Bool ?? false)
             let real = (proj as NSString).resolvingSymlinksInPath
             if let k = one.first(where: { $0.value.kind == "away" && !$0.value.project.isEmpty
                                           && ($0.value.project as NSString).resolvingSymlinksInPath == real })?.key {

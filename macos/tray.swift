@@ -11125,13 +11125,66 @@ struct SettingsView: View {
 // ---- the session corner: the open Claude sessions, top right of the screen ------
 
 struct CornerRow: Identifiable, Equatable {
-    let id: String              // the session id
-    let pid: Int
+    let id: String              // the session id ("away:…" for one handed over)
+    let pid: Int                // 0 for one handed over
     let name: String
     let project: String
-    let state: String           // "waiting", "done", "working" or "idle"
+    let state: String           // "waiting", "done", "working" or "idle"; "unknown":
+                                // handed over, and its machine not heard from lately
     let age: String             // how long it has been so, "" for idle
     let recent: Double          // the order: working now first, then by when it last ran
+    var kind = "here"           // "away": handed over to `machine`
+    var machine = ""
+    var canOpen = true          // handed over: aht can open it from here
+    var status = ""             // Claude Code's own word: busy, shell, waiting or idle
+
+    /// What the list shows at its right.
+    var rightText: String {
+        let t = state == "waiting" && !age.isEmpty ? "waits " + age : age
+        guard kind == "away" else { return t }
+        return "→ " + machine + (t.isEmpty ? (state == "unknown" ? " ?" : "") : " " + t)
+    }
+    /// Branch and Send wait until it has finished, and say so.
+    var busy: Bool { ["busy", "shell", "waiting"].contains(status) }
+    var later: String {
+        ["busy", "shell"].contains(status) ? " (once it has finished)"
+            : status == "waiting" ? " (answer it first)" : ""
+    }
+}
+
+/// What the confirmation of Send to <machine> says (as wincorner.send_question).
+func sendQuestion(_ res: [String: Any], _ name: String, _ to: String) -> String {
+    let h = res["handover"] as? [String: Any] ?? [:]
+    let there = h["there_path"] as? String ?? "the same place"
+    var t = "The session ends here, and its project folder (\(res["project"] as? String ?? "")) "
+        + "and its history go to \(to), to \(there).\n"
+    if h["pc"] as? Bool == true {
+        t += "\(to) is a PC: no session starts there; its tray offers Continue here."
+    } else {
+        t += "The session goes on there, and this tab connects to it. On \(to) it keeps working "
+            + "when this Mac sleeps or loses its connection."
+    }
+    t += "\n\nBring it back later with Take Back… (right-click it in the corner list, or in "
+        + "aht's window)."
+    for w in res["warnings"] as? [String] ?? [] { t += "\n\nNote: " + w }
+    return t
+}
+
+/// One line of text asked for in a small window: what was typed, or nil.
+func askText(_ title: String, _ body: String, _ value: String, confirm: String) -> String? {
+    let a = NSAlert()
+    a.messageText = title
+    a.informativeText = body
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+    field.stringValue = value
+    a.accessoryView = field
+    a.addButton(withTitle: confirm)
+    a.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+    a.window.initialFirstResponder = field
+    NSApp.activate(ignoringOtherApps: true)
+    guard a.runModal() == .alertFirstButtonReturn else { return nil }
+    let t = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.isEmpty ? nil : t
 }
 
 let CORNER_STATE = HOME + "/.aht/run/corner.json"
@@ -11148,6 +11201,8 @@ final class CornerModel: ObservableObject {
     @Published var width: CGFloat = 252         // how wide the list is
     @Published var most = 12                    // how many sessions it lists, the rest "+n more"
     @Published var note: String?                // why a click went nowhere, for a few seconds
+    @Published var machines: [String] = []      // set up here, for Send to
+    var away: [[String: Any]] = []              // `aht _corner`: the sessions handed over
     var sessionsDir = HOME + "/.claude/sessions"
     private var last: [String: String] = [:]    // session → its status at the last look
     private var done: [String: Double] = [:]    // session → when it finished
@@ -11219,7 +11274,39 @@ final class CornerModel: ObservableObject {
                 ?? t.auto ?? (own.isEmpty ? (cwd as NSString).lastPathComponent : own)
             found[pid] = (CornerRow(id: sid, pid: pid, name: name, project: cwd, state: state,
                                     age: state == "idle" ? "" : Self.age(now - since),
-                                    recent: working ? 1e12 + since : since), st)
+                                    recent: working ? 1e12 + since : since, status: st), st)
+        }
+        // the sessions handed over to other machines, as their machines last
+        // said (no chime: their notices bring their own)
+        var awayRows: [CornerRow] = []
+        for a in away {
+            guard let key = a["id"] as? String else { continue }
+            let st = ["working": "busy", "waiting": "waiting", "idle": "idle"][a["state"] as? String ?? ""]
+            var state = "unknown"
+            var since = (a["since"] as? NSNumber)?.doubleValue
+            if let st = st {
+                let w = st == "busy", was = last[key] == "busy" || last[key] == "shell"
+                let t = since ?? now
+                if w {
+                    done[key] = nil
+                    if !was || runSince[key] == nil { runSince[key] = t }
+                } else {
+                    runSince[key] = nil
+                    if st == "idle" && was { done[key] = now }
+                }
+                state = st == "waiting" ? "waiting" : w ? "working" : done[key] != nil ? "done" : "idle"
+                since = w ? runSince[key] ?? t : state == "done" ? done[key] ?? t : t
+                status[key] = st
+            } else {
+                status[key] = last[key] ?? "unknown"
+            }
+            awayRows.append(CornerRow(
+                id: key, pid: 0, name: a["name"] as? String ?? "session",
+                project: a["project"] as? String ?? "", state: state,
+                age: state == "idle" || state == "unknown" || since == nil ? "" : Self.age(now - since!),
+                recent: state == "working" ? 1e12 + (since ?? 0) : since ?? 0, kind: "away",
+                machine: a["machine"] as? String ?? "?", canOpen: a["can_open"] as? Bool ?? false,
+                status: st ?? "unknown"))
         }
         byPid = found
         done = done.filter { status[$0.key] != nil }
@@ -11232,6 +11319,7 @@ final class CornerModel: ObservableObject {
         for (row, _) in found.values where one[row.id] == nil || one[row.id]!.pid < row.pid {
             one[row.id] = row
         }
+        for row in awayRows where one[row.id] == nil { one[row.id] = row }
         let rows = one.values.sorted {
             ($0.recent, $1.name.lowercased(), $1.pid) > ($1.recent, $0.name.lowercased(), $0.pid)
         }
@@ -11296,9 +11384,9 @@ final class CornerModel: ObservableObject {
     }
 
     /// A line under the list's top for a few seconds.
-    func say(_ text: String) {
+    func say(_ text: String, for secs: Double = 8) {
         note = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
             if self?.note == text { self?.note = nil }
         }
     }
@@ -11341,6 +11429,7 @@ struct CornerBackground: NSViewRepresentable {
 struct CornerView: View {
     @ObservedObject var c: CornerModel
     let open: (CornerRow) -> Void
+    var act: (CornerRow, String) -> Void = { _, _ in }   // the right-click menu's
     let hide: () -> Void
     var drag: (CGPoint, Bool) -> Void = { _, _ in }   // from where (true: let go)
     var home: () -> Void = {}                   // back to the corner
@@ -11421,8 +11510,9 @@ struct CornerView: View {
                 .foregroundColor(r.state == "idle" ? .secondary : .primary)
                 .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 6)
-            Text(r.state == "waiting" ? "waits " + r.age : r.age)
-                .font(.system(size: 10).monospacedDigit()).foregroundColor(.secondary)
+            Text(r.rightText)
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundColor(r.kind == "away" ? Color(red: 0.15, green: 0.39, blue: 0.92) : .secondary)
                 .lineLimit(1).fixedSize().layoutPriority(1)
         }
         .padding(.horizontal, 6).padding(.vertical, 3)
@@ -11437,9 +11527,37 @@ struct CornerView: View {
         .onHover { inside in
             if inside { hover = r.id } else if hover == r.id { hover = nil }
         }
+        .contextMenu { menu(r) }
         .help(r.name + "\n" + (r.project as NSString).abbreviatingWithTildeInPath + "\n"
-              + (r.state == "done" ? "Done. A click goes to its tab and clears the mark."
-                 : "A click goes to its tab."))
+              + (r.kind == "away"
+                 ? "On \(r.machine): " + (r.state == "unknown" ? "not heard from lately" : r.state == "waiting"
+                    ? "waiting for you" : r.state) + ".\n"
+                    + (r.canOpen ? "A click opens it; right-click for Take Back." : "Right-click for Take Back.")
+                 : r.state == "done" ? "Done. A click goes to its tab and clears the mark."
+                 : "A click goes to its tab; right-click for more."))
+    }
+
+    /// Right-click: Go to Tab, Branch…, Send to <machine>…; on a session
+    /// handed over, Open Session and Take Back….
+    @ViewBuilder func menu(_ r: CornerRow) -> some View {
+        if r.kind == "away" {
+            Button("Open Session") { act(r, "open") }.disabled(!r.canOpen)
+            Button("Take Back…") { act(r, "take-back") }
+        } else {
+            Button("Go to Tab") { act(r, "goto") }
+            Button("Branch…" + r.later) { act(r, "branch") }.disabled(r.busy)
+            Divider()
+            if c.machines.isEmpty {
+                Button("Send to Another Machine (add one in the Machines tab first)") {}
+                    .disabled(true)
+            } else {
+                ForEach(c.machines, id: \.self) { m in
+                    Button("Send to \(m)…" + r.later) { act(r, "send:" + m) }.disabled(r.busy)
+                }
+            }
+        }
+        Divider()
+        Button("Hide the List") { hide() }
     }
 }
 
@@ -11521,8 +11639,10 @@ final class CornerPanel {
     let model = CornerModel()
     private var panel: NSPanel?
     private var timer: Timer?
+    private var awayTimer: Timer?
     private var size = CGSize.zero
     var onHide: () -> Void = {}
+    var onTakeBack: (String) -> Void = { _ in }      // the window's Take Back on that project
 
     var shown: Bool { panel?.isVisible ?? false }
     /// The chimes need the sessions watched while the list is hidden, too.
@@ -11573,6 +11693,7 @@ final class CornerPanel {
             p.contentView = CornerHostingView(rootView: CornerView(
                 c: model,
                 open: { [weak self] r in self?.open(r) },
+                act: { [weak self] r, what in self?.act(r, what) },
                 hide: { [weak self] in self?.onHide() },
                 drag: { [weak self] at, done in self?.drag(at, done) },
                 home: { [weak self] in
@@ -11598,6 +11719,15 @@ final class CornerPanel {
     /// A look every second and a half, while the list shows or the chimes
     /// listen.
     private func pace() {
+        if shown && awayTimer == nil {
+            lookAway()
+            awayTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+                self?.lookAway()
+            }
+        } else if !shown {
+            awayTimer?.invalidate()
+            awayTimer = nil
+        }
         if shown || listening {
             if timer == nil {
                 timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -11675,9 +11805,102 @@ final class CornerPanel {
         }
     }
 
-    /// A click on a session: its tab to the front, or a line saying why not.
+    /// The sessions handed over to other machines, and the machines set up
+    /// here, from the core (which asks no machine: it reads what the notices
+    /// last heard).
+    private func lookAway() {
+        DispatchQueue.global(qos: .utility).async {
+            guard let d = ahtJSON(["_corner"]) else { return }
+            DispatchQueue.main.async {
+                self.model.away = d["away"] as? [[String: Any]] ?? []
+                self.model.machines = d["machines"] as? [String] ?? []
+                self.model.poll()
+                self.place()
+            }
+        }
+    }
+
+    /// One of the right-click menu's actions.
+    private func act(_ r: CornerRow, _ what: String) {
+        switch what {
+        case "goto", "open": open(r)
+        case "take-back": onTakeBack(r.project)
+        case "branch": branch(r)
+        default:
+            if what.hasPrefix("send:") { send(r, String(what.dropFirst(5))) }
+        }
+    }
+
+    private func tell(_ r: CornerRow, _ why: String) {
+        model.say(r.name + ": " + why)
+        DispatchQueue.main.async { self.place(force: true) }
+    }
+
+    /// A branch of the session, in a new tab right after its own.
+    private func branch(_ r: CornerRow) {
+        model.seen(r)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let dry = ahtJSON(["branch", String(r.pid), "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = (dry["blockers"] as? [String])?.first { return self.tell(r, why) }
+                guard let name = askText(
+                    "Branch “\(r.name)”",
+                    "The branch opens in a new tab right after this one, with the conversation so far "
+                        + "and the same tab colour; this session goes on as it is.\n\nName of the "
+                        + "new branch:",
+                    dry["name"] as? String ?? r.name + " ⑂", confirm: "Branch") else { return }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let res = ahtJSON(["branch", String(r.pid), "--name", name, "--apply", "--json"])
+                    let why = (res?["blockers"] as? [String])?.first
+                        ?? (res == nil ? "aht gave no answer — see the log (Settings)" : nil)
+                    if let why = why { DispatchQueue.main.async { self.tell(r, why) } }
+                }
+            }
+        }
+    }
+
+    /// The session, with its project, to another machine: the checks first,
+    /// then a question, then the session ends here and its tab follows it.
+    private func send(_ r: CornerRow, _ to: String) {
+        model.say("Checking \(to) for “\(r.name)”…", for: 300)
+        place(force: true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = ahtJSON(["send", String(r.pid), "--to", to, "--json"])
+                ?? ["blockers": ["aht gave no answer — see the log (Settings)"]]
+            DispatchQueue.main.async {
+                self.model.note = nil
+                self.place(force: true)
+                if let b = res["blockers"] as? [String], !b.isEmpty {
+                    _ = alert("“\(r.name)” cannot go to \(to) now", b.joined(separator: "\n\n"))
+                    return
+                }
+                guard alert("Send “\(r.name)” to \(to)?", sendQuestion(res, r.name, to),
+                            confirm: "Send") else { return }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let done = ahtJSON(["send", String(r.pid), "--to", to, "--apply", "--json"])
+                    let why = (done?["blockers"] as? [String])?.first
+                        ?? (done == nil ? "aht gave no answer — see the log (Settings)" : nil)
+                    if let why = why { DispatchQueue.main.async { self.tell(r, why) } }
+                }
+            }
+        }
+    }
+
+    /// A click on a session: its tab to the front, or a line saying why not;
+    /// one handed over opens where it runs.
     private func open(_ r: CornerRow) {
         model.seen(r)
+        if r.kind == "away" {
+            guard r.canOpen else { return tell(r, "its session runs in a terminal on \(r.machine), "
+                                                + "not in a window aht can open from here") }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let d = ahtJSON(["_corner", "--open", r.project])
+                guard d?["ok"] as? Bool != true else { return }
+                let why = d?["why"] as? String ?? "aht could not open it"
+                DispatchQueue.main.async { self.tell(r, why) }
+            }
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let res = sh(PY, [ahtScript(), "goto", String(r.pid), "--json"])
             let d = (try? JSONSerialization.jsonObject(with: Data(res.out.utf8))) as? [String: Any]
@@ -11976,6 +12199,16 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         }
         corner.onHide = { [weak self] in
             self?.model.set("session_corner", "false")
+        }
+        corner.onTakeBack = { [weak self] path in
+            guard let self = self else { return }
+            self.openWindow()
+            self.model.tab = .projects
+            self.model.refresh {
+                guard let p = self.model.projects.first(where: { $0.path == path }) else { return }
+                self.model.selection = p.path
+                if p.takesBack(self.model.machines) { self.model.takeBack(p) }
+            }
         }
         model.offerSetup = { [weak self] in self?.offerGettingStarted() }
         model.openWelcome = { [weak self] in self?.showWelcome() }

@@ -53,8 +53,8 @@ ck("minutes, hours, days", (C.age(61), C.age(3 * 3600 + 5), C.age(2 * 86400)) ==
 with tempfile.TemporaryDirectory() as td:
     home, run = Path(td) / "claude", Path(td) / "run"
     clock = Clock(1_000_000.0)
-    live = []
-    m = C.Model(home, run, records=lambda: live, clock=clock)
+    live, moving = [], []
+    m = C.Model(home, run, records=lambda: live, clock=clock, moving=lambda: moving)
 
     print("\n[states]")
     live[:] = [(10, rec("s1", "busy", at=clock.t - 120))]
@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory() as td:
     m.poll()
     ck("…then idle: done, from now", (m.rows[0].state, m.rows[0].age) == ("done", "now"))
     ck("the mark is kept in the run folder", "s1" in json.loads((run / "corner.json").read_text())["done"])
-    m2 = C.Model(home, run, records=lambda: live, clock=clock)
+    m2 = C.Model(home, run, records=lambda: live, clock=clock, moving=lambda: [])
     m2.poll()
     ck("…and outlasts a restart", m2.rows[0].state == "done")
     m.seen("s1")
@@ -131,6 +131,42 @@ with tempfile.TemporaryDirectory() as td:
     ck("…its machine not heard lately: a question mark",
        (m.rows[0].state, C.right_text(m.rows[0])) == ("unknown", "→ homebox ?"), C.right_text(m.rows[0]))
     ck("…and its mark waits", "away:x" in m.done)
+
+    print("\n[on its way]")
+    m.away = []
+    moving[:] = [{"kind": "handover", "project": "C:\\w\\paper", "remote": "homebox",
+                  "session": "x", "uuid": "u1", "stage": "checking homebox …", "started": clock.t}]
+    m.poll()
+    r = m.rows[0]
+    ck("a session on its way there has a row of its own, with the stage before data moves",
+       (r.kind, C.right_text(r), C.transfer_text(r.transfer))
+       == ("away", "→ homebox", "Checking homebox …"), (r, C.transfer_text(r.transfer)))
+    moving[0].update(stage="sending the project to homebox …", percent=45,
+                     done_bytes=45 << 20, total_bytes=100 << 20, eta=95)
+    m.poll()
+    r = m.rows[0]
+    ck("…then how much went, of how much, and how long it still takes",
+       C.right_text(r) == "→ homebox 45%"
+       and C.transfer_text(r.transfer) == "45.0 MB of 100.0 MB · 2 min left" and "1 on the way"
+       in m.summary(),
+       (C.right_text(r), C.transfer_text(r.transfer)))
+    ck("…and nothing to open until it is there",
+       [x[1] for x in C.menu_items(r, ["homebox"]) if x != "-"] == [None, "hide"])
+    moving[:] = []
+    m.poll()
+    ck("once it is there: the handed-over sessions are listed again", m.away_stale and not m.rows)
+    m.away_stale = False
+    m.away = [{"id": "away:x", "name": "paper", "project": "C:\\w\\paper", "machine": "homebox",
+               "state": "idle", "since": clock.t, "can_open": True}]
+    moving[:] = [{"kind": "reclaim", "project": "C:\\w\\paper", "remote": "homebox",
+                  "uuid": "u1", "percent": 80, "done_bytes": 2048, "total_bytes": 2560, "eta": 5}]
+    m.poll()
+    r = m.rows[0]
+    ck("Take Back: on the session's own row, coming back",
+       len(m.rows) == 1 and C.right_text(r) == "← homebox 80%"
+       and C.transfer_text(r.transfer) == "2 KB of 2 KB · under a minute left",
+       (m.rows, C.transfer_text(r.transfer)))
+    moving[:] = []
 
     print("\n[menu]")
     idle = C.Row(id="s", pid=5, name="n", kind="here", status="idle", state="idle")

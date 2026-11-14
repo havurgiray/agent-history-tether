@@ -540,7 +540,8 @@ def corner_sync():
         _corner().show()
     elif not want and c is not None and c.shown():
         c.hide()
-    if want and time.time() - AWAY_AT[0] > 15:
+    # also at once when a handover or a take-back ended
+    if want and (time.time() - AWAY_AT[0] > 15 or c is not None and c.m.away_stale):
         AWAY_AT[0] = time.time()
         _in_thread(_corner_away)
 
@@ -548,6 +549,7 @@ def corner_sync():
 def _corner_away():
     c = CORNER[0]
     if c is not None:
+        c.m.away_stale = False
         c.m.away, c.m.machines = aht.corner_away(), sorted(aht.remotes_config())
 
 
@@ -1207,11 +1209,14 @@ def corner_selftest():
                   "statusUpdatedAt": (now - 30) * 1000}),
             (13, {"sessionId": "c", "status": "idle", "cwd": "C:\\x\\three"})]
     with tempfile.TemporaryDirectory() as td:
-        m = wincorner.Model(td, td, records=lambda: recs)
+        m = wincorner.Model(td, td, records=lambda: recs, moving=lambda: [
+            {"kind": "handover", "project": "C:\\x\\five", "remote": "box", "uuid": "u5",
+             "stage": "sending the project to box …", "percent": 40, "done_bytes": 4 << 20,
+             "total_bytes": 10 << 20, "eta": 90}])
         m.away = [{"id": "away:d", "name": "four", "project": "C:\\x\\four",
                    "machine": "box", "state": "working", "since": now - 400, "can_open": True}]
         m.poll()
-        assert len(m.rows) == 4, m.rows
+        assert len(m.rows) == 5 and any(r.transfer for r in m.rows), m.rows
         for dark, dpi in ((False, 96), (True, 144)):
             w, h = wincorner.snapshot(m, os.path.join(td, "corner.bmp"), dark=dark, dpi=dpi)
             assert w > 100 and h > 60, (w, h)

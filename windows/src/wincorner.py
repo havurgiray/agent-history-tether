@@ -61,7 +61,7 @@ class Row:
     """One line of the list: a session open here (kind "here") or one handed
     over to another machine (kind "away")."""
     __slots__ = ("id", "pid", "name", "project", "state", "age", "recent", "kind", "machine",
-                 "can_open", "status")
+                 "can_open", "status", "transfer")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -80,7 +80,10 @@ class Model:
     working to idle is "done" until you click it or it works again; the marks
     are kept in a file, so they outlast the tray restarting."""
 
-    def __init__(self, claude_home, run_dir, records=None, clock=time.time):
+    def __init__(self, claude_home, run_dir, records=None, clock=time.time, moving=None):
+        self.moving = moving or aht.transfers      # handovers and take-backs running now
+        self.away_stale = False         # one ended: the tray lists the handed-over ones again
+        self.moved = set()
         self.sessions = Path(claude_home) / "sessions"
         self.projects = Path(claude_home) / "projects"
         self.state_file = Path(run_dir) / STATE_FILE
@@ -190,6 +193,30 @@ class Model:
                            recent=(1e12 + since if state == "working" else since) or 0.0,
                            kind="away", machine=a.get("machine"),
                            can_open=bool(a.get("can_open")), status=st or "unknown")
+        # a handover or take-back under way: on the session's row, or a row
+        # of its own while the session is on its way there
+        moving = [t for t in (self.moving() or []) if isinstance(t, dict)]
+        keys = {str(t.get("uuid") or t.get("project")) for t in moving}
+        if keys != self.moved:
+            self.away_stale = self.away_stale or bool(self.moved - keys)
+            self.moved = keys
+        for t in moving:
+            proj = os.path.normcase(os.path.realpath(str(t.get("project") or "")))
+            row = next((r for r in one.values()
+                        if r.kind == "away" and r.project
+                        and os.path.normcase(os.path.realpath(r.project)) == proj), None)
+            if row is None:
+                sid = t.get("session")
+                key = "away:" + str(sid or t.get("uuid"))
+                custom, auto = self._title(sid, str(t.get("project") or "")) if sid else (None, None)
+                row = one[key] = Row(
+                    id=key, pid=0, name=custom or auto
+                    or ntpath.basename(str(t.get("project") or "").rstrip("\\/")) or "session",
+                    project=str(t.get("project") or ""), state="moving", age="",
+                    recent=1e12 + float(t.get("started") or now), kind="away",
+                    machine=t.get("remote") or "?", can_open=False, status="moving")
+            row.transfer = {k: t.get(k) for k in ("kind", "stage", "percent", "done_bytes",
+                                                  "total_bytes", "eta")}
         self.done = {k: v for k, v in self.done.items() if k in status}
         if status != self.last:
             self.last = status
@@ -245,6 +272,9 @@ class Model:
         n = lambda s: sum(1 for r in self.rows if r.state == s)     # noqa: E731
         parts = [f"{n(s)} {w}" for s, w in (("waiting", "waiting"), ("done", "done"),
                                              ("working", "working")) if n(s)]
+        moving = sum(1 for r in self.rows if r.transfer)
+        if moving:
+            parts.append(f"{moving} on the way")
         if not self.rows:
             return "No Claude session open"
         return " · ".join(parts) if parts else f"{len(self.rows)} open, all idle"
@@ -259,8 +289,30 @@ class Model:
             aht.warn(f"CORNER the session corner's marks were not saved: {e}")
 
 
+def left_text(eta) -> str:
+    return ("under a minute left" if eta < 60 else f"{round(eta / 60)} min left"
+            if eta < 3600 else f"{eta // 3600} h {eta % 3600 // 60} min left")
+
+
+def transfer_text(t: dict) -> str:
+    """The second line of a session on its way (its arrow says which way):
+    how much went, of how much, and how long it still takes; before any
+    data moves, the stage."""
+    done, total, eta = t.get("done_bytes"), t.get("total_bytes"), t.get("eta")
+    if done is None:
+        st = str(t.get("stage") or "").strip()
+        return (st[:1].upper() + st[1:]) if st else (
+            "Taking back …" if t.get("kind") == "reclaim" else "Sending …")
+    out = aht._human(done) + (f" of {aht._human(total)}" if total else "")
+    return out + (" · " + left_text(int(eta)) if isinstance(eta, (int, float)) else "")
+
+
 def right_text(r: Row) -> str:
     """What the list shows at the right of a session."""
+    if r.transfer:
+        pct = r.transfer.get("percent")
+        arrow = "←" if r.transfer.get("kind") == "reclaim" else "→"
+        return f"{arrow} {r.machine}" + (f" {pct}%" if isinstance(pct, int) else "")
     t = ("waits " + r.age if r.state == "waiting" and r.age else r.age or "")
     if r.kind == "away":
         return f"→ {r.machine}" + (f" {t}" if t else " ?" if r.state == "unknown" else "")
@@ -269,6 +321,10 @@ def right_text(r: Row) -> str:
 
 def tip_text(r: Row) -> str:
     """The note that shows over a session."""
+    if r.transfer:
+        where = ("from " if r.transfer.get("kind") == "reclaim" else "to ") + str(r.machine)
+        verb = "Taking back" if r.transfer.get("kind") == "reclaim" else "Sending"
+        return f"{r.name}\n{r.project}\n{verb} {where}: {transfer_text(r.transfer)}."
     if r.kind == "away":
         how = ("not heard from lately" if r.state == "unknown" else
                {"working": "working", "waiting": "waiting for you", "done": "done",
@@ -285,6 +341,10 @@ def menu_items(r: Row, machines: list) -> list:
     """The right-click menu of a session: [(label, action or None for grayed,
     is default)], "-" for a line between.  Actions: "goto", "branch",
     "send:<machine>", "open", "take-back", "hide"."""
+    if r.transfer:
+        return [("Open Session (once it is there)" if r.transfer.get("kind") != "reclaim"
+                 else "Go to Tab (once it is back)", None, False), "-",
+                ("Hide the List", "hide", False)]
     if r.kind == "away":
         return [("Open Session", "open" if r.can_open else None, True),
                 ("Take Back…", "take-back", False), "-", ("Hide the List", "hide", False)]
@@ -323,6 +383,7 @@ def send_question(res: dict) -> str:
 # ---- the window ---------------------------------------------------------------- #
 
 PAD, HEAD, ROW, MORE, ICON_W, GAP, INSET = 5, 20, 22, 18, 14, 7, 6
+TLINE = 18                          # a session on its way: its second line and bar
 EDGE = 6
 LEFT, RIGHT, TOP, BOTTOM = 1, 2, 4, 8
 AWAY_RGB = (37, 99, 235)            # the folder badge's "handed over" blue
@@ -338,7 +399,8 @@ THEMES = {
 
 # Segoe Fluent Icons (Windows 11), else Segoe MDL2 Assets (Windows 10)
 GLYPH = {"working": "", "done": "", "idle": "", "unknown": "",
-         "circle": "", "bang": "", "close": ""}
+         "circle": "", "bang": "", "close": "",
+         "send": "\uE898", "back": "\uE896"}
 
 
 def blend(a, b, t):
@@ -599,8 +661,9 @@ def layout(m: Model, width_px: int, most: int, p: "Painter", dc) -> dict:
         y += h + p.px(3)
     rows = []
     for r in m.rows[:max(0, most)]:
-        rows.append((r, (pad, y, width_px - pad, y + p.px(ROW))))
-        y += p.px(ROW)
+        h = p.px(ROW + (TLINE if r.transfer else 0))
+        rows.append((r, (pad, y, width_px - pad, y + h)))
+        y += h
     out["rows"] = rows
     if len(m.rows) > most:
         out["more"] = (pad + p.px(INSET), y, width_px - pad, y + p.px(MORE))
@@ -633,9 +696,24 @@ def paint(dc, m: Model, lay: dict, p: "Painter", hover=None, hover_close=False):
         if bg:
             p.fill(dc, (a, b, c, d), bg, p.px(5))
         ix = a + p.px(INSET)
+        if r.transfer:                          # the second line and the bar
+            line2 = (ix + p.px(ICON_W + GAP), b + p.px(ROW) - p.px(3), c - p.px(INSET),
+                     d - p.px(5))
+            p.write(dc, p.small, transfer_text(r.transfer), line2, t["dim"],
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS)
+            bar = (line2[0], d - p.px(4), line2[2], d - p.px(2))
+            p.fill(dc, bar, blend(t["bg"], t["fg"], 0.12))
+            pct = r.transfer.get("percent")
+            if isinstance(pct, int) and pct > 0:
+                p.fill(dc, (bar[0], bar[1], bar[0] + (bar[2] - bar[0]) * min(pct, 100) // 100,
+                            bar[3]), t["away"])
+            d = b + p.px(ROW)
         icon = (ix, b, ix + p.px(ICON_W), d)
         flags = DT_SINGLELINE | DT_VCENTER | DT_CENTER
-        if r.state == "waiting":
+        if r.transfer:
+            p.write(dc, p.icons, GLYPH["back" if r.transfer.get("kind") == "reclaim" else "send"],
+                    icon, t["away"], flags)
+        elif r.state == "waiting":
             p.write(dc, p.icons, GLYPH["circle"], icon, t["waiting"], flags)
             p.write(dc, p.icons, GLYPH["bang"], icon, t["bg"], flags)
         else:
@@ -650,7 +728,7 @@ def paint(dc, m: Model, lay: dict, p: "Painter", hover=None, hover_close=False):
         nx = ix + p.px(ICON_W + GAP)
         p.write(dc, p.bold if r.state in ("done", "waiting") else p.text, r.name,
                 (nx, b, rx - rw - (p.px(6) if right else 0), d),
-                t["dim"] if r.state in ("idle", "unknown") else t["fg"],
+                t["dim"] if r.state in ("idle", "unknown") and not r.transfer else t["fg"],
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS)
     if "more" in lay:
         p.write(dc, p.small, f"+{len(m.rows) - len(lay['rows'])} more", lay["more"], t["dim"],

@@ -395,6 +395,22 @@ time.sleep(0.35)
 pg.bytes(5 << 20, 10 << 20, 75)
 got = json.loads(pf.read_text())
 _core22.Progress.done()
+_core22.note_install_seconds("box", 40)
+_core22.note_install_seconds("box", 60)
+_core22.note_install_seconds("pc", 200)
+pg2 = _core22.Progress(None)
+pf2 = sb / "progress-install.json"
+pg2.track(pf2, kind="handover", project=projX, remote="box", uuid="u2")
+pg2.say("installing Claude Code 9.9.9 on box …")
+pg2.timed(_core22.install_seconds("box"))
+time.sleep(1.4)
+got2 = json.loads(pf2.read_text())
+pg2.untimed()
+_core22.Progress.done()
+ck(_core22.install_seconds("box") == 60 and _core22.install_seconds("new") == 60
+   and got2.get("eta") in (58, 59) and 1 <= (got2.get("percent") or 0) <= 3
+   and got2.get("done_bytes") is None and not got2.get("over"),
+   f"installing Claude Code there: the time left, from how long it took there before ({got2})")
 ck(got.get("percent") == 50 and got.get("done_bytes") == 5 << 20 and got.get("eta") == 75
    and got.get("kind") == "handover" and got.get("pid") == os.getpid() and not pf.exists(),
    f"a transfer keeps its stage, bytes, total and time left in its file, gone at the end ({got})")

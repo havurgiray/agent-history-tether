@@ -10053,6 +10053,263 @@ def _agent_return_apply(req: dict, inp, out) -> dict:
     return {"ok": True, "done": done, "set_aside": set_aside, "returned": back,
             "session": latest, "session_title": redact(session_title(store, latest))}
 
+# ---- your own Claude Code setup on another machine --------------------------- #
+#
+# A handover carries a project (and what its folder holds: CLAUDE.md,
+# AGENTS.md, .claude/, .mcp.json) and its history, never what is set up for
+# you on this machine: ~/.claude/CLAUDE.md, your skills, agents, commands and
+# output styles, the plugins you turned on, your hooks, status line and MCP
+# servers.  The handover's check says what the other machine lacks of it;
+# `aht copy-setup <machine>` copies what can go, and lists the rest.
+
+SETUP_DIRS = ("skills", "agents", "commands", "output-styles")
+SETUP_WORDS = {"skills": "skill", "agents": "agent", "commands": "command",
+               "output-styles": "output style"}
+
+def _tree_digest(p: Path) -> str:
+    """One checksum for a file, or for a folder: its files' names and
+    contents (what is rebuilt per machine left out)."""
+    h = hashlib.sha256()
+    if p.is_file():
+        return file_sha256(p)
+    skip = handover_skip()
+    for dp, dns, fns in os.walk(p):
+        dns[:] = sorted(d for d in dns if not _skip_name(d, skip))
+        for f in sorted(fns):
+            if _skip_name(f, skip):
+                continue
+            fp = Path(dp) / f
+            try:
+                h.update(_nfc(str(fp.relative_to(p))).encode() + b"\0"
+                         + file_sha256(fp, 32 << 20).encode() + b"\n")
+            except OSError:
+                continue        # gone meanwhile, or unreadable: as if not there
+    return h.hexdigest()
+
+def claude_setup() -> dict:
+    """This machine's own Claude Code setup, as names and checksums (nothing
+    of what is in it leaves the machine): CLAUDE.md, each skill, agent,
+    command and output style, the plugins turned on and their marketplaces,
+    and the names of the hooks' events, of the MCP servers and whether a
+    status line is set."""
+    home = claude_home()
+    md = home / "CLAUDE.md"
+    out = {"home": str(home), "aht_home": str(aht_home()),
+           "claude_md": file_sha256(md) if md.is_file() else None, "items": {}}
+    for d in SETUP_DIRS:
+        try:
+            ents = sorted(e for e in (home / d).iterdir() if not e.name.startswith("."))
+        except OSError:
+            continue
+        out["items"][d] = {e.name: _tree_digest(e) for e in ents if e.is_dir() or e.is_file()}
+    try:
+        st = json.loads((home / "settings.json").read_text())
+    except (OSError, ValueError):
+        st = {}
+    st = st if isinstance(st, dict) else {}
+    out["plugins"] = sorted(k for k, v in (st.get("enabledPlugins") or {}).items() if v)
+    known = {}
+    try:
+        km = json.loads((home / "plugins" / "known_marketplaces.json").read_text())
+        known.update({k: (v or {}).get("source") for k, v in km.items() if isinstance(v, dict)})
+    except (OSError, ValueError, AttributeError):
+        pass
+    for k, v in (st.get("extraKnownMarketplaces") or {}).items():
+        if isinstance(v, dict) and v.get("source"):
+            known.setdefault(k, v["source"])
+    out["marketplaces"] = known
+    # hooks by event and program; aht's own are left out (aht sets them up
+    # wherever it is installed)
+    hooks = set()
+    for ev, groups in (st.get("hooks") or {}).items() if isinstance(st.get("hooks"), dict) else ():
+        for g in groups if isinstance(groups, list) else ():
+            for hk in (g or {}).get("hooks") or [] if isinstance(g, dict) else ():
+                cmd = str((hk or {}).get("command") or "") if isinstance(hk, dict) else ""
+                if not cmd or "agent-history-tether" in cmd or "aht.py" in cmd \
+                        or re.search(r"(^|[/\\])aht(\.exe)?(\s|$)", cmd.split(" ")[0]):
+                    continue
+                words = [w for w in cmd.split() if not w.startswith("-")]
+                prog = next((w for w in words[1:] if "." in os.path.basename(w)), words[0])
+                hooks.add(f"{ev}: {os.path.basename(prog.strip(chr(34) + chr(39)))}")
+    out["hooks"] = sorted(hooks)
+    out["status_line"] = bool(st.get("statusLine"))
+    try:
+        cj = json.loads(_claude_json().read_text())
+        out["mcp"] = sorted((cj.get("mcpServers") or {}).keys())
+    except (OSError, ValueError, AttributeError):
+        out["mcp"] = []
+    return out
+
+def _agent_claude_setup(req: dict) -> dict:
+    return {"ok": True, "setup": claude_setup()}
+
+def setup_gaps(here: dict, there: dict) -> dict:
+    """What the other machine lacks of this machine's setup: "missing" and
+    "differs" per kind (and CLAUDE.md), plugins, MCP servers; and what never
+    goes over (hooks, the status line)."""
+    g = {"claude_md": None, "missing": {}, "differs": {}, "plugins": [], "mcp": [],
+         "hooks": list(here.get("hooks") or []), "status_line": bool(here.get("status_line"))}
+    if here.get("claude_md") and there.get("claude_md") != here["claude_md"]:
+        g["claude_md"] = "differs" if there.get("claude_md") else "missing"
+    for d in SETUP_DIRS:
+        mine, theirs = (here.get("items") or {}).get(d) or {}, (there.get("items") or {}).get(d) or {}
+        g["missing"][d] = sorted(n for n in mine if n not in theirs)
+        g["differs"][d] = sorted(n for n in mine if n in theirs and theirs[n] != mine[n])
+    g["plugins"] = sorted(set(here.get("plugins") or []) - set(there.get("plugins") or []))
+    g["mcp"] = sorted(set(here.get("mcp") or []) - set(there.get("mcp") or []))
+    return g
+
+def _listed(xs: list, most: int = 4) -> str:
+    return ", ".join(xs[:most]) + (f" and {len(xs) - most} more" if len(xs) > most else "")
+
+def setup_gap_text(g: dict, machine: str):
+    """The handover's note on it, or None when nothing is missing."""
+    parts = []
+    if g.get("claude_md"):
+        parts.append("your global CLAUDE.md" + (" as it is here" if g["claude_md"] == "differs"
+                                                 else ""))
+    for d in SETUP_DIRS:
+        miss, diff = (g.get("missing") or {}).get(d) or [], (g.get("differs") or {}).get(d) or []
+        w = SETUP_WORDS[d]
+        if miss:
+            parts.append(f"{len(miss)} {w}{'s' if len(miss) > 1 else ''} ({_listed(miss)})")
+        if diff:
+            parts.append(f"{w}{'s' if len(diff) > 1 else ''} {_listed(diff)} as {'they are' if len(diff) > 1 else 'it is'} here")
+    pl = [p.split("@")[0] for p in g.get("plugins") or []]
+    if pl:
+        parts.append(f"{len(pl)} plugin{'s' if len(pl) > 1 else ''} ({_listed(pl)})")
+    if g.get("mcp"):
+        parts.append(f"the MCP server{'s' if len(g['mcp']) > 1 else ''} {_listed(g['mcp'])}")
+    if not parts:
+        return None
+    return (f"{machine} lacks your own Claude Code setup: " + "; ".join(parts) + ". A session "
+            f"there works without them; Copy My Claude Setup to {machine} (aht copy-setup "
+            f"{machine}) brings them over")
+
+def copy_setup(name: str, apply: bool = False) -> dict:
+    """Your own Claude Code setup to machine `name`: CLAUDE.md, skills,
+    agents, commands and output styles that are missing or differ there
+    (whatever they replace is set aside there first), and the plugins you
+    turned on, installed there from their marketplaces.  Hooks, the status
+    line and MCP servers are listed, not copied: they run programs of this
+    machine, by paths of this machine, and may hold keys."""
+    res = {"remote": name, "applied": False, "blockers": [], "warnings": []}
+    try:
+        rem = get_remote(name)
+        rem.connect()
+        here = claude_setup()
+        there = rem.agent("claude-setup", timeout=120)["setup"]
+    except HandoverError as e:
+        res["blockers"].append(str(e))
+        return res
+    g = setup_gaps(here, there)
+    files = {d: (g["missing"][d], g["differs"][d]) for d in SETUP_DIRS}
+    res.update(gaps=g, claude_md=g["claude_md"], copy={d: f[0] for d, f in files.items()},
+               replace={d: f[1] for d, f in files.items()}, plugins=g["plugins"],
+               marketplaces=sorted({p.split("@", 1)[1] for p in g["plugins"] if "@" in p}),
+               left_out={"hooks": g["hooks"], "status_line": g["status_line"],
+                         "mcp": [m for m in here.get("mcp") or []]},
+               there_home=there.get("home"))
+    if g["plugins"] and not (rem.info or {}).get("claude"):
+        res["warnings"].append(f"Claude Code is not installed on {name}: plugins are installed "
+                               "with it, so they are left out until it is there")
+    if not apply:
+        return res
+    home, rhome = claude_home(), str(there.get("home") or "")
+    aside = f"{there.get('aht_home') or '.aht'}/remote/aside/setup-{_stamp()}"
+    try:
+        if g["claude_md"]:
+            r = rem.send(str(home), rhome, only=["CLAUDE.md"], aside=aside)
+            if not r.get("ok", True):
+                raise HandoverError("CLAUDE.md: " + str(r.get("error")))
+        for d in SETUP_DIRS:
+            names = files[d][0] + files[d][1]
+            if not names:
+                continue
+            rem.agent("prepare", dirs=[f"{rhome}/{d}"])
+            r = rem.send(str(home / d), f"{rhome}/{d}", delete=True, aside=f"{aside}/{d}",
+                         skip=handover_skip(),
+                         only=[n + "/" if (home / d / n).is_dir() else n for n in names])
+            if not r.get("ok", True):
+                raise HandoverError(f"{d}: " + str(r.get("error")))
+        if g["plugins"] and (rem.info or {}).get("claude"):
+            got = rem.agent("claude-plugins", timeout=1200, plugins=g["plugins"],
+                            marketplaces={m: here["marketplaces"].get(m)
+                                          for m in res["marketplaces"]})
+            res["plugin_results"] = got.get("results") or []
+            res["warnings"] += [f"plugin {x['plugin']}: {x['error']}"
+                                for x in res["plugin_results"] if not x.get("ok")]
+    except HandoverError as e:
+        res["blockers"].append(str(e))
+        return res
+    res.update(applied=True, set_aside=aside)
+    log(f"SETUP copied to {name}: CLAUDE.md {g['claude_md']}, "
+        + ", ".join(f"{d} {len(files[d][0]) + len(files[d][1])}" for d in SETUP_DIRS)
+        + f", plugins {len(g['plugins'])}")
+    return res
+
+def _agent_claude_plugins(req: dict) -> dict:
+    """Here (the other machine): the marketplaces needed, then the plugins,
+    with Claude Code's own `claude plugin` commands."""
+    exe = find_claude(None, prefer_user=True)
+    if not exe:
+        return {"ok": False, "error": "Claude Code is not installed here"}
+    def run(args):
+        try:
+            r = subprocess.run([exe, "plugin"] + args, capture_output=True, text=True,
+                               timeout=300, cwd=str(Path.home()), stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DISABLE_AUTOUPDATER": "1"}, **_NO_WINDOW)
+            return r.returncode == 0, (r.stderr or r.stdout or "").strip()[-300:]
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, str(e)
+    have = claude_setup()["marketplaces"]
+    out = []
+    for m, src in (req.get("marketplaces") or {}).items():
+        if m in have or not isinstance(src, dict):
+            continue
+        where = src.get("repo") or src.get("url") or src.get("path")
+        if where:
+            ok, said = run(["marketplace", "add", str(where)])
+            if not ok:
+                out.append({"plugin": f"@{m}", "ok": False, "error": f"marketplace {m}: {said}"})
+    for p in req.get("plugins") or []:
+        ok, said = run(["install", str(p)])
+        out.append({"plugin": p, "ok": ok, **({} if ok else {"error": said})})
+    return {"ok": True, "results": out}
+
+def cmd_copy_setup(args) -> int:
+    res = copy_setup(args.name, args.apply)
+    lines = []
+    if res.get("gaps"):
+        g, n = res["gaps"], args.name
+        verb = "copied to" if res["applied"] else "would copy to"
+        if g["claude_md"]:
+            lines.append(f"{verb} {n}: CLAUDE.md" + (" (the one there is set aside)"
+                                                     if g["claude_md"] == "differs" else ""))
+        for d in SETUP_DIRS:
+            if res["copy"][d]:
+                lines.append(f"{verb} {n}: {d} {_listed(res['copy'][d], 8)}")
+            if res["replace"][d]:
+                lines.append(f"{verb} {n}, set aside there first: {d} {_listed(res['replace'][d], 8)}")
+        if res["plugins"]:
+            lines.append(("installed on " if res["applied"] else "would install on ")
+                         + f"{n}: plugins {_listed(res['plugins'], 8)}")
+        lo = res["left_out"]
+        if lo["hooks"] or lo["status_line"] or lo["mcp"]:
+            lines.append("left out (they run programs of this machine and may hold keys; set "
+                         "them up there yourself): "
+                         + "; ".join(x for x in (
+                             ("hooks for " + ", ".join(lo["hooks"])) if lo["hooks"] else "",
+                             "the status line" if lo["status_line"] else "",
+                             ("MCP servers " + ", ".join(lo["mcp"])) if lo["mcp"] else "") if x))
+        if len(lines) == (1 if (lo["hooks"] or lo["status_line"] or lo["mcp"]) else 0):
+            lines.insert(0, f"{n} has your Claude Code setup already")
+        if res.get("set_aside"):
+            lines.append(f"what it replaced is in {res['set_aside']} on {n}")
+        if not args.apply and not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+    return _emit(args, res, lines)
+
 AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "hash": _agent_hash, "prepare": _agent_prepare,
              "trust": _agent_trust, "install-claude": _agent_install_claude,
@@ -10070,7 +10327,8 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "relay-note": lambda req: _agent_relay_note(req),
              "uncopy": _agent_uncopy,
              "mark-handing": _agent_mark_handing, "mark-away": _agent_mark_away,
-             "unmark": _agent_unmark, "return-plan": _agent_return_plan}
+             "unmark": _agent_unmark, "return-plan": _agent_return_plan,
+             "claude-setup": _agent_claude_setup, "claude-plugins": _agent_claude_plugins}
 
 def cmd_core(args):
     """`aht _core --id`: the id of the core this build carries (the name of
@@ -10393,6 +10651,32 @@ def _update_entry(uid: str, **fields) -> None:
                 e[k] = v
         save_registry(reg)
 
+def install_seconds(machine: str):
+    """How long Claude Code took to install on `machine` lately (the middle
+    of the last three), else on any machine, else None."""
+    try:
+        d = json.loads((aht_home() / "run" / "claude-installs.json").read_text())
+    except (OSError, ValueError):
+        return None
+    mine = [float(x) for x in (d.get(machine) or []) if isinstance(x, (int, float))][-3:]
+    every = sorted(float(x) for v in d.values() if isinstance(v, list) for x in v
+                   if isinstance(x, (int, float)))
+    pick = sorted(mine) or every
+    return pick[len(pick) // 2] if pick else None
+
+def note_install_seconds(machine: str, secs: float) -> None:
+    f = aht_home() / "run" / "claude-installs.json"
+    try:
+        d = json.loads(f.read_text())
+        d = d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        d = {}
+    d[machine] = (list(d.get(machine) or []) + [round(secs, 1)])[-5:]
+    try:
+        _write_json(f, d)
+    except OSError as e:
+        warn(f"HANDOVER how long the install took was not kept: {e}")
+
 def transfer_path(uid: str) -> Path:
     """Where a handover or a take-back of project `uid` says how far it got
     (the session corner reads it)."""
@@ -10432,6 +10716,8 @@ class Progress:
         self.path, self.talk = path, talk
         self.stage, self.pct, self.at = "", None, 0.0
         self.bytes_done = self.bytes_total = self.eta = None
+        self.over = False               # a timed step took longer than it did before
+        self._timed = None
         self.tracked, self.info, self.started = None, {}, time.time()
     def track(self, path, **info) -> None:
         """Also keep `info` (kind, project, remote, session) and how far it
@@ -10439,6 +10725,7 @@ class Progress:
         self.tracked, self.info = path, info
         self._write(force=True)
     def say(self, msg: str) -> None:
+        self.untimed()
         self.stage, self.pct = msg, None
         self.bytes_done = self.bytes_total = self.eta = None
         if self.talk:
@@ -10448,6 +10735,33 @@ class Progress:
         if n != self.pct:
             self.pct = n
             self._write()
+    def timed(self, expected: float) -> None:
+        """A step that tells nothing of how far it got (Claude Code installing
+        on the other machine): its percentage and the time left from how long
+        it took before (`expected` seconds), every second, until the next
+        say() or untimed().  In a terminal, a line that counts."""
+        mark = self._timed = (time.time(), max(5.0, float(expected)))
+        def tick():
+            while self._timed is mark:
+                took = time.time() - mark[0]
+                self.pct = min(95, int(took * 100 / mark[1]))
+                self.eta = int(mark[1] - took) if took < mark[1] else None
+                self.over = took >= mark[1]
+                self._write(force=True)
+                if self.talk:
+                    left = ("taking longer than before" if self.over else
+                            "under a minute left" if self.eta < 60 else
+                            f"about {round(self.eta / 60)} min left")
+                    sys.stderr.write(f"\r  {int(took)} s · {left}      ")
+                    sys.stderr.flush()
+                time.sleep(1)
+        threading.Thread(target=tick, daemon=True).start()
+    def untimed(self) -> None:
+        if self._timed is not None:
+            self._timed = None
+            self.eta, self.over = None, False
+            if self.talk:
+                sys.stderr.write("\n")
     def bytes(self, done: int, total=None, eta=None) -> None:
         """How many bytes went in this stage, of how many, and the seconds
         still to go (each when known)."""
@@ -10460,7 +10774,8 @@ class Progress:
             return
         self.at = time.time()
         now = {"stage": self.stage, "percent": self.pct, "at": self.at,
-               "done_bytes": self.bytes_done, "total_bytes": self.bytes_total, "eta": self.eta}
+               "done_bytes": self.bytes_done, "total_bytes": self.bytes_total, "eta": self.eta,
+               "over": self.over}
         for path, body in ((self.path, now),
                            (self.tracked, dict(self.info, pid=os.getpid(),
                                                started=self.started, **now))):
@@ -12008,6 +12323,16 @@ def cmd_handover(args):
         if out["blockers"]:
             return _emit(args, out, lines)
         if not args.apply:
+            # your own setup (not the project's) stays here: say what is missing there
+            try:
+                out["setup"] = setup_gaps(claude_setup(),
+                                          rem.agent("claude-setup", timeout=120)["setup"])
+                note = setup_gap_text(out["setup"], rem.name)
+                if note:
+                    out["warnings"].append(note)
+            except (HandoverError, KeyError, TypeError) as _x:
+                warn(f"HANDOVER the Claude Code setup on {rem.name} was not compared: "
+                     f"{_errmsg(_x)}")
             plan = push_project(rem, uid, entry, dry=True)
             out["plan"] = {
                 "files": plan["project"].get("files", 0),
@@ -12187,7 +12512,15 @@ def cmd_handover(args):
 
                 if install:
                     say(f"installing Claude Code {install} on {rem.name} …")
-                    got = rem.agent("install-claude", timeout=1000, version=install)
+                    # it says nothing of how far it got: the time it took before
+                    # (a first install: about 90 s)
+                    began = time.time()
+                    prog.timed(install_seconds(rem.name) or 90)
+                    try:
+                        got = rem.agent("install-claude", timeout=1000, version=install)
+                    finally:
+                        prog.untimed()
+                    note_install_seconds(rem.name, time.time() - began)
                     info["claude"] = got["claude"]
                 if not args.no_start:
                     # keyed as Claude Code keys it here (on a PC: C:/Users/…)
@@ -26884,6 +27217,13 @@ def build_parser():
     s.add_argument("--json", action="store_true")
     s.add_argument("--sandbox", metavar="PATH", help=argparse.SUPPRESS)   # test machines
     s.set_defaults(fn=cmd_remote)
+
+    s = sub.add_parser("copy-setup", help="your own Claude Code setup (CLAUDE.md, skills, "
+                       "agents, commands, plugins) to another machine")
+    s.add_argument("name", help="the machine, as `aht remote` names it")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_copy_setup)
 
     s = sub.add_parser("mirror", help="keep a project's copy on the other "
                        "machine up to date in the background")

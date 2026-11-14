@@ -79,7 +79,8 @@ function bytes(n) {
 // ---- talking to aht -----------------------------------------------------------
 
 // What the window opens on, when the tray opened it for one project
-// (Projects brought here ▸ Send Back…): p=<its path>&do=show|send-back
+// (Projects brought here ▸ Send Back…, the session corner's Take Back…):
+// p=<its path>&do=show|send-back|take-back
 // after #, read before the address is cleaned below.
 const GO = (() => {
   try {
@@ -3552,6 +3553,9 @@ function drawSettings(m) {
   const phone = h("input", { type: "text", value: S.config.notify_phone || "", placeholder: "ntfy:my-topic", style: "width:240px" });
   m.append(group("Notices", "Know when a session needs you",
     h("div", { class: "row" }, check("When a session waits for you", "notify_waiting"), check("When a long piece of work is done", "notify_finished")),
+    // the tray shows it (Windows); it looks at the setting every two seconds
+    ON_WINDOWS() ? h("div", { class: "row" }, check("Show the open Claude sessions at the bottom right of the screen", "session_corner", false),
+      h("span", { class: "dim small", text: "Sessions in the corner; a right-click on one offers Branch… and Send to a machine" })) : null,
     h("div", { class: "row" }, "Also send them to my phone:", phone, h("button", { text: "Save", onclick: () => setConfig("notify_phone", phone.value.trim()) }),
       h("button", { text: "Send a Test", onclick: async () => { const r = await run(["notices", "--test"]); toast(r.out.trim() || "Sent."); } })),
     h("div", { class: "dim small", text: "ntfy: a topic you follow in the free ntfy app. Anyone who knows an ntfy.sh topic's name can read it, so choose a name that is hard to guess." })));
@@ -3945,6 +3949,8 @@ function showGettingStarted() {
     let action = null;
     if (x.id === "login" && loginWorks()) {
       action = h("input", { type: "checkbox", checked: x.ok, onchange: async (e) => { await run(["autostart", e.target.checked ? "on" : "off"]); await refresh(); showGettingStarted(); } });
+    } else if (x.id === "corner" && ON_WINDOWS()) {
+      action = h("input", { type: "checkbox", checked: x.ok, onchange: async (e) => { await setConfig("session_corner", e.target.checked); showGettingStarted(); } });
     } else if (x.id === "chimes" || x.id === "corner") {
       action = null;
     } else if (x.id === "notifications") {
@@ -4165,6 +4171,8 @@ function openOn(go) {
   drawTop(); draw();
   // the project of a PC that does not answer goes back from the PC: its line says so
   if (go.do === "send-back" && !(p && pcHomeMute(copyOf(p)))) sendBack(p || { real_path: go.path, exists: true });
+  // the session corner's Take Back…: the project's own Take Back, as its row offers it
+  if (go.do === "take-back" && p && (awayOf(p) || {}).take) takeBack(p);
 }
 async function start() {
   $("#guide-btn").addEventListener("click", () => openGuide(null));

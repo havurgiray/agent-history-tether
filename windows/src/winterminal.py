@@ -635,6 +635,19 @@ def resume_line(e: dict, shell: str):
     return None
 
 
+def command_line(argv: list, shell: str):
+    """A program and its arguments as a line for `shell`; None for a shell
+    aht does not know."""
+    if shell in POWERSHELLS:                    # & runs a quoted program
+        return "& " + " ".join(_quote_powershell(a) for a in argv)
+    if shell == "cmd":
+        return " ".join(_quote_cmd(a) for a in argv)
+    if shell in ("bash", "sh", "zsh"):
+        return " ".join(shlex.quote(a.replace("\\", "/")) if i == 0 else shlex.quote(a)
+                        for i, a in enumerate(argv))
+    return None
+
+
 def at_prompt(line: str, shell: str) -> bool:
     """The text left of the cursor ends in a prompt, so nothing typed waits
     there and no program asks for input.  What aht types would else join a
@@ -786,6 +799,14 @@ class WindowsTerminal(aht.Terminal):
         r = _powershell(UIA_SELECT % (int(hwnd), rows[key]["tab"] - 1))
         # by what it printed: PowerShell writes its progress to stderr
         if r.stdout.strip() == "ok":
+            # the window comes forward from here too: a click in aht (the
+            # session corner) lets aht, not the PowerShell it started, do that
+            try:
+                u = ctypes.WinDLL("user32")
+                u.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+                u.SetForegroundWindow(ctypes.c_void_p(int(hwnd)))
+            except (OSError, AttributeError):
+                pass
             return "ok"
         aht.warn(f"TABS could not go to a tab: {(r.stderr or '').strip()[-200:]}")
         return "none"
@@ -807,6 +828,40 @@ class WindowsTerminal(aht.Terminal):
             return False
         got = _ask_helper({"type": [{"pid": pane["pid"], "text": line + "\r"}]})["typed"]
         return bool((got.get(str(pane["pid"])) or {}).get("ok"))
+
+    def command_line(self, key, argv: list):
+        pane = live_panes().get(key)
+        return command_line(argv, shell_of(pane)) if pane else None
+
+    def open_beside(self, key, entry: dict) -> str:
+        # `wt -w 0` is the window used last: the session's, once it is in front.
+        # Windows Terminal puts a new tab at the end of the window (or after the
+        # one in front, if its settings say so)
+        tabs = self.tabs()
+        row = tabs.get(key)
+        if row is None:
+            return "its tab is gone"
+        if self.go_to(key) != "ok":
+            return "aht could not bring its window to the front"
+        e = dict(entry, profile=row.get("profile"), color=row.get("color"))
+        before = set(live_panes())
+        cmd = wt_command([[e]], "0")
+        try:
+            subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
+        except OSError as x:
+            return f"Windows Terminal did not start: {x}"
+        wait_for(lambda: live_panes().keys(), lambda now: bool(now - before))
+        now = live_panes()
+        new = sorted((k for k in now if k not in before), key=lambda k: now[k]["born"])
+        if not new:
+            return "the new tab did not open"
+        pane = now[new[-1]]
+        line = resume_line(e, shell_of(pane))
+        if not line:
+            return "aht cannot type into the shell of the new tab"
+        got = _ask_helper({"type": [{"pid": pane["pid"], "text": line + "\r"}]})["typed"]
+        res = got.get(str(pane["pid"])) or {}
+        return "" if res.get("ok") else (res.get("why") or "the new tab did not take the command")
 
     def start(self, saved: dict = None) -> tuple:
         if self.running():

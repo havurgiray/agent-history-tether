@@ -311,6 +311,66 @@ ck(d.get("applied") and p3.wait(timeout=5) is not None and typed
 d = JS("checkup", "--close", str(p4.pid), "--apply", "--json", extra_env=cenv)
 ck(d.get("applied") and p4.wait(timeout=5) is not None,
    "checkup --close: the process ends; its conversation stays")
+# the session corner's right-click: a branch in a new tab beside its own,
+# a session sent to another machine, the sessions handed over
+p5 = fake_claude("w5", title="Bench")
+was_tabs = tabs_file.read_text()
+tabs_file.write_text(json.dumps(dict(json.loads(was_tabs), **{"/dev/ttysW5": {
+    "title": "Bench", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 5}})))
+benv = dict(wenv, AHT_TTYS=json.dumps({str(p5.pid): "/dev/ttysW5"}),
+            AHT_TTY_PROCS=json.dumps({"/dev/ttysW5": [[p5.pid, "claude --model opus --resume w5"]]}),
+            AHT_CMDLINES=json.dumps({str(p5.pid): "claude --model opus --resume w5 go"}))
+d = JS("branch", str(p5.pid), "--json", extra_env=benv)
+ck(not d.get("blockers") and d.get("name") == "Bench ⑂" and not d.get("applied"),
+   f"branch: a dry run names the branch after the session ({d})")
+d = JS("branch", str(p5.pid), "--name", "try more", "--apply", "--json", extra_env=benv)
+beside = [x for x in ilines() if x.get("what") == "beside"]
+new = d.get("branch") or "?"
+kept = json.loads((sb / ".aht" / "branches.json").read_text()).get(new, {})
+ck(d.get("applied") and beside and beside[-1]["tty"] == "/dev/ttysW5"
+   and f"--model opus --fork-session --session-id {new} --name 'try more' --resume w5"
+   in beside[-1]["text"] and beside[-1]["title"] == "try more"
+   and kept.get("from") == "w5" and kept.get("name") == "try more",
+   f"branch --apply: a new tab beside its own, with its options and a session id aht notes "
+   f"({d}, {beside[-1:]}, {kept})")
+copied = (tstore / "w5.jsonl").read_text().replace('"w5"', f'"{new}"')
+(tstore / f"{new}.jsonl").write_text(copied + json.dumps({"type": "user", "timestamp":
+    "2026-11-14T10:00:00Z", "message": {"role": "user", "content": "more"}}) + "\n")
+rowsB = {r["id"]: r for r in JS("sessions", projX, "--json").get("sessions", [])}
+ck(rowsB.get(new, {}).get("parent") == "w5" and rowsB[new].get("depth") == 1,
+   f"sessions: a branch aht opened sits under its origin, though Claude Code marked nothing "
+   f"({ {k: (v.get('parent'), v.get('depth')) for k, v in rowsB.items()} })")
+(rec / f"{p5.pid}.json").write_text(json.dumps({"pid": p5.pid, "cwd": projX, "sessionId": "w5",
+                                               "status": "busy"}))
+d = JS("branch", str(p5.pid), "--json", extra_env=benv)
+s = JS("send", str(p5.pid), "--to", "nowhere", "--json", extra_env=benv)
+ck(any("working" in b for b in d.get("blockers", []))
+   and any("working" in b for b in s.get("blockers", []))
+   and any("no machine named nowhere" in b for b in s.get("blockers", [])) and not s.get("applied"),
+   f"branch and send wait while a session works; send names a machine not set up ({d}, {s})")
+p5.kill(); p5.wait()
+tabs_file.write_text(was_tabs)
+regf = sb / ".aht" / "registry.json"
+was_reg = regf.read_text()
+regd = json.loads(was_reg)
+uidX = next(u for u, e in regd["projects"].items() if e["real_path"] == projX)
+regd["projects"][uidX]["away"] = {"remote": "box", "session": "w5", "since": "2026-11-14T09:00:00",
+                                  "window": "aht-x", "driven_by": "here", "remote_path": "/there/x"}
+regf.write_text(json.dumps(regd))
+board = sb / ".aht" / "run" / "board.json"
+board.write_text(json.dumps({"box": {"heard": time.time(), "sessions": [
+    {"agent": "claude", "session": "w5", "raw_status": "busy", "since": time.time() - 90,
+     "project": "/there/x"}]}}))
+aw = JS("_corner").get("away", [])
+ck(len(aw) == 1 and aw[0]["machine"] == "box" and aw[0]["state"] == "working"
+   and aw[0]["name"] == "Bench" and aw[0]["can_open"] and aw[0]["id"] == "away:w5",
+   f"the corner: a session handed over, as its machine last said ({aw})")
+board.write_text(json.dumps({"box": {"heard": time.time() - 3600, "sessions": []}}))
+aw = JS("_corner").get("away", [])
+ck(aw and aw[0]["state"] == "unknown", f"…its machine not heard for an hour: unknown ({aw})")
+regf.write_text(was_reg)
+board.unlink()
+
 for pr in (p2, shell):
     pr.kill(); pr.wait()
 for f in rec.glob("*.json"):

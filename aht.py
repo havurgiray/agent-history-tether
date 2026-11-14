@@ -5817,6 +5817,31 @@ def _proc_started(pid: int):
     except Exception:
         return None
 
+def session_record_live(pid: int, rec: dict) -> bool:
+    """Whether the process a session record names still runs and is the one
+    that wrote it.  In doubt (a start time that does not parse) it does."""
+    if not _pid_alive(pid):
+        return False
+    try:                                # same pid, other process: stale
+        start = str(rec.get("procStartFt") or rec["procStart"])
+        seen = _proc_started(pid)
+        if start.isdigit():
+            # Windows: when it was created, exactly, in FILETIME's scale;
+            # a number on another scale says nothing, so the record stands
+            ft = int(start)
+            if ft < 3e17 and seen is not None and abs(seen - (ft - 116444736000000000) / 1e7) > 2:
+                return False
+        else:
+            born = time.mktime(time.strptime(" ".join(start.split()), "%a %b %d %H:%M:%S %Y"))
+            # the record's clock may be UTC and ours local: equal start
+            # times differ by a whole number of quarter hours
+            off = abs(seen - born) % 900 if seen is not None else 0
+            if min(off, 900 - off) > 5:
+                return False
+    except Exception:
+        pass                    # a start time that does not parse: the record stands
+    return True
+
 def running_sessions(inside: str = None, home: Path = None) -> list:
     """Claude Code sessions open right now, from the CLI's own per-process
     records (<claude home>/sessions/<pid>.json).  A record counts unless its
@@ -5833,26 +5858,8 @@ def running_sessions(inside: str = None, home: Path = None) -> list:
             pid = int(rec.get("pid") or f.stem)
         except Exception:
             continue
-        if not _pid_alive(pid):
+        if not session_record_live(pid, rec):
             continue
-        try:                                # same pid, other process: stale
-            start = str(rec.get("procStartFt") or rec["procStart"])
-            seen = _proc_started(pid)
-            if start.isdigit():
-                # Windows: when it was created, exactly, in FILETIME's scale;
-                # a number on another scale says nothing, so the record stands
-                ft = int(start)
-                if ft < 3e17 and seen is not None and abs(seen - (ft - 116444736000000000) / 1e7) > 2:
-                    continue
-            else:
-                born = time.mktime(time.strptime(" ".join(start.split()), "%a %b %d %H:%M:%S %Y"))
-                # the record's clock may be UTC and ours local: equal start
-                # times differ by a whole number of quarter hours
-                off = abs(seen - born) % 900 if seen is not None else 0
-                if min(off, 900 - off) > 5:
-                    continue
-        except Exception:
-            pass                # a start time that does not parse: the record stands
         cwd = str(rec.get("cwd") or "")
         if inside and not _inside(os.path.realpath(cwd), inside):
             continue
@@ -11714,8 +11721,14 @@ def cmd_handover(args):
             + [os.path.realpath(os.path.expanduser(p)) for p in args.include or []]))
         entry["extras"] = extras
 
-        # (1) nothing may be running in it here
+        # (1) nothing may be running in it here; a session that ends before
+        # the move (`aht send`'s look ahead) and what it started do not count
         act = activity_in(real)
+        leaving = int(getattr(args, "leaving", None) or 0)
+        if leaving:
+            mine = _descendants_of(leaving)
+            act = {"sessions": [x for x in act["sessions"] if x["pid"] != leaving],
+                   "processes": [x for x in act["processes"] if x["pid"] not in mine]}
         out["here"] = act
         out["blockers"] += _activity_blockers(act, "on this machine")
         if act["processes"] and not args.allow_processes:
@@ -12211,7 +12224,7 @@ def cmd_handover(args):
     code = _emit(args, out, lines)
     if out.get("applied") and args.attach and not args.json and out.get("attach"):
         Progress.done()
-        os.execvp(out["attach"][0], out["attach"])
+        return _run_in_place(out["attach"])
     return code
 
 # ---- reclaim ------------------------------------------------------------------ #
@@ -14636,11 +14649,11 @@ def cmd_attach(args):
     if args.print:
         print(_argv_line(cmd))
         return 0
-    if args.window or os.name == "nt":
+    if args.window or os.name == "nt" and not _console_here():
         # a PC opens it in a console of its own (Windows Terminal when that is
         # the default): ssh -t <machine> tmux attach -t <window>
         return open_terminal(_argv_line(cmd), f"attach-{away.get('window')}")
-    os.execvp(cmd[0], cmd)
+    return _run_in_place(cmd)
 
 def _attach_peek(args, real: str, away: dict) -> int:
     """`aht attach <path> --peek`: the last lines of the session's screen
@@ -23656,6 +23669,11 @@ def _branch_of(transcript):
         return None, None
     parent, when = None, None
     with fh:
+        # a branch aht started (`aht branch`: --fork-session, which marks
+        # nothing): its own record says where it came from
+        mine = _branch_record().get(Path(transcript).stem)
+        if mine and mine.get("from"):
+            return mine["from"], mine.get("at")
         # the copies come first, and the mark is the last key of each entry:
         # the whole first entry, however big (a pasted picture)
         first = fh.readline()
@@ -24737,6 +24755,174 @@ def _iterm_do(tty: str, what: str, text: str = "") -> str:
 def _iterm_session(tty: str, what: str, text: str = "") -> bool:
     return _iterm_do(tty, what, text) == "ok"
 
+# a new tab next to a session's: found by its tty, made with iTerm2's Python
+# API (which puts it right after that tab, with its colour), else at the end
+# of its window with AppleScript; the line is written with AppleScript
+_SESSION_ID_SCRIPT = """
+on run argv
+  set want to item 1 of argv
+  set sep to character id 31
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            return "ok" & sep & (unique id of s) & sep & (profile name of s)
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "none"
+end run
+"""
+
+_WRITE_BY_ID_SCRIPT = """
+on run argv
+  set want to item 1 of argv
+  set ttl to item 2 of argv
+  set txt to item 3 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if unique id of s is want then
+            if ttl is not "" then tell s to set variable named "user.ahtTitle" to ttl
+            tell s to write text txt
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "none"
+end run
+"""
+
+_TAB_AT_END_SCRIPT = """
+on run argv
+  set want to item 1 of argv
+  set ttl to item 2 of argv
+  set txt to item 3 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if tty of s is want then
+            set p to profile name of s
+            try
+              tell w to set t2 to (create tab with profile p)
+            on error
+              tell w to set t2 to (create tab with default profile)
+            end try
+            if t2 is missing value then tell w to set t2 to (create tab with default profile)
+            set s2 to current session of t2
+            delay 0.3
+            if ttl is not "" then tell s2 to set variable named "user.ahtTitle" to ttl
+            tell s2 to write text txt
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "none"
+end run
+"""
+
+# a tab's colour, as the profile of its session holds it (an escape code
+# changes that session's copy of the profile, so this is the colour you see)
+_TAB_COLOR_KEYS = ("Tab Color", "Use Tab Color", "Tab Color (Light)", "Tab Color (Dark)",
+                   "Use Tab Color (Light)", "Use Tab Color (Dark)",
+                   "Use Separate Colors for Light and Dark Mode")
+
+def _osascript(script: str, *args) -> tuple:
+    """(what it printed, refused): refused when macOS does not let aht
+    control iTerm2."""
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-", *args], input=script,
+                           capture_output=True, text=True, timeout=30, cwd="/")
+    except Exception:
+        return "", False
+    return r.stdout.strip(), "(-1743)" in r.stderr
+
+def _api_answer(answer: dict, num: int) -> dict:
+    if answer.get(2):
+        raise RuntimeError("iTerm2: " + answer[2][0].decode(errors="replace")[:200])
+    return _pb_fields((answer.get(num) or [b""])[0])
+
+def _tree_sessions(node: bytes) -> set:
+    """The session ids in one of iTerm2's split trees."""
+    out = set()
+    for link in _pb_fields(node).get(2, []):
+        f = _pb_fields(link)
+        for s in f.get(1, []):
+            out.add((_pb_fields(s).get(1) or [b""])[0].decode())
+        for n in f.get(2, []):
+            out |= _tree_sessions(n)
+    return out
+
+def _iterm_tab_after(guid: str, profile: str):
+    """A new tab right after the tab of session `guid`, in its window, with
+    its profile and tab colour: the new session's id, or None when that
+    session is not to be found."""
+    got = _api_answer(iterm_api(_pb(1, 1) + _pb(110, _pb(1, guid) + b"".join(
+        _pb(2, k) for k in _TAB_COLOR_KEYS))), 110)
+    props = []
+    for raw in got.get(3, []):
+        f = _pb_fields(raw)
+        k, v = ((f.get(n) or [b""])[0].decode() for n in (1, 2))
+        if k in _TAB_COLOR_KEYS and v and v != "null":
+            props.append((k, v))
+    where = None
+    for wraw in _api_answer(iterm_api(_pb(1, 1) + _pb(106, b"")), 106).get(1, []):
+        w = _pb_fields(wraw)
+        for i, traw in enumerate(w.get(1, [])):
+            if guid in _tree_sessions((_pb_fields(traw).get(3) or [b""])[0]):
+                where = ((w.get(2) or [b""])[0].decode(), i)
+    if where is None:
+        return None
+    body = (_pb(2, where[0]) + _pb(3, where[1] + 1)
+            + b"".join(_pb(5, _pb(1, k) + _pb(2, v)) for k, v in props) + _pb(6, 1))
+    made = _api_answer(iterm_api(_pb(1, 1) + _pb(108, (_pb(1, profile) if profile else b"")
+                                                 + body)), 108)
+    if (made.get(1) or [0])[0] == 1 and profile:        # INVALID_PROFILE_NAME
+        made = _api_answer(iterm_api(_pb(1, 1) + _pb(108, body)), 108)
+    return (made.get(4) or [b""])[0].decode() or None
+
+def iterm_open_beside(tty: str, entry: dict) -> str:
+    """Open `entry` (as a restore opens it) in a new tab next to the iTerm2
+    session on `tty`: "" when it is open, else why not."""
+    line = _restore_command(entry)
+    title = str(entry.get("title") or "")
+    if os.environ.get("AHT_ITERM_LOG"):                 # tests: note it, touch nothing
+        with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
+            fh.write(json.dumps({"tty": tty, "what": "beside", "text": line,
+                                 "title": title}) + "\n")
+        return os.environ.get("AHT_ITERM_BESIDE", "")
+    if not IS_MAC or not _iterm_running():
+        return "iTerm2 is not open"
+    out, refused = _osascript(_SESSION_ID_SCRIPT, tty)
+    if refused:
+        return ITERM_REFUSED
+    parts = out.split("\x1f")
+    if parts[0] != "ok" or len(parts) < 3:
+        return "its iTerm2 tab is gone"
+    if iterm_api_on():
+        try:
+            new = _iterm_tab_after(parts[1], parts[2])
+        except Exception as e:
+            warn(f"TABS iTerm2 did not open a tab beside {tty}: {_errmsg(e)}")
+            new = None
+        if new:
+            time.sleep(0.3)                 # its shell starts
+            out, _ = _osascript(_WRITE_BY_ID_SCRIPT, new, title, line)
+            return "" if out == "ok" else "the new tab did not take the command"
+    # without the API: at the end of the window, coloured by an escape code
+    line = _restore_command(dict(entry, color=iterm_tab_colors().get(tty)))
+    out, refused = _osascript(_TAB_AT_END_SCRIPT, tty, title, line)
+    return "" if out == "ok" else ITERM_REFUSED if refused else "iTerm2 did not open the tab"
+
 def _resolve_open(target: str):
     """An open Claude session by pid, session id or project folder."""
     rows = running_sessions()
@@ -25007,6 +25193,275 @@ def restart_session(pid: int, apply: bool = False) -> dict:
     log(f"SESSION restarted pid {pid} in {row['tty']}: {cmd}")
     return res
 
+# ---- the session corner's menu: a branch beside, a session sent away ------- #
+
+def _descendants_of(pid: int) -> set:
+    """`pid` and every process it started, and they started (not on Windows,
+    where no process is ever counted as running in a folder)."""
+    out = {int(pid)}
+    if os.name == "nt":
+        return out
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True,
+                           timeout=10, cwd="/")
+    except Exception:
+        return out
+    kids = {}
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            kids.setdefault(int(f[1]), []).append(int(f[0]))
+    todo = [int(pid)]
+    while todo:
+        for k in kids.get(todo.pop(), []):
+            if k not in out:
+                out.add(k)
+                todo.append(k)
+    return out
+
+def _console_here() -> bool:
+    """aht runs in a console you type into (a PC's terminal tab), not for a
+    front end."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (OSError, ValueError):
+        return False
+
+def _run_in_place(cmd: list) -> int:
+    """Run `cmd` in this terminal, as the program you see there: it takes the
+    place of aht, except on Windows, where aht waits for it."""
+    if os.name == "nt":
+        try:
+            return subprocess.call(cmd)
+        except OSError as e:
+            print(f"{cmd[0]}: {e}", file=sys.stderr)
+            return 1
+    os.execvp(cmd[0], cmd)
+
+def _session_label(s: dict) -> str:
+    """An open session's name as the Claude app shows it, else its folder's."""
+    tr = _transcript_of(s["cwd"], s["session"]) if s.get("session") else None
+    return (_current_title(tr) or _auto_title(tr)
+            or os.path.basename(str(s.get("cwd") or "").rstrip("/\\")) or "session")
+
+def _not_now(s: dict, what: str):
+    """Why `what` cannot be done to the open session `s` now, or None."""
+    st = s.get("status")
+    if st in ("busy", "shell"):
+        return f"it is working; {what} it once it has finished"
+    if st == "waiting":
+        return f"it is waiting for you; answer it first, then {what} it"
+    return None
+
+def branches_path() -> Path:
+    return aht_home() / "branches.json"
+
+def _branch_record() -> dict:
+    """{branch's session id: {"from", "at", "name", "project"}} for the
+    branches aht started: Claude Code's --fork-session copies the
+    conversation without the marks /branch leaves, so aht keeps them."""
+    try:
+        d = json.loads(branches_path().read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def branch_session(target: str, name: str = None, apply: bool = False) -> dict:
+    """A branch of an open Claude session (Claude Code's --fork-session: a new
+    session with the conversation so far), started in a new tab next to the
+    session's own, with its tab colour.  The session itself goes on as it
+    was.  The dry run names what the branch would be called."""
+    s = _resolve_open(target)
+    res = {"applied": False, "blockers": []}
+    if s is None:
+        res["blockers"].append("no open Claude Code session matches")
+        return res
+    pid = s["pid"]
+    label = _session_label(s)
+    name = redact(" ".join(str(name or "").split()))[:120] or f"{label} ⑂"
+    res.update(pid=pid, session=s.get("session"), project=s["cwd"], label=label, name=name)
+    why = _not_now(s, "branch")
+    if why:
+        res["blockers"].append(why)
+    if not s.get("session"):
+        res["blockers"].append("Claude Code has not named this session yet")
+    term = terminal()
+    key = term.pane_of_pids([pid]).get(pid)
+    if not key or key not in term.last_tabs():
+        res["blockers"].append(f"it is not in a tab of {term.name or 'a terminal aht can drive'}, "
+                               "so aht has nowhere to put the branch beside it")
+    if not apply or res["blockers"]:
+        return res
+    new = str(_uuid.uuid4())            # the branch's id, so aht knows where it came from
+    entry = {"agent": "claude", "session": s["session"], "cwd": s["cwd"], "title": name,
+             "args": _claude_flags(_cmdline(pid)) + ["--fork-session", "--session-id", new,
+                                                     "--name", name]}
+    why = term.open_beside(key, entry)
+    res["applied"] = not why
+    if why:
+        res["blockers"].append(why)
+    else:
+        res["branch"] = new
+        try:
+            with Lock(timeout=10):
+                d = _branch_record()
+                d[new] = {"from": s["session"], "at": time.time(), "name": name,
+                          "project": s["cwd"]}
+                _write_json(branches_path(), d)
+        except (TimeoutError, OSError) as e:
+            warn(f"SESSION the branch {new} was not noted: {e}")
+    log(f"SESSION branch of {s['session']} ({s['cwd']}) as {name!r}: {why or 'opened'}")
+    return res
+
+def cmd_branch(args):
+    res = branch_session(args.target, args.name, args.apply)
+    lines = [("branched" if res["applied"] else "would branch")
+             + f": {res.get('label') or args.target} -> {res.get('name') or ''}"]
+    if not args.apply and not res["blockers"]:
+        lines.append("(dry run — pass --apply to do it)")
+    return _emit(args, res, lines)
+
+def send_session(target: str, to: str, apply: bool = False) -> dict:
+    """Send an open Claude session, with its project, to another machine:
+    the handover's checks first (this session does not count as running in
+    the folder, since it ends first), then the session ends in its tab, and
+    that tab runs the handover, which opens the session there in the same
+    tab once it is over.  The dry run says what would stop it."""
+    s = _resolve_open(target)
+    res = {"applied": False, "blockers": [], "warnings": [], "to": to}
+    if s is None:
+        res["blockers"].append("no open Claude Code session matches")
+        return res
+    pid, sid, real = s["pid"], s.get("session"), os.path.realpath(s["cwd"])
+    res.update(pid=pid, session=sid, project=real, label=_session_label(s))
+    why = _not_now(s, "send")
+    if why:
+        res["blockers"].append(why)
+    if not sid:
+        res["blockers"].append("Claude Code has not named this session yet")
+    if to not in remotes_config():
+        res["blockers"].append(f"no machine named {to} is set up here")
+    term = terminal()
+    key = term.pane_of_pids([pid]).get(pid)
+    row = next((r for r in session_checkup() if r["pid"] == pid), None) or {}
+    line = None
+    if not key or not row.get("in_terminal") or term.restart_line(row, []) is None:
+        res["blockers"].append(f"it does not run straight in a tab of "
+                               f"{term.name or 'a terminal aht can drive'}, so the "
+                               "handover could not go on in its place")
+    else:
+        line = term.command_line(key, _aht_argv() + ["handover", real, "--to", to, "--session",
+                                                     sid, "--attach", "--apply"])
+        if line is None:
+            res["blockers"].append("aht cannot type into the shell of its tab")
+    res["command"] = line
+    if res["blockers"]:
+        return res
+    try:                                # the handover's own look ahead
+        r = subprocess.run(_aht_argv() + ["handover", real, "--to", to, "--session", sid,
+                                          "--leaving", str(pid), "--json"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=300,
+                           stdin=subprocess.DEVNULL, cwd=real,
+                           **({"creationflags": 0x08000000} if os.name == "nt" else {}))
+        plan = json.loads(r.stdout)
+    except Exception as e:
+        res["blockers"].append(f"the handover's checks did not finish: {_errmsg(e)}")
+        return res
+    res["handover"] = {k: plan.get(k) for k in ("remote", "pc", "here_path", "there_path",
+                                                 "there", "transfer", "git")}
+    res["blockers"] += plan.get("blockers") or []
+    res["warnings"] += plan.get("warnings") or []
+    if plan.get("error"):
+        res["blockers"].append(plan["error"])
+    if not apply or res["blockers"]:
+        return res
+    done = close_session(pid, apply=True)
+    if not done["applied"]:
+        res["blockers"] += done["blockers"]
+        return res
+    time.sleep(0.5)                     # the shell gets its prompt back
+    res["applied"] = term.type_line(key, line)
+    if not res["applied"]:
+        res["blockers"].append("the session ended here, but aht could not type into its tab; "
+                               "send it with: " + line)
+    log(f"SESSION {sid} ({real}) sent to {to}: {'typed' if res['applied'] else 'not typed'}")
+    return res
+
+def cmd_send(args):
+    res = send_session(args.target, args.to, args.apply)
+    lines = [("sending" if res["applied"] else "would send")
+             + f": {res.get('label') or args.target} -> {args.to}"]
+    h = res.get("handover") or {}
+    if h.get("there_path"):
+        lines.append(f"   there: {h['there_path']}")
+    if not args.apply and not res["blockers"]:
+        lines.append("(dry run — pass --apply to do it)")
+    return _emit(args, res, lines)
+
+def corner_away() -> list:
+    """The sessions this machine handed over, for the session corner: where
+    they are, and how they were when their machine last answered
+    (run/board.json, which the notices keep; nothing is asked here)."""
+    heard, now, out = _board_heard(), time.time(), []
+    for uid, e in load_registry().get("projects", {}).items():
+        a = e.get("away") or {}
+        if not a:
+            continue
+        real, m = e["real_path"], a.get("remote") or a.get("holder") or a.get("host") or "?"
+        sid = a.get("session")
+        tr = _transcript_of(real, sid) if sid else None
+        name = (_current_title(tr) or _auto_title(tr)
+                or os.path.basename(real.rstrip("/\\")) or real)
+        b = heard.get(m) or {}
+        there = str(a.get("remote_path") or "").rstrip("/\\")
+        hit = next((x for x in b.get("sessions") or [] if sid and x.get("session") == sid), None) \
+            or next((x for x in b.get("sessions") or []
+                     if there and str(x.get("project") or "").rstrip("/\\") == there), None)
+        at = b.get("heard")
+        stale = not at or now - float(at) > BOARD_STALE
+        raw = (hit or {}).get("raw_status")
+        state = "unknown" if stale else {"busy": "working", "shell": "working",
+                                         "waiting": "waiting"}.get(raw, "idle")
+        out.append({"id": "away:" + (sid or uid), "uuid": uid, "session": sid, "project": real,
+                    "name": name, "machine": m, "state": state, "raw_status": raw if not stale
+                    else None, "since": (hit or {}).get("since"), "heard": at,
+                    "away_since": a.get("since"), "open_there": bool(hit),
+                    "arrival": bool(a.get("arrival")),
+                    "driven_by": a.get("driven_by") or "here",
+                    "can_open": not a.get("arrival") and bool(a.get("window"))
+                    and (a.get("driven_by") or "here") == "here"})
+    return out
+
+def open_away(path: str) -> dict:
+    """A handed-over session, from the corner: the tab that shows it already,
+    else a new window with it (`aht attach --window`)."""
+    real = os.path.realpath(path)
+    _uid, e = _entry_for(load_registry(), real)
+    a = (e or {}).get("away") or {}
+    if not a:
+        return {"ok": False, "why": "it is not handed over (any more)"}
+    win = str(a.get("window") or "")
+    if not win or a.get("arrival") or (a.get("driven_by") or "here") != "here":
+        return {"ok": False, "why": f"its session runs in a terminal on {a.get('remote')}, "
+                                    "not in a window aht can open from here"}
+    term = terminal()
+    for key, procs in term.pane_processes().items():
+        if any("attach" in line and win in line for _pid, line in procs):
+            if term.go_to(key) == "ok":
+                return {"ok": True, "how": "tab"}
+    pid = _spawn_aht(["attach", real, "--window"])
+    return {"ok": bool(pid), "how": "window",
+            "why": None if pid else "aht could not start `aht attach`"}
+
+def cmd_corner(args):
+    """For the session corner: the sessions handed over (`--away`), or one of
+    them opened (`--open PATH`)."""
+    if args.open:
+        print(json.dumps(open_away(args.open)))
+        return 0
+    print(json.dumps({"away": corner_away(), "machines": sorted(remotes_config())}))
+    return 0
+
 def cmd_sessions_checkup(args):
     if args.close:
         res = close_session(args.close, args.apply)
@@ -25096,6 +25551,17 @@ class Terminal:
     def type_line(self, key, line: str) -> bool:
         """Type a line into a pane, Enter included."""
         return False
+
+    def command_line(self, key, argv: list):
+        """`argv` as a line to type into the shell of pane `key`; None when
+        aht does not know that shell."""
+        return None
+
+    def open_beside(self, key, entry: dict) -> str:
+        """Open a new tab next to pane `key`'s tab, in its window and with its
+        colour, and start there what `entry` names (as a restore would): ""
+        when it is open, else why not."""
+        return "no terminal aht can drive here"
 
     def start(self, saved: dict = None) -> tuple:
         """Open the terminal if it is closed, for the layout `saved`: (aht
@@ -25676,6 +26142,12 @@ class ITerm2(Terminal):
     def type_line(self, key, line: str) -> bool:
         return _iterm_session(key, "write", line)
 
+    def command_line(self, key, argv: list):
+        return " ".join(shlex.quote(a) for a in argv)
+
+    def open_beside(self, key, entry: dict) -> str:
+        return iterm_open_beside(key, entry)
+
     def start(self, saved: dict = None) -> tuple:
         if os.environ.get("AHT_ITERM_LOG"):             # tests: nothing is started
             return bool(os.environ.get("AHT_ITERM_STARTED")), ""
@@ -25974,6 +26446,13 @@ def _other_steps(kind: str, step) -> list:
                         "needs Windows Terminal.",
                         "Install Windows Terminal from the Microsoft Store.", optional=True))
         out += terminal().steps(step)
+        corner = cfg_get("session_corner")
+        out.append(step("corner", corner, "Sessions in the corner",
+                        ("On: the" if corner else "Off. The") + " tray lists the open Claude "
+                        "sessions at the bottom right of the screen, as working, waiting for you "
+                        "or done; a click goes to the session's tab, a right-click offers Branch… "
+                        "and Send to a machine.", "The tray's menu → Sessions in the Corner.",
+                        optional=True))
     rc = claude_remote_control()
     out.append(step("remote_control", rc, "Your sessions in the Claude app",
                     "Remote Control is on, so every session is in the Claude app on your "
@@ -26377,6 +26856,7 @@ def build_parser():
                         "changes aside there and hand over anyway")
     s.add_argument("--status-file", dest="status_file", metavar="FILE",
                    help="keep the current stage and percentage in FILE (front-ends)")
+    s.add_argument("--leaving", metavar="PID", type=int, help=argparse.SUPPRESS)
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_handover)
@@ -26723,6 +27203,26 @@ def build_parser():
     s.add_argument("target", help="its project folder, session id or process id")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_goto)
+
+    s = sub.add_parser("branch", help="a branch of an open Claude session, in a new tab next "
+                       "to its own (the session goes on as it was)")
+    s.add_argument("target", help="its project folder, session id or process id")
+    s.add_argument("--name", help="the branch's name (default: the session's, with ⑂)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_branch)
+
+    s = sub.add_parser("send", help="send an open Claude session, with its project, to "
+                       "another machine: it ends here, and its tab follows it there")
+    s.add_argument("target", help="its project folder, session id or process id")
+    s.add_argument("--to", metavar="NAME", required=True)
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser("_corner")          # the session corner: handed-over sessions
+    s.add_argument("--open", metavar="PATH")
+    s.set_defaults(fn=cmd_corner)
 
     s = sub.add_parser("checkup", help="open Claude sessions worth a look: open twice, "
                        "stuck, not in the Claude app, older Claude Code")

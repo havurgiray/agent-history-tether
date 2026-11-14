@@ -139,10 +139,12 @@ function sizeText(n) {
 }
 function progressText(p, label) {
   let t = `${p.stage || label}${p.percent != null ? ` — ${Math.round(p.percent)} %` : ""}`;
+  const left = (e) => e < 60 ? "under a minute left" : e < 3600 ? `${Math.round(e / 60)} min left` : `${Math.floor(e / 3600)} h ${Math.floor(e % 3600 / 60)} min left`;
   if (p.done_bytes != null) {
     t += ` · ${sizeText(p.done_bytes)}${p.total_bytes ? ` of ${sizeText(p.total_bytes)}` : ""}`;
-    if (p.eta != null) t += ` · ${p.eta < 60 ? "under a minute left" : p.eta < 3600 ? `${Math.round(p.eta / 60)} min left` : `${Math.floor(p.eta / 3600)} h ${Math.floor(p.eta % 3600 / 60)} min left`}`;
-  }
+    if (p.eta != null) t += ` · ${left(p.eta)}`;
+  } else if (p.over) t += " · taking longer than before";     // an install there
+  else if (p.eta != null) t += ` · ${left(p.eta)}`;
   return t;
 }
 
@@ -3371,6 +3373,8 @@ function drawMachines(m) {
       send && !winBox ? menu("Sync", [["Keep All Projects in Sync…", () => syncAll(name, true)],
         ["Stop Keeping All in Sync…", () => syncAll(name, false), !S.projects.some((p) => p.mirror)]], { right: true, small: true }) : null,
       h("button", { class: "small", text: "Check…", onclick: () => checkMachine(name) }),
+      send && !winBox ? h("button", { class: "small", text: "Copy My Claude Setup…", title: "Your global CLAUDE.md, skills, agents, commands and plugins: a handover carries only the project's own",
+        onclick: () => copySetup(name) }) : null,
       h("button", { class: "small", text: "Remove…", onclick: async () => {
         if (!(await confirmIt(`Remove ${name}?`, "aht forgets this machine. Nothing on it is deleted.", "Remove"))) return;
         // a machine that still holds a project stays: aht says how to release it
@@ -3478,6 +3482,32 @@ function fixLine(fix) {
 /** Check: what this machine has and lacks, for asking it (its sessions,
  * search, Watch) and for handing a project over to it; each missing piece
  * with what fixes it. */
+/** Copy My Claude Setup: what it would do, a question, then the copy; what
+ * it replaces there is set aside there. */
+async function copySetup(name) {
+  const d = await busy(`comparing your Claude Code setup with ${name}…`, () => J("copy-setup", name, "--json"));
+  if (problems(d)) return tell(`aht could not compare it with ${name}`, problems(d));
+  const lines = [];
+  if (d.claude_md) lines.push(d.claude_md === "differs" ? `Your global CLAUDE.md (the one on ${name} is set aside first)` : "Your global CLAUDE.md");
+  for (const k of ["skills", "agents", "commands", "output-styles"]) {
+    if ((d.copy || {})[k] && d.copy[k].length) lines.push(`${k[0].toUpperCase() + k.slice(1)}: ${d.copy[k].join(", ")}`);
+    if ((d.replace || {})[k] && d.replace[k].length) lines.push(`${k[0].toUpperCase() + k.slice(1)} as they are here (those on ${name} set aside first): ${d.replace[k].join(", ")}`);
+  }
+  if ((d.plugins || []).length) lines.push(`Plugins, installed on ${name}: ${d.plugins.map((p) => p.split("@")[0]).join(", ")}`);
+  const lo = d.left_out || {}, out = [];
+  if ((lo.hooks || []).length) out.push("hooks for " + lo.hooks.join(", "));
+  if (lo.status_line) out.push("the status line");
+  if ((lo.mcp || []).length) out.push("MCP servers " + lo.mcp.join(", "));
+  let text = lines.length ? lines.join("\n") : "Nothing of your setup is missing there.";
+  if (out.length) text += `\n\nLeft out, since they run programs of this computer and may hold keys (set them up on ${name} yourself): ${out.join("; ")}.`;
+  for (const w of d.warnings || []) text += "\n\nNote: " + w;
+  if (!lines.length) return tell(`${name} has your Claude Code setup`, text);
+  if (!(await confirmIt(`Copy your Claude Code setup to ${name}?`, text, "Copy"))) return;
+  const r = await busy(`copying your setup to ${name}…`, () => J("copy-setup", name, "--apply", "--json"));
+  if (problems(r)) return tell(`Not copied to ${name}`, problems(r));
+  tell(`Copied to ${name}`, `What it replaced there is kept in ${r.set_aside || "aht's folder there"}.` + ((r.warnings || []).length ? "\n\n" + r.warnings.join("\n") : ""));
+}
+
 async function checkMachine(name) {
   const send = CAN_HAND_OVER();
   const s = sheet(`Check ${name}`, "Hand a project over", 720);

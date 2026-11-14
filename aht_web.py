@@ -63,7 +63,7 @@ COMMANDS = {
     "night-shift", "backup", "restore", "icons", "backends", "adopt", "setup", "update",
     "getting-started", "doctor", "reconcile", "reload", "version", "notices", "limits",
     "logs", "checkup", "forget", "orphans", "prune", "guide", "bind", "autostart",
-    "attach", "report-problem", "workspace", "goto", "branch", "send",
+    "attach", "report-problem", "workspace", "goto", "branch", "send", "copy-setup",
 }
 
 # commands the window may run only in one of these ways: `attach` would

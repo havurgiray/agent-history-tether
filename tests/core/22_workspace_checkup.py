@@ -370,6 +370,34 @@ aw = JS("_corner").get("away", [])
 ck(aw and aw[0]["state"] == "unknown", f"…its machine not heard for an hour: unknown ({aw})")
 regf.write_text(was_reg)
 board.unlink()
+# a handover or take-back under way: how far it got, for the corner
+runD = sb / ".aht" / "run"
+(runD / "transfer-live.json").write_text(json.dumps({
+    "kind": "handover", "project": projX, "remote": "box", "uuid": "live", "pid": os.getpid(),
+    "at": time.time(), "stage": "sending the project to box …", "percent": 40,
+    "done_bytes": 4096, "total_bytes": 10240, "eta": 30}))
+(runD / "transfer-gone.json").write_text(json.dumps({"kind": "reclaim", "pid": 999999,
+                                                      "at": time.time()}))
+mv = JS("_corner").get("moving", [])
+ck([t.get("uuid") for t in mv] == ["live"] and mv[0]["done_bytes"] == 4096
+   and not (runD / "transfer-gone.json").exists(),
+   f"the corner: what is on its way, as far as it got; a file whose command ended goes ({mv})")
+(runD / "transfer-live.json").unlink()
+sys.path.insert(0, str(HERE.parent))
+import aht as _core22
+m = _core22._RSYNC_PROGRESS.findall(b"\r  1,234,567  45%   12.34MB/s    0:01:05 (xfr#3, to-chk=1/9)")
+ck(m == [(b"1,234,567", b"45", b"0", b"01", b"05")], f"rsync's progress: bytes, percent, time left ({m})")
+pf = sb / "progress-test.json"
+pg = _core22.Progress(None)
+pg.track(pf, kind="handover", project=projX, remote="box", session="w5", uuid="u")
+pg.say("sending the project to box …")
+time.sleep(0.35)
+pg.bytes(5 << 20, 10 << 20, 75)
+got = json.loads(pf.read_text())
+_core22.Progress.done()
+ck(got.get("percent") == 50 and got.get("done_bytes") == 5 << 20 and got.get("eta") == 75
+   and got.get("kind") == "handover" and got.get("pid") == os.getpid() and not pf.exists(),
+   f"a transfer keeps its stage, bytes, total and time left in its file, gone at the end ({got})")
 
 for pr in (p2, shell):
     pr.kill(); pr.wait()

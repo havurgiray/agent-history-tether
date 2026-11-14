@@ -5682,6 +5682,9 @@ def _stamp() -> str:
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
+# rsync --info=progress2: "  1,234,567  45%   12.34MB/s    0:00:05 (xfr#3, …)"
+_RSYNC_PROGRESS = re.compile(rb"([\d,.']+)\s+(\d{1,3})%\s+\S+\s+(\d+):(\d{2}):(\d{2})")
+
 def _human(n) -> str:
     n = float(n or 0)
     for unit in ("B", "KB", "MB", "GB"):
@@ -6657,6 +6660,7 @@ class Remote:
         self.claude = spec.get("claude")
         self.info = {}
         self.on_percent = None          # called with rsync's percentage
+        self.on_bytes = None            # called with (bytes so far, total, seconds left)
         self._route = None              # (ssh target, host key alias) once known
         self.paths = _paths_rule(spec)  # remotes.<name>.paths (None: not chosen yet)
         self.home = spec.get("home") if isinstance(spec.get("home"), str) else None
@@ -7087,6 +7091,12 @@ class Remote:
                     done = re.findall(rb"(\d{1,3})%", chunk)
                     if done and self.on_percent:
                         self.on_percent(min(100, int(done[-1])))
+                    sofar = _RSYNC_PROGRESS.findall(chunk)
+                    if sofar and self.on_bytes:
+                        n, pct, h, m, sec = sofar[-1]
+                        n, pct = int(re.sub(rb"\D", b"", n)), int(pct)
+                        self.on_bytes(n, n * 100 // pct if pct else None,
+                                      int(h) * 3600 + int(m) * 60 + int(sec))
                     if progress and b"Number of files" not in b"".join(got[-3:]):
                         sys.stderr.write(chunk.decode("utf-8", "replace"))
                         sys.stderr.flush()
@@ -7306,15 +7316,22 @@ class Remote:
             for o in only})["trees"])
 
     def _meter(self, total, progress: bool):
-        """A counter of the bytes that went: on_percent (when `total` is known)
-        and, with `progress`, a line on the terminal.  None ends it."""
-        st = {"done": 0, "shown": -1, "at": 0.0}
+        """A counter of the bytes that went: on_percent (when `total` is known),
+        on_bytes (with the time left at the pace so far) and, with
+        `progress`, a line on the terminal.  None ends it."""
+        st = {"done": 0, "shown": -1, "at": 0.0, "began": time.time(), "told": 0.0}
         def tick(n):
             if n is None:
                 if progress and st["shown"] >= 0:
                     sys.stderr.write("\n")
                 return
             st["done"] += n
+            if self.on_bytes and time.time() - st["told"] > 0.5:
+                st["told"] = time.time()
+                took = time.time() - st["began"]
+                left = (int((total - st["done"]) * took / st["done"])
+                        if total and st["done"] and took > 1 else None)
+                self.on_bytes(st["done"], total, left)
             pct = min(100, st["done"] * 100 // total) if total else None
             if pct is not None and pct != st["shown"] and self.on_percent:
                 self.on_percent(pct)
@@ -10376,17 +10393,54 @@ def _update_entry(uid: str, **fields) -> None:
                 e[k] = v
         save_registry(reg)
 
+def transfer_path(uid: str) -> Path:
+    """Where a handover or a take-back of project `uid` says how far it got
+    (the session corner reads it)."""
+    return aht_home() / "run" / f"transfer-{uid}.json"
+
+def transfers() -> list:
+    """The handovers and take-backs running now, as their files say: those
+    whose process is gone are left out (and their files removed)."""
+    out = []
+    for f in sorted((aht_home() / "run").glob("transfer-*.json")):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        # a command that ended without tidying up, or a number another
+        # process has now: no word from it for half an hour
+        if not isinstance(d, dict) or not _pid_alive(int(d.get("pid") or 0)) \
+                or time.time() - float(d.get("at") or 0) > 1800:
+            try:
+                f.unlink()
+            except OSError:
+                pass            # gone already
+            continue
+        out.append(d)
+    return out
+
 class Progress:
     """Where a transfer stands, for a front-end that shows it: the stage in
-    words and the percentage rsync reports, rewritten into one small file
+    words, the percentage, and the bytes so far, the total and the time left
+    as rsync or aht's own copying count them, rewritten into one small file
     (--status-file: the Mac app's run/stage-*.json, the window's
-    run/window-*.json).  The file goes when the command ends (done())."""
+    run/window-*.json) and, for a handover or a take-back, into
+    run/transfer-<project>.json (track()).  The files go when the command
+    ends (done())."""
     written = set()                 # the files this run wrote
     def __init__(self, path=None, talk=False):
         self.path, self.talk = path, talk
         self.stage, self.pct, self.at = "", None, 0.0
+        self.bytes_done = self.bytes_total = self.eta = None
+        self.tracked, self.info, self.started = None, {}, time.time()
+    def track(self, path, **info) -> None:
+        """Also keep `info` (kind, project, remote, session) and how far it
+        got in `path`, for the session corner."""
+        self.tracked, self.info = path, info
+        self._write(force=True)
     def say(self, msg: str) -> None:
         self.stage, self.pct = msg, None
+        self.bytes_done = self.bytes_total = self.eta = None
         if self.talk:
             print(msg, flush=True)
         self._write(force=True)
@@ -10394,19 +10448,34 @@ class Progress:
         if n != self.pct:
             self.pct = n
             self._write()
+    def bytes(self, done: int, total=None, eta=None) -> None:
+        """How many bytes went in this stage, of how many, and the seconds
+        still to go (each when known)."""
+        self.bytes_done, self.bytes_total, self.eta = done, total, eta
+        if total:
+            self.pct = min(100, int(done * 100 // total))
+        self._write()
     def _write(self, force=False) -> None:
-        if not self.path or (not force and time.time() - self.at < 0.3):
+        if not (self.path or self.tracked) or (not force and time.time() - self.at < 0.3):
             return
         self.at = time.time()
-        try:
-            tmp = str(self.path) + ".new"
-            with open(tmp, "w") as fh:
-                json.dump({"stage": self.stage, "percent": self.pct, "at": self.at}, fh)
-            os.replace(tmp, self.path)
-            Progress.written.add(str(self.path))
-        except OSError as _x:
-            warn_once("progress", f"PROGRESS the status file {self.path} was not written: "
-                                  f"{_errmsg(_x)}")
+        now = {"stage": self.stage, "percent": self.pct, "at": self.at,
+               "done_bytes": self.bytes_done, "total_bytes": self.bytes_total, "eta": self.eta}
+        for path, body in ((self.path, now),
+                           (self.tracked, dict(self.info, pid=os.getpid(),
+                                               started=self.started, **now))):
+            if not path:
+                continue
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                tmp = str(path) + ".new"
+                with open(tmp, "w") as fh:
+                    json.dump(body, fh)
+                os.replace(tmp, path)
+                Progress.written.add(str(path))
+            except OSError as _x:
+                warn_once("progress", f"PROGRESS the status file {path} was not written: "
+                                      f"{_errmsg(_x)}")
 
     @classmethod
     def done(cls) -> None:
@@ -11688,6 +11757,7 @@ def cmd_handover(args):
     try:
         rem = get_remote(args.to)
         rem.on_percent = prog.percent
+        rem.on_bytes = prog.bytes
         out["remote"] = rem.name
         with Lock():
             reg = load_registry()
@@ -12014,6 +12084,8 @@ def cmd_handover(args):
             away.update(mux=None, arrival=not args.no_start)
         elif rem.sandbox:
             away["mux"] = "tmux"            # a tmux server of its own
+        prog.track(transfer_path(uid), kind="handover", project=real, remote=rem.name,
+                   session=sid, uuid=uid)
         with ProjectLock(uid):
             hd = handover_dir(uid)
             _retire_manifest(hd)            # an earlier attempt's: never a base
@@ -12701,6 +12773,7 @@ def cmd_reclaim(args):
             rem.pin(real, away.get("remote_path") or rem.path(real))
             there = away.get("host") or rem.name
         rem.on_percent = prog.percent
+        rem.on_bytes = prog.bytes
         out["remote"] = rem.name
         out["here_path"], out["there_path"] = real, rem._logical(rem.there(real))
 
@@ -12962,6 +13035,10 @@ def cmd_reclaim(args):
         if out["blockers"]:
             return _emit(args, out, lines)
 
+        a_ = away or {}                 # Bring Them Here: a copy, no handover
+        prog.track(transfer_path(uid), kind="reclaim", project=real,
+                   remote=a_.get("remote") or a_.get("holder") or getattr(rem, "name", None),
+                   session=a_.get("session"), uuid=uid)
         with ProjectLock(uid):
             try:
                 _snapshot_project(uid, entry)
@@ -25459,7 +25536,8 @@ def cmd_corner(args):
     if args.open:
         print(json.dumps(open_away(args.open)))
         return 0
-    print(json.dumps({"away": corner_away(), "machines": sorted(remotes_config())}))
+    print(json.dumps({"away": corner_away(), "machines": sorted(remotes_config()),
+                      "moving": transfers()}))
     return 0
 
 def cmd_sessions_checkup(args):

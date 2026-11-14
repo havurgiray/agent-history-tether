@@ -3716,8 +3716,15 @@ final class AppModel: ObservableObject {
                 guard let d = FileManager.default.contents(atPath: file),
                       let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
                 else { return }
-                let stage = (j["stage"] as? String) ?? what
+                var stage = (j["stage"] as? String) ?? what
                 let pct = (j["percent"] as? NSNumber)?.doubleValue
+                if let done = (j["done_bytes"] as? NSNumber)?.doubleValue {
+                    // once data moves: how much of how much, and how long it still takes
+                    let t = Transfer(kind: "", stage: "", percent: nil, done: done,
+                                     total: (j["total_bytes"] as? NSNumber)?.doubleValue,
+                                     eta: (j["eta"] as? NSNumber)?.doubleValue).text
+                    stage += " · " + t
+                }
                 DispatchQueue.main.async {
                     if self.working != nil {
                         self.working = stage
@@ -4226,6 +4233,26 @@ final class AppModel: ObservableObject {
     func gotoTab(_ r: BoardRow) {
         guard let pid = r.pid else { return }
         goto(pid: pid)
+    }
+
+    /// The Sessions tab's Branch… (as the corner list's).
+    func branchSession(_ r: BoardRow) {
+        guard let pid = r.pid else { return }
+        branchFlow(pid: pid, name: r.title ?? r.name) { [weak self] why in
+            _ = alert("No branch of “\(r.title ?? r.name)”", why)
+            self?.refreshBoard()
+        }
+    }
+
+    /// The Sessions tab's Send to <machine>… (as the corner list's).
+    func sendSession(_ r: BoardRow, to: String) {
+        guard let pid = r.pid else { return }
+        sendFlow(pid: pid, name: r.title ?? r.name, to: to, checking: { [weak self] on in
+            self?.working = on ? "checking \(to)…" : nil
+        }, tell: { [weak self] why in
+            _ = alert("“\(r.title ?? r.name)” was not sent", why)
+            self?.refreshBoard()
+        })
     }
 
     func goto(pid: Int) {
@@ -6670,6 +6697,25 @@ struct BoardRowView: View {
                     if r.inIterm {
                         Button("Go to Tab") { m.gotoTab(r) }
                             .controlSize(.small).buttonStyle(.borderless)
+                    }
+                    // as the corner list's right-click: Branch…, Send to <machine>…
+                    if r.local && r.inIterm && r.agent == "claude" && r.session != nil {
+                        let busy = ["busy", "shell", "waiting"].contains(r.rawStatus ?? "")
+                        Button("Branch…") { m.branchSession(r) }
+                            .controlSize(.small).buttonStyle(.borderless).disabled(busy)
+                            .help(busy ? "Once it has finished" : "A branch of this session in a new tab "
+                                  + "right after its own, with the conversation so far")
+                        if !m.machines.isEmpty {
+                            Menu("Send To") {
+                                ForEach(m.machines) { mc in
+                                    Button(mc.name + "…") { m.sendSession(r, to: mc.name) }
+                                }
+                            }
+                            .menuStyle(.borderlessButton).controlSize(.small).fixedSize()
+                            .disabled(busy)
+                            .help(busy ? "Once it has finished" : "This session goes on on that machine, "
+                                  + "with its project; its tab follows it there")
+                        }
                     }
                 }
                 .padding(.leading, 18)
@@ -11137,9 +11183,14 @@ struct CornerRow: Identifiable, Equatable {
     var machine = ""
     var canOpen = true          // handed over: aht can open it from here
     var status = ""             // Claude Code's own word: busy, shell, waiting or idle
+    var transfer: Transfer?     // a handover or take-back of it under way
 
     /// What the list shows at its right.
     var rightText: String {
+        if let t = transfer {
+            return (t.kind == "reclaim" ? "← " : "→ ") + machine
+                + (t.percent.map { " \($0)%" } ?? "")
+        }
         let t = state == "waiting" && !age.isEmpty ? "waits " + age : age
         guard kind == "away" else { return t }
         return "→ " + machine + (t.isEmpty ? (state == "unknown" ? " ?" : "") : " " + t)
@@ -11149,6 +11200,46 @@ struct CornerRow: Identifiable, Equatable {
     var later: String {
         ["busy", "shell"].contains(status) ? " (once it has finished)"
             : status == "waiting" ? " (answer it first)" : ""
+    }
+}
+
+/// A handover or take-back under way, as its run/transfer-<project>.json says
+/// (the core writes it; as wincorner's transfer_text shows it).
+struct Transfer: Equatable {
+    let kind: String            // "handover" or "reclaim"
+    let stage: String
+    let percent: Int?
+    let done: Double?
+    let total: Double?
+    let eta: Double?
+
+    static func human(_ n: Double) -> String {
+        var v = n
+        for unit in ["B", "KB", "MB", "GB"] {
+            if v < 1024 || unit == "GB" {
+                return unit == "B" || unit == "KB" ? "\(Int(v.rounded())) \(unit)"
+                    : String(format: "%.1f %@", v, unit)
+            }
+            v /= 1024
+        }
+        return "\(Int(n)) B"
+    }
+
+    /// How much went, of how much, and how long it still takes (its arrow
+    /// says which way); before any data moves, the stage.
+    var text: String {
+        guard let d = done else {
+            let st = stage.trimmingCharacters(in: .whitespaces)
+            return st.isEmpty ? (kind == "reclaim" ? "Taking back …" : "Sending …")
+                : st.prefix(1).uppercased() + st.dropFirst()
+        }
+        var t = Self.human(d) + (total.map { " of " + Self.human($0) } ?? "")
+        if let e = eta.map({ Int($0) }) {
+            t += " · " + (e < 60 ? "under a minute left" : e < 3600
+                          ? "\(Int((Double(e) / 60).rounded())) min left"
+                          : "\(e / 3600) h \(e % 3600 / 60) min left")
+        }
+        return t
     }
 }
 
@@ -11168,6 +11259,56 @@ func sendQuestion(_ res: [String: Any], _ name: String, _ to: String) -> String 
         + "aht's window)."
     for w in res["warnings"] as? [String] ?? [] { t += "\n\nNote: " + w }
     return t
+}
+
+/// Branch… (the corner's menu and the Sessions tab): the name asked for, then
+/// a branch of the session in a new tab next to its own; `tell` gets why not.
+func branchFlow(pid: Int, name: String, tell: @escaping (String) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let dry = ahtJSON(["branch", String(pid), "--json"]) ?? [:]
+        DispatchQueue.main.async {
+            if let why = (dry["blockers"] as? [String])?.first { return tell(why) }
+            guard let n = askText(
+                "Branch “\(name)”",
+                "The branch opens in a new tab right after this one, with the conversation so far "
+                    + "and the same tab colour; this session goes on as it is.\n\nName of the "
+                    + "new branch:",
+                dry["name"] as? String ?? name + " ⑂", confirm: "Branch") else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let res = ahtJSON(["branch", String(pid), "--name", n, "--apply", "--json"])
+                let why = (res?["blockers"] as? [String])?.first
+                    ?? (res == nil ? "aht gave no answer — see the log (Settings)" : nil)
+                if let why = why { DispatchQueue.main.async { tell(why) } }
+            }
+        }
+    }
+}
+
+/// Send to <machine>… (the corner's menu and the Sessions tab): the checks
+/// (`checking` while they run), what stops it or a question, then the
+/// session ends here and its tab follows it there; `tell` gets why not.
+func sendFlow(pid: Int, name: String, to: String, checking: @escaping (Bool) -> Void,
+              tell: @escaping (String) -> Void) {
+    checking(true)
+    DispatchQueue.global(qos: .userInitiated).async {
+        let res = ahtJSON(["send", String(pid), "--to", to, "--json"])
+            ?? ["blockers": ["aht gave no answer — see the log (Settings)"]]
+        DispatchQueue.main.async {
+            checking(false)
+            if let b = res["blockers"] as? [String], !b.isEmpty {
+                _ = alert("“\(name)” cannot go to \(to) now", b.joined(separator: "\n\n"))
+                return
+            }
+            guard alert("Send “\(name)” to \(to)?", sendQuestion(res, name, to),
+                        confirm: "Send") else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let done = ahtJSON(["send", String(pid), "--to", to, "--apply", "--json"])
+                let why = (done?["blockers"] as? [String])?.first
+                    ?? (done == nil ? "aht gave no answer — see the log (Settings)" : nil)
+                if let why = why { DispatchQueue.main.async { tell(why) } }
+            }
+        }
+    }
 }
 
 /// One line of text asked for in a small window: what was typed, or nil.
@@ -11203,6 +11344,8 @@ final class CornerModel: ObservableObject {
     @Published var note: String?                // why a click went nowhere, for a few seconds
     @Published var machines: [String] = []      // set up here, for Send to
     var away: [[String: Any]] = []              // `aht _corner`: the sessions handed over
+    var onMovedOn: () -> Void = {}              // a handover or take-back ended
+    private var moved: Set<String> = []
     var sessionsDir = HOME + "/.claude/sessions"
     private var last: [String: String] = [:]    // session → its status at the last look
     private var done: [String: Double] = [:]    // session → when it finished
@@ -11320,6 +11463,46 @@ final class CornerModel: ObservableObject {
             one[row.id] = row
         }
         for row in awayRows where one[row.id] == nil { one[row.id] = row }
+        // a handover or take-back under way (the core's run/transfer-*.json):
+        // on the session's row, or a row of its own while it is on its way
+        let run = HOME + "/.aht/run"
+        var keys: Set<String> = []
+        for f in (try? fm.contentsOfDirectory(atPath: run)) ?? []
+        where f.hasPrefix("transfer-") && f.hasSuffix(".json") {
+            guard let d = fm.contents(atPath: run + "/" + f),
+                  let t = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                  let tp = (t["pid"] as? NSNumber)?.int32Value, kill(tp, 0) == 0 || errno == EPERM,
+                  now - ((t["at"] as? NSNumber)?.doubleValue ?? 0) < 1800 else { continue }
+            let proj = t["project"] as? String ?? ""
+            keys.insert(t["uuid"] as? String ?? proj)
+            let tr = Transfer(kind: t["kind"] as? String ?? "handover", stage: t["stage"] as? String ?? "",
+                              percent: (t["percent"] as? NSNumber)?.intValue,
+                              done: (t["done_bytes"] as? NSNumber)?.doubleValue,
+                              total: (t["total_bytes"] as? NSNumber)?.doubleValue,
+                              eta: (t["eta"] as? NSNumber)?.doubleValue)
+            let real = (proj as NSString).resolvingSymlinksInPath
+            if let k = one.first(where: { $0.value.kind == "away" && !$0.value.project.isEmpty
+                                          && ($0.value.project as NSString).resolvingSymlinksInPath == real })?.key {
+                one[k]?.transfer = tr
+            } else {
+                let sid = t["session"] as? String
+                let key = "away:" + (sid ?? t["uuid"] as? String ?? proj)
+                let tt: (custom: String?, auto: String?) = sid.map { title($0, proj) } ?? (nil, nil)
+                var row = CornerRow(id: key, pid: 0,
+                                    name: tt.custom ?? tt.auto ?? (proj as NSString).lastPathComponent,
+                                    project: proj, state: "moving", age: "",
+                                    recent: 1e12 + ((t["started"] as? NSNumber)?.doubleValue ?? now),
+                                    kind: "away", machine: t["remote"] as? String ?? "?",
+                                    canOpen: false, status: "moving")
+                row.transfer = tr
+                one[key] = row
+            }
+        }
+        if keys != moved {
+            let ended = !moved.subtracting(keys).isEmpty
+            moved = keys
+            if ended { DispatchQueue.main.async { self.onMovedOn() } }
+        }
         let rows = one.values.sorted {
             ($0.recent, $1.name.lowercased(), $1.pid) > ($1.recent, $0.name.lowercased(), $0.pid)
         }
@@ -11440,6 +11623,8 @@ struct CornerView: View {
         let n = { (s: String) in c.rows.filter { $0.state == s }.count }
         let parts = [(n("waiting"), "waiting"), (n("done"), "done"), (n("working"), "working")]
             .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
+            + (c.rows.contains { $0.transfer != nil }
+               ? ["\(c.rows.filter { $0.transfer != nil }.count) on the way"] : [])
         return parts.isEmpty ? "\(c.rows.count) open, all idle" : parts.joined(separator: " · ")
     }
 
@@ -11495,6 +11680,10 @@ struct CornerView: View {
 
     func row(_ r: CornerRow) -> some View {
         let (icon, tint): (String, Color) = {
+            if let t = r.transfer {
+                return (t.kind == "reclaim" ? "arrow.down.circle.fill" : "arrow.up.circle.fill",
+                        Color(red: 0.15, green: 0.39, blue: 0.92))
+            }
             switch r.state {
             case "waiting": return ("exclamationmark.circle.fill", .orange)
             case "done": return ("checkmark.circle.fill", .green)
@@ -11502,18 +11691,29 @@ struct CornerView: View {
             default: return ("circle", .secondary)
             }
         }()
-        return HStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 11, weight: .semibold))
-                .foregroundColor(tint).frame(width: 14)
-            Text(r.name).font(.system(size: 12, weight: r.state == "done"
-                                      || r.state == "waiting" ? .semibold : .regular))
-                .foregroundColor(r.state == "idle" ? .secondary : .primary)
-                .lineLimit(1).truncationMode(.tail)
-            Spacer(minLength: 6)
-            Text(r.rightText)
-                .font(.system(size: 10).monospacedDigit())
-                .foregroundColor(r.kind == "away" ? Color(red: 0.15, green: 0.39, blue: 0.92) : .secondary)
-                .lineLimit(1).fixedSize().layoutPriority(1)
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(tint).frame(width: 14)
+                Text(r.name).font(.system(size: 12, weight: r.state == "done"
+                                          || r.state == "waiting" ? .semibold : .regular))
+                    .foregroundColor(r.state == "idle" && r.transfer == nil ? .secondary : .primary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 6)
+                Text(r.rightText)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(r.kind == "away" ? Color(red: 0.15, green: 0.39, blue: 0.92)
+                                     : .secondary)
+                    .lineLimit(1).fixedSize().layoutPriority(1)
+            }
+            if let t = r.transfer {             // how far it got, and how long it still takes
+                Text(t.text).font(.system(size: 10.5).monospacedDigit()).foregroundColor(.secondary)
+                    .lineLimit(1).truncationMode(.tail).padding(.leading, 21)
+                ProgressView(value: Double(t.percent ?? 0), total: 100)
+                    .progressViewStyle(.linear).controlSize(.mini)
+                    .tint(Color(red: 0.15, green: 0.39, blue: 0.92))
+                    .padding(.leading, 21).opacity(t.percent == nil ? 0.35 : 1)
+            }
         }
         .padding(.horizontal, 6).padding(.vertical, 3)
         .background(RoundedRectangle(cornerRadius: 5, style: .continuous)
@@ -11529,7 +11729,10 @@ struct CornerView: View {
         }
         .contextMenu { menu(r) }
         .help(r.name + "\n" + (r.project as NSString).abbreviatingWithTildeInPath + "\n"
-              + (r.kind == "away"
+              + (r.transfer != nil
+                 ? (r.transfer?.text ?? "") + (r.transfer?.kind == "reclaim" ? " (from " : " (to ")
+                    + r.machine + ")."
+                 : r.kind == "away"
                  ? "On \(r.machine): " + (r.state == "unknown" ? "not heard from lately" : r.state == "waiting"
                     ? "waiting for you" : r.state) + ".\n"
                     + (r.canOpen ? "A click opens it; right-click for Take Back." : "Right-click for Take Back.")
@@ -11540,7 +11743,10 @@ struct CornerView: View {
     /// Right-click: Go to Tab, Branch…, Send to <machine>…; on a session
     /// handed over, Open Session and Take Back….
     @ViewBuilder func menu(_ r: CornerRow) -> some View {
-        if r.kind == "away" {
+        if let t = r.transfer {
+            Button(t.kind == "reclaim" ? "Go to Tab (once it is back)" : "Open Session (once it is there)") {}
+                .disabled(true)
+        } else if r.kind == "away" {
             Button("Open Session") { act(r, "open") }.disabled(!r.canOpen)
             Button("Take Back…") { act(r, "take-back") }
         } else {
@@ -11669,6 +11875,7 @@ final class CornerPanel {
 
     init() {
         let d = UserDefaults.standard
+        model.onMovedOn = { [weak self] in self?.lookAway() }
         if d.double(forKey: "cornerWidth") > 0 { model.width = CGFloat(d.double(forKey: "cornerWidth")) }
         if d.object(forKey: "cornerRows") != nil { model.most = max(0, d.integer(forKey: "cornerRows")) }
     }
@@ -11839,57 +12046,24 @@ final class CornerPanel {
     /// A branch of the session, in a new tab right after its own.
     private func branch(_ r: CornerRow) {
         model.seen(r)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let dry = ahtJSON(["branch", String(r.pid), "--json"]) ?? [:]
-            DispatchQueue.main.async {
-                if let why = (dry["blockers"] as? [String])?.first { return self.tell(r, why) }
-                guard let name = askText(
-                    "Branch “\(r.name)”",
-                    "The branch opens in a new tab right after this one, with the conversation so far "
-                        + "and the same tab colour; this session goes on as it is.\n\nName of the "
-                        + "new branch:",
-                    dry["name"] as? String ?? r.name + " ⑂", confirm: "Branch") else { return }
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let res = ahtJSON(["branch", String(r.pid), "--name", name, "--apply", "--json"])
-                    let why = (res?["blockers"] as? [String])?.first
-                        ?? (res == nil ? "aht gave no answer — see the log (Settings)" : nil)
-                    if let why = why { DispatchQueue.main.async { self.tell(r, why) } }
-                }
-            }
-        }
+        branchFlow(pid: r.pid, name: r.name) { [weak self] why in self?.tell(r, why) }
     }
 
     /// The session, with its project, to another machine: the checks first,
     /// then a question, then the session ends here and its tab follows it.
     private func send(_ r: CornerRow, _ to: String) {
-        model.say("Checking \(to) for “\(r.name)”…", for: 300)
-        place(force: true)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let res = ahtJSON(["send", String(r.pid), "--to", to, "--json"])
-                ?? ["blockers": ["aht gave no answer — see the log (Settings)"]]
-            DispatchQueue.main.async {
-                self.model.note = nil
-                self.place(force: true)
-                if let b = res["blockers"] as? [String], !b.isEmpty {
-                    _ = alert("“\(r.name)” cannot go to \(to) now", b.joined(separator: "\n\n"))
-                    return
-                }
-                guard alert("Send “\(r.name)” to \(to)?", sendQuestion(res, r.name, to),
-                            confirm: "Send") else { return }
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let done = ahtJSON(["send", String(r.pid), "--to", to, "--apply", "--json"])
-                    let why = (done?["blockers"] as? [String])?.first
-                        ?? (done == nil ? "aht gave no answer — see the log (Settings)" : nil)
-                    if let why = why { DispatchQueue.main.async { self.tell(r, why) } }
-                }
-            }
-        }
+        sendFlow(pid: r.pid, name: r.name, to: to, checking: { [weak self] on in
+            guard let self = self else { return }
+            if on { self.model.say("Checking \(to) for “\(r.name)”…", for: 300) } else { self.model.note = nil }
+            self.place(force: true)
+        }, tell: { [weak self] why in self?.tell(r, why) })
     }
 
     /// A click on a session: its tab to the front, or a line saying why not;
     /// one handed over opens where it runs.
     private func open(_ r: CornerRow) {
         model.seen(r)
+        if r.transfer != nil { return }         // on its way: nothing to open yet
         if r.kind == "away" {
             guard r.canOpen else { return tell(r, "its session runs in a terminal on \(r.machine), "
                                                 + "not in a window aht can open from here") }

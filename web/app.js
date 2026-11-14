@@ -128,6 +128,24 @@ const run = async (args) => failedHow(args, await post("/api/run", { args }));
 /** One aht command's JSON answer ({} if none). */
 async function J(...args) { const a = await run(args); return a.json || {}; }
 
+/** How far a transfer got: its stage and percentage, and once data moves,
+ * how much of how much and how long it still takes. */
+function sizeText(n) {
+  let v = Number(n) || 0;
+  for (const u of ["B", "KB", "MB", "GB"]) {
+    if (v < 1024 || u === "GB") return u === "B" || u === "KB" ? `${Math.round(v)} ${u}` : `${v.toFixed(1)} ${u}`;
+    v /= 1024;
+  }
+}
+function progressText(p, label) {
+  let t = `${p.stage || label}${p.percent != null ? ` — ${Math.round(p.percent)} %` : ""}`;
+  if (p.done_bytes != null) {
+    t += ` · ${sizeText(p.done_bytes)}${p.total_bytes ? ` of ${sizeText(p.total_bytes)}` : ""}`;
+    if (p.eta != null) t += ` · ${p.eta < 60 ? "under a minute left" : p.eta < 3600 ? `${Math.round(p.eta / 60)} min left` : `${Math.floor(p.eta / 3600)} h ${Math.floor(p.eta % 3600 / 60)} min left`}`;
+  }
+  return t;
+}
+
 /** A long command: started, then followed until done (with its progress). */
 async function job(args, label, follow) {
   const started = await post("/api/start", { args, follow: !!follow });
@@ -137,7 +155,7 @@ async function job(args, label, follow) {
     const j = await get("/api/job?id=" + started.job);
     if (LOST) return gone();
     if (j.error) return { ok: false, out: "", err: j.error, json: null };
-    if (j.progress) setBusy(`${j.progress.stage || label}${j.progress.percent != null ? ` — ${Math.round(j.progress.percent)} %` : ""}`);
+    if (j.progress) setBusy(progressText(j.progress, label));
     if (j.done) return failedHow(args, j.answer || {});
   }
 }
@@ -3136,6 +3154,13 @@ function drawSessions(m) {
           const a = await J("goto", String(s.pid), "--json");
           if (!a.ok) ask("Could not go to its tab", a.why || "aht could not find its tab.", ["OK"]);
         } }) : null,
+        // as the session corner's right-click: Branch…, Send To
+        b.local && s.in_terminal && s.agent === "claude" && s.session ? h("button", { class: "small", text: "Branch…",
+          disabled: ["busy", "shell", "waiting"].includes(s.raw_status), title: "A branch of this session in a new tab, with the conversation so far",
+          onclick: () => branchSession(s) }) : null,
+        b.local && s.in_terminal && s.agent === "claude" && s.session && machineNames().length
+          ? menu("Send To", machineNames().map((n) => [`${n}…`, () => sendSession(s, n)]),
+            { small: true, right: true, disabled: ["busy", "shell", "waiting"].includes(s.raw_status) }) : null,
         b.local && s.can_restart ? h("button", { class: "small", text: "Restart in Its Tab…", onclick: async () => {
           if (!(await confirmIt("Restart this session in its tab?", "aht ends it and starts it again in the same tab, with the options it had. Its conversation stays.", "Restart"))) return;
           const a = await J("checkup", "--restart", String(s.pid), "--apply", "--json");
@@ -3150,6 +3175,50 @@ function drawSessions(m) {
     if (list.childNodes.length) g.append(list);
     m.append(g);
   }
+}
+
+/** The machines set up here, for Send To. */
+const machineNames = () => Object.keys((S.status.handover || {}).remotes || {}).sort();
+
+/** Branch… (as the session corner's): its name, then a branch of the
+ * session in a new tab beside its own. */
+async function branchSession(s) {
+  const dry = await busy("looking at the session…", () => J("branch", String(s.pid), "--json"));
+  if (problems(dry)) return tell("No branch now", problems(dry));
+  const label = dry.label || s.title || base(s.project);
+  const name = h("input", { type: "text", value: dry.name || "", style: "width:100%" });
+  const sh = sheet(`Branch “${label}”`, "Sessions in the corner", 520);
+  sh.body.append(h("p", { text: "The branch opens in a new tab beside this one, with the conversation so far; this session goes on as it is." }),
+    h("label", { class: "stack" }, "Name of the new branch", name));
+  const go = h("button", { class: "primary", text: "Branch", onclick: async () => {
+    const n = name.value.trim();
+    if (!n) return name.focus();
+    closeSheet();
+    const r = await busy("opening the branch…", () => J("branch", String(s.pid), "--name", n, "--apply", "--json"));
+    if (!r.applied) tell("No branch", problems(r) || "aht could not open it.");
+    else { toast(`“${n}” opened beside “${label}”.`); loadBoard(); }
+  } });
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter") go.click(); });
+  sh.foot.append(h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), go);
+  name.focus(); name.select();
+}
+
+/** Send To <machine>… (as the session corner's): the checks, a question,
+ * then the session ends here and its tab follows it there. */
+async function sendSession(s, to) {
+  const d = await busy(`checking ${to}…`, () => J("send", String(s.pid), "--to", to, "--json"));
+  const label = d.label || s.title || base(s.project);
+  if (problems(d)) return tell(`“${label}” cannot go to ${to} now`, problems(d));
+  const ho = d.handover || {};
+  const text = [`The session ends here, and its project folder (${d.project}) and its history go to ${to}, to ${ho.there_path || "the same place"}.`,
+    ho.pc ? `${to} is a PC: no session starts there; its tray offers Continue here.`
+      : `The session goes on there, and its tab connects to it. On ${to} it keeps working when this computer sleeps or loses its connection.`,
+    "Bring it back later with Take Back… (in the Projects tab, or a right-click in the session corner)."]
+    .concat((d.warnings || []).map((w) => "Note: " + w)).join("\n\n");
+  if (!(await confirmIt(`Send “${label}” to ${to}?`, text, "Send"))) return;
+  const r = await busy(`ending “${label}” here…`, () => J("send", String(s.pid), "--to", to, "--apply", "--json"));
+  if (!r.applied) tell(`“${label}” was not sent`, problems(r) || "aht could not send it.");
+  else { toast(`“${label}” is on its way to ${to}; its tab shows how far it got.`); loadBoard(); }
 }
 
 /** The saved layouts on the left, what the picked one would open on the right. */

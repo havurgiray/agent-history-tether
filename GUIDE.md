@@ -802,6 +802,10 @@ waiting for you.
   dragging tabs around, or beside a split, it can land one tab off. On
   Linux the window offers
   **End Process…** on each Claude session here instead of the buttons below.
+- **Branch…** and **Send To** do what the session corner's right-click does
+  (see *Sessions in the corner*): a branch of the session in a new tab
+  beside its own, or the session sent, with its project, to one of your
+  machines. Both wait while the session works or waits for you.
 - **Worth a look**, each with a reason: a session **open twice** (the same
   conversation runs in two processes, which both write to it; **End It…**
   closes one); one **working for hours with nothing written** (probably a
@@ -962,6 +966,14 @@ with its ×.
     there). Close the laptop: the session keeps working there.
   - Branch and Send wait while a session works or waits for you, and say
     so.
+- **On its way:** while a session is sent (or its project taken back), its
+  row shows an arrow up (or down), the machine and the percentage
+  (**→ homebox 45%**), and under it what is happening: before any data
+  moves, the stage (*Checking homebox …*), then how much went, of how much,
+  and how long it still takes (*120.0 MB of 260.0 MB · 2 min left*), with a
+  bar; the top line counts the sessions on the way. Each part of the transfer (the project's files, then
+  its history) counts on its own. The same line shows in aht's window while
+  it hands a project over or takes one back.
 - **A session sent to another machine** stays in the list, with an arrow
   and the machine's name (**→ homebox 3m**), working, waiting or done as
   that machine last said (the notices ask it about once a minute; **?**

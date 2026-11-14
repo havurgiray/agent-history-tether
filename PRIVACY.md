@@ -416,6 +416,10 @@ or brought to another machine with Bring Here:
 - `claude-version.json`: Claude Code's version and where it is;
 - `app-alive` (macOS) and `tray-alive` (Windows): that the Mac app or the
   tray runs, so that it shows aht's notices;
+- `transfer-<project id>.json`: while a handover or a take-back runs, the
+  project's path, the machine, the session's id, the stage, how many bytes
+  went of how many, the time left and the process's number, for the
+  session corner; it goes when the command ends;
 - macOS and Windows: the session corner's marks (`corner.json`: each open
   session's id, or a handed-over one's, its last state, and when it
   finished); on Windows also where you put the list (`corner-place.json`:

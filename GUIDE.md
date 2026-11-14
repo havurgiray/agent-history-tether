@@ -1730,7 +1730,27 @@ below that machine's home folder (`/Users/me/code/shop` here is
   homebox…** ends it here and hands its project over, in its own tab, which
   then shows it running there (see *Sessions in the corner*).
 - **Same Claude Code everywhere:** the other machine gets this computer's
-  exact version.
+  exact version. Installing it there tells nothing of how far it got, so
+  aht shows the time it took on that machine before (about 90 seconds the
+  first time) counting down, and says so when it takes longer.
+- **What travels:** the project folder with everything in it, so its own
+  rules and settings go along (`CLAUDE.md`, `AGENTS.md`,
+  `CLAUDE.local.md`, `.mcp.json` and the `.claude` folder with the
+  project's skills, commands and agents), and the project's history in
+  Claude Code (its conversations, memory, plans and /rewind snapshots).
+  What is set up for you on this computer does not: your global
+  `CLAUDE.md`, your own skills, agents, commands and output styles, the
+  plugins you turned on, your hooks, status line and MCP servers. The
+  handover's check says what of it the other machine lacks.
+- **Copy My Claude Setup to homebox…** (Machines tab; `aht copy-setup
+  homebox`) brings your global `CLAUDE.md`, skills, agents, commands and
+  output styles over, where they are missing or differ there, and installs
+  the plugins you turned on from their marketplaces, with Claude Code's own
+  `claude plugin` there. What it replaces there is set aside first, in
+  aht's folder there; what only that machine has stays. Hooks, the status
+  line and MCP servers are listed, not copied: they run programs of this
+  computer, by its paths, and may hold keys. aht's own hooks come with aht
+  wherever it is installed. Run it again after you change your setup.
 - **Between systems:** a Mac, a Linux machine or a Windows PC hands
   projects over to a Mac or Linux machine and takes them back; a Mac, a
   Linux machine or another PC also to a PC that answers (see *A Windows PC
@@ -1888,6 +1908,8 @@ went on.
   window uses; `aht remote remove homebox` forgets it.
 - `aht handover ~/Desktop/paper` — show what would be sent and what stands
   in the way; `--to homebox` names the machine, `--apply` does it.
+- `aht copy-setup homebox` — what of your own Claude Code setup homebox
+  lacks, and what copying it would do; `--apply` copies it.
 - `aht handover ~/Desktop/paper --apply --task "run the benchmark"` — hand
   it over and start the session there on that task (`--session <id>`:
   resume that session instead of the latest). A key, token or password in

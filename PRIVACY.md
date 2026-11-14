@@ -414,6 +414,9 @@ or brought to another machine with Bring Here:
   Now*; `update.json`: the last answer about new versions (version
   number, release notes, their page, when);
 - `claude-version.json`: Claude Code's version and where it is;
+  `claude-installs.json`: how many seconds installing Claude Code took on
+  each of your other machines (the last five), to say how long the next
+  one takes;
 - `app-alive` (macOS) and `tray-alive` (Windows): that the Mac app or the
   tray runs, so that it shows aht's notices;
 - `transfer-<project id>.json`: while a handover or a take-back runs, the
@@ -717,6 +720,18 @@ from it are as for any machine, with these differences:
 
 All of it travels over your SSH connection, and only for the features
 you use.
+
+- *Your own Claude Code setup there:* before a handover and for Copy My
+  Claude Setup (`aht copy-setup`), the names and checksums of the global
+  `CLAUDE.md`, the skills, agents, commands and output styles in Claude
+  Code's folder there, the names of the plugins turned on there and their
+  marketplaces, the names of the MCP servers, whether a status line is set,
+  and each hook's event and program name.  Nothing of what is in them.  The
+  same is read here.  Copy My Claude Setup then sends those files of yours
+  that are missing or differ there (what they replace there is set aside in
+  aht's folder there), and runs `claude plugin marketplace add` and `claude
+  plugin install` there for the plugins you turned on; hooks, the status
+  line and MCP servers stay here.
 
 - *Open sessions:* while you look at the Sessions tab (in the Mac app also
   when you open the Machines tab), when you run `aht board`, and for the

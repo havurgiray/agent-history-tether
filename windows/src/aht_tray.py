@@ -49,6 +49,7 @@ if not getattr(sys, "frozen", False):
 
 import aht      # noqa: E402
 import winlayer  # noqa: E402
+import wincorner  # noqa: E402
 
 FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -510,6 +511,55 @@ def _run_action(fn):
         tray_log(f"{_name(fn)} failed", e)
         balloon("That did not work", f"{type(e).__name__}: {e}"[:180]
                 + " (noted in aht's log)")
+
+
+# ---- the session corner -----------------------------------------------------
+
+CORNER = [None]         # its window, made when it first shows
+AWAY_AT = [0.0]         # when the handed-over sessions were last listed
+
+
+def _corner():
+    if CORNER[0] is None:
+        run = aht.aht_home() / "run"
+        hooks = {"open_window": act_open_window, "switch_off": corner_off,
+                 "ask": lambda t, x: msgbox(t, x, MB_YESNO | MB_ICONQUESTION) == IDYES,
+                 "tell": lambda t, x: msgbox(t, x, MB_OK | MB_ICONWARNING),
+                 "note": lambda what, e: tray_log(what, e)}
+        CORNER[0] = wincorner.Corner(wincorner.Model(aht.claude_home(), run), hooks, run)
+    return CORNER[0]
+
+
+def corner_sync():
+    """Show or hide the session corner as `session_corner` says (this menu,
+    the window's Settings or `aht config` set it); the sessions handed over
+    to other machines are listed again every 15 s, aside."""
+    want = bool(aht.cfg_get("session_corner"))
+    c = CORNER[0]
+    if want and (c is None or not c.shown()):
+        _corner().show()
+    elif not want and c is not None and c.shown():
+        c.hide()
+    if want and time.time() - AWAY_AT[0] > 15:
+        AWAY_AT[0] = time.time()
+        _in_thread(_corner_away)
+
+
+def _corner_away():
+    c = CORNER[0]
+    if c is not None:
+        c.m.away, c.m.machines = aht.corner_away(), sorted(aht.remotes_config())
+
+
+def corner_off():
+    _set_shared("session_corner", False)
+    corner_sync()
+
+
+def act_toggle_corner():
+    _set_shared("session_corner", not aht.cfg_get("session_corner"))
+    AWAY_AT[0] = 0.0
+    corner_sync()
 
 
 def _set_shared(key, value):
@@ -992,6 +1042,8 @@ def build_menu():
     sep(root)
 
     add(root, "Open aht…", act_open_window)
+    add(root, "Sessions in the Corner", act_toggle_corner,
+        checked=bool(aht.cfg_get("session_corner")))
     # a project another machine handed over here: no session started here
     came = arrivals()
     for name, label in came:
@@ -1123,6 +1175,8 @@ def wnd_proc(hwnd, msg, wparam, lparam):
                 pump_notices()
             elif wparam == 4:
                 save_workspace()
+            elif wparam == 5:
+                corner_sync()
             else:
                 refresh()
         except Exception as e:                    # the next tick tries again
@@ -1141,6 +1195,27 @@ def wnd_proc(hwnd, msg, wparam, lparam):
 
 
 # ---- entry -----------------------------------------------------------------
+
+def corner_selftest():
+    """The session corner drawn into a picture, as it would show: its fonts,
+    glyphs and layout at 100% and 150%, light and dark."""
+    import tempfile
+    now = time.time()
+    recs = [(11, {"sessionId": "a", "status": "busy", "cwd": "C:\\x\\one",
+                  "statusUpdatedAt": (now - 90) * 1000}),
+            (12, {"sessionId": "b", "status": "waiting", "cwd": "C:\\x\\two",
+                  "statusUpdatedAt": (now - 30) * 1000}),
+            (13, {"sessionId": "c", "status": "idle", "cwd": "C:\\x\\three"})]
+    with tempfile.TemporaryDirectory() as td:
+        m = wincorner.Model(td, td, records=lambda: recs)
+        m.away = [{"id": "away:d", "name": "four", "project": "C:\\x\\four",
+                   "machine": "box", "state": "working", "since": now - 400, "can_open": True}]
+        m.poll()
+        assert len(m.rows) == 4, m.rows
+        for dark, dpi in ((False, 96), (True, 144)):
+            w, h = wincorner.snapshot(m, os.path.join(td, "corner.bmp"), dark=dark, dpi=dpi)
+            assert w > 100 and h > 60, (w, h)
+
 
 def selftest():
     """Everything that can run without a tray area: bundling, seams, icon
@@ -1162,6 +1237,7 @@ def selftest():
         root, actions = build_menu()
         assert root and len(actions) >= 20, f"menu too small: {len(actions)}"
         user32.DestroyMenu(root)
+        corner_selftest()
         try:
             print("TRAY SELFTEST OK", cmd, f"{len(actions)} menu action(s)")
         except Exception:
@@ -1220,6 +1296,11 @@ def main():
     pump_notices()
     user32.SetTimer(HWND, 3, 3000, None)
     user32.SetTimer(HWND, 4, 60000, None)         # the workspace
+    try:
+        corner_sync()
+    except Exception as e:
+        tray_log("the session corner did not show", e)
+    user32.SetTimer(HWND, 5, 2000, None)          # the session corner: on or off
 
     msg = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

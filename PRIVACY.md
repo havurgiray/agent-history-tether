@@ -92,10 +92,16 @@ have sessions in each project it tracks.
   program of yours that runs inside the project, to warn you of them.  On
   Windows, before a switch or a Send Back, the names of the running
   programs (`tasklist`), of which aht keeps only whether Codex, Kimi Code,
-  Antigravity or Mistral Vibe is among them.  The Mac app's session corner
-  and chimes, when on, read Claude Code's records of its open sessions
-  every second and a half, and the end of each one's conversation file for
-  its name.
+  Antigravity or Mistral Vibe is among them.  The session corner (the Mac
+  app's, the Windows tray's) and the Mac app's chimes, when on, read Claude
+  Code's records of its open sessions every second and a half, and the end
+  of each one's conversation file for its name; the corner also reads, every
+  15 seconds, aht's own list of the projects handed over and what the
+  notices last heard from those machines (`run/board.json`), and asks no
+  machine itself.  Its right-click menu's **Branch…** reads the session's
+  command line (to keep the options it was started with) and opens a new
+  tab; **Send to <machine>…** is a handover (see [Your other
+  machines](#1-your-other-machines)).
 - **Claude Code's settings** (`~/.claude/settings.json`): to add and
   remove aht's hooks, and to show whether Remote Control and going on
   after the usage limit are on.
@@ -339,6 +345,7 @@ encrypt it.
 | `remote/copies.json` | the folders on this computer that are copies of another machine's projects: for each, the kind of copy (`sync`, `handover`, `brought`, `returned`), the project's id, the machine it came from (its name and aht's random id there), the project's path and system there, whether git converts line endings there (`autocrlf`), the attempt it came with, and since when.  Written when you bring a project here, and when another machine syncs a project here or hands one over to this computer | until you delete it; a later copy into the same folder replaces that folder's note |
 | `remote/run/`, `remote/replaced/`, `remote/aht-*.py`, `offsite/`, `arrivals/` | what another machine of yours writes here when it hands a project to this computer, syncs one here or keeps its backups here (see [Your other machines](#1-your-other-machines)) | as described there |
 | `opinions/` | copies of a project for `aht second-opinion`, with the task and each agent's output | until you discard them |
+| `branches.json` | the branches the session corner's **Branch…** (`aht branch`) opened: for each, its session id, the session it came from, when, the name you gave it and its folder, so Show Sessions lists it under that session (Claude Code marks only the branches of its own `/branch`) | until you delete it |
 | `night-shift.json` | the night shifts you planned: the project's path, the task, the machine, the times, and what happened (a cancelled one stays, marked so) | until you delete it; when you plan a new one, those that ended more than 30 days ago are dropped |
 | `run/` | short-lived state (see [below](#short-lived-state)) | overwritten as aht runs |
 | `aht-icons/` | Linux: the tray's two icons, written by the tray and by `tray.py --check` | rewritten each time the tray starts or is checked |
@@ -409,8 +416,11 @@ or brought to another machine with Bring Here:
 - `claude-version.json`: Claude Code's version and where it is;
 - `app-alive` (macOS) and `tray-alive` (Windows): that the Mac app or the
   tray runs, so that it shows aht's notices;
-- macOS: the session corner's marks (`corner.json`: each open session's
-  id, its last state, and when it finished), the time of the last layout
+- macOS and Windows: the session corner's marks (`corner.json`: each open
+  session's id, or a handed-over one's, its last state, and when it
+  finished); on Windows also where you put the list (`corner-place.json`:
+  its place on the screen, its width and how many sessions it lists);
+- macOS: the time of the last layout
   save (`workspace-autosave`), the tabs and titles a restore just opened
   (`workspace-opened.json`), and for a terminal window aht opens, the
   command it runs (`<name>.command`: the folder and the command);
@@ -501,7 +511,9 @@ features below send data, and only after you set them up.
 
 ### 1. Your other machines
 
-**Which features.**  Handover and take-back, Bring Here and Send Back,
+**Which features.**  Handover and take-back (also the session corner's
+**Send to <machine>…**, `aht send`, which ends that session here first),
+Bring Here and Send Back,
 Keep in sync (`aht mirror`, also in the background every 30 minutes),
 `offsite_backup` and fetching backups, `aht night-shift`, Pick Up and
 Leave a Note, and the session list, notices, Watch and search for those
@@ -1132,7 +1144,7 @@ over them.
   | `checkpoints`, `checkpoint_keep`, `checkpoint_excludes` | folder copies at session start |
   | `icons_enabled`, `icons_agent`, `icons_git` | folder badges, for the projects aht tracks and for git folders |
   | `tab_names`, `spotlight`, `workspace_save_minutes` | session names from iTerm2 tabs, Spotlight entries, saved layouts (macOS) |
-  | `session_corner`, `chimes` | the Mac app's list of open sessions and its sounds (both off by default) |
+  | `session_corner`, `chimes` | the list of open sessions (the Mac app, the Windows tray) and the Mac app's sounds (both off by default) |
   | `backends`, `backend_roots`, `watch_roots` | which agents and folders aht looks at, and where each agent keeps its history |
   | `notifications`, `notify_waiting`, `notify_finished`, `notify_limit` | notices on this computer, and which kinds |
   | `notify_phone` | notices on your phone: `imessage:<phone or Apple ID>` (macOS) or `ntfy:<topic or server address>`, an address only with `https://` (or `http://` to a server on this computer) (off by default) |
@@ -1331,7 +1343,7 @@ ends, a handover's dry run and result, Take Back, What Changed, `aht undo
 workspaces.
 
 **Not masked.**  On this computer, session names and tab titles stay as
-they are: in the Mac app's session corner, in the iTerm2 tab titles aht
+they are: in the session corner, in the iTerm2 tab titles aht
 sets from a session's name, in `run/tab-names.json` and
 `run/iterm-tabs.json`, in the tab titles of saved workspaces (restoring a
 layout sets them back), in `aht.log`, and the night shifts you plan

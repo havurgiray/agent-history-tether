@@ -10,8 +10,9 @@ over to another machine of yours.
 
 This guide shows aht on macOS, with its window. On Windows and Linux the
 window opens from the tray (**Open aht…**) or with `aht window`: the same
-tabs and dialogs, without what needs macOS (iTerm2, Spotlight, Finder, the
-session corner, chimes). See *On Windows and Linux*; the README's
+tabs and dialogs, without what needs macOS (iTerm2, Spotlight, Finder,
+chimes); on Windows the tray also shows the session corner. See *On Windows
+and Linux*; the README's
 *Platforms* table lists every feature per system.
 
 Each feature comes with an example and ends with its commands, each
@@ -197,6 +198,10 @@ welcome window and Getting started.
   `%VARIABLES%`, or a network path such as `\\server\share\…`); This PC,
   Libraries or Network cannot be chosen. On Linux the chooser is zenity's
   or kdialog's; with neither, the window asks you to type the path.
+- **Sessions in the corner** (Windows): the tray's menu → *Sessions in the
+  Corner* shows the list at the bottom right of the screen, above the
+  taskbar, with the same clicks and right-click menu as on a Mac (see
+  *Sessions in the corner*).
 - **Notices** come from the tray: a session that waits for you, a long one
   that is done, Claude's usage limit, a new version, a project that came to
   this PC. On Windows a click on one opens the window; a click on *shop
@@ -902,18 +907,9 @@ holds a project of yours (about once a minute).
 - What a session waits for shows with keys and passwords masked (see
   *Secrets check*), here and on your phone; on another machine it is
   masked before it leaves that machine.
-- **Sessions in the corner:** a small list in the screen's top-right
-  corner shows every open Claude session on this Mac: **working** (blue),
-  **waiting for you** (orange) or **done** (green), with how long it has
-  been so, under the name the Claude app shows. The sessions working now
-  come first, the one that started last on top; the rest follow by when
-  they last worked. *Done* stays until you click that session, which
-  brings its iTerm2 tab to the front, or until it works again. Drag the
-  list, or its edges, to move or resize it (a double-click on its top line
-  puts it back); sessions that do not fit show as "+n more". Turn it on or
-  off in the aht menu (*Sessions in the Corner*), in Settings → Notices,
-  or with its ×. It reads Claude Code's own records of its sessions every
-  second and a half, so it needs no tokens.
+- **Sessions in the corner:** a small list of every open Claude session,
+  working, waiting for you or done, that you can keep in a corner of the
+  screen (see *Sessions in the corner*).
 
 **In the terminal:**
 
@@ -922,6 +918,72 @@ holds a project of yours (about once a minute).
 - `aht limits` — list the sessions that stopped at Claude's usage limit in
   the last 12 hours, and when the limit resets; `--hours 48` looks back
   two days.
+
+## Sessions in the corner
+
+A small list of every open Claude session on this computer, in a corner
+of the screen, so you see at a glance which one needs you. On a Mac it
+sits in the top-right corner, under the menu bar; on Windows at the bottom
+right, above the taskbar. Turn it on or off in the aht menu (on Windows,
+the tray's menu) with *Sessions in the Corner*, in Settings → Notices, or
+with its ×.
+
+> **Example.** Three sessions work on three projects. The list shows
+> *paper* with an orange mark, **waits 2m**: it asks for a permission. A
+> click brings its tab to the front. Later *benchmarks* turns green,
+> **done**; you right-click it, choose **Branch…**, type *try the larger
+> data set*, and a new tab opens right after it with the conversation so
+> far, while *benchmarks* stays as it was.
+
+- **What it shows:** each session is **working** (blue), **waiting for
+  you** (orange) or **done** (green), with how long it has been so, under
+  the name the Claude app shows. The sessions working now come first, the
+  one that started last on top; the rest follow by when they last worked.
+  *Done* stays until you click that session or it works again.
+- **A click** brings the session's tab to the front: iTerm2's on a Mac,
+  Windows Terminal's on Windows.
+- **A right-click** on a session offers:
+  - **Go to Tab**, the same as a click.
+  - **Branch…** asks for a name, then opens a branch of the session in a
+    new tab: a new session with the conversation so far (Claude Code's
+    `--fork-session`), in the session's window and with its tab colour.
+    The session itself goes on in its own tab, untouched. In iTerm2 the
+    new tab comes right after the session's own; Windows Terminal puts it
+    at the end of that window. Show Sessions lists the branch under the
+    session it came from (see *A project's sessions*).
+  - **Send to <machine>…**, one for each machine you added (see *Hand a
+    project over to another machine*): the session goes on over there,
+    with its project. aht checks first and says what would stop it, for
+    example another session open in the same folder, then asks. Once you
+    say yes, the session ends here, its tab hands the project over, and
+    that same tab then shows the session running on the other machine
+    (with mosh on both, the connection outlasts a network that drops; on
+    a PC, a dropped connection ends the tab, and the session keeps working
+    there). Close the laptop: the session keeps working there.
+  - Branch and Send wait while a session works or waits for you, and say
+    so.
+- **A session sent to another machine** stays in the list, with an arrow
+  and the machine's name (**→ homebox 3m**), working, waiting or done as
+  that machine last said (the notices ask it about once a minute; **?**
+  when it has not answered for 10 minutes). A click on it opens it: its tab
+  if one shows it already, else a new window. A right-click offers **Open
+  Session** and **Take Back…**, which brings the project and its history
+  back here (see *Hand a project over to another machine*).
+- **Move and resize:** drag the list anywhere; its sides change its width,
+  and the edge away from where it sits (the bottom on a Mac, the top in
+  the corner on Windows) how many sessions it lists; the rest show as "+n
+  more". A double-click on its top line puts it back in the corner.
+- It reads Claude Code's own records of its sessions every second and a
+  half, so it needs no tokens. It never takes the keyboard from the window
+  you type in.
+
+**In the terminal:**
+
+- `aht branch ~/Desktop/benchmarks --name "try the larger data set"` — what
+  a branch of the session open in that folder would be called (also by
+  process or session id); `--apply` opens it.
+- `aht send ~/Desktop/benchmarks --to homebox` — the checks for sending
+  that session to homebox; `--apply` ends it and sends it, in its own tab.
 
 ## Chimes when a session is done or waits for you
 
@@ -1017,7 +1079,9 @@ only the latest. **Projects → More → Show Sessions…**
   one of its branches was used lately, so a branch you worked on today
   keeps the session it came from near the top.
 - **Branches** sit under the session they came from, a branch of a branch
-  one step further in. Each shows when it was branched and when it was
+  one step further in: those of `/branch` and those the corner list's
+  **Branch…** opened (aht notes where those came from, since Claude Code
+  marks only its own). Each shows when it was branched and when it was
   last active; other sessions show when they started. A branch whose
   origin is gone (for example after Claude Code's clean-up of old
   sessions) is listed with the others and says so.
@@ -1650,6 +1714,9 @@ below that machine's home folder (`/Users/me/code/shop` here is
 - **Nothing moves while something runs:** while an agent works or waits for
   you in the project, or another program runs in the folder, the handover
   waits.
+- **From the corner list:** right-click an open session → **Send to
+  homebox…** ends it here and hands its project over, in its own tab, which
+  then shows it running there (see *Sessions in the corner*).
 - **Same Claude Code everywhere:** the other machine gets this computer's
   exact version.
 - **Between systems:** a Mac, a Linux machine or a Windows PC hands
@@ -2744,8 +2811,8 @@ all of them can be set with `aht config --set name=value` and put back with
   `ntfy:<topic>` (or `ntfy:https://<your server>/<topic>`; `http://` only
   for a server on this computer).
 - `notify_limit` (on) — a session stopped at Claude's usage limit.
-- `session_corner` (off) — the app lists the open Claude sessions in the
-  screen's top-right corner (*Sessions in the corner*).
+- `session_corner` (off) — the app (on Windows, the tray) lists the open
+  Claude sessions in a corner of the screen (*Sessions in the corner*).
 - `chimes` (off) — the app plays a chime when a session here is done or
   waits for you (*Chimes when a session is done or waits for you*).
 - `chime_done` (Bloom), `chime_waiting` (Doorbell), `chime_limit` (Ebb) —

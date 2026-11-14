@@ -401,7 +401,7 @@ The guide's *The permission level follows the work* has the details.
 | feature | command | what it does |
 |---|---|---|
 | Undo a whole session | `aht undo <folder> [--apply]` | a copy of the project when a session starts, and the folder put back from it, including what the session's commands changed (macOS: copy-on-write clones that cost no room; Linux and Windows: real copies up to 100 MB, off until `checkpoints=true`) |
-| Notices | `aht notices` | a session here or on another machine waits for you or finished a long piece of work; also on the phone (`notify_phone`: iMessage, or ntfy over HTTPS).  On a Mac also the session corner and chimes |
+| Notices | `aht notices` | a session here or on another machine waits for you or finished a long piece of work; also on the phone (`notify_phone`: iMessage, or ntfy over HTTPS).  On a Mac and on Windows also the session corner; on a Mac chimes |
 | The usage limit | `aht limits` | spots a session that stopped at Claude's limit and says when it resets; `limit_switch` offers to go on in another agent |
 | Informed sessions | `informed_sessions = true` | a new Claude Code session learns in a few lines where the last one in its folder stopped, whichever agent ran it |
 | Loose ends | `aht loose-ends` | projects of the last 30 days with work not committed, open to-dos, or a last session that ended on a question |
@@ -409,6 +409,7 @@ The guide's *The permission level follows the work* has the details.
 | Night shift | `aht night-shift <folder> --task "…" --start 22:00 --back 07:00 --apply` | a handover with a task at the start time, taken back when the session is done after the end time (`night_shift = true`; this computer has to be awake) |
 | iTerm2 tab names (Mac) | `aht tab-names` | a Claude Code session takes its iTerm2 tab's title as its name, which the Claude app and `/resume` show; a rename goes back to the tab |
 | Workspace (Mac, Windows) | `aht workspace --restore` | the windows, tabs and sessions of iTerm2 or Windows Terminal, saved while you work and opened again after a restart |
+| Branch, send (Mac, Windows) | `aht branch`, `aht send` | the session corner's right-click: a branch of an open session in a new tab beside it, with its tab colour; or the session sent, with its project, to another machine, its tab following it there |
 | Go to a tab, checkup (Mac, Windows) | `aht goto`, `aht checkup` | brings a session's tab to the front; marks sessions open twice, stuck or outside the Claude app, and restarts one in its tab |
 | Spotlight, links, Finder (Mac) | `aht://search?q=…` | session titles in Spotlight, `aht://` links from Shortcuts or a script, Finder Quick Actions, ⌃⌥⌘A for the search; whatever starts an agent or changes files asks first |
 
@@ -435,10 +436,12 @@ macOS-first: new features are built and tested there first.
 | The other machine stays awake while a handed-over agent works | ✓ (`caffeinate`) | ✓ (`systemd-inhibit`, or GNOME's own inhibitor) | — |
 | Notices | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
-| Restore Workspace | ✓ iTerm2 | ✓ Windows Terminal | — |
-| Go to Tab, restart in its tab | ✓ iTerm2 | ✓ Windows Terminal | — |
+| Restore Workspace | ✓ iTerm2 | — | ✓ Windows Terminal |
+| Go to Tab, restart in its tab | ✓ iTerm2 | — | ✓ Windows Terminal |
+| Session corner: the open sessions at a glance; a right-click to Branch or Send to a machine | ✓ top right | — | ✓ bottom right, above the taskbar |
+| Branch: a branch of a session in a new tab | ✓ iTerm2, right after its tab | — | ✓ Windows Terminal, at the end of its window |
 | iTerm2: session names from tabs | ✓ | — | — |
-| Session corner, chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
+| Chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |
 
 ## What uses tokens
 

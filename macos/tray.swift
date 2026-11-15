@@ -1209,7 +1209,8 @@ func fetchedText(_ d: [String: Any]?, _ f: OffsiteFolder, said: String) -> Strin
     }
     if n == 0 && !probs.isEmpty { return "Nothing was fetched from \(f.name)'s folder." + notCame }
     if n == 0 { return "Nothing to fetch: every backup in \(f.name)'s folder is here already." }
-    let renamed = ((d["renamed"] as? [String]) ?? []).filter { $0.hasSuffix(".zip") }.count
+    let renamed = ((d["renamed"] as? [String]) ?? [])
+        .filter { $0.hasSuffix(".zip") || $0.hasSuffix(".snap") }.count
     return "Fetched \(n) backup(s), \(byteText(d["bytes"])), from \(f.name)'s folder. Nothing "
         + "here was replaced" + (renamed == 0 ? "." : "; \(renamed) differed from a backup of "
         + "the same name here and " + (renamed == 1 ? "sits" : "sit") + " next to it under a "

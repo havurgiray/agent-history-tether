@@ -197,9 +197,7 @@ CONFIG_DEFAULTS = {
     "log_level":        "info",      # debug | info | warn | error
     "watcher_owner":    "agent",     # agent (LaunchAgent/systemd/RunKey) | none
     "backup_enabled":   True,
-    "backup_interval_hours": 24.0,
-    "backup_keep":      10,          # per project; the copies on the other machine
-                                     #   follow it, keeping at least 3
+    "backup_interval_hours": 6.0,    # a snapshot takes only what is new (BACKUP_TIERS)
     "backup_dir":       None,        # None -> <aht_home>/backups
     "linux_emblem_method": "auto",   # auto | gio | kde | both | none
     "linux_agent_emblem": "emblem-favorite",
@@ -278,7 +276,10 @@ POLICY_CHOICES = {
 # are ignored and not shown; `config --set` says why and goes on
 RETIRED_KEYS = {"new_policy": "aht always takes on a new project",
                 "workspace_keep": "saved layouts thin out with age instead: all from the "
-                                  "last two hours, then one an hour, a day, a week, a month"}
+                                  "last two hours, then one an hour, a day, a week, a month",
+                "backup_keep": "backups thin out with age instead: all from the last two "
+                               "days, then one a day for two weeks, one a week for three "
+                               "months, one a month for a year"}
 
 def cfg_get(key, default=None):
     cfg = load_config()
@@ -2083,13 +2084,289 @@ def _sources_sig(sources: list) -> str:
         newest = max(newest, int(st.st_mtime))
     return f"{n}:{size}:{newest}"
 
+# ---- the backup store -------------------------------------------------------- #
+#
+# A backup ("snapshot") of a project's histories is a small list of its files,
+# <project id>/<stamp>.snap (JSON, xz-packed), whose every file is made of
+# pieces kept once in objects/<ab>/<sha256 of the piece> (".xz" when packed).
+# A picture an agent keeps inside a conversation as base64 text is kept once,
+# as the picture itself, however many conversations and snapshots hold it;
+# a conversation that only grew since the last snapshot adds only what is
+# new.  A file reads back byte for byte (its size and sha256 are checked).
+# Backups made before (<stamp>.zip) are read as they are.
+
+STORE_B64_MIN = 4000                # a base64 string this long is a file in a conversation
+_B64_RUN = re.compile(rb'"([A-Za-z0-9+/]{%d,}={0,2})"' % STORE_B64_MIN)
+_STORE_RAW = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".pdf", ".zip", ".gz",
+              ".xz", ".zst", ".bz2", ".7z", ".mp3", ".m4a", ".mp4", ".mov", ".webm"}
+STORE_XZ = 3                        # 10% of the text at ~40 MB/s (preset 6: 9%, 12 MB/s)
+STORE_GRACE = 3600                  # s: a piece this new is never removed (a backup may be writing)
+# one in each of these stays: all from the last two days, then one a day for two
+# weeks, one a week for three months, one a month for a year
+BACKUP_TIERS = ((2 * 86400, None), (14 * 86400, "day"), (92 * 86400, "week"),
+                (366 * 86400, "month"))
+
+class BackupDamaged(Exception):
+    pass
+
+def _objects(base: Path = None) -> Path:
+    return (backups_root() if base is None else base) / "objects"
+
+def _object_file(h: str, packed: bool, base: Path = None) -> Path:
+    return _objects(base) / h[:2] / (h + ".xz" if packed else h)
+
+def _find_object(h: str, base: Path = None):
+    for packed in (True, False):
+        p = _object_file(h, packed, base)
+        if p.is_file():
+            return p, packed
+    return None, False
+
+def put_object(data: bytes, pack: bool = True, base: Path = None, stats: dict = None) -> str:
+    """Keep `data` once in the store: its name, the sha256 of the data.  One
+    there already is used again (and touched, so a clean-up that runs now
+    leaves it)."""
+    import lzma
+    h = hashlib.sha256(data).hexdigest()
+    have, _packed = _find_object(h, base)
+    if have is not None:
+        try:
+            os.utime(have)
+        except OSError:
+            pass                # read-only: it is there all the same
+        return h
+    body = data
+    if pack:
+        z = lzma.compress(data, preset=STORE_XZ)
+        pack = len(z) < len(data) * 0.97
+        body = z if pack else data
+    p = _object_file(h, pack, base)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(body)
+    os.replace(tmp, p)
+    if stats is not None:
+        stats["bytes"] = stats.get("bytes", 0) + len(body)
+        stats["objects"] = stats.get("objects", 0) + 1
+    return h
+
+def get_object(h: str, base: Path = None) -> bytes:
+    import lzma
+    p, packed = _find_object(h, base)
+    if p is None:
+        raise BackupDamaged(f"a piece of the backups is missing ({h[:12]})")
+    data = p.read_bytes()
+    if packed:
+        data = lzma.decompress(data)
+    if hashlib.sha256(data).hexdigest() != h:
+        raise BackupDamaged(f"a piece of the backups is damaged ({h[:12]})")
+    return data
+
+def _store_parts(data: bytes, arc: str, base: Path = None, stats: dict = None) -> list:
+    """The pieces `data` (a file, or what a file gained) is kept as:
+    ["t", text object, offset, length] and ["b", picture object] (written
+    back as base64).  A conversation's own text goes into one packed object."""
+    import base64
+    if not data:
+        return []
+    if not arc.endswith(".jsonl"):
+        ext = os.path.splitext(arc)[1].lower()
+        return [["t", put_object(data, ext not in _STORE_RAW, base, stats), 0, len(data)]]
+    text, plan, last = bytearray(), [], 0
+    for m in _B64_RUN.finditer(data):
+        s = m.group(1)
+        try:
+            raw = base64.b64decode(s, validate=True)
+        except ValueError:
+            continue
+        if base64.b64encode(raw) != s:          # it would not write back the same
+            continue
+        if m.start(1) > last:
+            plan.append(("t", len(text), m.start(1) - last))
+            text += data[last:m.start(1)]
+        plan.append(("b", put_object(raw, False, base, stats)))
+        last = m.end(1)
+    if last < len(data):
+        plan.append(("t", len(text), len(data) - last))
+        text += data[last:]
+    th = put_object(bytes(text), True, base, stats) if text else None
+    return [["t", th, x[1], x[2]] if x[0] == "t" else ["b", x[1]] for x in plan]
+
+def _read_manifest(path) -> dict:
+    import lzma
+    return json.loads(lzma.decompress(Path(path).read_bytes()))
+
+def _write_manifest(path: Path, m: dict) -> None:
+    import lzma
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(lzma.compress(json.dumps(m, separators=(",", ":")).encode(), preset=6))
+    os.replace(tmp, path)
+
+def _file_entry(data: bytes, arc: str, prev: dict, mtime_ns: int, base: Path = None,
+                stats: dict = None) -> dict:
+    """A file of a snapshot.  One that only grew since `prev` (the same file
+    in the snapshot before) keeps prev's pieces and adds what is new."""
+    if prev and 0 < prev.get("size", 0) <= len(data) \
+            and hashlib.sha256(data[:prev["size"]]).hexdigest() == prev.get("sha"):
+        parts = list(prev["parts"]) + _store_parts(data[prev["size"]:], arc, base, stats)
+    else:
+        parts = _store_parts(data, arc, base, stats)
+    return {"size": len(data), "mtime": mtime_ns, "sha": hashlib.sha256(data).hexdigest(),
+            "parts": parts}
+
+class SnapshotReader:
+    """The files of one backup: a store snapshot (<stamp>.snap) or an older
+    zip, read alike.  Every file read from the store is checked against its
+    size and sha256 (BackupDamaged)."""
+    def __init__(self, snap):
+        p = Path(snap.get("snap") or snap.get("zip")) if isinstance(snap, dict) else Path(snap)
+        self.path, self.zf, self.files = p, None, None
+        if p.suffix == ".zip":
+            import zipfile
+            self.zf = zipfile.ZipFile(p)
+        else:
+            self.files = _read_manifest(p)["files"]
+            self.base = p.parent.parent
+
+    def names(self) -> list:
+        if self.zf is not None:
+            return [i.filename for i in self.zf.infolist() if not i.is_dir()]
+        return list(self.files)
+
+    def size(self, name: str) -> int:
+        return self.zf.getinfo(name).file_size if self.zf is not None else self.files[name]["size"]
+
+    def read(self, name: str) -> bytes:
+        import base64
+        if self.zf is not None:
+            return self.zf.read(name)
+        e, cache, out = self.files[name], {}, bytearray()
+        for part in e["parts"]:
+            if part[0] == "b":
+                out += base64.b64encode(get_object(part[1], self.base))
+                continue
+            if part[1] not in cache:
+                cache[part[1]] = get_object(part[1], self.base)
+            out += cache[part[1]][part[2]:part[2] + part[3]]
+        if len(out) != e["size"] or hashlib.sha256(out).hexdigest() != e["sha"]:
+            raise BackupDamaged(f"{name} does not read back as it was kept")
+        return bytes(out)
+
+    def text_only(self, name: str) -> bytes:
+        """A file without the pictures in it (a store snapshot then reads no
+        picture at all): for titles and times."""
+        if self.zf is not None:
+            return _B64_RUN.sub(b'""', self.zf.read(name)) if name.endswith(".jsonl") \
+                else self.zf.read(name)
+        cache, out = {}, bytearray()
+        for part in self.files[name]["parts"]:
+            if part[0] == "t":
+                if part[1] not in cache:
+                    cache[part[1]] = get_object(part[1], self.base)
+                out += cache[part[1]][part[2]:part[2] + part[3]]
+        return bytes(out)
+
+    def open(self, name: str):
+        import io
+        return io.BytesIO(self.read(name))
+
+    def close(self) -> None:
+        if self.zf is not None:
+            self.zf.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+def _backup_bucket(t: float, now: float):
+    """BACKUP_TIERS: "all", a bucket to keep one of, or None (too old)."""
+    import datetime
+    age, d = now - t, datetime.datetime.fromtimestamp(max(0.0, t))
+    for most, unit in BACKUP_TIERS:
+        if age < most:
+            return "all" if unit is None else {
+                "day": ("day", d.date().isoformat()),
+                "week": ("week",) + tuple(d.isocalendar()[:2]),
+                "month": ("month", d.year, d.month)}[unit]
+    return None
+
+def thin_snapshots(snaps: list, now: float = None) -> list:
+    """The snapshots of one project to remove (BACKUP_TIERS): of each day,
+    week or month the newest stays, and the newest of all always."""
+    now = time.time() if now is None else now
+    keep, best = {id(s) for s in snaps[-1:]}, {}
+    for s in snaps:
+        b = _backup_bucket(s.get("t") or 0.0, now)
+        if b == "all":
+            keep.add(id(s))
+        elif b is not None and (b not in best or (s.get("t") or 0) >= (best[b].get("t") or 0)):
+            best[b] = s
+    keep |= {id(s) for s in best.values()}
+    return [s for s in snaps if id(s) not in keep]
+
+def store_gc(base: Path = None, grace: float = STORE_GRACE) -> dict:
+    """Remove the pieces no snapshot uses any more (and leftovers of a write
+    that was cut off).  When any snapshot cannot be read, nothing goes."""
+    base = backups_root() if base is None else base
+    objs = _objects(base)
+    res = {"removed": 0, "bytes": 0}
+    if not objs.is_dir():
+        return res
+    used = set()
+    for m in base.glob("*/*.snap"):
+        try:
+            for e in _read_manifest(m)["files"].values():
+                used.update(p[1] for p in e["parts"])
+        except Exception as _x:
+            warn(f"BACKUP {m.parent.name}/{m.name} is not readable, so no piece is removed: "
+                 f"{_errmsg(_x)}")
+            return dict(res, error=f"{m.name} is not readable")
+    now = time.time()
+    for sub in objs.iterdir():
+        for f in sub.iterdir() if sub.is_dir() else []:
+            if f.name.split(".")[0] in used and not f.name.endswith(".tmp"):
+                continue
+            try:
+                st = f.stat()
+                if now - st.st_mtime < grace:
+                    continue
+                f.unlink()
+                res["removed"] += 1
+                res["bytes"] += st.st_size
+            except OSError:
+                continue        # gone meanwhile, or not ours to remove
+    if res["removed"]:
+        log(f"BACKUP {res['removed']} piece(s) no backup uses went ({_human(res['bytes'])})")
+    return res
+
+def store_verify(base: Path = None) -> dict:
+    """Read every file of every snapshot back and check it."""
+    base = backups_root() if base is None else base
+    res = {"snapshots": 0, "files": 0, "bytes": 0, "problems": []}
+    for m in sorted(base.glob("*/*.snap")):
+        res["snapshots"] += 1
+        try:
+            with SnapshotReader(m) as rd:
+                for n in rd.names():
+                    res["bytes"] += len(rd.read(n))
+                    res["files"] += 1
+        except Exception as e:
+            res["problems"].append(f"{m.parent.name}/{m.name}: {_errmsg(e)}")
+    return res
+
 def _snapshots(uid: str) -> list:
+    """The backups of one project, oldest first: store snapshots (<stamp>.snap)
+    and older zips alike, each with its meta file's facts and "t", when it
+    was made."""
     d = backups_root() / uid
     out = []
     if not d.is_dir():
         return out
-    for z in sorted(d.glob("*.zip")):
-        meta = {"uuid": uid, "stamp": z.stem, "zip": str(z)}
+    for z in sorted(list(d.glob("*.zip")) + list(d.glob("*.snap")), key=lambda f: (f.stem, f.suffix)):
+        meta = {"uuid": uid, "stamp": z.stem, ("zip" if z.suffix == ".zip" else "snap"): str(z)}
         try:
             meta["zip_bytes"] = z.stat().st_size
         except OSError:
@@ -2101,18 +2378,18 @@ def _snapshots(uid: str) -> list:
         except Exception as _x:
             warn_once("snapshot-meta", f"BACKUP {z.name}: its meta file is not readable: "
                                        f"{_errmsg(_x)}")
+        meta["t"] = _stamp_time(z.stem, z) or 0.0
         out.append(meta)
+    out.sort(key=lambda m: (m["t"], m["stamp"]))
     return out
 
-def _prune_snapshots(uid: str) -> int:
-    try:
-        keep = max(1, int(cfg_get("backup_keep", 10)))
-    except Exception:
-        keep = 10
-    snaps = _snapshots(uid)
-    drop = snaps[:-keep] if len(snaps) > keep else []
+def _prune_snapshots(uid: str, gc: bool = True) -> int:
+    """Thin a project's backups out (BACKUP_TIERS); with `gc`, the pieces no
+    backup uses any more go too (a whole pass does that once, at its end)."""
+    drop = thin_snapshots(_snapshots(uid))
     for m in drop:
-        for p in (Path(m["zip"]), Path(m["zip"]).with_suffix(".meta.json")):
+        f = Path(m.get("snap") or m["zip"])
+        for p in (f, f.with_suffix(".meta.json")):
             try:
                 p.unlink()
             except FileNotFoundError:
@@ -2120,11 +2397,14 @@ def _prune_snapshots(uid: str) -> int:
             except OSError as _x:
                 warn(f"BACKUP an old backup was not removed: {p.name}: {_errmsg(_x)}")
     if drop:
-        log(f"BACKUP pruned {len(drop)} old snapshot(s) for {uid}")
+        log(f"BACKUP thinned out {len(drop)} old snapshot(s) of {uid}")
+        if gc and any(m.get("snap") for m in drop):
+            store_gc()
     return len(drop)
 
-def _snapshot_project(uid: str, entry: dict) -> dict:
-    import zipfile
+def _snapshot_project(uid: str, entry: dict, gc: bool = True) -> dict:
+    """A snapshot of the project's histories, of every agent, into the store:
+    only what is new since its last snapshot takes room."""
     res = {"uuid": uid, "real_path": entry.get("real_path")}
     sources = _project_sources(entry)
     if not sources:
@@ -2138,43 +2418,59 @@ def _snapshot_project(uid: str, entry: dict) -> dict:
     d = backups_root() / uid
     d.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    z = d / f"{stamp}.zip"
+    z = d / f"{stamp}.snap"
     n = 2
-    while z.exists():
-        z = d / f"{stamp}-{n}.zip"
+    while z.exists() or z.with_suffix(".zip").exists():
+        z = d / f"{stamp}-{n}.snap"
         n += 1
-    # this process's own: two passes at once never write the same file
-    tmp = Path(f"{z}.{os.getpid()}.tmp")
-    total = 0
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f, arc in sources:
-            try:
-                zf.write(f, arc)
-                total += f.stat().st_size
-            except OSError:
-                continue
-    os.replace(tmp, z)
+    prev = {}
+    if snaps and snaps[-1].get("snap"):
+        try:
+            prev = _read_manifest(snaps[-1]["snap"])["files"]
+        except Exception as _x:
+            warn(f"BACKUP the last snapshot of {uid} is not readable; this one is whole: "
+                 f"{_errmsg(_x)}")
+    files, total, stats = {}, 0, {}
+    for f, arc in sources:
+        try:
+            st = f.stat()
+            p = prev.get(arc)
+            if p and p.get("size") == st.st_size and p.get("mtime") == st.st_mtime_ns:
+                files[arc] = p                  # unchanged since the last snapshot
+            else:
+                files[arc] = _file_entry(f.read_bytes(), arc, p, st.st_mtime_ns, stats=stats)
+            total += files[arc]["size"]
+        except OSError:
+            continue            # gone meanwhile
+    _write_manifest(z, {"v": 1, "uuid": uid, "stamp": z.stem, "files": files})
     refs = []
     chit = claude_backend().find(entry.get("real_path") or "")
     if chit:
         refs = sorted(transcript_file_refs(chit[1],
                                            entry.get("real_path") or "", limit=25))
-    meta = {"uuid": uid, "stamp": z.stem,
+    meta = {"uuid": uid, "stamp": z.stem, "format": "store",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "real_path": entry.get("real_path"),
             "stores": entry.get("stores") or {},
             "backends": sorted({a.split("/", 1)[0] for _f, a in sources}),
-            "sig": sig, "files": len(sources), "bytes": total,
+            "sig": sig, "files": len(files), "bytes": total,
+            "added_bytes": stats.get("bytes", 0) + z.stat().st_size,
+            "sessions": sum(1 for a in files if _SESSION_MEMBER.match(a)),
             "file_refs": refs}
     try:
         z.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
     except OSError as _x:
         warn(f"BACKUP the meta file of {z.name} was not written: {_errmsg(_x)}")
-    _prune_snapshots(uid)
-    res.update(status="backed-up", stamp=z.stem, files=len(sources), bytes=total)
+    _prune_snapshots(uid, gc=gc)
+    res.update(status="backed-up", stamp=z.stem, files=len(files), bytes=total,
+               added_bytes=meta["added_bytes"])
     log(f"BACKUP {entry.get('real_path')} -> {uid}/{z.name} "
-        f"({len(sources)} file(s), backends {meta['backends']})")
+        f"({len(files)} file(s), {_human(meta['added_bytes'])} new, backends {meta['backends']})")
     return res
+
+# a session's own file in a backup: Claude Code's conversation, Kimi Code's
+_SESSION_MEMBER = re.compile(r"^(claude)/([^/]+)\.jsonl$|"
+                             r"^(kimi-code)/(session_[^/]+)/agents/main/wire\.jsonl$")
 
 def backup_pass(only_uid=None) -> list:
     reg = load_registry()
@@ -2183,11 +2479,16 @@ def backup_pass(only_uid=None) -> list:
         if only_uid and uid != only_uid:
             continue
         try:
-            results.append(_snapshot_project(uid, entry))
+            results.append(_snapshot_project(uid, entry, gc=False))
         except Exception as e:
             results.append({"uuid": uid, "status": "failed", "error": str(e)})
             error(f"BACKUP failed for {entry.get('real_path')}: {e}")
-    _touch_backup_stamp()
+    try:                            # once for the whole pass: what thinning freed
+        store_gc()
+    except Exception as e:
+        error(f"BACKUP the clean-up of the store failed: {e}")
+    if not only_uid:
+        _touch_backup_stamp()
     return results
 
 def _auto_backup_lock():
@@ -2293,22 +2594,44 @@ def match_snapshots(folder: str, limit: int = 8) -> list:
     rows.sort(key=lambda r: -r["score"])
     return rows[:limit]
 
-def _restore_snapshot(snap: dict, new_real: str) -> dict:
+def _fork_claude(data: bytes, rel: str, fork: dict) -> tuple:
+    """A Claude Code file of a backup, for a new project made from it: its
+    session gets a new id (file name, folder, every "sessionId", a branch's
+    origin), and "cwd" names the new folder."""
+    first, _, rest = rel.partition("/")
+    stem = first[:-6] if first.endswith(".jsonl") else first
+    if stem in fork["ids"]:
+        first = fork["ids"][stem] + (".jsonl" if first.endswith(".jsonl") else "")
+    rel = first + ("/" + rest if rest else "")
+    if rel.endswith(".jsonl"):
+        ids = fork["ids"]
+        data = re.sub(rb'"sessionId"(\s*):(\s*)"([0-9A-Za-z-]{8,64})"',
+                      lambda m: b'"sessionId"' + m.group(1) + b":" + m.group(2) + b'"'
+                      + ids.get(m.group(3).decode(), m.group(3).decode()).encode() + b'"', data)
+        old = json.dumps(fork["old"])[1:-1].encode()
+        new = json.dumps(fork["new"])[1:-1].encode()
+        if old:
+            data = re.sub(rb'"cwd"(\s*):(\s*)"' + re.escape(old) + rb'(?=["/\\])',
+                          lambda m: b'"cwd"' + m.group(1) + b":" + m.group(2) + b'"' + new, data)
+    return data, rel
+
+def _restore_snapshot(snap: dict, new_real: str, fork: dict = None) -> dict:
     """Extract a snapshot for a folder at its NEW location.  Dir backends land
     under key(new_real); file backends go back to their original place in the
     global store and then have their cwd rewritten to the new path.  Nothing
-    is ever overwritten."""
-    import zipfile
+    is ever overwritten.  With `fork` (a new project made from a backup: {"ids":
+    old session id -> new, "old": its folder then, "new"}): Claude Code's
+    sessions get new ids, and the agents that keep sessions in one global
+    store are left out, so the original project keeps all of its own."""
     added, skipped, rewrites = 0, 0, 0
     per_backend: dict = {}
     old_real = snap.get("real_path") or ""
     restored_files = []
     added_in_dirs: dict = {}
-    with zipfile.ZipFile(snap["zip"]) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            arc = info.filename.replace("\\", "/")
+    left_out = set()
+    with SnapshotReader(snap) as zf:
+        for name in zf.names():
+            arc = name.replace("\\", "/")
             if "/" not in arc:
                 skipped += 1
                 continue
@@ -2317,6 +2640,12 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
             if b is None or b.kind == "stub":
                 skipped += 1
                 continue
+            if fork is not None and b.kind != "dir":
+                left_out.add(bname)
+                continue
+            data = None
+            if fork is not None and bname == "claude" and not rel.startswith("__aht_companion__"):
+                data, rel = _fork_claude(zf.read(name), rel, fork)
             if b.kind == "dir":
                 if rel.startswith("__aht_companion__"):
                     dest = dict(b.companions(b.keys[0](new_real), new_real)).get(
@@ -2342,8 +2671,10 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
                 skipped += 1
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, open(dest, "wb") as out:
-                shutil.copyfileobj(src, out)
+            if data is None:
+                data = zf.read(name)
+            with open(dest, "wb") as out:
+                out.write(data)
             added += 1
             per_backend[bname] = per_backend.get(bname, 0) + 1
             if b.kind == "files":
@@ -2359,7 +2690,7 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
                 log(f"RESTORE [{bname}] {note}")
         except Exception as e:
             warn(f"RESTORE [{bname}] follow-up failed: {e}")
-    if old_real and old_real != new_real:
+    if old_real and old_real != new_real and fork is None:
         # re-point cwd in the restored session files AND in any live session
         # files still referencing the snapshot-era path (the live ones are
         # copied into the backup store first, like every metadata rewrite)
@@ -2394,7 +2725,130 @@ def _restore_snapshot(snap: dict, new_real: str) -> dict:
                 except Exception as e:
                     warn(f"RESTORE rewrite failed {f}: {e}")
     return {"added": added, "existing_kept": skipped,
-            "cwd_rewrites": rewrites, "per_backend": per_backend}
+            "cwd_rewrites": rewrites, "per_backend": per_backend,
+            "left_out": sorted(left_out)}
+
+def _store_bytes(root: Path) -> int:
+    """What the backups take on disk (snapshots, zips, the store's pieces)."""
+    total = 0
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d != "rewrites"]
+        for n in fns:
+            try:
+                total += os.lstat(os.path.join(dp, n)).st_size
+            except OSError:
+                continue        # gone meanwhile
+    return total
+
+def migrate_backups(apply: bool = False, say=None) -> dict:
+    """The backups made as zips, into the store: each zip becomes a snapshot
+    with the same stamp, and goes only once every file of it reads back from
+    the store exactly as the zip holds it."""
+    import zipfile
+    root = backups_root()
+    res = {"zips": 0, "zip_bytes": 0, "migrated": 0, "problems": [], "applied": apply}
+    dirs = sorted(d for d in root.iterdir() if d.is_dir() and d.name != "objects") \
+        if root.is_dir() else []
+    for d in dirs:
+        snaps = _snapshots(d.name)
+        zips = [m for m in snaps if m.get("zip")]
+        res["zips"] += len(zips)
+        res["zip_bytes"] += sum(m.get("zip_bytes") or 0 for m in zips)
+        if not apply or not zips:
+            continue
+        prev = {}
+        for m in snaps:                         # oldest first: each one adds to the one before
+            if m.get("snap"):
+                try:
+                    prev = _read_manifest(m["snap"])["files"]
+                except Exception:
+                    prev = {}
+                continue
+            zp = Path(m["zip"])
+            target = zp.with_suffix(".snap")
+            if target.exists():
+                res["problems"].append(f"{d.name}/{target.name} is there already")
+                continue
+            try:
+                files, stats = {}, {}
+                with zipfile.ZipFile(zp) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        mt = int(time.mktime(info.date_time + (0, 0, -1))) * 10 ** 9
+                        files[info.filename] = _file_entry(zf.read(info), info.filename,
+                                                           prev.get(info.filename), mt, stats=stats)
+                _write_manifest(target, {"v": 1, "uuid": d.name, "stamp": zp.stem, "files": files})
+                with zipfile.ZipFile(zp) as zf, SnapshotReader(target) as rd:
+                    names = sorted(i.filename for i in zf.infolist() if not i.is_dir())
+                    if sorted(rd.names()) != names:
+                        raise BackupDamaged("its list of files reads back differently")
+                    for n in names:
+                        if rd.read(n) != zf.read(n):
+                            raise BackupDamaged(f"{n} reads back differently")
+                meta = {k: v for k, v in m.items() if k not in ("zip", "snap", "zip_bytes", "t")}
+                meta.update(format="store", from_zip=True, files=len(files),
+                            bytes=sum(e["size"] for e in files.values()),
+                            added_bytes=stats.get("bytes", 0) + target.stat().st_size,
+                            sessions=sum(1 for a in files if _SESSION_MEMBER.match(a)))
+                zp.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
+                zp.unlink()
+                res["migrated"] += 1
+                prev = files
+                if say:
+                    say(f"{d.name[:8]}/{zp.stem}: {_human(m.get('zip_bytes') or 0)} zip -> "
+                        f"{_human(meta['added_bytes'])} new in the store")
+            except Exception as e:
+                res["problems"].append(f"{d.name}/{zp.name}: {_errmsg(e)}")
+                try:
+                    target.unlink()
+                except OSError:
+                    pass        # not made
+    if apply:
+        res["gc"] = store_gc(grace=0) if not res["problems"] else None
+        log(f"BACKUP {res['migrated']} zip(s) moved into the store"
+            + (f"; {len(res['problems'])} kept as zips" if res["problems"] else ""))
+    res["bytes_now"] = _store_bytes(root) if root.is_dir() else 0
+    return res
+
+_TS = re.compile(rb'"timestamp":"([0-9T:.\-]+Z?)"')
+
+def snapshot_sessions(snap: dict) -> list:
+    """The sessions one backup holds: agent, id, title, first and last
+    activity, size, and for a Claude branch the session it came from."""
+    out = []
+    with SnapshotReader(snap) as rd:
+        for n in rd.names():
+            m = _SESSION_MEMBER.match(n)
+            if not m:
+                continue
+            agent, sid = ("claude", m.group(2)) if m.group(1) else ("kimi", m.group(4))
+            data = rd.text_only(n)
+            title = None
+            for kind, field in ((b"custom-title", "customTitle"), (b"ai-title", "aiTitle")):
+                at = data.rfind(b'"' + kind + b'"')
+                while at >= 0 and title is None:
+                    start = data.rfind(b"\n", 0, at) + 1
+                    end = data.find(b"\n", at)
+                    try:
+                        j = json.loads(data[start:end if end >= 0 else len(data)])
+                        if j.get("type") == kind.decode() and j.get(field):
+                            title = redact(str(j[field]))
+                    except ValueError:
+                        pass    # not a whole line: the one before
+                    at = data.rfind(b'"' + kind + b'"', 0, start)
+                if title:
+                    break
+            ts = _TS.findall(data[:200000]), _TS.findall(data[-200000:])
+            fork = _FORKED_RE.search(data[:2000000])
+            out.append({"agent": agent, "session": sid, "title": title,
+                        "started": _when(ts[0][0].decode()) if ts[0] else None,
+                        "updated": _when(ts[1][-1].decode()) if ts[1] else None,
+                        "bytes": rd.size(n),
+                        "branch_of": fork.group(1).decode() if fork else
+                        (_branch_record().get(sid) or {}).get("from")})
+    out.sort(key=lambda r: r.get("updated") or 0, reverse=True)
+    return out
 
 def backup_status() -> dict:
     root = backups_root()
@@ -2402,12 +2856,12 @@ def backup_status() -> dict:
     try:
         if root.is_dir():
             for d in root.iterdir():
-                if d.is_dir():
-                    zips = list(d.glob("*.zip"))
-                    if zips:
+                if d.is_dir() and d.name != "objects":
+                    snaps = list(d.glob("*.zip")) + list(d.glob("*.snap"))
+                    if snaps:
                         n_proj += 1
-                        n_zip += len(zips)
-                        size += sum(z.stat().st_size for z in zips)
+                        n_zip += len(snaps)
+            size = _store_bytes(root)
     except OSError as _x:
         warn_once("backup-status", "BACKUP the backups folder could not be listed: "
                                    f"{_errmsg(_x)}")
@@ -2418,7 +2872,7 @@ def backup_status() -> dict:
         last = None
     return {"enabled": bool(cfg_get("backup_enabled", True)),
             "interval_hours": cfg_get("backup_interval_hours", 24.0),
-            "keep": cfg_get("backup_keep", 10), "dir": str(root),
+            "keep": "tiers", "dir": str(root),
             "last_run": last, "projects": n_proj, "snapshots": n_zip,
             "bytes": size}
 
@@ -4159,12 +4613,73 @@ def cmd_backup(args):
                 print("   left alone there (an older aht's, not all of them are here): "
                       + ", ".join(st["legacy"]))
         return 1 if st.get("problems") else 0
+    if args.migrate or args.verify:
+        lock = _auto_backup_lock()
+        if lock is None:
+            print("a backup runs right now; try again in a moment", file=sys.stderr)
+            return 1
+        try:
+            if args.verify:
+                res = store_verify()
+                if args.json:
+                    print(json.dumps(res, indent=2))
+                else:
+                    print(f"read back {res['files']} file(s) of {res['snapshots']} snapshot(s), "
+                          f"{_human(res['bytes'])}: "
+                          + ("all as they were kept" if not res["problems"] else
+                             f"{len(res['problems'])} problem(s)"))
+                    for x in res["problems"]:
+                        print(f"  ✗ {x}")
+                return 1 if res["problems"] else 0
+            talk = not args.json and not args.quiet
+            res = migrate_backups(args.apply, say=(lambda m: print("  " + m, flush=True))
+                                  if talk else None)
+        finally:
+            lock.close()
+        if args.json:
+            print(json.dumps(res, indent=2))
+        elif not args.apply:
+            print(f"{res['zips']} backup(s) are zips ({_human(res['zip_bytes'])}); "
+                  "moving them into the store keeps every file and takes far less room "
+                  "(dry run — pass --apply to do it)")
+        else:
+            print(f"moved {res['migrated']} of {res['zips']} zip(s) into the store; the "
+                  f"backups now take {_human(res['bytes_now'])}")
+            for x in res["problems"]:
+                print(f"  ✗ kept as a zip: {x}")
+        return 1 if res["problems"] else 0
+
+    if args.show:
+        real = os.path.realpath(args.show)
+        uid = args.uuid or read_marker(real)
+        snaps = _snapshots(uid) if uid else []
+        snap = next((m for m in snaps if m["stamp"] == args.stamp), None) if args.stamp \
+            else (snaps[-1] if snaps else None)
+        if snap is None:
+            print(f"no backup {args.stamp or ''} of {real}".replace("  ", " "), file=sys.stderr)
+            return 2
+        rows = snapshot_sessions(snap)
+        if args.json:
+            print(json.dumps({"project": real, "uuid": uid, "stamp": snap["stamp"],
+                              "sessions": rows}, indent=2))
+        else:
+            print(f"backup {snap['stamp']} of {snap.get('real_path') or real}: "
+                  f"{len(rows)} session(s)")
+            for r in rows:
+                print(f"  {_when_text(r['updated']) if r.get('updated') else '?':>16}  "
+                      f"{AGENT_NAMES.get(r['agent'], r['agent']):12} "
+                      f"{(r['title'] or '(no title)')[:50]:50}  {r['session'][:8]}"
+                      + ("  (a branch)" if r.get("branch_of") else ""))
+        return 0
+
     if args.list:
         reg = load_registry()
         rows = []
         root = backups_root()
         if root.is_dir():
             for d in sorted(p for p in root.iterdir() if p.is_dir()):
+                if args.project and d.name != (read_marker(os.path.realpath(args.project)) or ""):
+                    continue
                 snaps = _snapshots(d.name)
                 if not snaps:
                     continue
@@ -4173,9 +4688,12 @@ def cmd_backup(args):
                              "real_path": (entry or {}).get("real_path")
                              or snaps[-1].get("real_path"),
                              "tracked": entry is not None,
-                             "snapshots": [{k: m.get(k) for k in
-                                            ("stamp", "created_at", "backends",
-                                             "files", "zip_bytes")}
+                             "snapshots": [dict({k: m.get(k) for k in
+                                                 ("stamp", "created_at", "backends",
+                                                  "files", "bytes", "sessions")},
+                                                format=m.get("format") or "zip",
+                                                took=m.get("added_bytes")
+                                                if m.get("snap") else m.get("zip_bytes"))
                                            for m in snaps]})
         if args.json:
             print(json.dumps({"backup_root": str(root), "projects": rows},
@@ -4190,7 +4708,10 @@ def cmd_backup(args):
                 for s in r["snapshots"]:
                     print(f"     {s['stamp']}  "
                           f"[{', '.join(s.get('backends') or [])}]  "
-                          f"{(s.get('zip_bytes') or 0)/1024:.0f} KiB")
+                          + (f"{s['sessions']} session(s), " if s.get("sessions") is not None
+                             else "")
+                          + (f"{_human(s.get('took') or 0)} new" if s["format"] == "store"
+                             else f"{_human(s.get('took') or 0)} zip"))
             if any(not r["tracked"] for r in rows):
                 print("\n  ? = project no longer tracked; reconnect with:  "
                       "aht restore <folder> --apply")
@@ -4200,9 +4721,12 @@ def cmd_backup(args):
         root = backups_root()
         n = 0
         if root.is_dir():
-            for d in sorted(p for p in root.iterdir() if p.is_dir()):
-                n += _prune_snapshots(d.name)
-        print(f"pruned {n} snapshot(s)  (backup_keep={cfg_get('backup_keep', 10)})")
+            for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name != "objects"):
+                n += _prune_snapshots(d.name, gc=False)
+        g = store_gc()
+        print(f"thinned out {n} snapshot(s) (all from the last two days, then one a day for "
+              f"two weeks, one a week for three months, one a month for a year); "
+              f"{g['removed']} piece(s) no backup uses went ({_human(g['bytes'])})")
         return 0
 
     held = None
@@ -4251,7 +4775,104 @@ def cmd_backup(args):
               + f"\n  store: {backups_root()}")
     return 0
 
+def _checkpoints_of(uid: str) -> list:
+    """A project's copies of its files (Undo a whole session), newest first."""
+    base = checkpoints_root() / uid
+    out = []
+    for d in base.iterdir() if base.is_dir() else []:
+        try:
+            meta = json.loads((d / "meta.json").read_text())
+        except Exception:
+            continue                    # not finished, or not one
+        out.append(dict(meta, id=d.name, path=str(d / "files")))
+    out.sort(key=lambda c: (c.get("at") or 0, c["id"]), reverse=True)
+    return out
+
+def new_project_from_backup(uid: str, stamp: str, target: str, with_files: bool = False,
+                            apply: bool = False) -> dict:
+    """A new project from a backup: the conversations it holds (Claude Code's
+    under new session ids, in the new folder), and with `with_files` the
+    project's files as they were then (the copy Undo a whole session took
+    last before the backup).  The project it came from is not touched."""
+    snaps = _snapshots(uid)
+    snap = next((m for m in snaps if m["stamp"] == stamp), None) if stamp else \
+        (snaps[-1] if snaps else None)
+    new = os.path.realpath(os.path.expanduser(target))
+    res = {"applied": False, "blockers": [], "project": new, "uuid": uid,
+           "stamp": snap["stamp"] if snap else stamp,
+           "from": (snap or {}).get("real_path"), "files_from": None, "sessions": 0}
+    if snap is None:
+        res["blockers"].append(f"no backup {stamp or ''} of that project".replace("  ", " "))
+        return res
+    if os.path.exists(new) and (not os.path.isdir(new) or os.listdir(new)):
+        res["blockers"].append(f"{new} is there already and not empty: choose a new folder")
+    if new == os.path.realpath(str(Path.home())):
+        res["blockers"].append("that is your home folder, not a new project's")
+    rows = snapshot_sessions(snap)
+    res["sessions"] = len(rows)
+    res["agents"] = sorted({r["agent"] for r in rows})
+    if with_files:
+        cps = [c for c in _checkpoints_of(uid) if (c.get("at") or 0) <= (snap.get("t") or 0) + 60]
+        if cps:
+            c = cps[0]
+            res["files_from"] = {"id": c["id"], "at": c.get("at"), "files": c.get("files"),
+                                 "session": c.get("session")}
+        else:
+            res["blockers"].append("aht kept no copy of the project's files from before this "
+                                   "backup (Undo a whole session keeps them, from when it is on)")
+    if not apply or res["blockers"]:
+        return res
+    os.makedirs(new, exist_ok=True)
+    if res["files_from"]:
+        cp = copy_tree(str(checkpoints_root() / uid / res["files_from"]["id"] / "files"), new,
+                       [], copy_limit=1 << 40)
+        if not cp["ok"]:
+            res["blockers"].append(cp["why"])
+            return res
+        shutil.rmtree(os.path.join(new, ".aht"), ignore_errors=True)   # the other project's marks
+        res["files_copied"] = cp["files"]
+    nu = new_uuid()
+    write_marker(new, nu)
+    with Lock():
+        reg = load_registry()
+        _register(reg, nu, new)
+        save_registry(reg)
+    ids = {r["session"]: str(_uuid.uuid4()) for r in rows if r["agent"] == "claude"}
+    got = _restore_snapshot(snap, new, fork={"ids": ids, "old": snap.get("real_path") or "",
+                                             "new": new})
+    res.update(applied=True, new_uuid=nu, added=got["added"], left_out=got["left_out"],
+               session_ids=ids)
+    try:
+        apply_badge(new, desired_marks(new, True))
+    except Exception as _x:
+        warn(f"BADGE not updated for {new}: {_errmsg(_x)}")
+    log(f"RESTORE new project {new} from {uid}/{snap['stamp']}: {got['added']} file(s)"
+        + (f", the files of checkpoint {res['files_from']['id']}" if res["files_from"] else ""))
+    return res
+
 def cmd_restore(args):
+    if getattr(args, "into", None):
+        real = os.path.realpath(args.path)
+        uid = args.uuid or read_marker(real)
+        if not uid:
+            print(f"error: {real} has no aht marker; name the project with --uuid",
+                  file=sys.stderr)
+            return 2
+        res = new_project_from_backup(uid, args.stamp, args.into, args.with_files, args.apply)
+        lines = [("made" if res["applied"] else "would make") + f": {res['project']}",
+                 f"   from the backup {res['stamp']} of {res.get('from') or uid}: "
+                 f"{res['sessions']} session(s)"]
+        if res.get("files_from"):
+            lines.append(f"   with the project's files as they were "
+                         f"{_when_text(res['files_from']['at'])} "
+                         f"({res['files_from'].get('files')} file(s))")
+        if res.get("left_out"):
+            lines.append("   left out (their sessions stay with the original project): "
+                         + ", ".join(AGENT_NAMES.get(a, a) for a in res["left_out"]))
+        if not args.apply and not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+
     real = os.path.realpath(args.path)
     if not os.path.isdir(real):
         print(f"error: not a directory: {real}", file=sys.stderr)
@@ -16326,14 +16947,18 @@ def update_search_index(progress=None) -> dict:
         db.execute("update sessions set live = 0 where live = 1 and key not in "
                    "(select key from live_now)")
         unplaced = gone | {r[0] for r in db.execute(
-            "select key from sessions where live = 0 and source not like '%.zip'")}
+            "select key from sessions where live = 0 and source not like '%.zip' "
+            "and source not like '%.snap'")}
         # what only the backups still hold (newest snapshot first)
         root = backups_root()
         have = {r[0] for r in db.execute("select key from sessions")} - unplaced
         owners = load_registry().get("projects", {})
-        member = re.compile(r"^(claude)/([^/]+)\.jsonl$|"
-                            r"^(kimi-code)/(session_[^/]+)/agents/main/wire\.jsonl$")
-        for zp in sorted(root.glob("*/*.zip"), reverse=True) if root.is_dir() else []:
+        member = _SESSION_MEMBER
+        # zips and store snapshots, newest first (their names start with the stamp)
+        found = sorted(list(root.glob("*/*.zip")) + list(root.glob("*/*.snap")),
+                       key=lambda f: (f.stem, f.parent.name), reverse=True) \
+            if root.is_dir() else []
+        for zp in found:
             st = _stat(zp)
             k = known.get(str(zp))
             if st is None or (k and abs(k[1] - st.st_mtime) < 1e-6 and not unplaced):
@@ -16345,11 +16970,11 @@ def update_search_index(progress=None) -> dict:
                 meta = {}
             project = (owners.get(uid) or {}).get("real_path") or meta.get("real_path")
             try:
-                zf = zipfile.ZipFile(zp)
+                zf = SnapshotReader(zp)
             except Exception:
                 continue
             with zf:
-                for name in zf.namelist():
+                for name in zf.names():
                     m = member.match(name)
                     if not m:
                         continue
@@ -16453,7 +17078,7 @@ def search_history(q: str, project: str = None, agent: str = None,
             proj = r["project"]
             if r["live"] and proj and os.path.isdir(proj):
                 r["resume"] = resume_command(r["agent"], r["session"], proj)
-            elif not r["live"] and str(r["source"]).endswith(".zip"):
+            elif not r["live"] and str(r["source"]).endswith((".zip", ".snap")):
                 zp = Path(r["source"])
                 r["restore"] = {"uuid": zp.parent.name, "stamp": zp.stem,
                                 "project": proj if proj and os.path.isdir(proj) else None}
@@ -22060,16 +22685,25 @@ def _offsite_state() -> dict:
         return {}
 
 def _backup_files(root: Path) -> dict:
-    """{"<project id>/<file>": size} of the backups under `root`: each zip
-    and its .meta.json, and every copy made before a rewrite
-    ("<project id>/rewrites/<…>")."""
+    """{"<project id>/<file>": size} of the backups under `root`: each zip or
+    store snapshot and its .meta.json, every copy made before a rewrite
+    ("<project id>/rewrites/<…>"), and the store's pieces
+    ("objects/<ab>/<sha256>[.xz]")."""
     out = {}
     try:
         for d in root.iterdir() if root.is_dir() else []:
             if not d.is_dir() or not _SAFE_NAME.fullmatch(d.name):
                 continue
+            if d.name == "objects":
+                for sub in d.iterdir():
+                    for f in sub.iterdir() if sub.is_dir() and _SAFE_NAME.fullmatch(sub.name) \
+                            else []:
+                        if f.is_file() and not f.name.endswith(".tmp") \
+                                and _SAFE_NAME.fullmatch(f.name):
+                            out[f"objects/{sub.name}/{f.name}"] = f.stat().st_size
+                continue
             for f in d.iterdir():
-                if f.is_file() and f.name.endswith((".zip", ".meta.json")):
+                if f.is_file() and f.name.endswith((".zip", ".snap", ".meta.json")):
                     out[f"{d.name}/{f.name}"] = f.stat().st_size
             rw = d / "rewrites"
             if rw.is_dir() and not rw.is_symlink():
@@ -22083,8 +22717,13 @@ def _backup_files(root: Path) -> dict:
     return out
 
 def _is_snapshot(rel: str) -> bool:
-    """A backup's zip ("<project id>/<stamp>.zip"), not a rewrite's copy."""
-    return rel.count("/") == 1 and rel.endswith(".zip")
+    """A backup ("<project id>/<stamp>.zip" or ".snap"), not a rewrite's copy
+    nor a piece of the store."""
+    return rel.count("/") == 1 and rel.endswith((".zip", ".snap")) \
+        and not rel.startswith("objects/")
+
+def _snap_stem(rel: str) -> str:
+    return rel.split("/", 1)[1].rsplit(".", 1)[0]
 
 def _offsite_root() -> Path:
     return aht_home() / "offsite"
@@ -22167,13 +22806,19 @@ def _agent_offsite_prune(req: dict) -> dict:
     removed = []
     for rel in sorted(set(req.get("files") or [])):
         proj, _, fname = str(rel).partition("/")
-        if not (_SAFE_NAME.fullmatch(proj) and _SAFE_NAME.fullmatch(fname)
-                and fname.endswith(".zip")):
+        if not (_SAFE_NAME.fullmatch(proj) and proj != "objects" and _SAFE_NAME.fullmatch(fname)
+                and fname.endswith((".zip", ".snap"))):
             continue
-        zips = sorted(f.name for f in (base / proj).glob("*.zip"))
-        if fname not in zips or len(zips) - zips.index(fname) - 1 < floor:
+        stem = fname.rsplit(".", 1)[0]
+        snaps = sorted((f.name.rsplit(".", 1)[0], f.name)
+                       for f in list((base / proj).glob("*.zip")) + list((base / proj).glob("*.snap")))
+        names = [n for _s, n in snaps]
+        # a zip moved into the store goes once its snapshot is here; anything
+        # else only beyond the newest `floor`
+        moved = fname.endswith(".zip") and (base / proj / (stem + ".snap")).is_file()
+        if fname not in names or (not moved and len(names) - names.index(fname) - 1 < floor):
             continue
-        for f in (base / proj / fname, base / proj / (fname[:-4] + ".meta.json")):
+        for f in [base / proj / fname] + ([] if moved else [base / proj / (stem + ".meta.json")]):
             try:
                 f.unlink()
             except FileNotFoundError:
@@ -22181,14 +22826,18 @@ def _agent_offsite_prune(req: dict) -> dict:
             except OSError as _x:
                 warn(f"OFFSITE a kept backup was not removed: {f.name}: {_errmsg(_x)}")
         removed.append(rel)
-    return {"ok": True, "removed": removed}
+    gc = store_gc(base) if any(r.endswith(".snap") for r in removed) else None
+    return {"ok": True, "removed": removed, "gc": gc}
 
 def _pruned_here(rel: str, mine: dict) -> bool:
     """A backup this computer pruned itself: newer ones of its project are
-    still here.  None at all is no prune (backups wiped, or a new computer),
-    and then nothing is removed over there."""
-    proj, _, fname = rel.partition("/")
-    return any(k.startswith(proj + "/") and _is_snapshot(k) and k.split("/", 1)[1] > fname
+    still here, or (a zip) it is here in the store now.  None at all is no
+    prune (backups wiped, or a new computer), and then nothing is removed
+    over there."""
+    proj, stem = rel.split("/", 1)[0], _snap_stem(rel)
+    if rel.endswith(".zip") and f"{proj}/{stem}.snap" in mine:
+        return True
+    return any(k.startswith(proj + "/") and _is_snapshot(k) and _snap_stem(k) > stem
                for k in mine)
 
 def offsite_push() -> dict:
@@ -22230,6 +22879,15 @@ def offsite_push() -> dict:
         sent.update({k: mine[k] for k in missing})
         res["files"], res["bytes"] = len([k for k in missing if _is_snapshot(k)]), \
             sum(mine[k] for k in missing)
+    # the facts of a backup that moved into the store (its meta file keeps
+    # its name): the new ones go over the old
+    newer = [k for k in res["differs"] if k.endswith(".meta.json")
+             and k[:-len(".meta.json")] + ".snap" in mine]
+    if newer:
+        r = rem.send(str(here), there, only=newer)
+        if r["ok"]:
+            sent.update({k: mine[k] for k in newer})
+            res["differs"] = [k for k in res["differs"] if k not in newer]
     # only backups go there; a rewrite's copy stays until the user deletes it here
     pruned = sorted(k for k in sent if _is_snapshot(k) and k not in mine
                     and _pruned_here(k, mine))
@@ -22238,8 +22896,13 @@ def offsite_push() -> dict:
                          floor=OFFSITE_FLOOR)["removed"]
         for k in gone:
             sent.pop(k, None)
-            sent.pop(k[:-4] + ".meta.json", None)
+            if not (k.endswith(".zip") and k.rsplit(".", 1)[0] + ".snap" in mine):
+                sent.pop(k.rsplit(".", 1)[0] + ".meta.json", None)
         res["removed"] = len(gone)
+    # pieces of the store this computer no longer has: that machine removes
+    # them itself once no snapshot there uses them
+    for k in [k for k in sent if k.startswith("objects/") and k not in mine]:
+        sent.pop(k)
     sent_all[rem.name] = sent
     st.update(machine=rem.name, at=time.time(), files=res["files"], bytes=res["bytes"],
               pulled=False, sent=sent_all)
@@ -22312,7 +22975,9 @@ def offsite_fetch(source: str = None) -> dict:
     here.mkdir(parents=True, exist_ok=True)
     mine = _backup_files(here)
     new = sorted(k for k in theirs if k not in mine)
-    other = sorted(k for k in theirs if k in mine and mine[k] != theirs[k])
+    # a piece of the store is named by its content: one here is the same
+    other = sorted(k for k in theirs if k in mine and mine[k] != theirs[k]
+                   and not k.startswith("objects/"))
     there = f"{info['home']}/.aht/offsite/{folder}/backups"
     res = {"machine": rem.name, "from": {"id": src["id"], "name": src["name"]},
            "files": 0, "bytes": 0, "pulled": True, "renamed": [], "problems": [],
@@ -27342,6 +28007,13 @@ def build_parser():
     s.add_argument("--uuid")
     s.add_argument("--list", action="store_true")
     s.add_argument("--prune", action="store_true")
+    s.add_argument("--show", metavar="FOLDER", help="the sessions a backup of that project holds")
+    s.add_argument("--stamp", help="with --show: that backup (default: the newest)")
+    s.add_argument("--migrate", action="store_true",
+                   help="move the backups made as zips into the store (with --apply)")
+    s.add_argument("--verify", action="store_true",
+                   help="read every file of every backup back and check it")
+    s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_backup)
 
@@ -27349,6 +28021,10 @@ def build_parser():
     s.add_argument("path")
     s.add_argument("--uuid")
     s.add_argument("--stamp")
+    s.add_argument("--into", metavar="FOLDER",
+                   help="a new project from that backup, in this new folder")
+    s.add_argument("--with-files", action="store_true", dest="with_files",
+                   help="with --into: and the project's files as they were then")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_restore)

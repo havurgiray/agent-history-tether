@@ -22,8 +22,9 @@ r = run("backup", "--json")
 d = json.loads(r.stdout)
 ck(d["counts"].get("backed-up", 0) >= 1, "backup pass snapshots")
 snapdirs = [p for p in (sb / ".aht" / "backups").iterdir()
-            if p.is_dir() and list(p.glob("*.zip"))]
-ck(len(snapdirs) >= 1, "zips written")
+            if p.is_dir() and list(p.glob("*.snap"))]
+ck(len(snapdirs) >= 1 and (sb / ".aht" / "backups" / "objects").is_dir(),
+   "snapshots written into the store")
 meta = json.loads(sorted((sb / ".aht" / "backups" / uid)
                          .glob("*.meta.json"))[-1].read_text())
 ck("gemini" in meta["backends"] and "codex" in meta["backends"]

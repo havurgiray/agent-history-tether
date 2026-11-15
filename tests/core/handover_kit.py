@@ -1095,6 +1095,27 @@ def phase1_unfinished(box, bhome, stubs, henv, hrun, J, hook, project_row):
        f"offsite: an older aht's folder with nothing left goes unnamed; one with only "
        f"rewrites' copies is taken over once they are here too ({d1.get('legacy')}, "
        f"{d2.get('legacy')}, {d3.get('adopted')}, {d3.get('legacy')})")
+    # a backup that moved into the store: its snapshot and pieces go there,
+    # the zip there goes, and its meta file there is the new one
+    mz = "20260201-000000.zip"
+    (up / mz).write_bytes(b"zip " + mz.encode())
+    (up / mz.replace(".zip", ".meta.json")).write_text("{}")
+    J(orun("backup", "--offsite", "--json"))
+    body = b"text of p1 " * 50
+    hobj = core.put_object(body, True, base=sb / ".aht" / "backups")
+    msnap = up / mz.replace(".zip", ".snap")
+    core._write_manifest(msnap, {"v": 1, "uuid": "p1", "stamp": msnap.stem, "files": {
+        "claude/x.jsonl": {"size": len(body), "mtime": 0, "parts": [["t", hobj, 0, len(body)]],
+                           "sha": core.hashlib.sha256(body).hexdigest()}}})
+    (up / mz).unlink()
+    (up / mz.replace(".zip", ".meta.json")).write_text(json.dumps({"format": "store"}))
+    d4 = J(orun("backup", "--offsite", "--json"))
+    ck(not (there / mz).exists() and (there / msnap.name).is_file()
+       and list((fold / "backups" / "objects").rglob(hobj + "*"))
+       and json.loads((there / mz.replace(".zip", ".meta.json")).read_text()).get("format")
+       == "store",
+       f"offsite: a backup moved into the store: its snapshot and pieces go there, the zip "
+       f"there goes, its facts are the new ones ({d4.get('removed')}, {d4.get('differs')})")
     hrun("config", "--unset", "offsite_backup")
     shutil.rmtree(up)
 

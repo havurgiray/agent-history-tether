@@ -4519,7 +4519,7 @@ final class AppModel: ObservableObject {
                 guard alert("Move this history to the Trash?",
                             "The history of \(t.path) — \(n) Claude Code session\(n == 1 ? "" : "s"), "
                             + byteText(plan["bytes"]) + ". It goes to the Trash, where Put Back "
-                            + "brings it back, and aht's daily backups keep it too.",
+                            + "brings it back, and aht's backups keep it too.",
                             confirm: "Move to Trash") else { return }
                 self.busy("moving it to the Trash…") {
                     let d = ahtJSON(["tidy", "--remove-history=" + t.key, "--apply", "--json"]) ?? [:]
@@ -10720,9 +10720,9 @@ struct WelcomeView: View {
 
     var extrasLine: String {
         switch (w.badges, w.backups) {
-        case (true, true): return "Badge project folders in Finder, and back up the histories once a day."
+        case (true, true): return "Badge project folders in Finder, and back up the histories every few hours."
         case (true, false): return "Badge project folders in Finder."
-        case (false, true): return "Back up the histories once a day."
+        case (false, true): return "Back up the histories every few hours."
         default: return ""
         }
     }
@@ -10816,7 +10816,7 @@ struct WelcomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("A few more").font(.title2.weight(.semibold))
             Toggle("Badge project folders in Finder", isOn: $w.badges)
-            Toggle("Back up the agents' histories once a day", isOn: $w.backups)
+            Toggle("Back up the agents' histories every few hours", isOn: $w.backups)
             Toggle("Show notices (a session waits for you, a long one is done)", isOn: $w.notifications)
             Toggle("Start aht in the menu bar when I log in", isOn: $w.login)
             Spacer()
@@ -11331,7 +11331,7 @@ struct SettingsView: View {
                             Text(why).font(.caption).foregroundColor(.orange)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
-                        Text("After each daily backup, aht adds the new ones to a folder of this "
+                        Text("After each automatic backup, aht adds the new ones to a folder of this "
                              + "Mac's own there. A backup there goes only after aht removed it "
                              + "here, and at least 3 per project stay. Fetch Backups From… brings "
                              + "back the backups any of your computers left there: it adds what "

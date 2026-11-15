@@ -3778,7 +3778,7 @@ function drawSettings(m) {
         h("button", { text: "Fetch Backups From…", disabled: !off || !CAN_REACH(), onclick: () => fetchBackups(off) })),
       mute ? h("div", { class: "row pc-why" }, h("span", { class: "warn small grow", text: pcWhy(mute) }), helpBtn(PC_SETUP)) : null,
       h("div", { class: "dim small", text: names.length
-        ? "After each daily backup, aht adds the new ones to a folder of this computer's own there. A backup there goes only after aht removed it here, and at least 3 per project stay. Fetch Backups From… brings back the backups any of your computers left there: it adds what is missing here and replaces nothing."
+        ? "After each automatic backup, aht adds the new ones to a folder of this computer's own there. A backup there goes only after aht removed it here, and at least 3 per project stay. Fetch Backups From… brings back the backups any of your computers left there: it adds what is missing here and replaces nothing."
         : "Add one of your other machines in the Machines tab first." })));
   }
   m.append(group("Folder badges", "Folder badges", h("div", { class: "row" }, check("Badge folders", "icons_enabled"), check("Agent symbols", "icons_agent"), check("Git “+”", "icons_git"),
@@ -4220,8 +4220,8 @@ async function showWelcome(again) {
       independent: "give a copied folder a fresh start, without history", ignore: "do nothing when a folder is copied" }[W.copies] || "keep your rule for a copied folder";
     return moved + "; " + copied + ".";
   };
-  const extrasLine = () => W.badges && W.backups ? "Badge project folders, and back up the histories once a day."
-    : W.badges ? "Badge project folders." : W.backups ? "Back up the histories once a day." : "";
+  const extrasLine = () => W.badges && W.backups ? "Badge project folders, and back up the histories every few hours."
+    : W.badges ? "Badge project folders." : W.backups ? "Back up the histories every few hours." : "";
   const toggle = (label, key) => h("label", { class: "check" }, h("input", { type: "checkbox", checked: !!W[key], onchange: (e) => { W[key] = e.target.checked; } }), label);
   // the tray at login as it will be set, with its box right there: a no given
   // before (in the installer, say) is kept, and says so
@@ -4308,7 +4308,7 @@ async function showWelcome(again) {
         pol("A project folder is copied", "copies", [["ask", "Ask me"], ["duplicate", "Duplicate the history"], ["independent", "Fresh identity, no history"], ["ignore", "Do nothing"]]));
       f.append(...btns("projects", "Next", () => { W.page = "extras"; paint(); }));
     } else if (W.page === "extras") {
-      wrap.append(h("h2", { text: "A few more" }), toggle("Badge project folders", "badges"), toggle("Back up the agents' histories once a day", "backups"),
+      wrap.append(h("h2", { text: "A few more" }), toggle("Badge project folders", "badges"), toggle("Back up the agents' histories every few hours", "backups"),
         toggle("Show notices (a session waits for you, a long one is done)", "notifications"),
         loginWorks() ? loginLine("Start aht's tray when I log in") : null);
       f.append(...btns("rules", "Next", () => { W.quickly = false; W.page = "updates"; paint(); }));

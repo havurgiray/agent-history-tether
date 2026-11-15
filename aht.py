@@ -22613,7 +22613,7 @@ def _history_link(root: Path, name: str) -> bool:
 def remove_orphan_history(store: str, apply: bool = False) -> dict:
     """A Claude Code history that no tracked folder owns goes to the Trash —
     only when the user asks, and never one a tracked project owns or a
-    session uses.  The daily history backups keep it as well.  On Windows
+    session uses.  The history backups keep it as well.  On Windows
     it goes only to the Recycle Bin: what would be deleted for good (that
     drive has no bin, its bin removes files at once, too big for it) is
     refused before; should Windows still delete it for good, "deleted" is

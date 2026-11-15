@@ -7961,11 +7961,10 @@ class Remote:
         file there.  `add_only`: never over any file there.  Stats keep
         rsync's keys: files, bytes, sent, deleted, ok, error."""
         names, anchored = _skip_split(skip)
-        mover, here = self.transfer(), None
-        if mover == "rsync" and self._converts_names() and (only is None or only):
-            here = _local_tree(local_root, names, only)
-            if _iconv_cannot(_tree_names(here)):
-                mover = "aht"
+        mover = self.transfer()
+        if mover == "rsync" and self._converts_names() and (only is None or only) \
+                and any(_iconv_cannot([n]) for n in _local_names(local_root, names, only)):
+            mover = "aht"
         if mover == "rsync":
             src, dst = local_root.rstrip("/") + "/", self.spec(remote_root.rstrip("/") + "/")
             if only is not None and not only:
@@ -7976,7 +7975,7 @@ class Remote:
             return dict(r, transfer="rsync", problems=[])
         if only is not None and not only:
             return _no_stats("aht")
-        plan = _plan_copy(here if here is not None else _local_tree(local_root, names, only),
+        plan = _plan_copy(_local_tree(local_root, names, only),
                           self._far_tree(remote_root, names, only), delete=delete,
                           anchored=anchored, protect=protect, only=only, update=update,
                           add_only=add_only, keep_raw=self._same_system())
@@ -8498,6 +8497,17 @@ def _iconv_cannot(names) -> list:
     are no UTF-8 (Python's escapes for them).  aht's own copy moves those."""
     return [n for n in names
             if any(ord(c) > 0xFFFF or 0xDC80 <= ord(c) <= 0xDCFF for c in n)]
+
+def _local_names(root: str, names: list, only=None):
+    """Every name under `root` (with `only` all at the top, under those),
+    without a look at sizes or times: the check for _iconv_cannot."""
+    tops = [os.path.join(root, o.rstrip("/")) for o in only] if _top_only(only) else [root]
+    for top in tops:
+        yield os.path.basename(top)
+        for _dp, dns, fns in os.walk(top):
+            dns[:] = [d for d in dns if not _skip_name(d, names)]
+            yield from dns
+            yield from (f for f in fns if not _skip_name(f, names))
 
 def _merge_trees(parts: dict) -> dict:
     """Manifests of some files and folders at the top of one folder ({name:

@@ -713,10 +713,11 @@ year.
   and a file read from a backup is checked against its size and checksum.
   `aht backup --verify` reads them all back.
 - **Backups made by earlier versions of aht** are zips; they are read as
-  they are.
-  `aht backup --migrate --apply` moves them in and removes each zip only
-  after every file of it read back from the store exactly as the zip held
-  it.
+  they are. The automatic backup moves them into the store, a few minutes
+  at a time, and removes each zip only after every file of it read back
+  from the store exactly as the zip held it; a zip waits while the disk
+  has less free than twice its size and 1 GB.
+  `aht backup --migrate --apply` moves them all at once.
 - To stop Claude Code from deleting old sessions at all, set
   `"cleanupPeriodDays": 36500` in `~/.claude/settings.json`.
 - **A second copy on another machine.** **Settings → Backups on another

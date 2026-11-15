@@ -2535,13 +2535,37 @@ def maybe_auto_backup() -> None:
             if not backup_due():         # the pass that held it just ran
                 return
             done = sum(1 for r in backup_pass() if r["status"] == "backed-up")
+            moved = _auto_migrate()
         finally:
             lock.close()
         if done:
             log(f"BACKUP auto pass: {done} project(s) snapshotted")
+        if done or moved:
             _spawn_offsite()
     except Exception as e:
         error(f"BACKUP auto pass failed: {e}")
+
+AUTO_MIGRATE_SECONDS = 300     # an automatic pass moves zips into the store this long
+
+def _auto_migrate() -> int:
+    """Zips an earlier aht made, moved into the store a few minutes at a
+    time by the automatic pass (under its lock), so a machine that updated
+    aht moves in by itself.  How many moved."""
+    root = backups_root()
+    try:
+        if not root.is_dir() or not any(root.glob("*/*.zip")):
+            return 0
+        r = migrate_backups(apply=True, budget=AUTO_MIGRATE_SECONDS, gc=False)
+    except Exception as e:
+        error(f"BACKUP moving the zips into the store failed: {e}")
+        return 0
+    for pr in r["problems"]:
+        warn(f"BACKUP kept as a zip: {pr}")
+    if r["migrated"] or r["left"]:
+        log(f"BACKUP auto pass: {r['migrated']} zip(s) moved into the store"
+            + (f", {r['left']} left for the next pass" if r["left"] else "")
+            + (" (the disk is nearly full)" if r.get("low_space") else ""))
+    return r["migrated"]
 
 def _spawn_auto_backup() -> None:
     try:
@@ -2755,13 +2779,18 @@ def _store_bytes(root: Path) -> int:
                 continue        # gone meanwhile
     return total
 
-def migrate_backups(apply: bool = False, say=None) -> dict:
+def migrate_backups(apply: bool = False, say=None, budget: float = None,
+                    gc: bool = True) -> dict:
     """The backups made as zips, into the store: each zip becomes a snapshot
     with the same stamp, and goes only once every file of it reads back from
-    the store exactly as the zip holds it."""
+    the store exactly as the zip holds it.  `budget`: seconds, after which
+    the rest waits (`left`) for the next time; a zip also waits while the
+    disk has less free than twice its size and 1 GB."""
     import zipfile
     root = backups_root()
-    res = {"zips": 0, "zip_bytes": 0, "migrated": 0, "problems": [], "applied": apply}
+    res = {"zips": 0, "zip_bytes": 0, "migrated": 0, "problems": [], "applied": apply,
+           "left": 0}
+    until = time.time() + budget if budget is not None else None
     dirs = sorted(d for d in root.iterdir() if d.is_dir() and d.name != "objects") \
         if root.is_dir() else []
     for d in dirs:
@@ -2781,6 +2810,17 @@ def migrate_backups(apply: bool = False, say=None) -> dict:
                 continue
             zp = Path(m["zip"])
             target = zp.with_suffix(".snap")
+            if until is not None and time.time() > until:
+                res["left"] += 1
+                continue
+            try:
+                free = shutil.disk_usage(root).free
+            except OSError:
+                free = None
+            if free is not None and free < 2 * (m.get("zip_bytes") or 0) + (1 << 30):
+                res["left"] += 1
+                res["low_space"] = True
+                continue
             if target.exists():
                 res["problems"].append(f"{d.name}/{target.name} is there already")
                 continue
@@ -2820,7 +2860,7 @@ def migrate_backups(apply: bool = False, say=None) -> dict:
                 except OSError:
                     pass        # not made
     if apply:
-        res["gc"] = store_gc() if not res["problems"] else None     # a pass's new pieces stay
+        res["gc"] = store_gc() if gc and not res["problems"] else None   # a pass's new pieces stay
         log(f"BACKUP {res['migrated']} zip(s) moved into the store"
             + (f"; {len(res['problems'])} kept as zips" if res["problems"] else ""))
     res["bytes_now"] = _store_bytes(root) if root.is_dir() else 0
@@ -4660,6 +4700,9 @@ def cmd_backup(args):
         else:
             print(f"moved {res['migrated']} of {res['zips']} zip(s) into the store; the "
                   f"backups now take {_human(res['bytes_now'])}")
+            if res["left"]:
+                print(f"  {res['left']} wait: the disk needs twice a zip's size and 1 GB free "
+                      "while it moves")
             for x in res["problems"]:
                 print(f"  ✗ kept as a zip: {x}")
         return 1 if res["problems"] else 0
@@ -4772,8 +4815,11 @@ def cmd_backup(args):
                   file=sys.stderr)
             return 2
 
+    moved = 0
     try:
         results = backup_pass(only_uid=only)
+        if held is not None:            # the automatic pass: older zips move in too
+            moved = _auto_migrate()
     finally:
         if held is not None:
             held.close()
@@ -4781,7 +4827,8 @@ def cmd_backup(args):
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     if args.json:
-        print(json.dumps({"ran": True, "counts": counts, "results": results},
+        print(json.dumps({"ran": True, "counts": counts, "results": results,
+                          **({"zips_moved": moved} if held is not None else {})},
                          indent=2))
     else:
         print(f"backed up {counts.get('backed-up', 0)} project(s)"

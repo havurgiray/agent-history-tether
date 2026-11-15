@@ -467,8 +467,9 @@ These files in `run/` are kept longer:
   which pieces make up which file, with each file's size, time and
   checksum; a `.meta.json` next to it says what it holds (folder, agents,
   number of files and sessions, what it took).  Backups made by earlier
-  versions of aht are ZIP files (`<stamp>.zip`) until `aht backup --migrate
-  --apply` moves them in, after reading every file back.  Files aht is about to
+  versions of aht are ZIP files (`<stamp>.zip`) until the automatic backup
+  (a few minutes at a time) or `aht backup --migrate --apply` moves them in,
+  after reading every file back.  Files aht is about to
   rewrite while relinking are copied to `rewrites/` in the same folder.
 - **Location.**  `~/.aht/backups/<project id>/`, or the folder you set in
   `backup_dir`.

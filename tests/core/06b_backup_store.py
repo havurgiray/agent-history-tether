@@ -186,4 +186,17 @@ ck(made2.get("applied") and (wf / "notes.md").read_text() == "then\n"
    and (wf / ".aht" / ".project-id").read_text().strip() != uid,
    f"restore --into --with-files --apply: the files from then, under a project id of its own "
    f"({made2.get('files_from')})")
+
+# a machine that updated aht: its automatic pass moves the zips in by itself
+zq = zdir / "20200102-000000.zip"
+with zipfile.ZipFile(zq, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("claude/z2.jsonl", line(type="custom-title", customTitle="Moved by itself"))
+zq.with_suffix(".meta.json").write_text(json.dumps({"uuid": uid, "stamp": zq.stem,
+                                                    "real_path": str(proj), "sig": "y"}))
+(bk / ".last-run").unlink(missing_ok=True)
+au = JS("backup", "--auto", "--json", extra_env={"AHT_NO_BACKUP": ""})
+ck(au.get("ran") and au.get("zips_moved") == 1 and not zq.exists()
+   and zq.with_suffix(".snap").exists(),
+   f"backup --auto: a zip left by an earlier aht moves into the store by itself "
+   f"({ {k: v for k, v in au.items() if k != 'results'} })")
 done()

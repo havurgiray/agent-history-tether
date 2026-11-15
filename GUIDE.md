@@ -2490,6 +2490,13 @@ off.
   iTerm2 brought back by itself are not opened twice, and neither are tabs
   from a second click on Open Them. aht needs permission to control
   iTerm2 (see *Getting started*).
+- **When iTerm2 brought its windows back itself** (macOS reopens an app's
+  windows unless *Close windows when quitting an application* is on in
+  System Settings → Desktop & Dock), its tabs come back with their titles
+  but only an empty shell in each. aht then resumes each session in the
+  tab with its title, as long as that tab holds just a shell waiting at its
+  prompt (one with something half typed, or with a program running, is
+  left alone), and opens new tabs only for the rest.
 
 **On Windows** the same works with Windows Terminal: Sessions tab →
 **Restore Workspace…**. While the tray runs, aht looks at the layout every

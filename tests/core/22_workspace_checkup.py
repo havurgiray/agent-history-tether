@@ -178,8 +178,50 @@ ck(em.get("cwd") == projX and d.get("applied") and d["plan"]["opens"] == 2
    f"workspace: a session is kept and opened in its conversation's folder, not where "
    f"Claude moved to ({em.get('cwd')}, {d.get('plan')})")
 (sb / ".aht" / "workspaces" / "20200101-000000.json").unlink()
-moved.unlink()
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
+
+# the tabs iTerm2 brought back itself (macOS reopening its windows): a session
+# goes back into the idle tab with its title; the rest open in new tabs
+back = dict(json.loads(moved.read_text()), tabs=[
+    dict(em, session=sid_, title=t_, tab=i_ + 1, cwd=projX)
+    for i_, (sid_, t_) in enumerate((("r1", "Paper"), ("r2", "Bench"), ("r3", "Gone")))])
+(sb / ".aht" / "workspaces" / "20200102-000000.json").write_text(json.dumps(back))
+busy_ = subprocess.Popen(["sleep", "600"], cwd="/", stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+tabs_before = tabs_file.read_text()
+tabs_file.write_text(json.dumps({
+    "/dev/ttysR1": {"title": "Paper", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 1},
+    "/dev/ttysR2": {"title": "Bench", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 2},
+    "/dev/ttysR3": {"title": "Gone", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 3}}))
+renv = dict(wenv, AHT_TTY_PROCS=json.dumps({
+    "/dev/ttysR1": [[shell.pid, "-zsh"]], "/dev/ttysR2": [[shell.pid, "-zsh"]],
+    "/dev/ttysR3": [[shell.pid, "-zsh"], [busy_.pid, "vim notes.md"]]}),
+    AHT_ITERM_LINES=json.dumps({"/dev/ttysR1": "me@mac ~ % ", "/dev/ttysR2": "me@mac ~ % git sta"}))
+n_before = len(ilines())
+d = JS("workspace", "--restore", "20200102-000000", "--apply", "--json", extra_env=renv)
+new = ilines()[n_before:]
+typed_ = [x for x in new if x.get("what") == "write"]
+script = next((x["script"] for x in new if x.get("what") == "restore"), "")
+ck(d.get("applied") and [x["tty"] for x in typed_] == ["/dev/ttysR1"]
+   and "--resume r1" in typed_[0]["text"] and "--resume r1" not in script
+   and "--resume r2" in script and "--resume r3" in script,
+   f"workspace: a session goes back into the idle tab iTerm2 brought back with its title; a "
+   f"tab with a half-typed line or a program in it is left alone ({typed_}, {script[-300:]})")
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
+n_before = len(ilines())
+d = JS("workspace", "--restore", "20200102-000000", "--apply", "--json",
+       extra_env=dict(renv, AHT_ITERM_STARTED="1"))
+new = ilines()[n_before:]
+ck(d.get("applied") and sorted(x["tty"] for x in new if x.get("what") == "write")
+   == ["/dev/ttysR1", "/dev/ttysR2"]
+   and "--resume r3" in next((x["script"] for x in new if x.get("what") == "restore"), ""),
+   f"workspace: right after iTerm2 started, its restored shells take their sessions ({new})")
+busy_.kill(); busy_.wait()
+tabs_file.write_text(tabs_before)
 (sb / ".aht" / "run" / "workspace-opened.json").unlink()
+(sb / ".aht" / "workspaces" / "20200102-000000.json").unlink()
+moved.unlink()
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
 
 # saved every few minutes by the app; not while a restore's sessions start
 a1 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
@@ -187,7 +229,7 @@ a2 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
 (sb / ".aht" / "run" / "workspace-autosave").unlink()
 (sb / ".aht" / "run" / "workspace-opened.json").write_text(json.dumps({"at": time.time()}))
 a4 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
-(sb / ".aht" / "run" / "workspace-opened.json").unlink()
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
 run("config", "--set", "workspace_save_minutes=0", "--no-reload")
 a3 = JS("workspace", "--save", "--auto", "--json", extra_env=cenv)
 r = run("config", "--set", "workspace_keep=2", "--no-reload")

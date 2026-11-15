@@ -26490,6 +26490,8 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
         # what did open is starting: the note keeps a second click from
         # opening it again, also when the rest did not open
         log(f"WORKSPACE restored {pick['id']}: {got['opened']} tab(s)/pane(s)"
+            + (f", {got['into']} of them in the tabs {term.name} brought back"
+               if got.get("into") else "")
             + (f", {term.name} started first" if started else ""))
     else:
         try:
@@ -26512,6 +26514,91 @@ def iterm_started():
     except Exception as _x:
         warn_once("ps-iterm", f"PROCESS when iTerm2 started could not be told: {_errmsg(_x)}")
     return None
+
+_LAST_LINES_SCRIPT = """
+on run argv
+  set sep to character id 31
+  set rs to character id 30
+  set out to ""
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          set k to tty of s
+          if argv contains k then
+            set txt to (contents of s) as text
+            set out to out & k & sep & txt & rs
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return out
+end run
+"""
+
+def _iterm_last_lines(ttys) -> dict:
+    """{tty: the last line with text on its screen} for these iTerm2 sessions."""
+    ttys = list(ttys)
+    if not ttys:
+        return {}
+    if os.environ.get("AHT_ITERM_TABS"):                # tests: a stand-in
+        lines = json.loads(os.environ.get("AHT_ITERM_LINES") or "{}")
+        return {t: lines.get(t, "% ") for t in ttys}
+    out, _refused = _osascript(_LAST_LINES_SCRIPT, *ttys)
+    got = {}
+    for row in out.split("\x1e"):
+        tty, _, text = row.lstrip("\n").partition("\x1f")
+        if tty in ttys:     # the screen ends in empty rows below the prompt
+            got[tty] = next((x for x in reversed(text.splitlines()) if x.strip()), "")
+    return got
+
+def _at_prompt(line: str) -> bool:
+    """A shell waits at its prompt with nothing typed: the line ends in a
+    prompt's sign.  One it does not know means no."""
+    t = (line or "").rstrip()
+    return bool(t) and not t.endswith(">>") and t[-1] in ">$#%❯➜λ»"
+
+def iterm_reuse(plan: dict, tabs: dict, started: bool) -> tuple:
+    """(the plan without what goes back into tabs that are there, [(tty,
+    entry)]): an entry of a tab of one pane, with a title, goes into an open
+    tab of that title that holds one idle shell (the first such, by window
+    and tab).  When iTerm2 did not start just now, only a shell at its
+    prompt takes it: a half-typed command must not get a line added."""
+    procs = _tty_processes()
+    def idle(tty):
+        ps = [a for _pid, a in procs.get(tty, []) if a.split()]
+        return bool(ps) and all(os.path.basename(a.split()[0]).lstrip("-") in _SHELLS | {"login"}
+                                for a in ps)
+    free = {}
+    order = lambda kv: (int(kv[1].get("window") or 0), int(kv[1].get("tab") or 0),   # noqa: E731
+                        int(kv[1].get("pane") or 0))
+    for tty, t in sorted(tabs.items(), key=order):
+        title = str(t.get("title") or "")
+        if title and int(t.get("panes") or 1) == 1 and idle(tty):
+            free.setdefault(title, []).append(tty)
+    if not free:
+        return plan, []
+    wanted = {e.get("title") for win in plan["windows"] for panes in win for e in panes
+              if len(panes) == 1}
+    cands = [t for title, ts in free.items() if title in wanted for t in ts]
+    ready = set(cands) if started else {t for t, line in _iterm_last_lines(cands).items()
+                                        if _at_prompt(line)}
+    into, windows = [], []
+    for win in plan["windows"]:
+        keep = []
+        for panes in win:
+            e = panes[0]
+            tty = next((t for t in free.get(e.get("title") or "", []) if t in ready), None) \
+                if len(panes) == 1 else None
+            if tty:
+                free[e["title"]].remove(tty)
+                into.append((tty, e))
+            else:
+                keep.append(panes)
+        if keep:
+            windows.append(keep)
+    return dict(plan, windows=windows, opens=sum(len(p) for w in windows for p in w)), into
 
 def _restore_command(e: dict) -> str:
     steps = []
@@ -26619,6 +26706,23 @@ class ITerm2(Terminal):
         return not why, why
 
     def open_plan(self, plan: dict, tabs: dict, started: bool, saved: dict = None) -> dict:
+        # the tabs iTerm2 brought back itself (its own window restoration,
+        # or macOS reopening its windows): a session goes back into the tab
+        # with its title, while that tab is an idle shell at its prompt
+        plan, into = iterm_reuse(plan, tabs, started)
+        typed, why = 0, []
+        for tty, e in into:
+            if _iterm_session(tty, "write", _restore_command(e)):
+                typed += 1
+            else:
+                why.append(f"{e.get('title')}: aht could not type into its tab")
+        if not plan["opens"]:
+            return {"opened": typed, "why": "; ".join(why), "into": typed}
+        got = self._open_new(plan, tabs, started)
+        return {"opened": typed + got["opened"], "into": typed,
+                "why": "; ".join(why + ([got["why"]] if got["why"] else []))}
+
+    def _open_new(self, plan: dict, tabs: dict, started: bool) -> dict:
         # the empty window iTerm2 opens when it starts takes the first tab
         reuse = started and len(tabs) == 1 and not next(iter(tabs.values())).get("title") and \
             all(os.path.basename(a.split()[0]).lstrip("-") in _SHELLS | {"login"}

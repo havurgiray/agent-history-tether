@@ -233,7 +233,7 @@ func schedule() {
     let work = DispatchWorkItem { if !running { launch() } }
     pending = work
     // a short quiet moment, so a burst is one run; never held back for long
-    let at = min(now.addingTimeInterval(0.3), firstAt!.addingTimeInterval(1.5))
+    let at = min(now.addingTimeInterval(0.15), firstAt!.addingTimeInterval(1.5))
     queue.asyncAfter(deadline: .now() + max(0, at.timeIntervalSince(now)), execute: work)
 }
 

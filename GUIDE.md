@@ -620,12 +620,14 @@ and the agent starts empty there. aht notices and moves the history along.
 - **The watcher** is what notices a move as it happens: it runs in the
   background from login and relinks the histories of a folder you moved or
   renamed at once, for every agent, so your sessions follow the folder.
-  On a Mac it does not search your folders for that: aht notes the number
-  each project's folder has on its disk, and the disk says where that
-  folder is now, also when you moved it out of the watched folders. A
-  folder in the Trash counts as missing, not as moved. Saving files in a
-  project starts nothing; the watched folders are still walked once a
-  day, for what has no such number yet. Without it (`watcher_owner` set to `none`), only Claude Code's start
+  It does not search your folders for that: aht notes the number each
+  project's folder has on its disk, and on a Mac and on Windows the disk
+  says where that folder is now, also when you moved it out of the
+  watched folders (on Linux the system tells the watcher what was renamed
+  to what, inside the watched folders). A folder in the Trash counts as
+  missing, not as moved. Saving files in a project starts nothing; the
+  watched folders are still walked once a day, for what has no such
+  number yet. Without it (`watcher_owner` set to `none`), only Claude Code's start
   hook relinks, when a session starts in the moved folder, and **Find
   Moved Folders Now** catches up on the rest.
 
@@ -2838,8 +2840,9 @@ all of them can be set with `aht config --set name=value` and put back with
 - `scan_max_depth` (7) — how many folder levels below a watched folder aht
   looks for projects.
 - `extra_prune_dirs` (none) — folder names aht never looks into.
-- `debounce_seconds` (2) — how long the watcher waits after a change on disk
-  before it looks.
+- `debounce_seconds` (0.3) — the quiet moment the watcher waits for after a
+  change before it looks, on Windows and Linux (never more than 1.5
+  seconds in all; the Mac's is fixed).
 - `dialog_timeout` (180) — seconds a question waits for your answer; no
   answer means nothing changes.
 - `notifications` (on) — notices about relinks, copies and backups.

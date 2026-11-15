@@ -2,18 +2,24 @@
 """
 aht watcher for Linux — the counterpart of the macOS FSEvents watcher.
 
-Watches the configured roots and, on a debounced change, runs
-    aht.py reconcile --notify
-which detects moved/renamed/copied project folders and relinks their Claude
-history according to the configured policies (ask via zenity/kdialog by default).
+Watches the configured roots and tells aht when a tracked project was
+renamed or moved, a copy or a project from elsewhere appeared, or a git
+repository did.  It does not search: inotify names the folders that appear,
+go or are renamed, aht.WatchJudge decides whether one of them matters (a
+project, a folder above one, a marker's folder, a .git), and only then
+    aht.py reconcile --quick --notify [--renamed OLD NEW] [--look DIR]
+runs, without the walk of the roots.  Files being saved start nothing.  A
+regular look every ten minutes starts aht's periodic work, and the roots are
+walked once a day (and at the start), for what went unseen.
 
 Two backends:
   • inotify  (default) — via ctypes, no third-party modules.  Recursive by
     walking the tree and adding one watch per directory, then adding watches for
     directories as they appear.
   • polling  (--poll, or automatic when the inotify watch budget is exhausted) —
-    re-walks the roots every few seconds and compares the marker map.  Slower to
-    react but immune to inotify limits and works on network/fuse mounts.
+    every few seconds it checks that each project is where the registry has
+    it, and walks the roots with each regular look.  Slower to react but
+    immune to inotify limits and works on network/fuse mounts.
 
 Single-flight by construction: reconcile runs synchronously in the event loop,
 so a prompt can never be stacked on top of another prompt.  Events that arrive
@@ -134,12 +140,12 @@ class Inotify:
             raise
         pos, n = 0, len(data)
         while pos + _EVENT.size <= n:
-            wd, mask, _cookie, ln = _EVENT.unpack_from(data, pos)
+            wd, mask, cookie, ln = _EVENT.unpack_from(data, pos)
             pos += _EVENT.size
             raw = data[pos:pos + ln]
             pos += ln
             name = raw.split(b"\0", 1)[0].decode("utf-8", "replace")
-            yield wd, mask, name
+            yield wd, mask, cookie, name
 
     def close(self):
         try:
@@ -172,10 +178,12 @@ class Runner:
         self.extra = list(extra_args or [])
         self.runs = 0
 
-    def run(self) -> int:
+    def run(self, extra=()) -> int:
         """Run reconcile synchronously.  Synchronous IS the single-flight
-        guarantee: no second prompt can appear while this one is open."""
-        cmd = [self.python, str(self.core), "reconcile", "--notify"] + self.extra
+        guarantee: no second prompt can appear while this one is open.
+        `extra`: reconcile's own options ("--quick", "--look", …); none: with
+        the walk of the roots."""
+        cmd = [self.python, str(self.core), "reconcile", "--notify"] + self.extra + list(extra)
         if self.roots:
             cmd += ["--roots"] + list(self.roots)
         self.runs += 1
@@ -190,16 +198,21 @@ class Runner:
             log(f"reconcile exited {r.returncode} in {dt:.1f}s: "
                 f"{(r.stderr or '').strip()[:400]}")
         else:
-            summary = ""
+            summary, quiet = "", False
             try:
                 import json
                 d = json.loads(r.stdout or "{}")
                 bits = [f"{k}={len(d.get(k, []))}" for k in ("moves", "copies", "news")
                         if d.get(k)]
-                summary = " ".join(bits) or "nothing to do"
+                summary = (" ".join(bits) or "nothing to do") \
+                    + (" (with the walk)" if d.get("walked") else "")
+                # a look that found nothing leaves no line
+                quiet = not bits and not d.get("walked") \
+                    and not os.environ.get("AHT_WATCHER_DEBUG")
             except Exception:
                 summary = "ok"
-            log(f"reconcile {summary} ({dt:.1f}s)")
+            if not quiet:
+                log(f"reconcile {summary} ({dt:.1f}s)")
         return r.returncode
 
 
@@ -207,29 +220,23 @@ class Runner:
 # Backends
 # --------------------------------------------------------------------------- #
 
-def marker_signature(roots):
-    """Cheap fingerprint of 'which marker lives where'.  Any move, rename, copy,
-    new project or deletion changes it — which is exactly the set of events the
-    reconciler acts on."""
-    try:
-        path_to_uuid, _ = aht.find_markers(list(roots))
-    except Exception as e:
-        log(f"scan failed: {e}")
-        return None
-    return tuple(sorted(path_to_uuid.items()))
-
-
 def run_poll(roots, runner, interval, once=False):
+    """No inotify here: every `interval` seconds each project is checked to
+    be where the registry has it, and the roots are walked with each regular
+    look (a move is only found by that walk: this system does not say where
+    a folder went)."""
     log(f"polling every {interval}s over {len(roots)} root(s)")
-    sig = marker_signature(roots)
+    judge = aht.WatchJudge()
+    next_look = time.time() + aht.WATCH_LOOK_SECONDS
     while True:
         time.sleep(interval)
-        new = marker_signature(roots)
-        if new is not None and new != sig:
-            runner.run()
+        a = judge.args()
+        if a is not None or time.time() >= next_look:
+            runner.run()                      # with the walk
+            judge.ran()
+            next_look = time.time() + aht.WATCH_LOOK_SECONDS
             if once:
                 return 0
-            sig = marker_signature(roots)     # re-read: reconcile itself moves things
 
 
 def run_inotify(roots, runner, debounce, max_watches, once=False):
@@ -259,20 +266,25 @@ def run_inotify(roots, runner, debounce, max_watches, once=False):
         return run_poll(roots, runner, max(10.0, debounce * 5), once)
 
     log(f"inotify watching {added} director(ies) under {len(roots)} root(s), "
-        f"debounce {debounce}s")
+        f"quiet moment {debounce}s")
     poller = select.poll()
     poller.register(ino.fd, select.POLLIN)
-    deadline = None                      # when the debounce window closes
+    judge = aht.WatchJudge(scan_new=True)
+    deadline = first = None              # when the quiet moment ends
+    moved_from = {}                      # cookie -> the folder as it was named
+    next_look = time.time() + aht.WATCH_LOOK_SECONDS
 
     while True:
-        timeout = None if deadline is None else max(0.0, deadline - time.time()) * 1000
-        events = poller.poll(timeout)
+        due = next_look if deadline is None else min(deadline, next_look)
+        events = poller.poll(max(0.0, due - time.time()) * 1000)
         now = time.time()
         if events:
-            for wd, mask, name in ino.read_events():
+            for wd, mask, cookie, name in ino.read_events():
                 if mask & IN_Q_OVERFLOW:
-                    log("inotify queue overflowed — rescanning")
-                    deadline = now + debounce
+                    log("inotify queue overflowed — the roots are walked")
+                    judge.lost()
+                    first = first or now
+                    deadline = min(now + debounce, first + max(debounce, 1.5))
                     continue
                 if mask & IN_IGNORED:
                     ino.drop(wd)
@@ -280,27 +292,58 @@ def run_inotify(roots, runner, debounce, max_watches, once=False):
                 base = ino.wd_to_path.get(wd)
                 if base is None:
                     continue
+                path = os.path.join(base, name) if name else base
+                if not mask & IN_ISDIR:
+                    # files: only a marker or a .git file that appears matters
+                    if not mask & (IN_CREATE | IN_MOVED_TO) or name != ".git":
+                        if mask & (IN_MOVE_SELF | IN_DELETE_SELF):
+                            first = first or now    # a watched folder went: is a project gone?
+                            deadline = min(now + debounce, first + max(debounce, 1.5))
+                        continue
+                    judge.added(path)
+                elif mask & IN_MOVED_FROM:
+                    moved_from[cookie] = path
+                elif mask & IN_MOVED_TO:
+                    old = moved_from.pop(cookie, None)
+                    if old:
+                        judge.renamed(old, path)
+                    else:
+                        judge.added(path)           # it came from outside the roots
+                elif mask & IN_CREATE:
+                    judge.added(path)
+                elif mask & IN_DELETE:
+                    judge.removed(path)
                 if mask & IN_ISDIR and (mask & (IN_CREATE | IN_MOVED_TO)):
-                    # a directory appeared: watch it and everything under it,
-                    # otherwise a folder pasted in one shot would be invisible
-                    new_dir = os.path.join(base, name)
+                    # a directory appeared: watch it and everything under it
+                    # (a renamed one: under its new name), otherwise a folder
+                    # pasted in one shot would be invisible
                     if not name.startswith(".") and name not in pruned:
                         try:
-                            for d in walk_dirs(new_dir, pruned):
+                            for d in walk_dirs(path, pruned):
                                 if len(ino.wd_to_path) >= max_watches:
                                     break
                                 ino.add(d)
                         except OSError:
                             pass
-                deadline = now + debounce
+                first = first or now
+                deadline = min(now + debounce, first + max(debounce, 1.5))
             continue
+        a = None
         if deadline is not None and now >= deadline:
-            deadline = None
-            runner.run()
+            deadline = first = None
+            moved_from.clear()           # what left the roots: the judge sees a project gone
+            a = judge.args()
+        if a is None and now >= next_look:
+            a = ["--quick"]              # the regular look: aht's periodic work starts from it
+        if a is not None:
+            runner.run(a)
+            judge.ran()
+            next_look = time.time() + aht.WATCH_LOOK_SECONDS
             # the reconcile may have renamed folders; make sure their new
-            # locations are watched too
+            # locations are watched too (not after a look that found
+            # everything in place: that would walk the roots every time)
             try:
-                for root in roots:
+                for root in (roots if a != ["--quick"] else []):
                     for d in walk_dirs(root, pruned):
                         if len(ino.wd_to_path) >= max_watches:
                             break
@@ -352,9 +395,9 @@ def main(argv=None):
     debounce = args.debounce
     if debounce is None:
         try:
-            debounce = float(aht.cfg_get("debounce_seconds", 2.0))
+            debounce = float(aht.cfg_get("debounce_seconds", 0.3))
         except Exception:
-            debounce = 2.0
+            debounce = 0.3
 
     runner = Runner(CORE, args.python, roots, [])
     log(f"starting (core={CORE}, python={args.python})")

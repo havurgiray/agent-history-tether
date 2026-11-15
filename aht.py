@@ -190,7 +190,7 @@ CONFIG_DEFAULTS = {
     "icons_enabled":    True,
     "icons_agent":      True,        # badge tethered projects
     "icons_git":        True,        # badge git repos under the watched roots
-    "debounce_seconds": 2.0,
+    "debounce_seconds": 0.3,
     "scan_max_depth":   7,
     "extra_prune_dirs": [],
     "dialog_timeout":   180,
@@ -1790,6 +1790,121 @@ def watch_list(reg: dict) -> dict:
     return {"v": 1, "projects": sorted(rows, key=lambda r: r["path"]),
             "git": sorted(reg.get("git_repos") or []), "prune": sorted(prune_dirs()),
             "git_wanted": bool(cfg_get("icons_enabled", True) and cfg_get("icons_git", True))}
+
+WATCH_LOOK_SECONDS = 600       # s between a watcher's regular looks (the periodic work)
+
+class WatchJudge:
+    """What the Windows and the Linux watcher keep between the changes they
+    are told of, to decide without a walk whether aht has to look (the Mac
+    watcher does the same in Swift).  They pass on what happened to
+    folders: one appeared (`added`), went (`removed`) or was renamed.
+    `args()`, at the end of a quiet moment, gives what to run reconcile
+    with, or None: nothing aht follows changed.
+
+    `scan_new` (Linux): a folder that appeared is looked through for
+    markers, since what was put into it before it was watched went unseen."""
+
+    def __init__(self, scan_new: bool = False):
+        self.scan_new = scan_new
+        self.look, self.new_dirs, self.moves = set(), set(), []
+        self.full = False
+        self._stamp, self._reg = None, {"projects": {}}
+        self.handled = self.mismatch()
+
+    def _registry(self) -> dict:
+        try:
+            st = registry_path().stat()
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        if stamp != self._stamp:
+            self._stamp, self._reg = stamp, load_registry()
+            self._paths = {os.path.normcase(os.path.realpath(e["real_path"]))
+                           for e in self._reg["projects"].values() if e.get("real_path")}
+            self._repos = {os.path.normcase(p) for p in self._reg.get("git_repos") or []}
+        return self._reg
+
+    def mismatch(self) -> str:
+        """The projects that are not where the registry has them, as text."""
+        out = []
+        for uid, e in sorted(self._registry()["projects"].items()):
+            old = e.get("real_path")
+            if not old:
+                continue
+            now = project_now(uid, e) or (old if os.path.isdir(old) else None)
+            # as spelled: a rename that only changes the case counts too
+            if now is None or os.path.normpath(now) != os.path.normpath(old):
+                out.append(f"{old} -> {now or 'gone'}")
+        return "\n".join(out)
+
+    def _in_project(self, path: str) -> bool:
+        p = os.path.normcase(os.path.realpath(path))
+        while True:
+            if p in self._paths:
+                return True
+            up = os.path.dirname(p)
+            if up == p:
+                return False
+            p = up
+
+    def added(self, path: str) -> None:
+        self._registry()
+        name, up = os.path.basename(path), os.path.dirname(path)
+        if name in (".aht", ".claude"):
+            # a marker in a folder the registry does not have: a copy, or a
+            # project from elsewhere
+            if os.path.normcase(os.path.realpath(up)) not in self._paths and not _in_trash(up):
+                self.look.add(up)
+        elif name == ".git":
+            if os.path.normcase(os.path.realpath(up)) not in self._repos and not _in_trash(up):
+                self.look.add(up)
+        elif self.scan_new and not name.startswith(".") and name not in prune_dirs() \
+                and not self._in_project(up):
+            self.new_dirs.add(path)
+
+    def removed(self, path: str) -> None:
+        pass                    # mismatch() sees a project that went
+
+    def renamed(self, old: str, new: str) -> None:
+        self._registry()
+        o = os.path.normcase(os.path.realpath(old))
+        if any(p == o or p.startswith(o.rstrip(os.sep) + os.sep) for p in self._paths):
+            self.moves.append((old, new))
+        else:
+            self.added(new)
+
+    def lost(self) -> None:
+        """Changes went unseen: only a walk knows what happened."""
+        self.full = True
+
+    def args(self):
+        look = set(self.look)
+        if self.new_dirs:
+            tops = [d for d in self.new_dirs
+                    if not any(d != o and _inside(d, o) for o in self.new_dirs)]
+            try:
+                look |= {p for p in find_markers([d for d in tops if os.path.isdir(d)])[0]
+                         if os.path.normcase(p) not in self._paths}
+            except OSError:
+                self.full = True
+        full, moves = self.full, list(self.moves)
+        self.look, self.new_dirs, self.moves, self.full = set(), set(), [], False
+        if full:
+            return []
+        if not look and not moves and self.mismatch() == self.handled:
+            return None
+        out = ["--quick"]
+        if look:
+            out += ["--look"] + sorted(look)
+        for a, b in moves:
+            out += ["--renamed", a, b]
+        return out
+
+    def ran(self) -> None:
+        """aht looked: what it left as it is (a move you declined) is not
+        brought up again."""
+        self._stamp = None
+        self.handled = self.mismatch()
 
 def write_watch_list(reg: dict) -> None:
     """run/watch.json, rewritten only when it would read differently (the

@@ -30,6 +30,7 @@ import ctypes.wintypes as wintypes
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -80,12 +81,6 @@ _kernel32.WaitForSingleObject.restype = wintypes.DWORD
 _kernel32.WaitForMultipleObjects.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
                                              wintypes.BOOL, wintypes.DWORD]
 _kernel32.WaitForMultipleObjects.restype = wintypes.DWORD
-_kernel32.FindFirstChangeNotificationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL,
-                                                   wintypes.DWORD]
-_kernel32.FindFirstChangeNotificationW.restype = wintypes.HANDLE
-_kernel32.FindNextChangeNotification.argtypes = [wintypes.HANDLE]
-_kernel32.FindNextChangeNotification.restype = wintypes.BOOL
-_kernel32.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
 
 try:
     _user32.MessageBoxTimeoutW.argtypes = [wintypes.HWND, wintypes.LPCWSTR,
@@ -546,8 +541,42 @@ def _default_watch_roots():
 
 
 # --------------------------------------------------------------------------- #
-# The watcher  (FindFirstChangeNotificationW, watching each root's subtree)
+# The watcher  (ReadDirectoryChangesW over each root's subtree)
 # --------------------------------------------------------------------------- #
+# It does not search.  Windows names the folders that appear, go or are
+# renamed under the roots (folders only: files being saved wake nothing);
+# aht.WatchJudge then asks, by each tracked project's folder id, whether one
+# is no longer where the registry has it, and only then, or when a marker or
+# a .git appeared in a folder aht does not know, a reconcile runs
+# (`--quick`: without the walk of the roots).
+
+FILE_LIST_DIRECTORY = 0x0001
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+FILE_FLAG_OVERLAPPED = 0x40000000
+FILE_ACTION_ADDED, FILE_ACTION_REMOVED = 1, 2
+FILE_ACTION_RENAMED_OLD, FILE_ACTION_RENAMED_NEW = 4, 5
+
+
+class _Overlapped(ctypes.Structure):
+    _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE)]
+
+
+_kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.HANDLE]
+_kernel32.CreateFileW.restype = wintypes.HANDLE
+_kernel32.ReadDirectoryChangesW.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                            wintypes.BOOL, wintypes.DWORD, wintypes.LPVOID,
+                                            ctypes.POINTER(_Overlapped), wintypes.LPVOID]
+_kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+_kernel32.GetOverlappedResult.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Overlapped),
+                                          ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+_kernel32.GetOverlappedResult.restype = wintypes.BOOL
+_kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
+_kernel32.CancelIo.argtypes = [wintypes.HANDLE]
+
 
 def _wlog(msg: str) -> None:
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] watcher: {msg}"
@@ -568,8 +597,10 @@ class Runner:
     def __init__(self, roots):
         self.roots = list(roots)
 
-    def run(self) -> int:
-        cmd = self_cmd("reconcile", "--notify")
+    def run(self, extra=()) -> int:
+        """`extra`: reconcile's own options ("--quick", "--look", …); none:
+        with the walk of the roots."""
+        cmd = self_cmd("reconcile", "--notify") + list(extra)
         if self.roots:
             cmd += ["--roots"] + self.roots
         t0 = time.time()
@@ -588,82 +619,159 @@ class Runner:
                 d = json.loads(r.stdout or "{}")
                 bits = [f"{k}={len(d.get(k, []))}" for k in ("moves", "copies", "news")
                         if d.get(k)]
-                _wlog(f"reconcile {' '.join(bits) or 'nothing to do'} ({dt:.1f}s)")
+                # a look that found nothing leaves no line
+                if bits or d.get("walked") or os.environ.get("AHT_WATCHER_DEBUG"):
+                    _wlog(f"reconcile {' '.join(bits) or 'nothing to do'} ({dt:.1f}s"
+                          f"{', with the walk' if d.get('walked') else ''})")
             except Exception:
                 _wlog("reconcile ok")
         return r.returncode
 
 
-def _marker_signature(roots):
-    """Cheap fingerprint of 'which marker lives where' — any move, rename,
-    copy, new project or deletion changes it (same as the Linux watcher)."""
-    try:
-        path_to_uuid, _ = aht.find_markers(list(roots))
-    except Exception as e:
-        _wlog(f"scan failed: {e}")
-        return None
-    return tuple(sorted(path_to_uuid.items()))
+class _DirWatch:
+    """The names of the folders that appear, go or are renamed anywhere
+    under one root."""
+
+    def __init__(self, root: str):
+        self.root = root
+        self.h = _kernel32.CreateFileW(root, FILE_LIST_DIRECTORY, 7, None, 3,
+                                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, None)
+        if not self.h or self.h == INVALID_HANDLE:
+            raise OSError(ctypes.get_last_error(), f"cannot open {root}")
+        self.event = _kernel32.CreateEventW(None, True, False, None)
+        self.ov = _Overlapped(hEvent=self.event)
+        self.buf = ctypes.create_string_buffer(64 * 1024)
+        self._arm()
+
+    def _arm(self) -> None:
+        _kernel32.ResetEvent(self.event)
+        if not _kernel32.ReadDirectoryChangesW(self.h, self.buf, len(self.buf), True,
+                                               FILE_NOTIFY_CHANGE_DIR_NAME, None,
+                                               ctypes.byref(self.ov), None):
+            raise OSError(ctypes.get_last_error(), f"cannot watch {self.root}")
+
+    def take(self):
+        """[(action, path)] since the last call, and the watch goes on; None
+        when more happened than Windows kept (only a walk knows what)."""
+        n = wintypes.DWORD(0)
+        ok = _kernel32.GetOverlappedResult(self.h, ctypes.byref(self.ov), ctypes.byref(n), False)
+        out = None
+        if ok and n.value:
+            out, data, pos = [], self.buf.raw[:n.value], 0
+            while pos + 12 <= len(data):
+                nxt, action, ln = struct.unpack_from("<III", data, pos)
+                name = data[pos + 12:pos + 12 + ln].decode("utf-16-le", "replace")
+                out.append((action, os.path.join(self.root, name)))
+                if not nxt:
+                    break
+                pos += nxt
+        self._arm()
+        return out
+
+    def close(self) -> None:
+        _kernel32.CancelIo(self.h)
+        _kernel32.CloseHandle(self.h)
+        _kernel32.CloseHandle(self.event)
+
+
+def _tell(judge, changes) -> None:
+    """Pass a batch of folder changes on to the judge."""
+    if changes is None:
+        judge.lost()
+        return
+    old = None
+    for action, path in changes:
+        if action == FILE_ACTION_RENAMED_OLD:
+            old = path
+        elif action == FILE_ACTION_RENAMED_NEW:
+            if old:
+                judge.renamed(old, path)
+            else:
+                judge.added(path)
+            old = None
+        elif action == FILE_ACTION_ADDED:
+            judge.added(path)
+        elif action == FILE_ACTION_REMOVED:
+            judge.removed(path)
 
 
 def _run_poll(roots, runner, interval, stop_h, once=False):
+    """No change notices here: every `interval` seconds the projects are
+    asked for by their ids (no walk), and the roots are walked with each
+    regular look, for what has no id yet."""
     _wlog(f"polling every {interval}s over {len(roots)} root(s)")
-    sig = _marker_signature(roots)
+    judge = aht.WatchJudge()
+    next_look = time.time() + aht.WATCH_LOOK_SECONDS
     while True:
         if _kernel32.WaitForSingleObject(stop_h, int(interval * 1000)) == WAIT_OBJECT_0:
             _wlog("stopped")
             return 0
-        new = _marker_signature(roots)
-        if new is not None and new != sig:
-            runner.run()
+        a = judge.args()
+        if a is None and time.time() >= next_look:
+            a = []
+        if a is not None:
+            runner.run(a)
+            judge.ran()
+            next_look = time.time() + aht.WATCH_LOOK_SECONDS
             if once:
                 return 0
-            sig = _marker_signature(roots)   # re-read: reconcile itself moves things
 
 
 def _run_notify(roots, runner, debounce, stop_h, once=False):
-    handles, watched = [], []
+    watches = []
     for r in roots:
-        h = _kernel32.FindFirstChangeNotificationW(
-            r, True, FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME)
-        if h and h != INVALID_HANDLE:
-            handles.append(h)
-            watched.append(r)
-        else:
-            _wlog(f"cannot watch {r} (error {ctypes.get_last_error()})")
-    if not handles:
+        try:
+            watches.append(_DirWatch(r))
+        except OSError as e:
+            _wlog(f"cannot watch {r} ({e})")
+    if not watches:
         return _run_poll(roots, runner, 15.0, stop_h, once)
 
-    _wlog(f"watching {len(watched)} root(s) recursively, debounce {debounce}s")
-    arr = (wintypes.HANDLE * (1 + len(handles)))(stop_h, *handles)
-    deadline = None
+    _wlog(f"watching {len(watches)} root(s) recursively, quiet moment {debounce}s")
+    judge = aht.WatchJudge()
+    arr = (wintypes.HANDLE * (1 + len(watches)))(stop_h, *[w.event for w in watches])
+    deadline = first = None
+    next_look = time.time() + aht.WATCH_LOOK_SECONDS
     try:
         while True:
-            timeout = INFINITE if deadline is None else \
-                max(0, int((deadline - time.time()) * 1000))
-            res = _kernel32.WaitForMultipleObjects(len(arr), arr, False, timeout)
+            due = next_look if deadline is None else min(deadline, next_look)
+            res = _kernel32.WaitForMultipleObjects(
+                len(arr), arr, False, max(0, int((due - time.time()) * 1000)))
             now = time.time()
             if res == WAIT_OBJECT_0:                       # stop event
                 _wlog("stopped")
                 return 0
-            if WAIT_OBJECT_0 < res <= WAIT_OBJECT_0 + len(handles):
-                idx = res - WAIT_OBJECT_0 - 1
-                if not _kernel32.FindNextChangeNotification(handles[idx]):
-                    _wlog(f"lost watch on {watched[idx]} — falling back to polling")
+            if WAIT_OBJECT_0 < res <= WAIT_OBJECT_0 + len(watches):
+                w = watches[res - WAIT_OBJECT_0 - 1]
+                try:
+                    _tell(judge, w.take())
+                except OSError:
+                    _wlog(f"lost watch on {w.root} — falling back to polling")
                     return _run_poll(roots, runner, 15.0, stop_h, once)
-                deadline = now + debounce
+                # a short quiet moment, so a burst is one look; never held
+                # back for long
+                first = first or now
+                deadline = min(now + debounce, first + max(debounce, 1.5))
                 continue
             if res == WAIT_TIMEOUT:
+                a = None
                 if deadline is not None and now >= deadline:
-                    deadline = None
-                    runner.run()
+                    deadline = first = None
+                    a = judge.args()
+                if a is None and now >= next_look:
+                    a = ["--quick"]     # the regular look: the periodic work starts from it
+                if a is not None:
+                    runner.run(a)
+                    judge.ran()
+                    next_look = time.time() + aht.WATCH_LOOK_SECONDS
                     if once:
                         return 0
                 continue
             _wlog(f"wait failed (error {ctypes.get_last_error()}) — polling instead")
             return _run_poll(roots, runner, 15.0, stop_h, once)
     finally:
-        for h in handles:
-            _kernel32.FindCloseChangeNotification(h)
+        for w in watches:
+            w.close()
 
 
 def cmd_watch(argv) -> int:
@@ -716,14 +824,16 @@ def cmd_watch(argv) -> int:
     debounce = args.debounce
     if debounce is None:
         try:
-            debounce = float(aht.cfg_get("debounce_seconds", 2.0))
+            debounce = float(aht.cfg_get("debounce_seconds", 0.3))
         except Exception:
-            debounce = 2.0
+            debounce = 0.3
 
     runner = Runner(roots)
     _wlog(f"starting ({'frozen exe' if FROZEN else 'script'}: {sys.executable})")
     if not args.no_startup_scan:
-        runner.run()          # catch anything that moved while we were not running
+        # what moved while this was not running: found by the ids (the walk
+        # runs with it when the day's one is due)
+        runner.run(["--quick"])
 
     try:
         if args.poll:

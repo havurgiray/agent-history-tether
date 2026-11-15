@@ -112,6 +112,85 @@ except subprocess.TimeoutExpired:
     ck(False, "watcher did not exit")
 ck((sb / "claude" / enc(projB)).is_dir(), "claude store relinked by the watcher")
 
+print("\n[1b] the inotify watcher: no walk for a move, and none for what does not matter")
+if not sys.platform.startswith("linux"):
+    print("  SKIP inotify needs Linux")
+else:
+    def aht_json(*a_):
+        r_ = subprocess.run([PY, str(ROOT / "aht.py"), *a_], env=env, capture_output=True, text=True)
+        try:
+            return json.loads(r_.stdout)
+        except ValueError:
+            return {}
+    def reg_path():
+        try:
+            reg_ = json.loads((sb / ".aht" / "registry.json").read_text())
+        except (OSError, ValueError):
+            return None, 0
+        ps = reg_.get("projects", {})
+        return (ps.get(uid_b) or {}).get("real_path"), len(ps)
+    def until(cond, secs=10.0):
+        t0 = time.time()
+        while time.time() - t0 < secs:
+            if cond():
+                return time.time() - t0
+            time.sleep(0.05)
+        return None
+    def took(t_):
+        return "%.2f s" % t_ if t_ is not None else "not in 10 s"
+    uid_b = (Path(projB) / ".aht" / ".project-id").read_text().strip()
+    subprocess.run([PY, str(ROOT / "aht.py"), "config", "--set", "copy_policy=duplicate"],
+                   env=env, capture_output=True)
+    aht_json("reconcile", "--apply")            # the day's walk is done
+    wlog = sb / "watcher.out"
+    with open(wlog, "w") as out_:
+        wproc = subprocess.Popen([PY, str(ROOT / "linux" / "watcher.py"), "--no-startup-scan"],
+                                 env=dict(env, AHT_WATCHER_DEBUG="1"), stdout=out_,
+                                 stderr=subprocess.STDOUT)
+    def runs():
+        return [l for l in wlog.read_text().splitlines() if "reconcile " in l]
+    try:
+        ck(until(lambda: "inotify watching" in wlog.read_text()) is not None,
+           "the watcher watches with inotify")
+        time.sleep(0.5)
+        for i in range(30):                     # a build: folders and files inside the project
+            os.makedirs(os.path.join(projB, "build", f"d{i}"))
+            Path(projB, "build", f"d{i}", "f.txt").write_text("x")
+        shutil.rmtree(os.path.join(projB, "build"))
+        time.sleep(2.0)
+        ck(not runs(), f"folders made inside a project start nothing ({runs()})")
+        projN = os.path.realpath(str(roots / "projN"))
+        os.rename(projB, projN)
+        t = until(lambda: reg_path()[0] == projN)
+        ck(t is not None and (sb / "claude" / enc(projN)).is_dir(),
+           f"a renamed project is relinked ({took(t)})")
+        time.sleep(1.0)
+        ck(runs() and "moves=1" in runs()[-1] and "walk" not in runs()[-1],
+           f"…from what inotify said was renamed, with no walk ({runs()[-1:]})")
+        os.makedirs(str(roots / "grp"))
+        time.sleep(0.5)
+        os.rename(projN, str(roots / "grp" / "projN"))
+        until(lambda: (reg_path()[0] or "").endswith("grp/projN"))
+        time.sleep(0.5)
+        os.rename(str(roots / "grp"), str(roots / "grp2"))
+        projG = os.path.realpath(str(roots / "grp2" / "projN"))
+        t = until(lambda: reg_path()[0] == projG)
+        ck(t is not None, f"a parent folder renamed: relinked ({took(t)})")
+        time.sleep(1.0)
+        n = len(runs())
+        os.makedirs(str(roots / "plain"))
+        os.rename(str(roots / "plain"), str(roots / "plain2"))
+        time.sleep(2.0)
+        ck(len(runs()) == n, f"a folder renamed that holds no project starts nothing ({runs()[n:]})")
+        shutil.copytree(projG, str(roots / "copyG"))
+        t = until(lambda: reg_path()[1] == 2)
+        ck(t is not None and (roots / "copyG" / ".aht" / ".project-id").read_text().strip() != uid_b,
+           f"a copy is found in the folder that appeared, and gets its own id ({took(t)})")
+    finally:
+        wproc.terminate()
+        wproc.wait()
+    projB = projG
+
 print("\n[2] tray --check degrades cleanly without desktop deps")
 r = subprocess.run([PY, str(ROOT / "linux" / "tray.py"), "--check"],
                    env=env, capture_output=True, text=True)

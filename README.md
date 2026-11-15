@@ -194,13 +194,13 @@ a moved folder.
 - **Registry**: `~/.aht/registry.json` maps `uuid → {real_path,
   per-backend stores}`.
 - **Watcher**: FSEvents (macOS), inotify and polling (Linux) or
-  `FindFirstChangeNotificationW` (Windows) over the watched folders.  On
-  macOS it does not search: the registry notes each project folder's id
-  on its disk, the file system says where a folder with that id is now,
-  and the watcher starts aht only when a project is not where it was, or
-  a marker or a `.git` appeared (`aht reconcile --quick`); files saved
-  inside a project start nothing, and the walk of the watched folders
-  runs once a day.  It
+  `ReadDirectoryChangesW` (Windows) over the watched folders.  It does
+  not search: the registry notes each project folder's id on its disk,
+  macOS and Windows say where a folder with that id is now (on Linux,
+  inotify says what was renamed to what), and the watcher starts aht
+  only when a project is not where it was, or a marker or a `.git`
+  appeared (`aht reconcile --quick`); files saved inside a project start
+  nothing, and the walk of the watched folders runs once a day.  It
   detects moves, renames and copies and asks before it relinks
   (`move_policy`: ask, apply, decline or ignore; `copy_policy`: ask,
   duplicate, independent or ignore).

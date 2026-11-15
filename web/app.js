@@ -3460,6 +3460,8 @@ function drawMachines(m) {
       h("button", { class: "small", text: "Check…", onclick: () => checkMachine(name) }),
       send && !winBox ? h("button", { class: "small", text: "Copy My Claude Setup…", title: "Your global CLAUDE.md, skills, agents, commands and plugins: a handover carries only the project's own",
         onclick: () => copySetup(name) }) : null,
+      send && !winBox ? h("button", { class: "small", text: "Free Up Space…", title: "The copies aht set aside there that a newer file still holds whole",
+        onclick: () => tidyMachine(name) }) : null,
       h("button", { class: "small", text: "Remove…", onclick: async () => {
         if (!(await confirmIt(`Remove ${name}?`, "aht forgets this machine. Nothing on it is deleted.", "Remove"))) return;
         // a machine that still holds a project stays: aht says how to release it
@@ -3591,6 +3593,21 @@ async function copySetup(name) {
   const r = await busy(`copying your setup to ${name}…`, () => J("copy-setup", name, "--apply", "--json"));
   if (problems(r)) return tell(`Not copied to ${name}`, problems(r));
   tell(`Copied to ${name}`, `What it replaced there is kept in ${r.set_aside || "aht's folder there"}.` + ((r.warnings || []).length ? "\n\n" + r.warnings.join("\n") : ""));
+}
+
+/** Machines → Free Up Space…: the copies aht set aside on a machine (when a
+ * sync or handover replaced a file there) that a newer file still holds
+ * whole, mostly conversations that only grew; removing them loses nothing. */
+async function tidyMachine(name) {
+  const d = await busy(`looking at what aht set aside on ${name}…`, () => J("remote", "tidy", name, "--json"));
+  if (problems(d)) return tell(`aht could not look on ${name}`, problems(d));
+  const stays = d.kept_bytes ? ` ${sizeText(d.kept_bytes)} of copies of what changed stays, as long as aht keeps them.` : "";
+  if (!d.files) return tell(`Nothing to free on ${name}`, "No copy aht set aside there is held whole by a newer file." + stays);
+  const copies = d.files === 1 ? "1 copy" : `${d.files} copies`;
+  if (!(await confirmIt(`Free ${sizeText(d.bytes)} on ${name}?`, `${copies} that aht set aside there, when a sync or a handover replaced a file, are held whole by a newer file: mostly conversations that only grew since. Removing them loses nothing.` + stays, "Remove Them"))) return;
+  const r = await busy(`removing them on ${name}…`, () => J("remote", "tidy", name, "--apply", "--json"));
+  if (problems(r)) return tell(`Not removed on ${name}`, problems(r));
+  tell(`${sizeText(r.bytes)} freed on ${name}`, `${r.files === 1 ? "1 copy" : r.files + " copies"} removed.` + (r.kept_bytes ? ` ${sizeText(r.kept_bytes)} stays.` : ""));
 }
 
 async function checkMachine(name) {

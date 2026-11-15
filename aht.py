@@ -10241,10 +10241,145 @@ def prune_set_asides(base, keep: int = ASIDE_KEEP, days: float = ASIDE_DAYS) -> 
             n += 1
     return n
 
+def _starts_with(big: Path, small: Path) -> bool:
+    """`big` begins with every byte of `small`: the same file, only grown."""
+    try:
+        if big.stat().st_size < small.stat().st_size:
+            return False
+        with open(big, "rb") as a, open(small, "rb") as b:
+            while True:
+                piece = b.read(1 << 20)
+                if not piece:
+                    return True
+                if a.read(len(piece)) != piece:
+                    return False
+    except OSError:
+        return False
+
+def _drop_empty_dirs(top: Path) -> None:
+    for dirpath, _dirs, _files in os.walk(top, topdown=False):
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass                # not empty: it stays
+
+def drop_contained_asides(base, live: dict = None, only: str = None,
+                          apply: bool = True) -> dict:
+    """In `base` (one project's set-aside copies, a folder per transfer), the
+    copies that a newer file still begins with, byte for byte: the file now
+    in place (`live`: {"history": [folders], "project": [...], ...}, by the
+    first part of the copy's path) or a later set-aside copy of it.  Almost
+    always a conversation that only grew since, so nothing of it is lost
+    when the copy goes.  `only`: the one transfer's folder to look at.
+    Returns {"files", "bytes", "kept_bytes"}; with apply they go, and so do
+    the folders left empty."""
+    base = Path(base)
+    res = {"files": 0, "bytes": 0, "kept_bytes": 0}
+    if not base.is_dir():
+        return res
+    stamps = [d for _t, _n, d in sorted((_stamp_time(d.name, d) or 0, d.name, d)
+                                         for d in base.iterdir()
+                                         if d.is_dir() and not d.is_symlink())]
+    live = {k: [Path(p) for p in (v if isinstance(v, (list, tuple)) else [v]) if p]
+            for k, v in (live or {}).items()}
+    listed = {}
+    def same_name(n: Path) -> bool:
+        # exactly this name: on a disk that ignores case, README.md is not
+        # the newer readme.md (a name whose case changed stays set aside)
+        d = str(n.parent)
+        if d not in listed:
+            try:
+                listed[d] = set(os.listdir(d))
+            except OSError:
+                listed[d] = set()
+        return n.name in listed[d]
+    for i, sd in enumerate(stamps):             # oldest first: later copies still there
+        if only and sd.name != only:
+            continue
+        for dirpath, _dirs, names in os.walk(sd):
+            for fn in names:
+                f = Path(dirpath) / fn
+                try:
+                    if f.is_symlink() or not f.is_file():
+                        continue
+                    size = f.stat().st_size
+                except OSError:
+                    continue
+                rel = f.relative_to(sd)
+                newer = [p.joinpath(*rel.parts[1:]) for p in live.get(rel.parts[0], [])] \
+                    if len(rel.parts) > 1 else []
+                newer += [s / rel for s in stamps[i + 1:]]
+                if any(not n.is_symlink() and n.is_file() and same_name(n)
+                       and _starts_with(n, f) for n in newer):
+                    res["files"] += 1
+                    res["bytes"] += size
+                    if apply:
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass        # stays; the next tidy-up tries again
+                else:
+                    res["kept_bytes"] += size
+        if apply:
+            _drop_empty_dirs(sd)
+    return res
+
+def tidy_set_asides(base, live: dict = None, only: str = None) -> dict:
+    """After a transfer: what it set aside that a newer file still begins
+    with goes (drop_contained_asides), then the older folders
+    (prune_set_asides)."""
+    out = {"dropped": drop_contained_asides(base, live, only=only)}
+    out["pruned"] = prune_set_asides(base)
+    return out
+
+def tidy_asides_here(apply: bool = False) -> dict:
+    """Every set-aside copy on this machine that a newer file still begins
+    with: those of transfers from other machines (~/.aht/remote/replaced,
+    the file now in place found through copies.json) and of returns here
+    (~/.aht/handover/<id>/replaced, through the registry)."""
+    res = {"files": 0, "bytes": 0, "kept_bytes": 0, "projects": 0, "applied": apply}
+    ch, croot = claude_home(), claude_backend().root()
+    side = {"plans": [str(ch / "plans")], "file-history": [str(ch / "file-history")]}
+    places = []
+    rep = aht_home() / "remote" / "replaced"
+    if rep.is_dir():
+        paths = {}
+        for p, c in read_copies().items():
+            paths.setdefault((c or {}).get("uuid"), []).append(p)
+        for d in sorted(rep.iterdir()):
+            ps = paths.get(d.name, [])
+            places.append((d, {"project": ps, **side,
+                               "history": [str(croot / _key_claude(p)) for p in ps]}))
+    hroot = aht_home() / "handover"
+    if hroot.is_dir():
+        projects = load_registry().get("projects", {})
+        for d in sorted(hroot.iterdir()):
+            real = (projects.get(d.name) or {}).get("real_path")
+            store = _store_of(real) if real else None
+            places.append((d / "replaced", {"project": [real] if real else [], **side,
+                                            "history": [str(store)] if store else []}))
+    for base, live in places:
+        if not base.is_dir():
+            continue
+        r = drop_contained_asides(base, live, apply=apply)
+        res["projects"] += 1 if r["files"] else 0
+        for k in ("files", "bytes", "kept_bytes"):
+            res[k] += r[k]
+    if apply:
+        log(f"ASIDE removed {res['files']} set-aside copies a newer file still holds "
+            f"({_human(res['bytes'])}); {_human(res['kept_bytes'])} stays")
+    return res
+
 def _agent_prune(req: dict) -> dict:
-    """Drop what earlier syncs set aside: see prune_set_asides."""
+    """Drop what earlier syncs set aside: see tidy_set_asides."""
+    dropped = drop_contained_asides(req["dir"], req.get("live"), only=req.get("only")) \
+        if req.get("only") else None
     return {"ok": True, "pruned": prune_set_asides(req["dir"],
-                                                   int(req.get("keep") or ASIDE_KEEP))}
+                                                   int(req.get("keep") or ASIDE_KEEP)),
+            **({"dropped": dropped} if dropped else {})}
+
+def _agent_tidy_asides(req: dict) -> dict:
+    return {"ok": True, **tidy_asides_here(apply=bool(req.get("apply")))}
 
 # ---- folders here that are copies of another machine's projects ------------ #
 #
@@ -10776,7 +10911,10 @@ def _agent_return_apply(req: dict, inp, out) -> dict:
             _update_entry(uid, away=None, returned=back)
             _end_pause(uid, a.get("remote"))
             _retire_manifest(hd)
-            prune_set_asides(hd / "replaced")
+            tidy_set_asides(hd / "replaced", {
+                "project": [real], "history": [str(store)],
+                "plans": [str(claude_home() / "plans")],
+                "file-history": [str(claude_home() / "file-history")]}, only=aside.name)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
     log(f"SEND BACK {real} <- {holder} ({pd['updated']} updated, {pd['new']} new, "
@@ -11054,6 +11192,7 @@ AGENT_OPS = {"probe": _agent_probe, "manifest": _agent_manifest,
              "board": lambda req: _agent_board(req),
              "udp-echo": _agent_udp_echo,
              "prune": _agent_prune,
+             "tidy-asides": _agent_tidy_asides,
              "offsite-list": lambda req: _agent_offsite_list(req),
              "offsite-prune": lambda req: _agent_offsite_prune(req),
              "offsite-adopt": lambda req: _agent_offsite_adopt(req),
@@ -11819,8 +11958,16 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
                      progress=progress)
         res["extras"].append({"path": p, **r})
     if not dry:
+        # what this sync set aside that the file now there still begins with
+        # (a conversation that only grew) goes; then the older folders
+        live = {"project": [rpath], "file-history": [f"{rclaude}/file-history"],
+                "plans": [f"{rclaude}/plans"]}
+        if store:
+            live["history"] = [f"{rclaude}/projects/{_key_claude(rpath)}"]
         try:
-            rem.agent("prune", dir=posixpath.dirname(aside), keep=ASIDE_KEEP)
+            pr = rem.agent("prune", dir=posixpath.dirname(aside), keep=ASIDE_KEEP,
+                           only=posixpath.basename(aside), live=live, timeout=600)
+            res["aside_dropped"] = (pr.get("dropped") or {}).get("bytes", 0)
         except HandoverError as _x:
             warn(f"HANDOVER the older set-aside copies on {rem.name} were not pruned: "
                  f"{_errmsg(_x)}")
@@ -14202,7 +14349,10 @@ def cmd_reclaim(args):
                 for r in read_relays(real):     # a bring's relay is answered
                     if r.get("kind") in ("bring", "handover") and r.get("closed") is None:
                         close_relay(real, r["id"], "taken-back")
-            prune_set_asides(hd / "replaced")
+            tidy_set_asides(hd / "replaced", {
+                "project": [real], "history": [str(store)],
+                "plans": [str(claude_home() / "plans")],
+                "file-history": [str(claude_home() / "file-history")]}, only=aside.name)
         mm = (load_registry().get("projects", {}).get(uid) or {}).get("mirror") or {}
         synced = mm.get("enabled") and mm.get("remote") == rem.name
         if not copy:
@@ -15512,7 +15662,45 @@ def _watch(name: str, on: bool) -> dict:
     log(f"REMOTE {name}: watch {'on' if on else 'off'}")
     return dict(out, watch=on, applied=True)
 
+def _remote_tidy(args) -> int:
+    """aht remote tidy [name] [--apply]: the set-aside copies on that machine
+    (on this one without a name) that a newer file still holds whole."""
+    where = args.name or "this computer"
+    try:
+        if args.name:
+            rem = get_remote(args.name)
+            rem.connect()
+            out = rem.agent("tidy-asides", apply=args.apply, timeout=3600)
+        else:
+            out = {"ok": True, **tidy_asides_here(apply=args.apply)}
+    except HandoverError as e:
+        out = {"ok": False, "error": str(e)}
+    if out.get("ok") is False and "tidy-asides" in str(out.get("error") or ""):
+        out["error"] = f"update aht on {where} first: the aht there cannot tidy up yet"
+    out["machine"] = args.name
+    if args.json:
+        print(json.dumps(out, indent=2))
+    elif not out.get("ok", True):
+        print(f"✗ {out.get('error')}", file=sys.stderr)
+    elif not out["files"]:
+        print(f"on {where}: no set-aside copy a newer file still holds"
+              + (f"; {_human(out['kept_bytes'])} of copies of what changed stays"
+                 if out["kept_bytes"] else ""))
+    elif args.apply:
+        print(f"on {where}: removed {out['files']} set-aside copies "
+              f"({_human(out['bytes'])}) that a newer file still holds whole; "
+              f"{_human(out['kept_bytes'])} stays")
+    else:
+        print(f"on {where}: {out['files']} set-aside copies ({_human(out['bytes'])}) are "
+              f"held whole by a newer file (a conversation that only grew since) and can "
+              f"go; {_human(out['kept_bytes'])} stays.\n"
+              f"   aht remote tidy{' ' + args.name if args.name else ''} --apply "
+              f"removes them")
+    return 0 if out.get("ok", True) else 1
+
 def cmd_remote(args):
+    if args.action == "tidy" and not args.name:     # this computer: no ssh needed
+        return _remote_tidy(args)
     if not can_reach_machines():
         print(NO_SSH, file=sys.stderr)
         return 2
@@ -15629,6 +15817,8 @@ def cmd_remote(args):
             save_config(cfg)
         print(f"{'removed' if act == 'remove' else 'default is now'}: {args.name}")
         return 0
+    if act == "tidy":
+        return _remote_tidy(args)
     if act == "check":
         names = sorted(remotes_config()) if args.name in (None, "all") and \
             (args.name == "all" or not cfg_get("default_remote")) else [args.name]
@@ -28097,7 +28287,7 @@ def build_parser():
                        "handed over to")
     s.add_argument("action", nargs="?",
                    choices=("list", "add", "remove", "default", "check", "discover", "watch",
-                            "paths"))
+                            "paths", "tidy"))
     s.add_argument("name", nargs="?")
     s.add_argument("target", nargs="?", help="user@host, as ssh takes it")
     s.add_argument("--off", action="store_true", help="with watch: stop watching it")
@@ -28109,6 +28299,8 @@ def build_parser():
     s.add_argument("--add", nargs=2, metavar=("HERE", "THERE"),
                    help="with paths: projects in HERE go to THERE on that machine")
     s.add_argument("--remove", metavar="HERE", help="with paths: drop the rule for HERE")
+    s.add_argument("--apply", action="store_true",
+                   help="with tidy: remove the set-aside copies a newer file still holds")
     s.add_argument("--json", action="store_true")
     s.add_argument("--sandbox", metavar="PATH", help=argparse.SUPPRESS)   # test machines
     s.set_defaults(fn=cmd_remote)

@@ -5961,6 +5961,48 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Machines → Free Up Space…: the copies aht set aside on a machine (when
+    /// a sync or handover replaced a file there) that a newer file still holds
+    /// whole, mostly conversations that only grew; removing them loses nothing.
+    func tidyMachine(_ mc: Machine) {
+        busy("looking at what aht set aside on \(mc.name)…") {
+            let d = ahtJSON(["remote", "tidy", mc.name, "--json"])
+                ?? ["ok": false, "error": "aht gave no answer — see the log (Settings)"]
+            DispatchQueue.main.async {
+                if d["ok"] as? Bool == false {
+                    _ = alert("aht could not look on \(mc.name)", d["error"] as? String ?? "")
+                    return
+                }
+                let files = d["files"] as? Int ?? 0, kept = (d["kept_bytes"] as? NSNumber)?.int64Value ?? 0
+                let stays = kept > 0 ? " \(byteText(kept)) of copies of what changed stays, "
+                    + "as long as aht keeps them." : ""
+                guard files > 0 else {
+                    return _ = alert("Nothing to free on \(mc.name)",
+                                     "No copy aht set aside there is held whole by a newer file." + stays)
+                }
+                let copies = files == 1 ? "1 copy" : "\(files) copies"
+                guard alert("Free \(byteText(d["bytes"])) on \(mc.name)?",
+                            "\(copies) that aht set aside there, when a sync or a handover replaced "
+                            + "a file, are held whole by a newer file: mostly conversations that only "
+                            + "grew since. Removing them loses nothing." + stays,
+                            confirm: "Remove Them") else { return }
+                self.busy("removing them on \(mc.name)…") {
+                    let r = ahtJSON(["remote", "tidy", mc.name, "--apply", "--json"])
+                        ?? ["ok": false, "error": "aht gave no answer — see the log (Settings)"]
+                    DispatchQueue.main.async {
+                        if r["ok"] as? Bool == false {
+                            _ = alert("Not removed on \(mc.name)", r["error"] as? String ?? "")
+                        } else {
+                            let n = r["files"] as? Int ?? 0
+                            _ = alert("\(byteText(r["bytes"])) freed on \(mc.name)",
+                                      (n == 1 ? "1 copy" : "\(n) copies") + " removed.")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Settings' Ask the Machines: each machine's check, for what copies its
     /// files (rsync where it has it, under "auto").
     func askMovers() {
@@ -9796,6 +9838,10 @@ struct MachinesView: View {
                                     .disabled(!m.canReach || !mc.asks)
                                     .help("Your global CLAUDE.md, skills, agents, commands and plugins "
                                           + "to \(mc.name): a handover carries only the project's own")
+                                Button("Free Up Space…") { m.tidyMachine(mc) }
+                                    .disabled(!m.canReach || !mc.asks)
+                                    .help("The copies aht set aside on \(mc.name) that a newer file "
+                                          + "still holds whole")
                                 Button("Remove…") { m.remove(mc) }
                             }
                             .disabled(m.working != nil)

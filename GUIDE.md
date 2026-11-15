@@ -1839,7 +1839,12 @@ below that machine's home folder (`/Users/me/code/shop` here is
 - **Nothing is lost:** whatever a transfer replaces is set aside first, in
   `~/.aht/handover/<project id>/replaced/` here and
   `~/.aht/remote/replaced/` on the other machine. The newest 5 of those
-  folders and every one younger than 30 days are kept.
+  folders and every one younger than 30 days are kept. A copy that the
+  file now in place still begins with, byte for byte, goes right after the
+  transfer: that is a conversation that only grew, so nothing of it is
+  lost. `aht remote tidy homebox` does the same for what earlier versions
+  of aht left there (`--apply` removes them; without a name, on this
+  computer).
 - **What copies the files:** rsync, when this machine has rsync 3, the
   other has rsync, and neither is Windows; otherwise aht's own copy, which
   needs nothing there beyond python3 (on a PC: aht, or Python 3). aht's own
@@ -1959,6 +1964,9 @@ went on.
 - `aht remote` — list your machines; `aht remote watch homebox` watches
   one (`--off` stops); `aht remote default homebox` makes it the one the
   window uses; `aht remote remove homebox` forgets it.
+- `aht remote tidy homebox` — the copies set aside there that a newer file
+  still holds whole, and how much they take; `--apply` removes them.
+  Without a name: on this computer.
 - `aht handover ~/Desktop/paper` — show what would be sent and what stands
   in the way; `--to homebox` names the machine, `--apply` does it.
 - `aht copy-setup homebox` — what of your own Claude Code setup homebox

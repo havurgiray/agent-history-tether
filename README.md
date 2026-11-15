@@ -316,7 +316,9 @@ aht reclaim ~/Desktop/paper --apply      # Take Back: files and history come bac
   sends files in pieces of at most 1 MB, checks each one before it puts
   it in place, and sends only the new end of a file that grew.  Against
   rsync it gives up the delta inside a big changed file and resuming a
-  half-sent one.
+  half-sent one.  Between a Mac and Linux it also moves a folder with an
+  emoji in a name, which macOS's name converter (rsync's `--iconv`)
+  cannot take.
 - **When the link drops.**  A handover cut off halfway is settled at the
   next check: finished when anything happened there, else undone.
   **Release** (`aht reclaim <folder> --release`) lets a project count as

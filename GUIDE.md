@@ -1855,7 +1855,12 @@ below that machine's home folder (`/Users/me/code/shop` here is
   minutes, the copy ends; the files that arrived whole stay, and the next
   sync or handover sends the rest. **Check** says which one each machine
   gets; **Settings → Handover → Copies files with** chooses
-  (`handover_transfer`).
+  (`handover_transfer`). Between a Mac and Linux, a project or folder with
+  a name that holds an emoji goes by aht's own copy even so: rsync turns
+  names with macOS's converter, which refuses such a name on the way out
+  and garbles it on the way in.
+- **A file that cannot go** (one that cannot be read, say) fails Keep in
+  sync, and the project shows why; its conversations still go.
 - **Names whose case changed** there (`readme.md` → `README.md`) come back
   renamed on a Mac; two names that differ only in case are both kept, one
   under the conflict name. Empty folders made there come back too.

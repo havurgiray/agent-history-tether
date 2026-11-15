@@ -108,6 +108,26 @@ if kit.start("rsync") or kit.start("aht"):
            f"remote tidy: this computer's own set-aside copies, a dry run ({d})")
         h.hrun("remote", "tidy", "--apply", "--json")
         ck(not (lrep / "s1.jsonl").exists(), "remote tidy --apply: they go here too")
+
+        # a file that cannot go (rsync's exit 23) does not hold the
+        # conversations back; the sync still fails and says so
+        if os.environ.get("AHT_TRANSFER") == "rsync" and os.geteuid() != 0:
+            locked = Path(proj, "locked.txt")
+            locked.write_text("no\n")
+            os.chmod(locked, 0)
+            with open(st / "s1.jsonl", "a") as fh:
+                fh.write(line(2))
+            time.sleep(1.1)
+            try:
+                r = h.J(h.hrun("mirror", "--run", "--json"))
+            finally:
+                os.chmod(locked, 0o644)
+            row = (r.get("mirrored") or [{}])[0]
+            ck(row.get("status") == "skipped"
+               and "its conversations went" in str(row.get("reason"))
+               and far.read_text().count("\n") == 3,
+               f"a file that cannot go: the conversation still went, and the sync says what "
+               f"failed ({str(row.get('reason'))[:120]})")
     finally:
         kit.stop_stand_ins(h.bhome)
 done()

@@ -436,6 +436,34 @@ def transport_suite():
         ck(r["ok"] and len(mine) == 1 and (nh / mine[0]).read_text() == "v3 from there\n",
            f"…and back here, no twin ({mine})")
 
+        # rsync between a Mac and Linux turns names with macOS's converter,
+        # which stops at U+FFFF: a name with an emoji goes by aht's own copy
+        ck(core._iconv_cannot(["a.txt", key, "日本", "🟩 plan", "x\udcff"]) == ["🟩 plan", "x\udcff"],
+           "names rsync cannot turn between a Mac and Linux: past U+FFFF, or no UTF-8")
+        if core.find_rsync() and os.name != "nt":
+            eh, ef = X / "emoji-here", X / "emoji-far"
+            eh.mkdir()
+            (eh / "plain.txt").write_text("p\n")
+            os.environ["AHT_TRANSFER"] = "rsync"
+            rem._converts_names = lambda: True
+            try:
+                r1 = rem.send(str(eh), str(ef))
+                (eh / "🟩 notes.md").write_text("e\n")
+                r2 = rem.send(str(eh), str(ef))
+                (ef / "🫶🏻.json").write_text("{}\n")
+                r3 = rem.fetch(str(ef), str(eh))
+                (ef / "💰.md").write_text("m\n")
+                r4 = rem.fetch(str(ef), str(eh), entries={"💰.md": "💰.md"})
+            finally:
+                del rem._converts_names
+                os.environ["AHT_TRANSFER"] = "aht"
+            ck([x.get("transfer") for x in (r1, r2, r3, r4)] == ["rsync", "aht", "aht", "aht"]
+               and all(x["ok"] for x in (r1, r2, r3, r4))
+               and (ef / "🟩 notes.md").read_text() == "e\n"
+               and (eh / "🫶🏻.json").read_text() == "{}\n" and (eh / "💰.md").is_file(),
+               "Mac and Linux: rsync, but aht's own copy where a name has an emoji, both "
+               f"ways ({[x.get('transfer') for x in (r1, r2, r3, r4)]})")
+
         # CRLF read as LF (the hash op's norm)
         (X / "crlf.txt").write_bytes(b"one\r\ntwo\r\n" * 70000 + b"\r")
         (X / "lf.txt").write_bytes(b"one\ntwo\n" * 70000 + b"\r")

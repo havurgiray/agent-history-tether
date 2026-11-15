@@ -7769,8 +7769,7 @@ class Remote:
                "--partial-dir=.aht-rsync-partial"]
         if cfg_get("handover_compress", True) and not self.local:
             cmd.append("-z")
-        theirs = str(self.info.get("system") or "")
-        if not self.local and theirs and IS_MAC != (theirs == "Darwin"):
+        if self._converts_names():
             if not rs.get("iconv"):
                 raise HandoverError(f"{rs['path']} cannot convert file names "
                                     "between macOS and Linux — brew install rsync")
@@ -7875,6 +7874,11 @@ class Remote:
         return "rsync" if (os.name != "nt" and theirs != "Windows" and there
                            and find_rsync()) else "aht"
 
+    def _converts_names(self) -> bool:
+        """rsync turns names between a Mac's form and the other system's."""
+        theirs = str(self.info.get("system") or "")
+        return not self.local and bool(theirs) and IS_MAC != (theirs == "Darwin")
+
     def send(self, local_root: str, remote_root: str, *, delete: bool = False,
              aside: str = None, skip=(), protect=(), only=None, update: bool = False,
              add_only: bool = False, dry: bool = False, progress: bool = False) -> dict:
@@ -7886,7 +7890,13 @@ class Remote:
         these keys, or folders ending in "/".  `update`: never over a newer
         file there.  `add_only`: never over any file there.  Stats keep
         rsync's keys: files, bytes, sent, deleted, ok, error."""
-        if self.transfer() == "rsync":
+        names, anchored = _skip_split(skip)
+        mover, here = self.transfer(), None
+        if mover == "rsync" and self._converts_names() and (only is None or only):
+            here = _local_tree(local_root, names, only)
+            if _iconv_cannot(_tree_names(here)):
+                mover = "aht"
+        if mover == "rsync":
             src, dst = local_root.rstrip("/") + "/", self.spec(remote_root.rstrip("/") + "/")
             if only is not None and not only:
                 return _no_stats("rsync")
@@ -7894,10 +7904,9 @@ class Remote:
                            dry=dry, update=update, add_only=add_only, progress=progress,
                            protect=[_rsync_pat(p) for p in protect], **_rsync_only(only))
             return dict(r, transfer="rsync", problems=[])
-        names, anchored = _skip_split(skip)
         if only is not None and not only:
             return _no_stats("aht")
-        plan = _plan_copy(_local_tree(local_root, names, only),
+        plan = _plan_copy(here if here is not None else _local_tree(local_root, names, only),
                           self._far_tree(remote_root, names, only), delete=delete,
                           anchored=anchored, protect=protect, only=only, update=update,
                           add_only=add_only, keep_raw=self._same_system())
@@ -7966,7 +7975,17 @@ class Remote:
                 else:
                     p.unlink()
                 dels.append(k)
-        if not rename and self.transfer() == "rsync":
+        names, anchored = _skip_split(skip)
+        mover, far = "aht" if rename else self.transfer(), None
+        if mover == "rsync" and self._converts_names():
+            if entries is not None:
+                if _iconv_cannot(list(entries) + [v for v in entries.values() if v]):
+                    mover = "aht"
+            elif only is None or only:
+                far = self._far_tree(remote_root, names, only)
+                if _iconv_cannot(_tree_names(far)):
+                    mover = "aht"
+        if mover == "rsync":
             if (entries is not None and not entries) or (only is not None and not only):
                 return dict(_no_stats("rsync"), deleted=len(dels))
             sel = {"files_from": list(entries.values())} if entries is not None \
@@ -7975,11 +7994,10 @@ class Remote:
                            local_root.rstrip("/") + "/", backup_dir=aside, skip=list(skip),
                            update=update, add_only=add_only, progress=progress, **sel)
             return dict(r, transfer="rsync", problems=[], deleted=len(dels))
-        names, anchored = _skip_split(skip)
         if entries is None:
             if only is not None and not only:
                 return dict(_no_stats("aht"), deleted=len(dels))
-            plan = _plan_copy(self._far_tree(remote_root, names, only),
+            plan = _plan_copy(far if far is not None else self._far_tree(remote_root, names, only),
                               _local_tree(local_root, names, only), anchored=anchored,
                               only=only, update=update, add_only=add_only,
                               keep_raw=self._same_system())
@@ -8399,6 +8417,17 @@ def _far_join(root: str, name: str) -> str:
 
 def _top_only(only) -> bool:
     return only is not None and all("/" not in o.rstrip("/") for o in only)
+
+def _tree_names(tree: dict) -> list:
+    return list(tree.get("files") or {}) + list(tree.get("dirs") or [])
+
+def _iconv_cannot(names) -> list:
+    """Names rsync cannot turn between a Mac's form and another system's.
+    macOS's converter (UTF-8-MAC) stops at U+FFFF: a name with an emoji is
+    refused on the way out and comes in garbled.  Nor can it take bytes that
+    are no UTF-8 (Python's escapes for them).  aht's own copy moves those."""
+    return [n for n in names
+            if any(ord(c) > 0xFFFF or 0xDC80 <= ord(c) <= 0xDCFF for c in n)]
 
 def _merge_trees(parts: dict) -> dict:
     """Manifests of some files and folders at the top of one folder ({name:
@@ -11927,8 +11956,14 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
                               skip=handover_skip() + ([RELAYS_REL] if sync else []),
                               protect=() if sync else (RELAYS_REL[1:],),
                               dry=dry, progress=progress)
+    late = None
     if not res["project"]["ok"]:
-        raise HandoverError("sending the project failed: " + res["project"]["error"])
+        late = "sending the project failed: " + res["project"]["error"]
+        # Keep in sync: some files that did not go (rsync's exit 23, a name
+        # aht's copy could not place) do not hold the conversations back; the
+        # sync still fails, with what stayed behind
+        if not (sync and (res["project"].get("rc") == 23 or res["project"].get("problems"))):
+            raise HandoverError(late)
     if store:
         rkey = _key_claude(rpath)
         res["history"] = rem.send(str(store), f"{rclaude}/projects/{rkey}",
@@ -11971,6 +12006,9 @@ def push_project(rem: Remote, uid: str, entry: dict, *, progress: bool = False,
         except HandoverError as _x:
             warn(f"HANDOVER the older set-aside copies on {rem.name} were not pruned: "
                  f"{_errmsg(_x)}")
+    if late:
+        raise HandoverError(late.replace(" failed:", " failed (its conversations went):", 1)
+                            if store else late)
     return res
 
 # ---- mirror ------------------------------------------------------------------ #

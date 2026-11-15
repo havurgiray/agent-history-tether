@@ -69,7 +69,7 @@ ck((tools / "kimi" / "sessions" / md5(projF)).is_dir()
 ck((tools / "claude" / enc(projF)).is_dir(), "claude store restored at NEW key")
 ck(d["cwd_rewrites"] >= 1, "restore re-pointed session cwd values")
 codex_files = list((tools / "codex").rglob("*.jsonl"))
-ck(any(projF in f.read_text() for f in codex_files),
+ck(any(json.dumps(projF)[1:-1] in f.read_text() for f in codex_files),  # as JSON writes it
    "live codex session re-pointed at the restored folder's new path")
 
 done()

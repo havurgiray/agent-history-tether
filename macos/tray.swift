@@ -3403,6 +3403,76 @@ struct SessionListView: Identifiable {
     let items: [SessionItem]
 }
 
+/// A backup of a project's conversations (`aht backup --list`).
+struct BackupItem: Identifiable {
+    var id: String { stamp }
+    let stamp: String
+    let sessions: Int?
+    let took: Double?           // what it added to the backups (an older zip: its size)
+    let store: Bool
+
+    init(_ d: [String: Any]) {
+        stamp = d["stamp"] as? String ?? ""
+        sessions = (d["sessions"] as? NSNumber)?.intValue
+        took = (d["took"] as? NSNumber)?.doubleValue
+        store = d["format"] as? String == "store"
+    }
+
+    /// When it was made, from its stamp (YYYYmmdd-HHMMSS).
+    var date: String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        guard let d = f.date(from: String(stamp.prefix(15))) else { return stamp }
+        let o = DateFormatter()
+        o.dateStyle = .medium
+        o.timeStyle = .short
+        return o.string(from: d)
+    }
+
+    var detail: String {
+        var bits: [String] = []
+        if let n = sessions { bits.append(n == 1 ? "1 session" : "\(n) sessions") }
+        if let t = took {
+            bits.append(store ? "took " + Transfer.human(t) : "an older zip of " + Transfer.human(t))
+        }
+        return bits.joined(separator: " · ")
+    }
+}
+
+/// A session a backup holds (`aht backup --show`).
+struct BackupSession: Identifiable {
+    var id: String { agent + ":" + session }
+    let agent: String
+    let session: String
+    let title: String
+    let updated: Double?
+    let branch: Bool
+
+    init(_ d: [String: Any]) {
+        agent = d["agent"] as? String ?? "claude"
+        session = d["session"] as? String ?? ""
+        title = d["title"] as? String ?? ""
+        updated = (d["updated"] as? NSNumber)?.doubleValue
+        branch = d["branch_of"] as? String != nil
+    }
+}
+
+struct BackupsView: Identifiable {
+    let id = UUID()
+    let project: Project
+    var items: [BackupItem]
+    var shown: String? = nil            // the backup whose sessions show
+    var sessions: [BackupSession] = []
+    var said: String? = nil             // what the last action did
+}
+
+/// The backups of a project, newest first.
+func backupItems(_ path: String) -> [BackupItem] {
+    let d = ahtJSON(["backup", "--list", "--project", path, "--json"]) ?? [:]
+    let snaps = ((d["projects"] as? [[String: Any]])?.first?["snapshots"] as? [[String: Any]]) ?? []
+    return snaps.map(BackupItem.init).reversed()
+}
+
 /// A step of Getting started (`aht getting-started`); ok nil: cannot tell now.
 struct SetupStep: Identifiable {
     let id: String
@@ -3526,6 +3596,7 @@ final class AppModel: ObservableObject {
     @Published var coverageNote: String?        // which projects get no copy at a session start
     @Published var showGettingStarted = false
     @Published var sessionList: SessionListView?
+    @Published var backups: BackupsView?
     @Published var showUpdate = false
     @Published var problems: ProblemsView?      // Recent problems
     @Published var offsite: OffsiteView?        // Fetch Backups From…
@@ -5336,6 +5407,133 @@ final class AppModel: ObservableObject {
         background { aht(["resume-here", path, "--session", session, "--agent", agent]) }
     }
 
+    /// The backups of a project: Projects → More → Backups….
+    func openBackups(_ p: Project) {
+        busy("reading the backups…") {
+            let items = backupItems(p.path)
+            DispatchQueue.main.async { self.backups = BackupsView(project: p, items: items) }
+        }
+    }
+
+    /// Back Up Now, for this one project.
+    func backupThis(_ p: Project) {
+        busy("backing up \(p.name)…") {
+            let d = ahtJSON(["backup", "--project", p.path, "--json"]) ?? [:]
+            let r = (d["results"] as? [[String: Any]])?.first ?? [:]
+            let items = backupItems(p.path)
+            let said: String = {
+                switch r["status"] as? String {
+                case "backed-up": return "Backed up: it took "
+                    + Transfer.human((r["added_bytes"] as? NSNumber)?.doubleValue ?? 0) + "."
+                case "unchanged": return "Nothing changed since its last backup."
+                case "no-history": return "This project has no conversations to back up yet."
+                default: return "The backup did not work: " + (r["error"] as? String ?? "see the log")
+                }
+            }()
+            DispatchQueue.main.async {
+                if self.backups?.project.path == p.path {
+                    self.backups?.items = items
+                    self.backups?.said = said
+                }
+            }
+        }
+    }
+
+    func showBackupSessions(_ b: BackupItem) {
+        guard let v = backups else { return }
+        busy("reading that backup…") {
+            let d = ahtJSON(["backup", "--show", v.project.path, "--stamp", b.stamp, "--json"]) ?? [:]
+            let rows = ((d["sessions"] as? [[String: Any]]) ?? []).map(BackupSession.init)
+            DispatchQueue.main.async {
+                self.backups?.shown = b.stamp
+                self.backups?.sessions = rows
+            }
+        }
+    }
+
+    /// Restore…: what that backup holds and is missing here comes back.
+    func restoreBackup(_ b: BackupItem) {
+        guard let v = backups else { return }
+        guard alert("Restore the backup of \(b.date)?",
+                    "The sessions it holds that are gone here come back, so you can continue "
+                        + "them. Nothing that is here now is changed or replaced.",
+                    confirm: "Restore") else { return }
+        busy("restoring…") {
+            let d = ahtJSON(["restore", v.project.path, "--stamp", b.stamp, "--apply", "--json"]) ?? [:]
+            let added = (d["added"] as? NSNumber)?.intValue ?? 0
+            DispatchQueue.main.async {
+                self.backups?.said = d["status"] as? String != "restored"
+                    ? "Not restored: " + ((d["blockers"] as? [String])?.first ?? "see the log")
+                    : added == 0 ? "Nothing was missing: everything in that backup is here."
+                    : "\(added) file(s) came back."
+            }
+        }
+    }
+
+    /// New Project From This…: a new folder with that backup's conversations,
+    /// and the project's files from then when aht kept a copy of them.
+    func newProjectFromBackup(_ b: BackupItem) {
+        guard let v = backups else { return }
+        busy("looking at that backup…") {
+            let probe = NSTemporaryDirectory() + "aht-new-project-check-\(getpid())"
+            let dry = ahtJSON(["restore", v.project.path, "--stamp", b.stamp, "--into", probe,
+                               "--with-files", "--json"]) ?? [:]
+            let files = !((dry["blockers"] as? [String]) ?? []).contains { $0.contains("no copy") }
+            DispatchQueue.main.async {
+                let panel = NSSavePanel()
+                panel.title = "New Project From a Backup"
+                panel.message = "The new project's folder"
+                panel.prompt = "Make It"
+                panel.nameFieldStringValue = v.project.name + " " + String(b.stamp.prefix(8))
+                panel.directoryURL = URL(fileURLWithPath: (v.project.path as NSString)
+                    .deletingLastPathComponent)
+                panel.canCreateDirectories = true
+                NSApp.activate(ignoringOtherApps: true)
+                guard panel.runModal() == .OK, let url = panel.url else { return }
+                var withFiles = false
+                let a = NSAlert()
+                a.messageText = "Start “\(url.lastPathComponent)” from the backup of \(b.date)?"
+                if files {
+                    a.informativeText = "With its files: the project's files as they were then (the "
+                        + "copy Undo a Session kept), and the conversations. Conversations only: "
+                        + "an empty folder with the conversations, to continue them there. "
+                        + "The project they come from is not touched."
+                    a.addButton(withTitle: "With Its Files")
+                    a.addButton(withTitle: "Conversations Only")
+                } else {
+                    a.informativeText = "The conversations of that backup, in a new folder, to "
+                        + "continue them there; aht kept no copy of the project's files from then. "
+                        + "The project they come from is not touched."
+                    a.addButton(withTitle: "Make It")
+                }
+                a.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+                let pick = a.runModal()
+                if pick == (files ? .alertThirdButtonReturn : .alertSecondButtonReturn) { return }
+                withFiles = files && pick == .alertFirstButtonReturn
+                self.busy("making the new project…") {
+                    let res = ahtJSON(["restore", v.project.path, "--stamp", b.stamp, "--into", url.path,
+                                       "--apply", "--json"] + (withFiles ? ["--with-files"] : [])) ?? [:]
+                    DispatchQueue.main.async {
+                        if let bl = res["blockers"] as? [String], !bl.isEmpty {
+                            _ = alert("No new project", bl.joined(separator: "\n\n"))
+                            return
+                        }
+                        self.backups = nil
+                        let n = (res["sessions"] as? NSNumber)?.intValue ?? 0
+                        let left = (res["left_out"] as? [String] ?? []).map { AGENT_LABEL[$0] ?? $0 }
+                        self.refresh { self.selection = (res["project"] as? String) ?? url.path }
+                        _ = alert("“\(url.lastPathComponent)” is a new project",
+                                  "\(n) session(s) from the backup of \(b.date)"
+                                      + (withFiles ? ", with the project's files from then" : "")
+                                      + ". More → Show Sessions continues one."
+                                      + (left.isEmpty ? "" : " Left out, since their sessions stay "
+                                         + "with the original: " + left.joined(separator: ", ") + "."))
+                    }
+                }
+            }
+        }
+    }
+
     /// Every session of the project, each branch under the session it came from.
     func openSessionList(_ p: Project) {
         busy("reading the sessions…") {
@@ -6248,6 +6446,7 @@ struct MainView: View {
         .sheet(isPresented: $m.showWorkspace) { WorkspaceSheet() }
         .sheet(isPresented: $m.showGettingStarted) { GettingStartedSheet() }
         .sheet(item: $m.sessionList) { v in SessionListSheet(v: v) }
+        .sheet(item: $m.backups) { v in BackupsSheet(v: v) }
         .sheet(isPresented: $m.showUpdate) { UpdateSheet() }
         .sheet(item: $m.problems) { _ in ProblemsSheet() }
         .sheet(item: $m.offsite) { _ in FetchBackupsSheet() }
@@ -7624,6 +7823,7 @@ struct MoreMenu: View {
             Button("Show Sessions…") { m.openSessionList(p) }
             Button("What Changed…") { m.openChanges(p) }
             Button("Undo a Session…") { m.openUndo(p) }
+            Button("Backups…") { m.openBackups(p) }
             Button("Journal") { m.journal(p) }
             Button("AI-Use Statement") { m.statement(p) }
             Button("Share a Session…") { m.share(p) }
@@ -8850,6 +9050,96 @@ struct UndoSheet: View {
 
 /// A project's sessions, the latest work first, each branch indented under
 /// the session it came from; any of them can be continued.
+struct BackupsSheet: View {
+    @EnvironmentObject var m: AppModel
+    let v: BackupsView
+
+    func stamp(_ t: Double?) -> String {
+        guard let t = t, t > 0 else { return "—" }
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f.string(from: Date(timeIntervalSince1970: t))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                headed("Backups: \(v.project.name)", "Backups, and bringing a session back")
+                Spacer()
+                Button("Back Up Now") { m.backupThis(v.project) }
+                    .help("A backup of this project's conversations now; it takes only what is new")
+            }
+            Text("aht backs up this project's conversations, of every agent, while you work. "
+                 + "It keeps all from the last two days, then one a day for two weeks, one a "
+                 + "week for three months and one a month for a year. A backup takes only "
+                 + "what is new since the one before, and a picture once.")
+                .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let s = v.said {
+                Text(s).font(.callout).foregroundColor(.accentColor)
+            }
+            Divider()
+            if v.items.isEmpty {
+                Text("No backup of this project yet. Back Up Now makes one.").foregroundColor(.secondary)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(v.items) { b in
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(b.date).fontWeight(v.shown == b.stamp ? .semibold : .regular)
+                                Text(b.detail).font(.caption).foregroundColor(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            Button("Sessions") { m.showBackupSessions(b) }
+                                .help("The sessions this backup holds")
+                            Button("Restore…") { m.restoreBackup(b) }
+                                .help("Bring back what it holds and is gone here; nothing here is changed")
+                            Button("New Project From This…") { m.newProjectFromBackup(b) }
+                                .help("A new folder with these conversations, and the project's files "
+                                      + "from then when aht kept a copy")
+                        }
+                        .padding(.vertical, 6)
+                        Divider()
+                    }
+                }
+            }
+            .frame(maxHeight: v.shown == nil ? .infinity : 220)
+            if let shown = v.shown, let b = v.items.first(where: { $0.stamp == shown }) {
+                Text("In the backup of \(b.date): \(v.sessions.count) session(s)").font(.headline)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(v.sessions) { s in
+                            HStack(spacing: 8) {
+                                if s.branch {
+                                    Image(systemName: "arrow.triangle.branch").foregroundColor(.secondary)
+                                        .help("A branch of another session")
+                                }
+                                Text(s.title.isEmpty ? "(no title)" : s.title).lineLimit(1)
+                                if s.agent != "claude" {
+                                    Text(AGENT_LABEL[s.agent] ?? s.agent).font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer(minLength: 8)
+                                Text("last active " + stamp(s.updated)).font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text(String(s.session.prefix(8))).font(.caption.monospaced())
+                                    .foregroundColor(.secondary).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Close") { m.backups = nil }.keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 760, height: 560)
+    }
+}
+
 struct SessionListSheet: View {
     @EnvironmentObject var m: AppModel
     let v: SessionListView
@@ -11837,6 +12127,9 @@ struct CornerView: View {
             Button("Go to Tab") { act(r, "goto") }
             Button("Branch…" + r.later) { act(r, "branch") }.disabled(r.busy)
             Divider()
+            Button("Back Up This Project Now") { act(r, "backup-now") }
+            Button("Backups of This Project…") { act(r, "backups") }
+            Divider()
             if c.machines.isEmpty {
                 Button("Send to Another Machine (add one in the Machines tab first)") {}
                     .disabled(true)
@@ -11933,6 +12226,7 @@ final class CornerPanel {
     private var size = CGSize.zero
     var onHide: () -> Void = {}
     var onTakeBack: (String) -> Void = { _ in }      // the window's Take Back on that project
+    var onBackups: (String) -> Void = { _ in }       // the window's Backups of that project
 
     var shown: Bool { panel?.isVisible ?? false }
     /// The chimes need the sessions watched while the list is hidden, too.
@@ -12116,9 +12410,31 @@ final class CornerPanel {
         switch what {
         case "goto", "open": open(r)
         case "take-back": onTakeBack(r.project)
+        case "backups": onBackups(r.project)
+        case "backup-now": backupNow(r)
         case "branch": branch(r)
         default:
             if what.hasPrefix("send:") { send(r, String(what.dropFirst(5))) }
+        }
+    }
+
+    /// Back Up This Project Now: what it took, under the list's top line.
+    private func backupNow(_ r: CornerRow) {
+        model.say("Backing up “\(r.name)”…", for: 120)
+        place(force: true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(["backup", "--project", r.project, "--json"]) ?? [:]
+            let x = (d["results"] as? [[String: Any]])?.first ?? [:]
+            let said: String = {
+                switch x["status"] as? String {
+                case "backed-up": return "backed up; it took "
+                    + Transfer.human((x["added_bytes"] as? NSNumber)?.doubleValue ?? 0)
+                case "unchanged": return "nothing changed since its last backup"
+                default: return "not backed up: " + (x["error"] as? String
+                    ?? (d.isEmpty ? "it is in no project aht tracks" : "see the log"))
+                }
+            }()
+            DispatchQueue.main.async { self.tell(r, said) }
         }
     }
 
@@ -12457,6 +12773,19 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         }
         corner.onHide = { [weak self] in
             self?.model.set("session_corner", "false")
+        }
+        corner.onBackups = { [weak self] path in
+            guard let self = self else { return }
+            self.openWindow()
+            self.model.tab = .projects
+            self.model.refresh {
+                // the project the session's folder is in
+                guard let p = self.model.projects
+                    .filter({ path == $0.path || path.hasPrefix($0.path + "/") })
+                    .max(by: { $0.path.count < $1.path.count }) else { return }
+                self.model.selection = p.path
+                self.model.openBackups(p)
+            }
         }
         corner.onTakeBack = { [weak self] path in
             guard let self = self else { return }

@@ -80,7 +80,7 @@ function bytes(n) {
 
 // What the window opens on, when the tray opened it for one project
 // (Projects brought here ▸ Send Back…, the session corner's Take Back…):
-// p=<its path>&do=show|send-back|take-back
+// p=<its path>&do=show|send-back|take-back|backups
 // after #, read before the address is cleaned below.
 const GO = (() => {
   try {
@@ -748,6 +748,7 @@ function detail() {
       ["Show Sessions…", () => openSessionList(p)],
       ["What Changed…", () => openChanges(p)],
       ["Undo a Session…", () => openUndo(p)],
+      ["Backups…", () => openBackups(p)],
       ["Journal", () => openJournal(p)],
       ["AI-Use Statement", () => openStatement(p)],
       ["Share a Session…", () => share(p)],
@@ -1573,6 +1574,90 @@ async function openSessionList(p) {
   const n = items.filter((x) => x.branched).length;
   s.foot.append(h("span", { class: "dim small", text: plural(items.length, "session") + (n ? `, ${n} of them branches` : "") }),
     h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+}
+
+/** When a backup was made, from its stamp (YYYYmmdd-HHMMSS…). */
+function stampDate(st) {
+  const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(st || "");
+  return m ? when(new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() / 1000) : st;
+}
+
+/** Projects → More → Backups…: a project's backups, newest first, each with
+ * its sessions, Restore… and New Project From This…. */
+async function openBackups(p, said) {
+  const d = await busy("reading the backups…", () => J("backup", "--list", "--project", p.real_path, "--json"));
+  const items = (((d.projects || [])[0] || {}).snapshots || []).slice().reverse();
+  const s = sheet(`Backups: ${base(p.real_path)}`, "Backups, and bringing a session back", 860);
+  s.body.append(h("p", { class: "dim", text: "aht backs up this project's conversations, of every agent, while you work. It keeps all from the last two days, then one a day for two weeks, one a week for three months and one a month for a year. A backup takes only what is new since the one before, and a picture once." }));
+  if (said) s.body.append(h("p", { class: "okc", text: said }));
+  const list = h("div", { class: "sessions" }), detail = h("div");
+  for (const b of items) {
+    const bits = [b.sessions != null ? plural(b.sessions, "session") : null,
+      b.took != null ? (b.format === "store" ? "took " : "an older zip of ") + sizeText(b.took) : null];
+    list.append(h("div", { class: "s" },
+      h("div", { class: "grow" }, h("strong", { text: stampDate(b.stamp) }),
+        h("div", { class: "dim small", text: bits.filter(Boolean).join(" · ") })),
+      h("button", { text: "Sessions", onclick: () => backupSessions(p, b, detail) }),
+      h("button", { text: "Restore…", onclick: () => restoreBackup(p, b) }),
+      h("button", { text: "New Project From This…", onclick: () => newProjectFromBackup(p, b) })));
+  }
+  if (!items.length) list.append(h("p", { class: "dim", text: "No backup of this project yet. Back Up Now makes one." }));
+  s.body.append(list, detail);
+  s.foot.append(h("button", { text: "Back Up Now", onclick: async () => {
+    const r = await busy("backing up…", () => J("backup", "--project", p.real_path, "--json"));
+    const x = (r.results || [])[0] || {};
+    openBackups(p, x.status === "backed-up" ? `Backed up: it took ${sizeText(x.added_bytes || 0)}.`
+      : x.status === "unchanged" ? "Nothing changed since its last backup." : "Not backed up: " + (x.error || problems(r) || "see the log"));
+  } }), h("span", { class: "spacer" }), h("button", { text: "Close", class: "primary", onclick: closeSheet }));
+}
+
+async function backupSessions(p, b, box) {
+  const d = await busy("reading that backup…", () => J("backup", "--show", p.real_path, "--stamp", b.stamp, "--json"));
+  clear(box).append(h("h2", { text: `In the backup of ${stampDate(b.stamp)}: ${plural((d.sessions || []).length, "session")}` }));
+  for (const x of d.sessions || []) {
+    box.append(h("div", { class: "row small" }, x.branch_of ? h("span", { class: "branch", text: "⑂", title: "A branch of another session" }) : null,
+      h("span", { class: "ellipsis grow", text: x.title || "(no title)" }),
+      x.agent !== "claude" ? h("span", { class: "dim", text: AGENTS[x.agent] || x.agent }) : null,
+      h("span", { class: "dim", text: "last active " + (x.updated ? when(x.updated) : "—") }),
+      h("span", { class: "dim mono", text: (x.session || "").slice(0, 8) })));
+  }
+}
+
+async function restoreBackup(p, b) {
+  if (!(await confirmIt(`Restore the backup of ${stampDate(b.stamp)}?`, "The sessions it holds that are gone here come back, so you can continue them. Nothing that is here now is changed or replaced.", "Restore"))) return;
+  const r = await busy("restoring…", () => J("restore", p.real_path, "--stamp", b.stamp, "--apply", "--json"));
+  openBackups(p, r.status !== "restored" ? "Not restored: " + (problems(r) || "see the log")
+    : !r.added ? "Nothing was missing: everything in that backup is here." : `${plural(r.added, "file")} came back.`);
+}
+
+async function newProjectFromBackup(p, b) {
+  const sep = p.real_path.includes("\\") ? "\\" : "/";
+  const parent = p.real_path.slice(0, p.real_path.lastIndexOf(sep));
+  const path = h("input", { type: "text", value: `${parent}${sep}${base(p.real_path)} ${b.stamp.slice(0, 8)}`, style: "flex:1;min-width:300px" });
+  const probe = await busy("looking at that backup…", () => J("restore", p.real_path, "--stamp", b.stamp, "--into", path.value + " (check)", "--with-files", "--json"));
+  const files = !(probe.blockers || []).some((x) => x.includes("no copy"));
+  const withFiles = h("input", { type: "checkbox", checked: files, disabled: !files });
+  const s = sheet(`New project from the backup of ${stampDate(b.stamp)}`, "Backups, and bringing a session back", 680);
+  const said = h("div");
+  s.body.append(h("p", { text: "A new folder with this backup's conversations, to continue them there. The project they come from is not touched." }),
+    h("div", { class: "row" }, "Folder:", path, h("button", { text: "Choose Where…", onclick: async () => {
+      const where = await pickFolder("Where the new project goes");
+      if (where) path.value = where + sep + path.value.split(/[\\/]/).pop();
+    } })),
+    h("label", { class: "check" }, withFiles, files ? "With the project's files as they were then (the copy Undo a Session kept)"
+      : "With the project's files: aht kept no copy of them from then"), said);
+  const go = h("button", { class: "primary", text: "Make It", onclick: async () => {
+    go.disabled = true;
+    const r = await busy("making the new project…", () => J("restore", p.real_path, "--stamp", b.stamp, "--into", path.value.trim(), "--apply", "--json", ...(withFiles.checked ? ["--with-files"] : [])));
+    go.disabled = false;
+    if (!r.applied) return clear(said).append(h("p", { class: "warn", text: problems(r) || "aht could not make it." }));
+    closeSheet();
+    await refresh();
+    S.selection = r.project; draw();
+    tell(`${base(r.project)} is a new project`, `${plural(r.sessions || 0, "session")} from the backup of ${stampDate(b.stamp)}${withFiles.checked ? ", with the project's files from then" : ""}. More → Show Sessions continues one.`
+      + ((r.left_out || []).length ? ` Left out, since their sessions stay with the original: ${r.left_out.map((a) => AGENTS[a] || a).join(", ")}.` : ""));
+  } });
+  s.foot.append(h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), go);
 }
 
 function textSheet(title, text, topic, extra) {
@@ -4272,6 +4357,8 @@ function openOn(go) {
   if (go.do === "send-back" && !(p && pcHomeMute(copyOf(p)))) sendBack(p || { real_path: go.path, exists: true });
   // the session corner's Take Back…: the project's own Take Back, as its row offers it
   if (go.do === "take-back" && p && (awayOf(p) || {}).take) takeBack(p);
+  // the session corner's Backups of This Project…
+  if (go.do === "backups" && p) openBackups(p);
 }
 async function start() {
   $("#guide-btn").addEventListener("click", () => openGuide(null));

@@ -182,12 +182,13 @@ with tempfile.TemporaryDirectory() as td:
     idle = C.Row(id="s", pid=5, name="n", kind="here", status="idle", state="idle")
     busy = C.Row(id="s", pid=5, name="n", kind="here", status="busy", state="working")
     acts = [x[1] for x in C.menu_items(idle, ["homebox", "pc"]) if x != "-"]
-    ck("an idle session: Go to Tab, Branch, Send to each machine, Hide",
-       acts == ["goto", "branch", "send:homebox", "send:pc", "hide"], acts)
+    ck("an idle session: Go to Tab, Branch, its project's backups, Send to each machine, Hide",
+       acts == ["goto", "branch", "backup-now", "backups", "send:homebox", "send:pc", "hide"], acts)
     labels = [x[0] for x in C.menu_items(busy, ["homebox"]) if x != "-"]
     grey = [x[1] for x in C.menu_items(busy, ["homebox"]) if x != "-"]
     ck("a working one: Branch and Send wait, and say so",
-       grey == ["goto", None, None, "hide"] and "once it has finished" in labels[1], labels)
+       grey == ["goto", None, "backup-now", "backups", None, "hide"]
+       and "once it has finished" in labels[1], labels)
     ck("no machine set up: Send says where to add one",
        any("add one in aht's window" in x[0] for x in C.menu_items(idle, []) if x != "-"))
     away = C.Row(id="away:x", name="paper", kind="away", can_open=False, machine="pc")

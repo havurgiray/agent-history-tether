@@ -74,7 +74,7 @@ COMMAND_NEEDS = {"attach": ("--window", "--peek", "--print")}
 # what the window may open on (the tray's Projects brought here ▸ Send Back…):
 # AHT_WINDOW_PROJECT=<a folder> and AHT_WINDOW_DO=<one of these> in the
 # environment of `aht window`, passed on through /open to the page, after #
-OPEN_DO = ("show", "send-back", "take-back")   # the last: the session corner's menu
+OPEN_DO = ("show", "send-back", "take-back", "backups")   # the last: the session corner's menu
 
 
 def open_hint(env=None) -> str:

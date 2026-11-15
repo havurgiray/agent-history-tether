@@ -343,7 +343,7 @@ def tip_text(r: Row) -> str:
 def menu_items(r: Row, machines: list) -> list:
     """The right-click menu of a session: [(label, action or None for grayed,
     is default)], "-" for a line between.  Actions: "goto", "branch",
-    "send:<machine>", "open", "take-back", "hide"."""
+    "backup-now", "backups", "send:<machine>", "open", "take-back", "hide"."""
     if r.transfer:
         return [("Open Session (once it is there)" if r.transfer.get("kind") != "reclaim"
                  else "Go to Tab (once it is back)", None, False), "-",
@@ -354,7 +354,9 @@ def menu_items(r: Row, machines: list) -> list:
     busy = r.status in WORKING or r.status == "waiting"
     later = " (once it has finished)" if r.status in WORKING else \
         " (answer it first)" if r.status == "waiting" else ""
-    out = [("Go to Tab", "goto", True), ("Branch…" + later, None if busy else "branch", False)]
+    out = [("Go to Tab", "goto", True), ("Branch…" + later, None if busy else "branch", False),
+           "-", ("Back Up This Project Now", "backup-now", False),
+           ("Backups of This Project…", "backups", False)]
     if machines:
         out.append("-")
         out += [(f"Send to {m}…" + later, None if busy else "send:" + m, False) for m in machines]
@@ -983,6 +985,16 @@ class Corner:
         if what == "take-back":
             self.hooks["open_window"](r.project, "take-back")
             return
+        if what == "backups":
+            _uid, root = aht.project_holding(r.project)
+            if root:
+                self.hooks["open_window"](root, "backups")
+            else:
+                self.say(f"{r.name}: its folder is in no project aht tracks")
+            return
+        if what == "backup-now":
+            self.backup_now(r)
+            return
         self.m.seen(r.id)
         self.tick()
         try:
@@ -1007,6 +1019,27 @@ class Corner:
             self._aside(r, lambda: aht.branch_session(str(r.pid), name, apply=True))
         elif what.startswith("send:"):
             self.send(r, what[5:])
+
+    def backup_now(self, r: Row):
+        """Back Up This Project Now: what it took, under the top line."""
+        self.say(f"Backing up “{r.name}”…", 120)
+
+        def go():
+            uid, _root = aht.project_holding(r.project)
+            if not uid:
+                said = "its folder is in no project aht tracks"
+            else:
+                try:
+                    x = (aht.backup_pass(only_uid=uid) or [{}])[0]
+                except Exception as e:
+                    self.hooks["note"]("the corner's backup failed", e)
+                    x = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+                said = ({"backed-up": f"backed up; it took {aht._human(x.get('added_bytes') or 0)}",
+                         "unchanged": "nothing changed since its last backup",
+                         "no-history": "no conversations to back up yet"}
+                        .get(x.get("status")) or f"not backed up: {x.get('error') or 'see the log'}")
+            self.post(lambda: self.say(f"{r.name}: {said}"))
+        threading.Thread(target=go, daemon=True).start()
 
     def send(self, r: Row, to: str):
         self.say(f"Checking {to} for “{r.name}”…", 300)

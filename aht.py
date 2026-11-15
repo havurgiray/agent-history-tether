@@ -1477,6 +1477,21 @@ def orphan_history_dirs(reg: dict) -> list:
 # Markers
 # --------------------------------------------------------------------------- #
 
+def project_holding(folder: str) -> tuple:
+    """(id, folder) of the tracked project a folder is in (itself or the
+    nearest folder above with aht's marker, up to the home folder), else
+    (None, None): a session's working folder can be one inside its project."""
+    p = os.path.realpath(folder)
+    home = os.path.realpath(str(Path.home()))
+    while True:
+        uid = read_marker(p)
+        if uid:
+            return uid, p
+        up = os.path.dirname(p)
+        if p == home or up == p:
+            return None, None
+        p = up
+
 def read_marker(folder: str) -> str | None:
     for rel in (MARKER_REL, LEGACY_MARKER_REL):
         mp = Path(folder) / rel
@@ -2811,7 +2826,7 @@ def migrate_backups(apply: bool = False, say=None) -> dict:
     res["bytes_now"] = _store_bytes(root) if root.is_dir() else 0
     return res
 
-_TS = re.compile(rb'"timestamp":"([0-9T:.\-]+Z?)"')
+_TS = re.compile(rb'"timestamp"\s*:\s*"([0-9T:.\-]+Z?)"')
 
 def snapshot_sessions(snap: dict) -> list:
     """The sessions one backup holds: agent, id, title, first and last
@@ -4650,8 +4665,9 @@ def cmd_backup(args):
         return 1 if res["problems"] else 0
 
     if args.show:
-        real = os.path.realpath(args.show)
-        uid = args.uuid or read_marker(real)
+        uid, real = project_holding(args.show)
+        real = real or os.path.realpath(args.show)
+        uid = args.uuid or uid
         snaps = _snapshots(uid) if uid else []
         snap = next((m for m in snaps if m["stamp"] == args.stamp), None) if args.stamp \
             else (snaps[-1] if snaps else None)
@@ -4678,7 +4694,7 @@ def cmd_backup(args):
         root = backups_root()
         if root.is_dir():
             for d in sorted(p for p in root.iterdir() if p.is_dir()):
-                if args.project and d.name != (read_marker(os.path.realpath(args.project)) or ""):
+                if args.project and d.name != (project_holding(args.project)[0] or ""):
                     continue
                 snaps = _snapshots(d.name)
                 if not snaps:
@@ -4750,10 +4766,10 @@ def cmd_backup(args):
     if args.uuid:
         only = args.uuid
     elif args.project:
-        real = os.path.realpath(args.project)
-        only = read_marker(real)
+        only, real = project_holding(args.project)
         if not only:
-            print(f"error: no aht marker in {real}", file=sys.stderr)
+            print(f"error: {os.path.realpath(args.project)} is in no project aht tracks",
+                  file=sys.stderr)
             return 2
 
     try:
@@ -4852,8 +4868,9 @@ def new_project_from_backup(uid: str, stamp: str, target: str, with_files: bool 
 
 def cmd_restore(args):
     if getattr(args, "into", None):
-        real = os.path.realpath(args.path)
-        uid = args.uuid or read_marker(real)
+        uid, real = project_holding(args.path)
+        real = real or os.path.realpath(args.path)
+        uid = args.uuid or uid
         if not uid:
             print(f"error: {real} has no aht marker; name the project with --uuid",
                   file=sys.stderr)

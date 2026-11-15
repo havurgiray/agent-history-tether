@@ -1006,19 +1006,37 @@ class Corner:
         elif what == "open":
             self._aside(r, lambda: aht.open_away(r.project))
         elif what == "branch":
-            dry = aht.branch_session(str(r.pid))
-            if dry["blockers"]:
-                self.say(f"{r.name}: {dry['blockers'][0]}")
-                return
-            name = ask_text(self.hwnd, f"Branch “{r.name}”",
-                            "The branch opens in a new tab with the conversation so far; "
-                            "this session goes on as it is. Name of the new branch:",
-                            dry["name"], "Branch", self.p.s if self.p else 1)
-            if name is None:
-                return
-            self._aside(r, lambda: aht.branch_session(str(r.pid), name, apply=True))
+            self.branch(r)
         elif what.startswith("send:"):
             self.send(r, what[5:])
+
+    def branch(self, r: Row):
+        """Branch…: its look ahead asks the terminal (PowerShell), so it runs
+        aside; the name box then opens on the window's thread."""
+        self.say(f"Getting “{r.name}” ready to branch…", 60)
+
+        def look():
+            try:
+                dry = aht.branch_session(str(r.pid))
+            except Exception as e:
+                self.hooks["note"]("the corner's Branch failed", e)
+                dry = {"blockers": [f"{type(e).__name__}: {e}"]}
+            self.post(lambda: self._branch_name(r, dry))
+        threading.Thread(target=look, daemon=True).start()
+
+    def _branch_name(self, r: Row, dry: dict):
+        self.m.note = None
+        self.place()
+        if dry.get("blockers"):
+            self.say(f"{r.name}: {dry['blockers'][0]}")
+            return
+        name = ask_text(self.hwnd, f"Branch “{r.name}”",
+                        "The branch opens in a new tab with the conversation so far; "
+                        "this session goes on as it is. Name of the new branch:",
+                        dry["name"], "Branch", self.p.s if self.p else 1)
+        if name is None:
+            return
+        self._aside(r, lambda: aht.branch_session(str(r.pid), name, apply=True))
 
     def backup_now(self, r: Row):
         """Back Up This Project Now: what it took, under the top line."""

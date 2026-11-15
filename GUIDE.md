@@ -1800,7 +1800,9 @@ below that machine's home folder (`/Users/me/code/shop` here is
   output styles over, where they are missing or differ there, and installs
   the plugins you turned on from their marketplaces, with Claude Code's own
   `claude plugin` there. What it replaces there is set aside first, in
-  aht's folder there; what only that machine has stays. Hooks, the status
+  aht's folder there; what only that machine has stays. A skill or agent
+  kept elsewhere and linked into `~/.claude` goes as what it holds, since
+  the link would point nowhere there. Hooks, the status
   line and MCP servers are listed, not copied: they run programs of this
   computer, by its paths, and may hold keys. aht's own hooks come with aht
   wherever it is installed. Run it again after you change your setup.

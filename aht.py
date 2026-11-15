@@ -11063,7 +11063,7 @@ def _tree_digest(p: Path) -> str:
                 continue
             fp = Path(dp) / f
             try:
-                h.update(_nfc(str(fp.relative_to(p))).encode() + b"\0"
+                h.update(_nfc(fp.relative_to(p).as_posix()).encode() + b"\0"   # one form on every system
                          + file_sha256(fp, 32 << 20).encode() + b"\n")
             except OSError:
                 continue        # gone meanwhile, or unreadable: as if not there
@@ -11209,12 +11209,26 @@ def copy_setup(name: str, apply: bool = False) -> dict:
             names = files[d][0] + files[d][1]
             if not names:
                 continue
+            # one kept elsewhere and linked here goes as what it holds: the
+            # link would point nowhere there
+            linked = {n: (home / d / n).resolve() for n in names if (home / d / n).is_symlink()}
+            plain = [n for n in names if n not in linked]
             rem.agent("prepare", dirs=[f"{rhome}/{d}"])
-            r = rem.send(str(home / d), f"{rhome}/{d}", delete=True, aside=f"{aside}/{d}",
-                         skip=handover_skip(),
-                         only=[n + "/" if (home / d / n).is_dir() else n for n in names])
-            if not r.get("ok", True):
-                raise HandoverError(f"{d}: " + str(r.get("error")))
+            sends = [(str(home / d), f"{rhome}/{d}", d,
+                      [n + "/" if (home / d / n).is_dir() else n for n in plain])] if plain else []
+            for n, real in linked.items():
+                if real.is_dir():
+                    sends.append((str(real), f"{rhome}/{d}/{n}", f"{d}/{n}", None))
+                elif real.is_file() and real.name == n:
+                    sends.append((str(real.parent), f"{rhome}/{d}", d, [n]))
+                else:
+                    res["warnings"].append(f"{d}/{n} links to a file of another name, so it "
+                                           "is left out")
+            for src, dst, part, only in sends:
+                r = rem.send(src, dst, delete=True, aside=f"{aside}/{part}",
+                             skip=handover_skip(), only=only)
+                if not r.get("ok", True):
+                    raise HandoverError(f"{part}: " + str(r.get("error")))
         if g["plugins"] and (rem.info or {}).get("claude"):
             got = rem.agent("claude-plugins", timeout=1200, plugins=g["plugins"],
                             marketplaces={m: here["marketplaces"].get(m)

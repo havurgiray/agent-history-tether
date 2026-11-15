@@ -44,10 +44,17 @@ if kit.start("aht"):
            and "MCP server papers" in note and "aht copy-setup box" in note
            and "same" not in note.split("skill commit")[0],
            f"hand over, dry run: what box lacks of your own setup, and how to bring it ({note or hd})")
+        # a skill and an agent kept elsewhere and linked here
+        dots = sb / "dotfiles"
+        (dots / "linked").mkdir(parents=True)
+        (dots / "linked" / "SKILL.md").write_text("linked one")
+        (dots / "lnk.md").write_text("a linked agent")
+        os.symlink(dots / "linked", here / "skills" / "linked")
+        os.symlink(dots / "lnk.md", here / "agents" / "lnk.md")
         d = h.J(h.hrun("copy-setup", "box", "--json"))
         ck(not d.get("applied") and d.get("claude_md") == "missing"
-           and d.get("copy", {}).get("skills") == [] and d["replace"]["skills"] == ["commit"]
-           and d["copy"]["agents"] == ["rev.md"] and d.get("plugins") == ["tool@market"]
+           and d.get("copy", {}).get("skills") == ["linked"] and d["replace"]["skills"] == ["commit"]
+           and d["copy"]["agents"] == ["lnk.md", "rev.md"] and d.get("plugins") == ["tool@market"]
            and d.get("marketplaces") == ["market"]
            and d["left_out"] == {"hooks": ["Stop: x.py"], "status_line": True, "mcp": ["papers"]}
            and not (there / "CLAUDE.md").exists(),
@@ -62,6 +69,11 @@ if kit.start("aht"):
            and [x.get("plugin") for x in d.get("plugin_results", []) if x.get("ok")] == ["tool@market"],
            f"copy-setup --apply: copied, the one it replaced set aside there, theirs kept, the "
            f"plugin installed there ({d}, {aside})")
+        ck(not (there / "skills" / "linked").is_symlink()
+           and (there / "skills" / "linked" / "SKILL.md").read_text() == "linked one"
+           and not (there / "agents" / "lnk.md").is_symlink()
+           and (there / "agents" / "lnk.md").read_text() == "a linked agent",
+           "copy-setup --apply: a linked skill folder and agent go as what they hold, not as links")
         d = h.J(h.hrun("copy-setup", "box", "--json"))
         ck(d.get("claude_md") is None and not any(d["copy"].values())
            and not any(d["replace"].values()),

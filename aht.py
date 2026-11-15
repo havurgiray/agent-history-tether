@@ -26892,6 +26892,26 @@ def send_session(target: str, to: str, apply: bool = False) -> dict:
         res["blockers"] += done["blockers"]
         return res
     time.sleep(0.5)                     # the shell gets its prompt back
+    # what the session started can outlive it (a server started with nohup);
+    # the handover would then stop in its tab with the session gone, so the
+    # session comes back in its tab instead
+    left = []
+    for _ in range(12):
+        act = activity_in(real)
+        left = act["processes"] + [x for x in act["sessions"] if x["pid"] != pid]
+        if not left:
+            break
+        time.sleep(0.5)
+    if left:
+        names = ", ".join(sorted({f"{x.get('name') or 'claude'} ({x['pid']})" for x in left}))
+        back = term.restart_line(row, [])
+        res["blockers"].append(
+            f"still running in this folder after the session ended: {names} — stop them, "
+            + ("then send it again; the session is back in its tab"
+               if back and term.type_line(key, back) else
+               f"then send it again; resume the session with: {back}"))
+        log(f"SESSION {sid} ({real}) not sent to {to}: {names} still ran there")
+        return res
     res["applied"] = term.type_line(key, line)
     if not res["applied"]:
         res["blockers"].append("the session ended here, but aht could not type into its tab; "

@@ -1014,7 +1014,10 @@ with its ×.
     that same tab then shows the session running on the other machine
     (with mosh on both, the connection outlasts a network that drops; on
     a PC, a dropped connection ends the tab, and the session keeps working
-    there). Close the laptop: the session keeps working there.
+    there). Close the laptop: the session keeps working there. If
+    something the session started still runs in the folder once it ended
+    (a server started with `nohup`), nothing is sent: the session comes
+    back in its tab, and aht names what to stop first.
   - **Back Up This Project Now** and **Backups of This Project…** (see
     *Backups, and bringing a session back*).
   - Branch and Send wait while a session works or waits for you, and say

@@ -660,4 +660,59 @@ ck(st.get("autoContinueAtUsageLimit") is True and st.get("remoteControlAtStartup
    and JS("limits", "--json").get("auto_continue") is True,
    "limits --auto-continue: Claude Code's setting, the others left as they were")
 
+# Send, once the session ended: what it started that still runs keeps the
+# project here, and the session comes back in its tab; else the handover goes
+typed = []
+
+
+class _Term:
+    name = "Stand-in"
+
+    def pane_of_pids(self, pids):
+        return {pids[0]: "pane"}
+
+    def restart_line(self, row, flags):
+        return "claude --resume s9"
+
+    def command_line(self, key, argv):
+        return "handover-line"
+
+    def type_line(self, key, line):
+        typed.append(line)
+        return True
+
+
+class _Ran:
+    stdout = json.dumps({"blockers": [], "warnings": []})
+
+
+left = [{"pid": 777, "name": "node"}]
+fakes = {"_resolve_open": lambda t: {"pid": 4242, "session": "s9", "cwd": str(sb)},
+         "_not_now": lambda s, what: None, "remotes_config": lambda: {"box": {}},
+         "terminal": lambda: _Term(), "_session_label": lambda s: "s9",
+         "session_checkup": lambda: [{"pid": 4242, "in_terminal": True}],
+         "close_session": lambda pid, apply=False: {"applied": True, "blockers": []},
+         "activity_in": lambda p: {"sessions": [], "processes": list(left)}}
+kept = {k: getattr(_core22, k) for k in fakes}
+run_was, sleep_was = _core22.subprocess.run, _core22.time.sleep
+try:
+    for k, v in fakes.items():
+        setattr(_core22, k, v)
+    _core22.subprocess.run = lambda *a, **k: _Ran()
+    _core22.time.sleep = lambda s: None
+    r1 = _core22.send_session("4242", "box", apply=True)
+    typed1 = list(typed)
+    left.clear()
+    typed.clear()
+    r2 = _core22.send_session("4242", "box", apply=True)
+finally:
+    for k, v in kept.items():
+        setattr(_core22, k, v)
+    _core22.subprocess.run, _core22.time.sleep = run_was, sleep_was
+ck(not r1["applied"] and "node (777)" in " ".join(r1["blockers"])
+   and "back in its tab" in " ".join(r1["blockers"]) and typed1 == ["claude --resume s9"]
+   and r2["applied"] and typed == ["handover-line"],
+   f"send: what the session started and still runs keeps the project here, the session "
+   f"comes back; else the handover goes ({r1['blockers']}, {typed1}, {typed})")
+
 done()

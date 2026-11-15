@@ -95,7 +95,8 @@ pick.write_bytes(was)
 # the tiers: all from two days, then one a day, a week, a month; the newest always
 sys.path.insert(0, str(HERE.parent))
 import aht as _core
-now = time.time()
+# from noon: two backups a little apart are then on one day at any hour
+now = time.mktime(time.localtime()[:3] + (12, 0, 0, 0, 0, -1))
 fake = [{"stamp": f"s{i}", "t": now - age} for i, age in enumerate(
     [400 * 86400, 200 * 86400, 199.9 * 86400, 60 * 86400, 59.9 * 86400, 10 * 86400,
      9.95 * 86400, 3 * 86400, 1.5 * 86400, 3600, 60])]

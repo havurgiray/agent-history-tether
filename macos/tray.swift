@@ -35,6 +35,7 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 import UserNotifications
+import notify
 
 let HOME = NSHomeDirectory()
 let TOOLS = HOME + "/.aht/tools/agent-history-tether"
@@ -12877,7 +12878,19 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         noticeOffset = (try? FileManager.default.attributesOfItem(atPath: NOTICE_QUEUE)[.size]
                         as? NSNumber)?.uint64Value ?? 0
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in self.pumpNotices() }
+        // the core says at once when a notice waits or the projects changed
+        // (a system-wide note named after this aht folder), so nothing is
+        // asked for every few seconds; the timer keeps the app marked alive
+        // and is the fallback
+        var real = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let ahtReal = realpath(HOME + "/.aht", &real) != nil ? String(cString: real) : HOME + "/.aht"
+        notify_register_dispatch("aht.notice:" + ahtReal, &noticeToken, .main) { [weak self] _ in
+            self?.pumpNotices()
+        }
+        notify_register_dispatch("aht.changed:" + ahtReal, &changedToken, .main) { [weak self] _ in
+            self?.model.refresh()
+        }
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in self.pumpNotices() }
         pumpNotices()
         // Spotlight: session titles, refreshed every half hour
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { self.model.indexSpotlight() }
@@ -13076,6 +13089,9 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     var noticeOffset: UInt64 = 0
 
     /// Marks the app alive for the core, and shows the notices it queued.
+    var noticeToken: Int32 = 0
+    var changedToken: Int32 = 0
+
     func pumpNotices() {
         let run = HOME + "/.aht/run"
         try? FileManager.default.createDirectory(atPath: run, withIntermediateDirectories: true)

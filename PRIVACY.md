@@ -356,8 +356,10 @@ encrypt it.
 
 `registry.json` holds, for each project aht tracks:
 
-- an id, the folder's path, where each agent keeps that project's
-  history, whether Antigravity or Mistral Vibe has sessions there (for
+- an id, the folder's path, the number the folder has on its disk and
+  which disk that is (the file system keeps this number while the folder
+  lives, so aht finds the folder again once it is renamed or moved),
+  where each agent keeps that project's history, whether Antigravity or Mistral Vibe has sessions there (for
   the badges), and when it was last updated;
 - for a project on another machine or on its way there: which machine
   (its name in aht, its host name, its system and aht's random id there),
@@ -419,6 +421,13 @@ or brought to another machine with Bring Here:
   one takes;
 - `app-alive` (macOS) and `tray-alive` (Windows): that the Mac app or the
   tray runs, so that it shows aht's notices;
+- `watch.json`: what the watcher reads to tell whether a project moved,
+  without searching your folders: each tracked project's path, the
+  number its folder has on its disk, the disk, whether it is there now,
+  the folders known as git repositories, and the folder names aht never
+  looks into;
+- `store-size.json`: how many bytes each folder of the backup store's
+  pieces holds, so the size of the backups is not counted anew each time;
 - `transfer-<project id>.json`: while a handover or a take-back runs, the
   project's path, the machine, the session's id, the stage, how many bytes
   went of how many, the time left and the process's number, for the

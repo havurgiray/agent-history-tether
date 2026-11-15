@@ -1788,7 +1788,8 @@ def watch_list(reg: dict) -> dict:
         rows.append({"path": os.path.realpath(p), "ino": int(fid.get("ino") or 0),
                      "vol": str(fid.get("vol") or ""), "here": here})
     return {"v": 1, "projects": sorted(rows, key=lambda r: r["path"]),
-            "git": sorted(reg.get("git_repos") or [])}
+            "git": sorted(reg.get("git_repos") or []), "prune": sorted(prune_dirs()),
+            "git_wanted": bool(cfg_get("icons_enabled", True) and cfg_get("icons_git", True))}
 
 def write_watch_list(reg: dict) -> None:
     """run/watch.json, rewritten only when it would read differently (the

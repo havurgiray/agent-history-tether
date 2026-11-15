@@ -620,7 +620,12 @@ and the agent starts empty there. aht notices and moves the history along.
 - **The watcher** is what notices a move as it happens: it runs in the
   background from login and relinks the histories of a folder you moved or
   renamed at once, for every agent, so your sessions follow the folder.
-  Without it (`watcher_owner` set to `none`), only Claude Code's start
+  On a Mac it does not search your folders for that: aht notes the number
+  each project's folder has on its disk, and the disk says where that
+  folder is now, also when you moved it out of the watched folders. A
+  folder in the Trash counts as missing, not as moved. Saving files in a
+  project starts nothing; the watched folders are still walked once a
+  day, for what has no such number yet. Without it (`watcher_owner` set to `none`), only Claude Code's start
   hook relinks, when a session starts in the moved folder, and **Find
   Moved Folders Now** catches up on the rest.
 

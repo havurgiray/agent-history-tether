@@ -199,4 +199,60 @@ ck(au.get("ran") and au.get("zips_moved") == 1 and not zq.exists()
    and zq.with_suffix(".snap").exists(),
    f"backup --auto: a zip left by an earlier aht moves into the store by itself "
    f"({ {k: v for k, v in au.items() if k != 'results'} })")
+
+# a move cut off after its snapshot was written: the zip comes back beside it
+with zipfile.ZipFile(zq, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("claude/z2.jsonl", line(type="custom-title", customTitle="Moved by itself"))
+m = JS("backup", "--migrate", "--apply", "--json")
+ck(m.get("migrated") == 1 and not m.get("problems") and not zq.exists()
+   and zq.with_suffix(".snap").exists(),
+   f"--migrate: a zip beside a snapshot that holds the same moves in again ({m})")
+with zipfile.ZipFile(zq, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr("claude/z2.jsonl", line(type="custom-title", customTitle="Something else"))
+m = JS("backup", "--migrate", "--apply", "--json")
+ck(not m.get("migrated") and "differs from the zip" in " ".join(m.get("problems") or [])
+   and zq.exists() and zq.with_suffix(".snap").exists(),
+   f"--migrate: one beside a snapshot that holds something else stays, and says so ({m})")
+zq.unlink()
+
+# a clean-up while a backup takes a piece again
+body = b"a piece taken again " * 40
+h1 = _core.put_object(body, base=bk)
+real_utime = _core.os.utime
+
+
+def taken(path, *a, **k):
+    os.unlink(path)                     # the clean-up was quicker
+    raise FileNotFoundError(path)
+
+
+_core.os.utime = taken
+try:
+    h2 = _core.put_object(body, base=bk)
+finally:
+    _core.os.utime = real_utime
+try:
+    again = _core.get_object(h1, bk)
+except _core.BackupDamaged as e:
+    again = str(e)
+ck(h2 == h1 and again == body,
+   f"a piece a clean-up took just as a backup took it again is written again "
+   f"({again if isinstance(again, str) else 'there'})")
+snap = sorted(bk.glob("*/*.snap"))[0]
+used = next(p_[1] for e in _core._read_manifest(snap)["files"].values() for p_ in e["parts"])
+f = _core._find_object(used, bk)[0]
+f.rename(f.with_name(f.name + ".gone"))
+g = _core.store_gc(bk, grace=0)
+ck(f.exists() and not f.with_name(f.name + ".gone").exists() and not g.get("error"),
+   f"a clean-up cut off between its steps: the piece a snapshot uses comes back ({g})")
+held = open(bk / "objects" / ".gc-lock", "a")
+fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+g = _core.store_gc(bk, grace=0)
+held.close()
+ck(g.get("skipped") and not g.get("removed"), f"one clean-up at a time ({g})")
+before = _core._store_bytes(bk)
+_core.put_object(os.urandom(5000), pack=False, base=bk)
+after = _core._store_bytes(bk)
+ck(after - before == 5000, f"the size of the backups, remembered per folder, counts a new piece "
+                           f"({before} -> {after})")
 done()

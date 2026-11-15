@@ -2147,9 +2147,11 @@ def put_object(data: bytes, pack: bool = True, base: Path = None, stats: dict = 
     if have is not None:
         try:
             os.utime(have)
+            return h
+        except FileNotFoundError:
+            pass                # a clean-up took it just now: it is written again
         except OSError:
-            pass                # read-only: it is there all the same
-        return h
+            return h            # read-only: it is there all the same
     body = data
     if pack:
         z = lzma.compress(data, preset=STORE_XZ)
@@ -2330,6 +2332,21 @@ def store_gc(base: Path = None, grace: float = STORE_GRACE) -> dict:
     res = {"removed": 0, "bytes": 0}
     if not objs.is_dir():
         return res
+    try:                    # one clean-up at a time; another one now: this one waits
+        lock = open(objs / ".gc-lock", "a")
+    except OSError:
+        return dict(res, error="the store's lock cannot be opened")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return dict(res, skipped="another clean-up runs now")
+    try:
+        return _store_gc(base, objs, grace, res)
+    finally:
+        lock.close()
+
+def _store_gc(base: Path, objs: Path, grace: float, res: dict) -> dict:
     used = set()
     for m in base.glob("*/*.snap"):
         try:
@@ -2342,13 +2359,34 @@ def store_gc(base: Path = None, grace: float = STORE_GRACE) -> dict:
     now = time.time()
     for sub in objs.iterdir():
         for f in sub.iterdir() if sub.is_dir() else []:
-            if f.name.split(".")[0] in used and not f.name.endswith(".tmp"):
+            h = f.name.split(".")[0]
+            if f.name.endswith(".gone"):
+                # a clean-up cut off between its two steps: what a snapshot
+                # uses goes back, the rest goes now
+                back = f.with_name(f.name[:-len(".gone")])
+                try:
+                    if h in used and not back.exists():
+                        os.replace(f, back)
+                    else:
+                        f.unlink()
+                except OSError:
+                    pass
+                continue
+            if h in used and not f.name.endswith(".tmp"):
                 continue
             try:
                 st = f.stat()
                 if now - st.st_mtime < grace:
                     continue
-                f.unlink()
+                # out of the way first: a backup that takes this piece again
+                # now either touched it before (it comes back) or finds it gone
+                # and writes it again (put_object)
+                gone = f.with_name(f.name + ".gone")
+                os.replace(f, gone)
+                if gone.stat().st_mtime > st.st_mtime:
+                    os.replace(gone, f)
+                    continue
+                gone.unlink()
                 res["removed"] += 1
                 res["bytes"] += st.st_size
             except OSError:
@@ -2521,29 +2559,6 @@ def _auto_backup_lock():
         fh.close()
         return None
     return fh
-
-def maybe_auto_backup() -> None:
-    try:
-        if os.environ.get("AHT_NO_BACKUP") or not cfg_get("backup_enabled", True):
-            return
-        if not backup_due():
-            return
-        lock = _auto_backup_lock()
-        if lock is None:
-            return
-        try:
-            if not backup_due():         # the pass that held it just ran
-                return
-            done = sum(1 for r in backup_pass() if r["status"] == "backed-up")
-            moved = _auto_migrate()
-        finally:
-            lock.close()
-        if done:
-            log(f"BACKUP auto pass: {done} project(s) snapshotted")
-        if done or moved:
-            _spawn_offsite()
-    except Exception as e:
-        error(f"BACKUP auto pass failed: {e}")
 
 AUTO_MIGRATE_SECONDS = 300     # an automatic pass moves zips into the store this long
 
@@ -2768,16 +2783,65 @@ def _restore_snapshot(snap: dict, new_real: str, fork: dict = None) -> dict:
             "left_out": sorted(left_out)}
 
 def _store_bytes(root: Path) -> int:
-    """What the backups take on disk (snapshots, zips, the store's pieces)."""
-    total = 0
-    for dp, dns, fns in os.walk(root):
-        dns[:] = [d for d in dns if d != "rewrites"]
+    """What the backups take on disk (snapshots, zips, the store's pieces).
+    A folder of pieces is counted again only when it changed (a piece is
+    never rewritten in place); what each held is remembered in run/."""
+    top, total = os.fspath(root), 0
+    for dp, dns, fns in os.walk(top):
+        dns[:] = [d for d in dns if d != "rewrites" and not (dp == top and d == "objects")]
         for n in fns:
             try:
                 total += os.lstat(os.path.join(dp, n)).st_size
             except OSError:
                 continue        # gone meanwhile
+    memo = aht_home() / "run" / "store-size.json"
+    try:
+        old = json.loads(memo.read_text())
+        old = old["dirs"] if isinstance(old, dict) and old.get("root") == top else {}
+    except (OSError, ValueError, KeyError):
+        old = {}
+    new = {}
+    try:
+        subs = list(os.scandir(os.path.join(top, "objects")))
+    except OSError:
+        subs = []
+    for e in subs:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                total += e.stat(follow_symlinks=False).st_size
+                continue
+            mt = e.stat(follow_symlinks=False).st_mtime_ns     # before its list: a later piece shows
+            got = old.get(e.name)
+            if not (isinstance(got, list) and len(got) == 2 and got[0] == mt):
+                got = [mt, 0]
+                for f in os.scandir(e.path):
+                    try:
+                        got[1] += f.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue        # gone meanwhile
+            new[e.name] = got
+            total += got[1]
+        except OSError:
+            continue
+    if new != old:
+        try:
+            memo.parent.mkdir(parents=True, exist_ok=True)
+            memo.write_text(json.dumps({"root": top, "dirs": new}))
+        except OSError:
+            pass                # counted again next time
     return total
+
+def _check_snap_as_zip(snap: Path, zp: Path) -> None:
+    """BackupDamaged unless the snapshot reads back as the zip, file for file
+    and byte for byte."""
+    import zipfile
+    with zipfile.ZipFile(zp) as zf, SnapshotReader(snap) as rd:
+        names = sorted(i.filename for i in zf.infolist() if not i.is_dir())
+        if sorted(rd.names()) != names:
+            raise BackupDamaged("its list of files reads back differently")
+        for n in names:
+            if rd.read(n) != zf.read(n):
+                raise BackupDamaged(f"{n} reads back differently")
 
 def migrate_backups(apply: bool = False, say=None, budget: float = None,
                     gc: bool = True) -> dict:
@@ -2822,8 +2886,15 @@ def migrate_backups(apply: bool = False, say=None, budget: float = None,
                 res["low_space"] = True
                 continue
             if target.exists():
-                res["problems"].append(f"{d.name}/{target.name} is there already")
-                continue
+                # a move cut off after its snapshot was written, before the
+                # zip went: when the two hold the same, it is done again
+                try:
+                    _check_snap_as_zip(target, zp)
+                    target.unlink()
+                except Exception as _x:
+                    res["problems"].append(f"{d.name}/{target.name} is there already, and "
+                                           f"differs from the zip ({_errmsg(_x)})")
+                    continue
             try:
                 files, stats = {}, {}
                 with zipfile.ZipFile(zp) as zf:
@@ -2834,13 +2905,7 @@ def migrate_backups(apply: bool = False, say=None, budget: float = None,
                         files[info.filename] = _file_entry(zf.read(info), info.filename,
                                                            prev.get(info.filename), mt, stats=stats)
                 _write_manifest(target, {"v": 1, "uuid": d.name, "stamp": zp.stem, "files": files})
-                with zipfile.ZipFile(zp) as zf, SnapshotReader(target) as rd:
-                    names = sorted(i.filename for i in zf.infolist() if not i.is_dir())
-                    if sorted(rd.names()) != names:
-                        raise BackupDamaged("its list of files reads back differently")
-                    for n in names:
-                        if rd.read(n) != zf.read(n):
-                            raise BackupDamaged(f"{n} reads back differently")
+                _check_snap_as_zip(target, zp)
                 meta = {k: v for k, v in m.items() if k not in ("zip", "snap", "zip_bytes", "t")}
                 meta.update(format="store", from_zip=True, files=len(files),
                             bytes=sum(e["size"] for e in files.values()),
@@ -3784,7 +3849,7 @@ def cmd_reconcile(args):
         if cfg_get("icons_enabled", True):
             for p in rebadge:
                 apply_badge(p, desired_marks(p, True))
-        maybe_auto_backup()
+        _spawn_auto_backup()            # its own process: moving zips in takes minutes
         _spawn_mirror()
         _spawn_search_update()
 
@@ -4826,6 +4891,11 @@ def cmd_backup(args):
     counts = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
+    if held is not None:
+        if counts.get("backed-up"):
+            log(f"BACKUP auto pass: {counts['backed-up']} project(s) snapshotted")
+        if counts.get("backed-up") or moved:
+            _spawn_offsite()
     if args.json:
         print(json.dumps({"ran": True, "counts": counts, "results": results,
                           **({"zips_moved": moved} if held is not None else {})},

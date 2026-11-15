@@ -162,7 +162,7 @@ def write_plist():
 {roots}    </array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>ProcessType</key><string>Background</string>
+    <key>ProcessType</key><string>Standard</string>
     <key>StandardOutPath</key><string>{_x(HOME / ".aht/aht-watcher.log")}</string>
     <key>StandardErrorPath</key><string>{_x(HOME / ".aht/aht-watcher.err")}</string>
 </dict>

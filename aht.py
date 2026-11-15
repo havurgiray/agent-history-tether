@@ -2930,7 +2930,7 @@ def _spawn_auto_backup() -> None:
             kw["creationflags"] = 0x08000200
         else:
             kw["start_new_session"] = True
-        subprocess.Popen(cmd, **kw)
+        subprocess.Popen(_gently(cmd), **kw)
     except Exception as _x:
         warn(f"BACKUP the automatic backup did not start: {_errmsg(_x)}")
 
@@ -12930,7 +12930,7 @@ def _spawn_mirror() -> None:
         reg = load_registry()
         if not any(mirror_due(e) for e in reg.get("projects", {}).values()):
             return
-        _spawn_aht(["mirror", "--run", "--due", "--quiet"])
+        _spawn_aht(["mirror", "--run", "--due", "--quiet"], gently=True)
     except Exception as _x:
         warn(f"MIRROR the background sync did not start: {_errmsg(_x)}")
 
@@ -17941,7 +17941,7 @@ def _spawn_search_update() -> None:
                 fcntl.flock(lock, fcntl.LOCK_UN)
         me = [sys.executable] if getattr(sys, "frozen", False) else \
             [sys.executable or "python3", str(Path(__file__).resolve())]
-        subprocess.Popen(me + ["search", "--update", "--quiet"],
+        subprocess.Popen(_gently(me + ["search", "--update", "--quiet"]),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, close_fds=True,
                          start_new_session=True, cwd="/")
@@ -23758,7 +23758,7 @@ def _spawn_offsite() -> None:
         if os.environ.get("AHT_NO_MIRROR") or not cfg_get("offsite_backup") \
                 or not can_reach_machines():
             return
-        _spawn_aht(["backup", "--offsite", "--quiet"])
+        _spawn_aht(["backup", "--offsite", "--quiet"], gently=True)
     except Exception as _x:
         warn(f"OFFSITE the copy of the backups did not start: {_errmsg(_x)}")
 
@@ -24240,10 +24240,22 @@ def _aht_argv() -> list:
         return [sys.executable, str(me.parent / "windows" / "src" / "aht_main.py")]
     return [sys.executable or "python3", str(me)]
 
-def _spawn_aht(args: list):
-    """Run `aht <args>` detached; its pid, or None."""
+def _gently(cmd: list) -> list:
+    """`cmd` as work in the background (a sync, a backup, the index): on a
+    Mac at background priority, so it does not slow what you are doing.  The
+    watcher itself runs at normal priority: a look that follows a move takes
+    0.2 s there and four times that at background priority."""
+    if IS_MAC and os.path.exists("/usr/sbin/taskpolicy") and not os.environ.get("AHT_NO_GENTLY"):
+        return ["/usr/sbin/taskpolicy", "-b"] + list(cmd)
+    return list(cmd)
+
+def _spawn_aht(args: list, gently: bool = False):
+    """Run `aht <args>` detached; its pid, or None.  `gently`: at background
+    priority."""
     try:
         cmd = _aht_argv() + args
+        if gently:
+            cmd = _gently(cmd)
         kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
               "stderr": subprocess.DEVNULL, "close_fds": True, "cwd": "/"}
         if os.name == "nt":

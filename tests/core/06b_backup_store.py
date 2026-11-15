@@ -130,6 +130,16 @@ zp.with_suffix(".meta.json").write_text(json.dumps({"uuid": uid, "stamp": zp.ste
 dry = JS("backup", "--migrate", "--json")
 ck(dry.get("zips") == 1 and zp.exists() and not dry.get("applied"),
    f"--migrate: a dry run counts the zips ({dry})")
+# not while an automatic pass runs (it may thin the zips out, and its new
+# pieces are in no list yet)
+import fcntl
+(sb / ".aht" / "run").mkdir(parents=True, exist_ok=True)
+held = open(sb / ".aht" / "run" / "backup-auto.lock", "a")
+fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+busy = run("backup", "--migrate", "--apply", "--json")
+held.close()
+ck(busy.returncode == 1 and "a backup runs right now" in busy.stderr and zp.exists(),
+   f"--migrate --apply: not while an automatic backup runs ({busy.stderr[-200:]})")
 m = JS("backup", "--migrate", "--apply", "--json")
 ck(m.get("migrated") == 1 and not zp.exists() and zp.with_suffix(".snap").exists()
    and not m.get("problems"),

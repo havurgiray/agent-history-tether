@@ -2820,7 +2820,7 @@ def migrate_backups(apply: bool = False, say=None) -> dict:
                 except OSError:
                     pass        # not made
     if apply:
-        res["gc"] = store_gc(grace=0) if not res["problems"] else None
+        res["gc"] = store_gc() if not res["problems"] else None     # a pass's new pieces stay
         log(f"BACKUP {res['migrated']} zip(s) moved into the store"
             + (f"; {len(res['problems'])} kept as zips" if res["problems"] else ""))
     res["bytes_now"] = _store_bytes(root) if root.is_dir() else 0

@@ -330,7 +330,7 @@ aht reclaim ~/Desktop/paper --apply      # Take Back: files and history come bac
   `handover_remote_control` (on by default) the session there is
   reachable from the Claude app.
 - **Backups on another machine**: `offsite_backup = <machine>` adds the
-  history backups there after each daily pass, in a folder of this
+  history backups there after each automatic pass, in a folder of this
   computer's own; `aht backup --fetch-offsite` brings them back, also to a
   new computer, and never overwrites.
 
@@ -481,7 +481,7 @@ explains each.
   `notifications`, `icons_enabled`, `icons_agent`, `icons_git`,
   `debounce_seconds`, `scan_max_depth`, `extra_prune_dirs`,
   `dialog_timeout`, `watcher_owner`, `log_level`, `update_check`
-- **Backups:** `backup_enabled`, `backup_interval_hours`, `backup_keep`,
+- **Backups:** `backup_enabled`, `backup_interval_hours`,
   `backup_dir`, `offsite_backup`
 - **Linux badges:** `linux_emblem_method`, `linux_agent_emblem`,
   `linux_git_emblem`

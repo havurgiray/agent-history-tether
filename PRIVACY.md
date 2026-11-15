@@ -336,7 +336,7 @@ encrypt it.
 | `registry.json` (and `.bak`) | the projects aht tracks (see [below](#the-registry)) | until you delete it, or `aht uninstall --purge` |
 | `aht.log`, `aht.log.1` | what aht did and when: folder paths, project and session names and the iTerm2 tab titles aht set (as they are, not masked), session ids, your other machines' names (and the Tailscale address aht reached one by), the notices it showed, warnings and errors (what aht was doing and the error's type and message, keys masked; for an error aht did not expect, its traceback: the lines of aht's code it went through); the Mac app's, the trays' and the window's own errors (`APP …`: the message they give, keys masked, on one line, at most 1,000 characters, at most 20 lines a minute from each).  Every line is one line: a line break in what aht logs is written ` ⏎ ` (only an unexpected error's traceback takes the lines after it).  A notice that did not reach the phone names *the phone setting*, not its address, server, topic or number; no conversations and no file contents | `aht.log` becomes `aht.log.1` at 5 MB, replacing the older one: about 10 MB at most |
 | `aht-watcher.log` (macOS, Windows), `aht-watcher.err` and `aht-notices.err` (macOS) | the background watcher's and the notices check's own output and errors, which can name project folders; on Linux this goes to your user journal (`journalctl --user -u aht-watcher`) | not rotated; delete them any time |
-| `backups/` | see [Backups](#backups) | the newest 10 snapshots per project |
+| `backups/` | see [Backups](#backups) | all from the last two days, then one a day for two weeks, one a week for three months, one a month for a year |
 | `search.db` | a search index: the text of messages (up to 4,000 characters each), what each tool call worked on (its command, file path, web address or search, up to 400 characters) and session titles, with keys masked whole before anything is cut (see [Security](#security)), plus agents, project paths and times | until you delete it; rebuilt when needed.  An index made by an earlier version is built anew once, keeping none of its old rows; a session whose history file is gone and that no backup holds then drops out |
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`: on by default on macOS, where the copies take no room, off elsewhere), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`), none older than 30 days |
 | `workspaces/` | macOS and Windows: saved iTerm2 or Windows Terminal layouts: this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session ids, on Windows pane ids, each Claude session's name (keys masked), and the options it was started with that it keeps when it starts again (permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, `--verbose`; never a first prompt).  Tab titles are kept as the terminal has them, so that restoring a layout sets them back; on Windows that can be a title a program set, which aht tells from one you chose only by its look | all from the last two hours, then one an hour for a day, one a day for a week, one a week for a month and one a month for a year; older ones are removed |
@@ -457,18 +457,28 @@ These files in `run/` are kept longer:
 
 ### Backups
 
-- **Contents.**  One ZIP file per project per snapshot, holding copies of
-  that project's history files from every agent aht watches: the complete
-  conversations, as the agents store them, including anything sensitive
-  they contain.  A small `.meta.json` file next to each ZIP lists what is
-  inside.  Files aht is about to rewrite while relinking are copied to
-  `rewrites/` in the same folder.
+- **Contents.**  Copies of each project's history files from every agent
+  aht watches: the complete conversations, as the agents store them,
+  including anything sensitive they contain.  They are kept in pieces in
+  `objects/`, each named by the checksum (SHA-256) of its content and kept
+  once however many backups hold it: a picture an agent keeps inside a
+  conversation as a picture of its own, the conversation's text packed
+  (xz).  A snapshot is a small packed list, `<project id>/<stamp>.snap`, of
+  which pieces make up which file, with each file's size, time and
+  checksum; a `.meta.json` next to it says what it holds (folder, agents,
+  number of files and sessions, what it took).  Backups made by earlier
+  versions of aht are ZIP files (`<stamp>.zip`) until `aht backup --migrate
+  --apply` moves them in, after reading every file back.  Files aht is about to
+  rewrite while relinking are copied to `rewrites/` in the same folder.
 - **Location.**  `~/.aht/backups/<project id>/`, or the folder you set in
   `backup_dir`.
-- **When.**  At most once every 24 hours (`backup_interval_hours`), and
-  only when the project's histories changed since the last snapshot.
-- **Retention.**  The newest 10 snapshots per project (`backup_keep`);
-  older ones are deleted automatically.  The copies in `rewrites/` are
+- **When.**  At most once every 6 hours (`backup_interval_hours`), only
+  when the project's histories changed since the last snapshot, and when
+  you ask (Back Up Now).  A snapshot stores only what is new.
+- **Retention.**  All snapshots of the last two days, then one a day for
+  two weeks, one a week for three months and one a month for a year; the
+  newest always stays.  Older ones are deleted automatically, and so are
+  the pieces no snapshot uses any more.  The copies in `rewrites/` are
   kept until you delete them.  For the copies on another machine
   (`offsite_backup`) see [Backups there](#backups-there).
 - **After uninstalling.**  Backups stay until you delete them, so that
@@ -973,7 +983,9 @@ With `offsite_backup`, copies of the backups go into
 last copied).  The copies aht made before it rewrote a history
 (`backups/<project id>/rewrites/`) go there too.  aht only adds there,
 and removes a backup there only after this computer pruned it here (so
-the copies there follow `backup_keep`), keeping at least 3 per project;
+the copies there thin out the same way), keeping at least 3 per project,
+and then the pieces no snapshot there uses; an older ZIP goes once the
+snapshot it became is there;
 it never removes the copies made before a rewrite there.  A folder that an older
 aht named after this computer is taken over only when everything in it
 is here too: its files move into this computer's folder (one that is
@@ -1158,7 +1170,7 @@ over them.
   | Setting | What it controls |
   |---|---|
   | `move_policy`, `copy_policy` | whether aht asks before relinking (moves and copies: asks by default) |
-  | `backup_enabled`, `backup_interval_hours`, `backup_keep`, `backup_dir` | whether, how often, how many and where backups are kept |
+  | `backup_enabled`, `backup_interval_hours`, `backup_dir` | whether, how often and where backups are kept |
   | `offsite_backup` | which of your machines keeps a copy of the backups (none by default) |
   | `checkpoints`, `checkpoint_keep`, `checkpoint_excludes` | folder copies at session start |
   | `icons_enabled`, `icons_agent`, `icons_git` | folder badges, for the projects aht tracks and for git folders |

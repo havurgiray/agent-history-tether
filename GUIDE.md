@@ -669,19 +669,57 @@ has history there.
 
 ## Backups, and bringing a session back
 
-Every day aht zips each project's histories, of all agents, into
-`~/.aht/backups` and keeps the ten newest per project.
+While you work, aht backs up each project's conversations, of every
+agent, into `~/.aht/backups`: at most every 6 hours, and only when
+something changed. A backup takes only what is new since the one before,
+so keeping many costs little: all from the last two days stay, then one a
+day for two weeks, one a week for three months and one a month for a
+year.
 
 > **Example.** Claude Code deletes sessions that were idle for 30 days. A
 > session from two months ago is no longer in `/resume`. Search for a word
 > you remember from it in the **Search** tab. The result says **deleted — in
 > a backup**; press **Restore…**. It adds what is missing and changes nothing
 > that is there, and the session can be resumed again.
+>
+> **Example.** A week ago a session took a turn you regret. Projects →
+> *paper* → More → **Backups…**, the backup of last Tuesday → **New Project
+> From This…**, a name, **With Its Files**: a new folder with the project's
+> files as they were then and the conversations of that day, to go on from
+> there. *paper* itself is not touched.
 
+- **Projects → More → Backups…** lists a project's backups, newest first,
+  each with its sessions and what it took. **Back Up Now** makes one of
+  this project at once. On each backup:
+  - **Sessions** lists the sessions it holds, with titles, branches and
+    when each was last active.
+  - **Restore…** brings back what it holds and is gone here; nothing that
+    is here is changed or replaced.
+  - **New Project From This…** makes a new folder with its conversations,
+    to continue them there; Claude Code's get new session ids, so the two
+    projects never mix up. **With Its Files** also puts the project's files
+    in it as they were then: the copy *Undo a whole session* kept last
+    before that backup (when that was on). Agents that keep every session
+    in one store of their own (Codex, for example) stay with the original
+    project and are named.
+- **From the corner list:** right-click a session → **Back Up This
+  Project Now**, or **Backups of This Project…** (see *Sessions in the
+  corner*).
+- **How little it takes:** a picture an agent keeps inside a conversation
+  is kept once, as a picture, however many conversations and backups hold
+  it, and a conversation that only grew adds only its new part, packed.
+- **Every file reads back exactly:** each piece is named by its checksum,
+  and a file read from a backup is checked against its size and checksum.
+  `aht backup --verify` reads them all back.
+- **Backups made by earlier versions of aht** are zips; they are read as
+  they are.
+  `aht backup --migrate --apply` moves them in and removes each zip only
+  after every file of it read back from the store exactly as the zip held
+  it.
 - To stop Claude Code from deleting old sessions at all, set
   `"cleanupPeriodDays": 36500` in `~/.claude/settings.json`.
 - **A second copy on another machine.** **Settings → Backups on another
-  machine**: pick one of your machines, and after each daily backup aht
+  machine**: pick one of your machines, and after each automatic backup aht
   adds the new backups to a folder of this computer's own there, named by
   a random id, so a lost or broken computer does not take the histories
   with it. Copying only adds: a backup there goes only after aht removed it
@@ -697,7 +735,7 @@ Every day aht zips each project's histories, of all agents, into
   size; this computer's own is marked, and so is one an older aht made.
   **Fetch** adds what is missing here and replaces nothing: a backup that
   differs from one of the same name here arrives next to it as
-  `<stamp>-from-<name>.zip`. Search then finds the sessions in them, and
+  `<stamp>-from-<name>`. Search then finds the sessions in them, and
   **Restore…** on a result brings one back. When a backup cannot be put
   in place, the others still arrive, and aht names it with why.
 - **An older aht's folder** there (named after this computer) becomes
@@ -708,11 +746,18 @@ Every day aht zips each project's histories, of all agents, into
 **In the terminal:**
 
 - `aht backup` — back up every project's histories now, instead of waiting
-  for the daily run (also **Back Up Now** in Settings → Histories);
+  for the next automatic one (also **Back Up Now** in Settings → Histories);
   `--project ~/Desktop/paper` or `--uuid <id>` backs up one project only.
-- `aht backup --list` — list the backups that are kept, per project.
-- `aht backup --prune` — delete the backups beyond the number kept
-  (`backup_keep`, 10).
+- `aht backup --list` — list the backups that are kept, per project
+  (`--project ~/Desktop/paper`: that one), with what each took.
+- `aht backup --show ~/Desktop/paper` — the sessions its newest backup
+  holds; `--stamp 20260901-120000` an older one.
+- `aht backup --prune` — thin the backups out now (they thin out by
+  themselves after each backup), and remove the pieces no backup uses.
+- `aht backup --verify` — read every file of every backup back and check
+  it.
+- `aht backup --migrate` — say how many backups are still zips;
+  `--apply` moves them into the store.
 - `aht restore ~/Desktop/paper` — say which backup of the paper project
   it would use (the newest); `--apply` adds it back: sessions that are
   missing return, nothing that is there is changed.
@@ -721,6 +766,10 @@ Every day aht zips each project's histories, of all agents, into
   id; `aht search` prints this line for a session only a backup holds).
 - `aht restore ~/Desktop/paper --stamp 20260901-120000 --apply` — use that
   older backup instead (the stamps are in `aht backup --list`).
+- `aht restore ~/Desktop/paper --stamp 20260901-120000 --into
+  ~/Desktop/paper-then --with-files --apply` — a new project from that
+  backup, with the files from then (without `--with-files`: the
+  conversations only).
 - `aht backup --offsite` — copy the backups to your other machine now.
 - `aht backup --offsite-list` — list every computer's folder of backups on
   that machine.
@@ -964,6 +1013,8 @@ with its ×.
     (with mosh on both, the connection outlasts a network that drops; on
     a PC, a dropped connection ends the tab, and the session keeps working
     there). Close the laptop: the session keeps working there.
+  - **Back Up This Project Now** and **Backups of This Project…** (see
+    *Backups, and bringing a session back*).
   - Branch and Send wait while a session works or waits for you, and say
     so.
 - **On its way:** while a session is sent (or its project taken back), its
@@ -1693,7 +1744,7 @@ with suggestions. **Projects → Tidy Up…** appears when there is something.
   `=`, because it begins with a dash; anything else (a path, another
   spelling, a link) is refused, and so is a history a tracked project owns
   or an open session uses. When aht refuses, it prints the name and why.
-  The daily backups keep the history as well.
+  The backups keep the history as well.
 
 ## Hand a project over to another machine
 
@@ -2809,9 +2860,11 @@ all of them can be set with `aht config --set name=value` and put back with
 
 **Backups**
 
-- `backup_enabled` (on), `backup_interval_hours` (24), `backup_keep` (10) —
-  the daily backup, how often, how many per project (copies on the other
-  machine follow `backup_keep`, keeping at least 3).
+- `backup_enabled` (on), `backup_interval_hours` (6) — the backups of the
+  conversations, and how often at most. They thin out by age: all from the
+  last two days, then one a day for two weeks, one a week for three months,
+  one a month for a year (copies on the other machine thin out the same
+  way, keeping at least 3).
 - `backup_dir` (`~/.aht/backups`) — where they go.
 - `offsite_backup` (none) — the machine that keeps a copy of them, in a
   folder of this computer's own.
@@ -2960,7 +3013,7 @@ and act only with `--apply`; `install`, `uninstall`, `config`, `roots`,
   `aht logs --lines 200` is the long form of `-n 200`.
 - An option that takes several values adds up when you give it twice:
   `--adopt A --adopt B` is the same as `--adopt A B`, and
-  `aht config --set backup_keep=20 --set notify_finished=false` sets
+  `aht config --set backup_interval_hours=12 --set notify_finished=false` sets
   both.
 - Options such as `--quiet`, `--status-file`, `backup --auto`, `setup
   --dismiss` (the welcome's Not Now), `checkpoint --session`/`--agent`

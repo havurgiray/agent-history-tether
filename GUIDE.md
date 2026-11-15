@@ -708,6 +708,7 @@ year.
 - **How little it takes:** a picture an agent keeps inside a conversation
   is kept once, as a picture, however many conversations and backups hold
   it, and a conversation that only grew adds only its new part, packed.
+  On one computer, moving 188 backups in took them from 19.1 GB to 3.0 GB.
 - **Every file reads back exactly:** each piece is named by its checksum,
   and a file read from a backup is checked against its size and checksum.
   `aht backup --verify` reads them all back.

@@ -2143,7 +2143,8 @@ def _snapshot_project(uid: str, entry: dict) -> dict:
     while z.exists():
         z = d / f"{stamp}-{n}.zip"
         n += 1
-    tmp = Path(str(z) + ".tmp")
+    # this process's own: two passes at once never write the same file
+    tmp = Path(f"{z}.{os.getpid()}.tmp")
     total = 0
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         for f, arc in sources:
@@ -2189,13 +2190,37 @@ def backup_pass(only_uid=None) -> list:
     _touch_backup_stamp()
     return results
 
+def _auto_backup_lock():
+    """The automatic backup's lock, held: an open file, or None when another
+    automatic pass runs now (each session that starts asks for one: many
+    sessions starting at once, as after Restore Workspace, make one pass)."""
+    try:
+        (aht_home() / "run").mkdir(parents=True, exist_ok=True)
+        fh = open(aht_home() / "run" / "backup-auto.lock", "a")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
 def maybe_auto_backup() -> None:
     try:
         if os.environ.get("AHT_NO_BACKUP") or not cfg_get("backup_enabled", True):
             return
         if not backup_due():
             return
-        done = sum(1 for r in backup_pass() if r["status"] == "backed-up")
+        lock = _auto_backup_lock()
+        if lock is None:
+            return
+        try:
+            if not backup_due():         # the pass that held it just ran
+                return
+            done = sum(1 for r in backup_pass() if r["status"] == "backed-up")
+        finally:
+            lock.close()
         if done:
             log(f"BACKUP auto pass: {done} project(s) snapshotted")
             _spawn_offsite()
@@ -2207,6 +2232,19 @@ def _spawn_auto_backup() -> None:
         if os.environ.get("AHT_NO_BACKUP") or not cfg_get("backup_enabled", True) \
                 or not backup_due():
             return
+        # sessions starting together start one pass, not one each
+        mark = aht_home() / "run" / "backup-auto.spawned"
+        try:
+            if time.time() - mark.stat().st_mtime < 120:
+                return
+        except OSError:
+            pass                # never spawned yet
+        try:
+            mark.parent.mkdir(parents=True, exist_ok=True)
+            mark.touch()
+        except OSError as _x:
+            warn_once("backup-spawned", f"BACKUP the note of a started pass was not kept: "
+                                        f"{_errmsg(_x)}")
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "backup", "--auto"]
         else:
@@ -4167,11 +4205,20 @@ def cmd_backup(args):
         print(f"pruned {n} snapshot(s)  (backup_keep={cfg_get('backup_keep', 10)})")
         return 0
 
+    held = None
     if args.auto:
         if os.environ.get("AHT_NO_BACKUP") or not cfg_get("backup_enabled", True):
             print(json.dumps({"ran": False, "reason": "disabled"}))
             return 0
         if not backup_due():
+            print(json.dumps({"ran": False, "reason": "not-due"}))
+            return 0
+        held = _auto_backup_lock()
+        if held is None:
+            print(json.dumps({"ran": False, "reason": "running"}))
+            return 0
+        if not backup_due():                # the pass that held it just ran
+            held.close()
             print(json.dumps({"ran": False, "reason": "not-due"}))
             return 0
 
@@ -4185,7 +4232,11 @@ def cmd_backup(args):
             print(f"error: no aht marker in {real}", file=sys.stderr)
             return 2
 
-    results = backup_pass(only_uid=only)
+    try:
+        results = backup_pass(only_uid=only)
+    finally:
+        if held is not None:
+            held.close()
     counts = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1

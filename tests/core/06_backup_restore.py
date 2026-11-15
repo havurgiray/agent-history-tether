@@ -32,6 +32,24 @@ ck("gemini" in meta["backends"] and "codex" in meta["backends"]
 r = run("backup", "--json")
 ck(json.loads(r.stdout)["counts"].get("unchanged", 0) >= 1, "unchanged skip")
 
+# the automatic pass: one at a time (sessions starting together each ask for
+# one, as after Restore Workspace), and none while one just ran
+import fcntl as _fcntl
+autoenv = {"AHT_NO_BACKUP": ""}
+(sb / ".aht" / "backups" / ".last-run").unlink(missing_ok=True)   # due again
+(sb / ".aht" / "run").mkdir(parents=True, exist_ok=True)
+held = open(sb / ".aht" / "run" / "backup-auto.lock", "a")
+_fcntl.flock(held, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+r1 = json.loads(run("backup", "--auto", "--json", extra_env=autoenv).stdout)
+held.close()
+r2 = json.loads(run("backup", "--auto", "--json", extra_env=autoenv).stdout)
+r3 = json.loads(run("backup", "--auto", "--json", extra_env=autoenv).stdout)
+ck(r1 == {"ran": False, "reason": "running"} and r2.get("ran") is True
+   and r3 == {"ran": False, "reason": "not-due"}
+   and not list((sb / ".aht" / "backups").rglob("*.tmp")),
+   f"backup --auto: none while another runs, then one, then none until due ({r1}, "
+   f"{ {k: v for k, v in r2.items() if k != 'results'} }, {r3})")
+
 # lose two stores + move, restore via the travelling marker
 shutil.rmtree(tools / "gemini" / sha(projE), ignore_errors=True)
 old_claude = tools / "claude" / enc(projE)

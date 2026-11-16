@@ -440,7 +440,7 @@ def transport_suite():
         # which stops at U+FFFF: a name with an emoji goes by aht's own copy
         ck(core._iconv_cannot(["a.txt", key, "日本", "🟩 plan", "x\udcff"]) == ["🟩 plan", "x\udcff"],
            "names rsync cannot turn between a Mac and Linux: past U+FFFF, or no UTF-8")
-        if core.find_rsync() and os.name != "nt":
+        if core.find_rsync() and sys.platform == "darwin":     # macOS's converter (UTF-8-MAC)
             eh, ef = X / "emoji-here", X / "emoji-far"
             eh.mkdir()
             (eh / "plain.txt").write_text("p\n")

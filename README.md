@@ -198,9 +198,12 @@ a moved folder.
   not search: the registry notes each project folder's id on its disk,
   macOS and Windows say where a folder with that id is now (on Linux,
   inotify says what was renamed to what), and the watcher starts aht
-  only when a project is not where it was, or a marker or a `.git`
-  appeared (`aht reconcile --quick`); files saved inside a project start
-  nothing, and the walk of the watched folders runs once a day.  It
+  only when a project is not where it was, a marker or a `.git`
+  appeared, or a folder appeared outside every project (made, or moved
+  in from elsewhere: only that folder is looked through)
+  (`aht reconcile --quick`); files saved inside a project start nothing,
+  and the walk of the watched folders runs when the watcher starts and
+  once a day.  It
   detects moves, renames and copies and asks before it relinks
   (`move_policy`: ask, apply, decline or ignore; `copy_policy`: ask,
   duplicate, independent or ignore).

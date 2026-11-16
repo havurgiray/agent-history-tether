@@ -141,6 +141,18 @@ try:
        f"a copy is seen where its marker appeared, and gets its own id ({took(t)})")
 
     time.sleep(1.0)
+    far = SB / "far-in"
+    (far / "theirs" / ".aht").mkdir(parents=True)
+    (far / "theirs" / ".aht" / ".project-id").write_text("from-another-machine\n", encoding="utf-8")
+    (far / "repo" / ".git").mkdir(parents=True)
+    brought = roots / "brought"
+    os.rename(far, brought)
+    t = until(lambda: any(os.path.normcase(e.get("real_path", "")) == os.path.normcase(str(brought / "theirs"))
+                          for e in reg()["projects"].values())
+              and any(os.path.normcase(r) == os.path.normcase(str(brought / "repo"))
+                      for r in reg().get("git_repos") or []))
+    ck(t is not None, f"a folder moved in: the project and the repository in it are found ({took(t)})")
+    time.sleep(1.0)
     projF = roots / "projF"
     os.rename(projE, projF)                     # back in: only its new place is told
     t = until(at(projF))

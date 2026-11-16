@@ -1460,9 +1460,6 @@ def _register(reg: dict, uid: str, real_path: str, stores=None) -> None:
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     reg["projects"][uid].update({k: prev[k] for k in REGISTRY_KEEP if k in prev})
-    fid = _folder_id(real_path)
-    if fid:
-        reg["projects"][uid]["fid"] = fid
     fid = folder_id(real_path)          # where it is found again once it moved
     if fid:
         reg["projects"][uid]["fid"] = fid
@@ -1498,87 +1495,6 @@ def orphan_history_dirs(reg: dict) -> list:
 # --------------------------------------------------------------------------- #
 # Markers
 # --------------------------------------------------------------------------- #
-
-def _folder_id(path: str):
-    """[device, inode] of a folder: who it is, whatever it is called or
-    wherever it goes on that disk.  None where the disk has no such ids."""
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return None
-    return [st.st_dev, st.st_ino] if st.st_ino else None
-
-def _ids_here() -> bool:
-    """This system can say where a folder is now from its id alone."""
-    return IS_MAC
-
-def _where_now(fid) -> str | None:
-    """Where the folder with this id is now (its spelling on disk), or None
-    when it is gone or the disk cannot say.  A Mac asks /.vol/<dev>/<inode>
-    for its path; what comes back is checked against the id."""
-    if not fid or not IS_MAC:
-        return None
-    try:
-        fd = os.open(f"/.vol/{int(fid[0])}/{int(fid[1])}", os.O_RDONLY | 0x8000)  # O_EVTONLY
-    except (OSError, ValueError, TypeError):
-        return None
-    try:
-        p = fcntl.fcntl(fd, 50, b"\0" * 1024).split(b"\0", 1)[0]       # F_GETPATH
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    p = os.fsdecode(p)
-    return p if p and _folder_id(p) == [int(fid[0]), int(fid[1])] else None
-
-def _markers_by_id(reg: dict, paths=()):
-    """uuid -> [folders], as find_markers gives it, without a walk: each
-    project where its folder is now, found by its id (a Mac), and the
-    marker in each folder of `paths` (a copy, or a folder tagged elsewhere).
-    A project with no id was not there at the last full look (that notes
-    the id of every project in place), so it is still away.  None when this
-    cannot be told without a walk."""
-    if not _ids_here() or not reg.get("ids_at"):
-        return None
-    out = {}
-    for uid, e in reg.get("projects", {}).items():
-        fid = e.get("fid")
-        if not fid:
-            continue
-        now = _where_now(fid)
-        if now and read_marker(now) == uid:
-            out.setdefault(uid, []).append(now)
-    for d in paths or ():
-        d = os.path.realpath(d)
-        uid = read_marker(d) if os.path.isdir(d) else None
-        if uid and d not in out.get(uid, []):
-            out.setdefault(uid, []).append(d)
-    return out
-
-def _markers_now(reg: dict, roots: list, quick: bool = False, paths=()) -> dict:
-    """uuid -> [folders]: by id when `quick` can tell, else the walk."""
-    if quick:
-        got = _markers_by_id(reg, paths)
-        if got is not None:
-            return got
-    return find_markers(roots)[1]
-
-def _note_ids(reg: dict, uuid_to_paths: dict, full: bool) -> bool:
-    """Each project in place gets its folder's id; after a full look that
-    is every one there (`ids_at`).  True when the registry changed."""
-    changed = False
-    for uid, ps in uuid_to_paths.items():
-        e = reg["projects"].get(uid)
-        if e is None or len(ps) != 1 or os.path.realpath(ps[0]) != os.path.realpath(e["real_path"]):
-            continue
-        fid = _folder_id(ps[0])
-        if fid and e.get("fid") != fid:
-            e["fid"] = fid
-            changed = True
-    if full and _ids_here():
-        reg["ids_at"] = time.time()
-        changed = True
-    return changed
 
 def project_holding(folder: str) -> tuple:
     """(id, folder) of the tracked project a folder is in (itself or the
@@ -1643,25 +1559,13 @@ def folder_id(path: str):
     except OSError:
         return None
 
+_WIN_IDS = {}
+
 def _win_path_of_id(vol: str, ino: int):
     import ctypes
-    import ctypes.wintypes as W
-    k = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    class _Desc(ctypes.Structure):
-        class _U(ctypes.Union):
-            _fields_ = [("FileId", ctypes.c_longlong), ("pad", ctypes.c_byte * 16)]
-        _anonymous_ = ("u",)
-        _fields_ = [("dwSize", W.DWORD), ("Type", ctypes.c_int), ("u", _U)]
-    k.CreateFileW.restype = W.HANDLE
-    k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p, W.DWORD, W.DWORD,
-                              W.HANDLE]
-    k.OpenFileById.restype = W.HANDLE
-    k.OpenFileById.argtypes = [W.HANDLE, ctypes.POINTER(_Desc), W.DWORD, W.DWORD,
-                               ctypes.c_void_p, W.DWORD]
-    k.GetFinalPathNameByHandleW.argtypes = [W.HANDLE, W.LPWSTR, W.DWORD, W.DWORD]
-    k.CloseHandle.argtypes = [W.HANDLE]
-    bad = (None, W.HANDLE(-1).value)
+    if not _WIN_IDS:
+        _WIN_IDS.update(_win_id_calls())
+    k, _Desc, bad = _WIN_IDS["k"], _WIN_IDS["desc"], _WIN_IDS["bad"]
     hv = k.CreateFileW(vol, 0, 7, None, 3, 0x02000000, None)      # the volume: a hint
     if hv in bad:
         return None
@@ -1684,6 +1588,27 @@ def _win_path_of_id(vol: str, ino: int):
             k.CloseHandle(h)
     finally:
         k.CloseHandle(hv)
+
+def _win_id_calls() -> dict:
+    """kernel32's calls for _win_path_of_id, set up once."""
+    import ctypes
+    import ctypes.wintypes as W
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class _Desc(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("FileId", ctypes.c_longlong), ("pad", ctypes.c_byte * 16)]
+        _anonymous_ = ("u",)
+        _fields_ = [("dwSize", W.DWORD), ("Type", ctypes.c_int), ("u", _U)]
+    k.CreateFileW.restype = W.HANDLE
+    k.CreateFileW.argtypes = [W.LPCWSTR, W.DWORD, W.DWORD, ctypes.c_void_p, W.DWORD, W.DWORD,
+                              W.HANDLE]
+    k.OpenFileById.restype = W.HANDLE
+    k.OpenFileById.argtypes = [W.HANDLE, ctypes.POINTER(_Desc), W.DWORD, W.DWORD,
+                               ctypes.c_void_p, W.DWORD]
+    k.GetFinalPathNameByHandleW.argtypes = [W.HANDLE, W.LPWSTR, W.DWORD, W.DWORD]
+    k.CloseHandle.argtypes = [W.HANDLE]
+    return {"k": k, "desc": _Desc, "bad": (None, W.HANDLE(-1).value)}
 
 def path_of_id(fid) -> str | None:
     """Where the folder with this id is now, or None: gone, or no such
@@ -1727,6 +1652,19 @@ def project_now(uid: str, entry: dict) -> str | None:
         return None
     return p if read_marker(p) == uid else None
 
+def _renamed_pairs(renamed) -> list:
+    return [(os.path.realpath(a), os.path.realpath(b)) for a, b in renamed or ()]
+
+def _renamed_to(path: str, pairs) -> list:
+    """Where `path` is after each (old, new) rename that took it along."""
+    p = os.path.realpath(path)
+    out = []
+    for a, b in pairs:
+        if _inside(p, a):
+            rest = p[len(a.rstrip("/\\")):]
+            out.append(b.rstrip("/\\") + rest)
+    return out
+
 def known_markers(reg: dict, look=(), renamed=()) -> tuple:
     """What find_markers gives, without the walk: each tracked project where
     it is now (by its folder's id, else where the registry has it), the
@@ -1735,6 +1673,7 @@ def known_markers(reg: dict, look=(), renamed=()) -> tuple:
     `renamed`.  An id that is missing or out of date is noted in the
     registry (`_dirty`)."""
     path_to_uuid, uuid_to_paths = {}, {}
+    renamed = _renamed_pairs(renamed)
 
     def add(uid, p):
         rp = os.path.realpath(p)
@@ -1757,13 +1696,9 @@ def known_markers(reg: dict, look=(), renamed=()) -> tuple:
             if fid and fid != e.get("fid"):
                 e["fid"] = fid
                 reg["_dirty"] = True
-        for a, b in renamed:
-            a, b = os.path.realpath(a), os.path.realpath(b)
-            ro = os.path.realpath(old)
-            if ro == a or ro.startswith(a.rstrip(os.sep) + os.sep):
-                cand = b + ro[len(a):]
-                if read_marker(cand) == uid:
-                    add(uid, cand)
+        for cand in _renamed_to(old, renamed):
+            if read_marker(cand) == uid:
+                add(uid, cand)
     for d in look:
         d = os.path.realpath(d)
         uid = read_marker(d)
@@ -1780,7 +1715,7 @@ def watch_list(reg: dict) -> dict:
         p = e.get("real_path")
         if not p:
             continue
-        fid = e.get("fid") or {}
+        fid = e.get("fid") if isinstance(e.get("fid"), dict) else {}
         try:
             here = os.path.isdir(p)
         except OSError:
@@ -1801,14 +1736,18 @@ class WatchJudge:
     `args()`, at the end of a quiet moment, gives what to run reconcile
     with, or None: nothing aht follows changed.
 
-    `scan_new` (Linux): a folder that appeared is looked through for
-    markers, since what was put into it before it was watched went unseen."""
+    A folder that appeared (made, or moved in from elsewhere) is looked
+    through by the reconcile (`--scan`) for markers and repositories: the
+    system names only the folder, not what it holds."""
 
-    def __init__(self, scan_new: bool = False):
+    _NEVER = object()
+
+    def __init__(self, scan_new: bool = True):
         self.scan_new = scan_new
         self.look, self.new_dirs, self.moves = set(), set(), []
         self.full = False
-        self._stamp, self._reg = None, {"projects": {}}
+        self._stamp, self._reg = self._NEVER, {"projects": {}}
+        self._paths, self._repos = set(), set()
         self.handled = self.mismatch()
 
     def _registry(self) -> dict:
@@ -1817,7 +1756,7 @@ class WatchJudge:
             stamp = (st.st_mtime_ns, st.st_size)
         except OSError:
             stamp = None
-        if stamp != self._stamp:
+        if stamp != self._stamp or self._stamp is self._NEVER:
             self._stamp, self._reg = stamp, load_registry()
             self._paths = {os.path.normcase(os.path.realpath(e["real_path"]))
                            for e in self._reg["projects"].values() if e.get("real_path")}
@@ -1838,14 +1777,25 @@ class WatchJudge:
         return "\n".join(out)
 
     def _in_project(self, path: str) -> bool:
+        return self._under(path, self._paths)
+
+    @staticmethod
+    def _under(path: str, folders) -> bool:
         p = os.path.normcase(os.path.realpath(path))
         while True:
-            if p in self._paths:
+            if p in folders:
                 return True
             up = os.path.dirname(p)
             if up == p:
                 return False
             p = up
+
+    def _new_folder(self, path: str) -> None:
+        name = os.path.basename(path)
+        if self.scan_new and not name.startswith(".") and name not in prune_dirs() \
+                and not self._in_project(path) and not self._under(path, self._repos) \
+                and not _in_trash(path) and not _inside(path, str(aht_home())):
+            self.new_dirs.add(path)
 
     def added(self, path: str) -> None:
         self._registry()
@@ -1858,20 +1808,25 @@ class WatchJudge:
         elif name == ".git":
             if os.path.normcase(os.path.realpath(up)) not in self._repos and not _in_trash(up):
                 self.look.add(up)
-        elif self.scan_new and not name.startswith(".") and name not in prune_dirs() \
-                and not self._in_project(up):
-            self.new_dirs.add(path)
+        else:
+            self._new_folder(path)
 
     def removed(self, path: str) -> None:
         pass                    # mismatch() sees a project that went
 
     def renamed(self, old: str, new: str) -> None:
+        """A rename inside the roots: what the folder holds was there before,
+        so only the projects and repositories in it are followed; nothing is
+        looked through, unless it was a folder a scan leaves out."""
         self._registry()
-        o = os.path.normcase(os.path.realpath(old))
-        if any(p == o or p.startswith(o.rstrip(os.sep) + os.sep) for p in self._paths):
+        if any(_inside(p, old) for p in self._paths | self._repos):
             self.moves.append((old, new))
-        else:
+        elif os.path.basename(new) in (".aht", ".claude", ".git"):
             self.added(new)
+        else:
+            was = os.path.basename(old)
+            if was.startswith(".") or was in prune_dirs():
+                self._new_folder(new)
 
     def lost(self) -> None:
         """Changes went unseen: only a walk knows what happened."""
@@ -1879,23 +1834,19 @@ class WatchJudge:
 
     def args(self):
         look = set(self.look)
-        if self.new_dirs:
-            tops = [d for d in self.new_dirs
-                    if not any(d != o and _inside(d, o) for o in self.new_dirs)]
-            try:
-                look |= {p for p in find_markers([d for d in tops if os.path.isdir(d)])[0]
-                         if os.path.normcase(p) not in self._paths}
-            except OSError:
-                self.full = True
+        scan = sorted(d for d in self.new_dirs if os.path.isdir(d)
+                      and not any(d != o and _inside(d, o) for o in self.new_dirs))
         full, moves = self.full, list(self.moves)
         self.look, self.new_dirs, self.moves, self.full = set(), set(), [], False
         if full:
             return []
-        if not look and not moves and self.mismatch() == self.handled:
+        if not look and not scan and not moves and self.mismatch() == self.handled:
             return None
         out = ["--quick"]
         if look:
             out += ["--look"] + sorted(look)
+        if scan:
+            out += ["--scan"] + scan
         for a, b in moves:
             out += ["--renamed", a, b]
         return out
@@ -1906,17 +1857,36 @@ class WatchJudge:
         self._stamp = None
         self.handled = self.mismatch()
 
-def write_watch_list(reg: dict) -> None:
+def _watch_sig(reg: dict) -> str:
+    """What the watchers' list is made of, without a look at the disk."""
+    return hashlib.sha256(json.dumps(
+        [sorted((e.get("real_path"), e.get("fid")) for e in reg.get("projects", {}).values()
+                if e.get("real_path")),
+         sorted(reg.get("git_repos") or []), sorted(prune_dirs()),
+         bool(cfg_get("icons_enabled", True) and cfg_get("icons_git", True))],
+        sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+def write_watch_list(reg: dict, force: bool = False) -> None:
     """run/watch.json, rewritten only when it would read differently (the
-    watchers read it again when it changes)."""
+    watchers read it again when it changes).  Unless `force` (a reconcile:
+    which projects are there now), only when what it is made of changed: a
+    save of the registry at a session's start looks at no project folder."""
     try:
         p = aht_home() / "run" / "watch.json"
-        text = json.dumps(watch_list(reg), sort_keys=True)
+        sig = _watch_sig(reg)
         try:
-            if p.read_text() == text:
-                return
+            old = p.read_text()
         except OSError:
-            pass                # not written yet
+            old = None          # not written yet
+        if not force and old is not None:
+            try:
+                if json.loads(old).get("sig") == sig:
+                    return
+            except ValueError:
+                pass            # unreadable: written again
+        text = json.dumps(dict(watch_list(reg), sig=sig), sort_keys=True)
+        if old == text:
+            return
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(f"watch.json.{os.getpid()}.tmp")
         tmp.write_text(text)
@@ -2441,11 +2411,20 @@ def find_git_repos(roots: list) -> set:
                            if not d.startswith(".") and d not in pruned]
     return found
 
-def known_git_repos(prev: set, look=()) -> set:
-    """find_git_repos without the walk: the ones known that still are one,
-    and the folders in `look` where a .git appeared (not inside a repository
-    already known, a hidden folder or one a scan leaves out, as the walk)."""
+def known_git_repos(prev: set, look=(), renamed=(), scan=()) -> set:
+    """find_git_repos without the walk of the roots: the ones known that
+    still are one, where each (old, new) rename in `renamed` took a known
+    one, the folders in `look` where a .git appeared, and the repositories
+    in the folders of `scan` (they appeared: made, or moved in from
+    elsewhere).  Not inside a repository already known, a hidden folder or
+    one a scan leaves out, as the walk."""
     now = {p for p in prev if os.path.exists(os.path.join(p, ".git"))}
+    pairs = _renamed_pairs(renamed)
+    for p in prev:
+        for q in _renamed_to(p, pairs):
+            if os.path.exists(os.path.join(q, ".git")):
+                now.add(q)
+    look = list(look) + (sorted(find_git_repos(list(scan))) if scan else [])
     pruned = prune_dirs()
     home = os.path.realpath(str(Path.home()))
     for d in look:
@@ -4164,15 +4143,20 @@ def cmd_reconcile(args):
     # wherever it went.  The walk of the watched folders finds what has no
     # id here yet (a copy, a project from elsewhere).  --quick (the
     # watchers) leaves the walk out: the watcher names the folders where a
-    # marker or a .git appeared (--look) and what was renamed (--renamed),
-    # and the walk runs once a day, as a safety net
+    # marker or a .git appeared (--look), the folders that appeared, made or
+    # moved in from elsewhere (--scan: walked, they alone) and what was
+    # renamed (--renamed); the walk runs once a day, as a safety net
     look = [os.path.realpath(d) for d in getattr(args, "look", None) or []]
     renamed = [tuple(r) for r in getattr(args, "renamed", None) or []]
+    news_in = [os.path.realpath(d) for d in getattr(args, "scan", None) or []
+               if os.path.isdir(d)]
+    news_in = [d for d in news_in if not any(d != o and _inside(d, o) for o in news_in)]
     quick = bool(getattr(args, "quick", False))
     walk = not quick
 
     def scan(reg):
-        found = find_markers(roots)[1] if walk else {}
+        found = find_markers(roots)[1] if walk else \
+            find_markers(news_in)[1] if news_in else {}
         for uid, paths in known_markers(reg, look, renamed)[1].items():
             have = found.setdefault(uid, [])
             have += [p for p in paths
@@ -4279,10 +4263,14 @@ def cmd_reconcile(args):
             # Linux: new emblems (a version of aht's own "+") go on every git
             # folder once, not only on the ones that changed
             redo = IS_LINUX and reg.get("git_emblems") != EMBLEM_VERSION
-            if bool(args.apply) or age > GIT_SCAN_INTERVAL or redo or look:
+            if bool(args.apply) or age > GIT_SCAN_INTERVAL or redo or look or news_in \
+                    or renamed or applied_moves:
                 tpaths = tethered_paths(reg)
                 git_prev = set(reg.get("git_repos", []))
-                git_now = find_git_repos(roots) if walk else known_git_repos(git_prev, look)
+                # a project that moved takes the repository it is along
+                went = renamed + [(m["from"], m["to"]) for m in applied_moves]
+                git_now = find_git_repos(roots) if walk else \
+                    known_git_repos(git_prev, look, went, news_in)
                 changed_git = [(p, desired_marks(p, p in tpaths))
                                for p in ((git_now | git_prev) if redo else (git_now ^ git_prev))]
                 reg["git_scan_at"] = time.time()
@@ -4329,6 +4317,9 @@ def cmd_reconcile(args):
                         f"(target occupied — see aht status)")
         notify_user("Agent project history", ", ".join(bits))
 
+    if acted:
+        with Lock():
+            write_watch_list(load_registry(), force=True)   # which projects are there now
     if applied_moves or applied_copies or (do_news and news):
         tell_app("changed")
     print(json.dumps({"applied": acted, "policies": pol, "asked": asked, "walked": walk,
@@ -28757,6 +28748,7 @@ def build_parser():
     # the watchers: no walk (see cmd_reconcile)
     s.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--look", nargs="*", action="extend", metavar="DIR", help=argparse.SUPPRESS)
+    s.add_argument("--scan", nargs="*", action="extend", metavar="DIR", help=argparse.SUPPRESS)
     s.add_argument("--renamed", nargs=2, action="append", metavar=("OLD", "NEW"),
                    help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_reconcile)

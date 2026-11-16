@@ -339,11 +339,11 @@ def run_inotify(roots, runner, debounce, max_watches, once=False):
             runner.run(a)
             judge.ran()
             next_look = time.time() + aht.WATCH_LOOK_SECONDS
-            # the reconcile may have renamed folders; make sure their new
-            # locations are watched too (not after a look that found
-            # everything in place: that would walk the roots every time)
+            # after a walk of the roots (changes went unseen), every folder
+            # is watched again; a folder that appeared got its watches when
+            # it was named, so no other run walks the roots here
             try:
-                for root in (roots if a != ["--quick"] else []):
+                for root in (roots if a == [] else []):
                     for d in walk_dirs(root, pruned):
                         if len(ino.wd_to_path) >= max_watches:
                             break

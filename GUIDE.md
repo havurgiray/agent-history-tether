@@ -625,9 +625,11 @@ and the agent starts empty there. aht notices and moves the history along.
   says where that folder is now, also when you moved it out of the
   watched folders (on Linux the system tells the watcher what was renamed
   to what, inside the watched folders). A folder in the Trash counts as
-  missing, not as moved. Saving files in a project starts nothing; the
-  watched folders are still walked once a day, for what has no such
-  number yet. Without it (`watcher_owner` set to `none`), only Claude Code's start
+  missing, not as moved. A folder that appears outside your projects
+  (made, or moved in from elsewhere) is looked through by itself, for a
+  project or a git repository in it. Saving files in a project starts
+  nothing; the watched folders are still walked when the watcher starts
+  and once a day, for what has no such number yet. Without it (`watcher_owner` set to `none`), only Claude Code's start
   hook relinks, when a session starts in the moved folder, and **Find
   Moved Folders Now** catches up on the rest.
 

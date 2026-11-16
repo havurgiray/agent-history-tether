@@ -182,8 +182,26 @@ else:
         os.rename(str(roots / "plain"), str(roots / "plain2"))
         time.sleep(2.0)
         ck(len(runs()) == n, f"a folder renamed that holds no project starts nothing ({runs()[n:]})")
+        far = sb / "far-in"
+        (far / "theirs" / ".aht").mkdir(parents=True)
+        (far / "theirs" / ".aht" / ".project-id").write_text("from-another-machine\n")
+        (far / "repo" / ".git").mkdir(parents=True)
+        brought = os.path.realpath(str(roots / "brought"))
+        os.rename(str(far), brought)
+        def found_in():
+            try:
+                reg_ = json.loads((sb / ".aht" / "registry.json").read_text())
+            except (OSError, ValueError):
+                return False
+            return any(e.get("real_path") == os.path.join(brought, "theirs")
+                       for e in reg_.get("projects", {}).values()) \
+                and os.path.join(brought, "repo") in (reg_.get("git_repos") or [])
+        t = until(found_in)
+        ck(t is not None, f"a folder moved in: the project and the repository in it are found "
+                          f"({took(t)})")
+        time.sleep(1.0)
         shutil.copytree(projG, str(roots / "copyG"))
-        t = until(lambda: reg_path()[1] == 2)
+        t = until(lambda: reg_path()[1] == 3)
         ck(t is not None and (roots / "copyG" / ".aht" / ".project-id").read_text().strip() != uid_b,
            f"a copy is found in the folder that appeared, and gets its own id ({took(t)})")
     finally:

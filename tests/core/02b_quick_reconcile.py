@@ -138,6 +138,21 @@ ck(gitty not in (reg().get("git_repos") or []), "…and one whose .git went is d
 
 # what the Windows and the Linux watcher decide by (the Mac's does it in Swift)
 os.environ.update({k: env[k] for k in env if k.startswith("AHT_")})
+empty = Path(os.path.realpath(sb)) / "no-registry-yet"
+empty.mkdir()
+was_home = os.environ["AHT_HOME"]
+os.environ["AHT_HOME"] = str(empty)
+try:
+    j0 = core.WatchJudge()
+    j0.added(str(roots / "x" / ".git"))
+    j0.added(str(roots / "y"))
+    j0.renamed(str(roots / "y"), str(roots / "z"))
+    ok0 = j0.args() is not None
+except Exception as e:
+    ok0 = f"{type(e).__name__}: {e}"
+finally:
+    os.environ["AHT_HOME"] = was_home
+ck(ok0 is True, f"the watchers' judge works before there is a registry ({ok0})")
 j = core.WatchJudge()
 ck(j.args() is None, "the watchers' judge: nothing changed, nothing to run")
 for d in ("build", "node_modules"):
@@ -149,8 +164,9 @@ shutil.copytree(projT, copy2)
 j.added(copy2)
 j.added(os.path.join(copy2, ".aht"))
 j.added(os.path.join(projT, ".aht"))            # a project it has: aht's own folder there
-ck(j.args() == ["--quick", "--look", copy2],
-   "…a marker's folder in a folder it does not have: a look there")
+ck(j.args() == ["--quick", "--look", copy2, "--scan", copy2],
+   "…a marker's folder in a folder it does not have: a look there, and the folder that "
+   "appeared is looked through")
 shutil.rmtree(copy2)
 newgit = os.path.realpath(str(roots / "newgit"))
 os.makedirs(os.path.join(newgit, ".git"))
@@ -171,6 +187,7 @@ os.makedirs(other)
 j.renamed(other, other + "2")
 os.rename(other, other + "2")
 ck(j.args() is None, "…a folder renamed that holds no project starts nothing")
+os.rename(other + "2", other)
 os.rename(projU, projT)                         # moved with no word of it (across folders)
 a = j.args()
 ck(a == ["--quick"], f"…a project that is not where it was, with no word of it: a look ({a})")
@@ -178,14 +195,51 @@ J("reconcile", "--apply", "--quick", "--renamed", projU, projT)
 j.ran()
 j.lost()
 ck(j.args() == [], "…changes that went unseen: a reconcile with its walk")
-if not has_ids:
-    j2 = core.WatchJudge(scan_new=True)
-    grp = os.path.realpath(str(roots / "pasted"))
-    shutil.copytree(projT, os.path.join(grp, "inner"))
-    j2.added(grp)                               # its inside was written before it was watched
-    ck(j2.args() == ["--quick", "--look", os.path.join(grp, "inner")],
-       "…Linux: a folder that appeared is looked through for markers")
-    shutil.rmtree(grp)
+
+# a folder moved in from elsewhere, holding a project of its own and a git
+# repository: the system names only that folder; aht looks through it
+far = Path(os.path.realpath(sb)) / "elsewhere-in"
+(far / "theirs" / ".aht").mkdir(parents=True)
+(far / "theirs" / ".aht" / ".project-id").write_text("from-another-machine\n")
+(far / "theirs" / "notes.md").write_text("x")
+(far / "repo" / ".git").mkdir(parents=True)
+moved_in = os.path.realpath(str(roots / "brought"))
+shutil.move(str(far), moved_in)
+j.added(moved_in)
+a = j.args()
+ck(a == ["--quick", "--scan", moved_in], f"…a folder moved in: looked through ({a})")
+d = J("reconcile", "--notify", *a)
+theirs, repo = os.path.join(moved_in, "theirs"), os.path.join(moved_in, "repo")
+ck(any(n["path"] == theirs for n in d["news"]) and theirs in [p["path"] for p in watch()["projects"]]
+   and repo in (reg().get("git_repos") or []),
+   f"--scan: the project in it is taken on and the repository in it noted "
+   f"({[n['path'] for n in d['news']]}, {[os.path.basename(r) for r in reg().get('git_repos') or []]})")
+j.ran()
+
+# a repository renamed: it is followed, not dropped until the day's walk
+repo2 = os.path.realpath(str(roots / "brought" / "repo-renamed"))
+os.rename(repo, repo2)
+j.renamed(repo, repo2)
+a = j.args()
+ck(a == ["--quick", "--renamed", repo, repo2], f"…a repository renamed: what was renamed ({a})")
+J("reconcile", "--notify", *a)
+repos = reg().get("git_repos") or []
+ck(repo2 in repos and repo not in repos, f"--renamed: the repository is noted where it is now "
+                                         f"({[os.path.basename(r) for r in repos]})")
+j.ran()
+
+# the watchers' list: a save that changes nothing it is made of leaves it
+# alone (no look at the projects' folders); a reconcile writes it
+wj = home / "run" / "watch.json"
+before = wj.stat().st_mtime_ns
+r1 = reg()
+r1["projects"][uid]["updated_at"] = "2000-01-01T00:00:00"
+with core.Lock():
+    core.save_registry(r1)
+ck(wj.stat().st_mtime_ns == before and "sig" in json.loads(wj.read_text()),
+   "a registry save that changes nothing the watchers read leaves their list alone")
+r1["projects"][uid]["fid"] = [1, 2]             # an id in a form it does not know
+ck(core.watch_list(r1)["projects"] and True, "…and an id it cannot read does not stop the list")
 
 # the walk, once a day
 r0 = reg()

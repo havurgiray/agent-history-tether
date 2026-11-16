@@ -424,8 +424,8 @@ or brought to another machine with Bring Here:
 - `watch.json`: what the watcher reads to tell whether a project moved,
   without searching your folders: each tracked project's path, the
   number its folder has on its disk, the disk, whether it is there now,
-  the folders known as git repositories, and the folder names aht never
-  looks into;
+  the folders known as git repositories, the folder names aht never
+  looks into, and a checksum of all that (to tell when it changed);
 - `store-size.json`: how many bytes each folder of the backup store's
   pieces holds, so the size of the backups is not counted anew each time;
 - `transfer-<project id>.json`: while a handover or a take-back runs, the

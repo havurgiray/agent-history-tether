@@ -547,8 +547,9 @@ def _default_watch_roots():
 # renamed under the roots (folders only: files being saved wake nothing);
 # aht.WatchJudge then asks, by each tracked project's folder id, whether one
 # is no longer where the registry has it, and only then, or when a marker or
-# a .git appeared in a folder aht does not know, a reconcile runs
-# (`--quick`: without the walk of the roots).
+# a .git appeared in a folder aht does not know, or a folder appeared
+# outside every project (made, or moved in: it is looked through), a
+# reconcile runs (`--quick`: without the walk of the roots).
 
 FILE_LIST_DIRECTORY = 0x0001
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -831,9 +832,9 @@ def cmd_watch(argv) -> int:
     runner = Runner(roots)
     _wlog(f"starting ({'frozen exe' if FROZEN else 'script'}: {sys.executable})")
     if not args.no_startup_scan:
-        # what moved while this was not running: found by the ids (the walk
-        # runs with it when the day's one is due)
-        runner.run(["--quick"])
+        # what changed while this was not running: a project moved is found
+        # by its id, but a copy or one put here from elsewhere only by the walk
+        runner.run()
 
     try:
         if args.poll:

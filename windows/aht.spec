@@ -47,8 +47,9 @@ COMMON = dict(
     binaries=[],
     hookspath=[],
     runtime_hooks=[],
+    # sqlite3 stays: search needs it; lzma too: the backup store packs with xz
     excludes=['tkinter', 'unittest', 'pydoc', 'doctest', 'test',
-              'xmlrpc', 'lzma', 'bz2', 'curses'],   # sqlite3 stays: search needs it
+              'xmlrpc', 'bz2', 'curses'],
     noarchive=False,
 )
 

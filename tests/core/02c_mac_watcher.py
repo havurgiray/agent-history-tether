@@ -56,8 +56,10 @@ def start(**more):
 
 w = start(AHT_ASSUME="Relink")
 try:
-    ck(until(lambda: len(runs()) == 1) is not None and "the regular look" in runs()[0],
-       f"at its start it looks once, by the ids ({runs()})")
+    ck(until(lambda: len(runs()) == 1) is not None and "the start" in runs()[0]
+       and "with the walk" in runs()[0],
+       f"at its start it looks once, with the walk: what changed while it was not running "
+       f"({runs()})")
     time.sleep(0.6)
 
     # files saved inside the project, and in a folder inside it
@@ -89,16 +91,30 @@ try:
        f"({'%.2f s' % took if took else 'not in 8 s'})")
     os.rename(projC, projB)
     until(lambda: reg()["projects"].get(uid, {}).get("real_path") == projB)
+    # out and back in, again and again: each run's end is seen, so the next
+    # change is acted on (an earlier build stopped after a few)
+    missed = []
+    for i in range(10):
+        for there in (projC, projB):
+            os.rename(projB if there == projC else projC, there)
+            if until(lambda: reg()["projects"].get(uid, {}).get("real_path") == there, 5) is None:
+                missed.append((i, os.path.basename(os.path.dirname(there))))
+                break
+            time.sleep(0.4)
+        if missed:
+            break
+    ck(not missed, f"twenty moves in a row, each one followed ({missed or 'all'})")
 
     # a parent folder renamed
     os.makedirs(str(roots / "group"))
     os.rename(projB, str(roots / "group" / "projB"))
     until(lambda: reg()["projects"].get(uid, {}).get("real_path", "").endswith("group/projB"))
+    n = len(runs())
     os.rename(str(roots / "group"), str(roots / "group2"))
     projD = os.path.realpath(str(roots / "group2" / "projB"))
     took = until(lambda: reg()["projects"].get(uid, {}).get("real_path") == projD)
     ck(took is not None, f"a parent folder renamed: relinked "
-                         f"({'%.2f s' % took if took else 'not in 8 s'})")
+                         f"({'%.2f s' % took if took else 'not in 8 s'}; {runs()[n:]})")
 
 finally:
     w.terminate()
@@ -106,7 +122,7 @@ finally:
 
 w = start(AHT_ASSUME="Duplicate")
 try:
-    until(lambda: "the regular look" in "".join(runs()[-1:]))
+    until(lambda: "the start" in "".join(runs()[-1:]))
     time.sleep(0.6)
     # a copy
     n = len(runs())
@@ -131,6 +147,23 @@ try:
         Path(gitty, f"file{i}.txt").write_text("x")
     time.sleep(1.5)
     ck(len(runs()) == n, f"…and work in a known repository starts nothing ({runs()[n:]})")
+
+    # a folder moved in from elsewhere, holding a project of its own and a
+    # repository: macOS names only that folder; it is looked through
+    far = Path(os.path.realpath(sb)) / "far-in"
+    (far / "theirs" / ".aht").mkdir(parents=True)
+    (far / "theirs" / ".aht" / ".project-id").write_text("from-another-machine\n")
+    (far / "repo" / ".git").mkdir(parents=True)
+    time.sleep(0.5)
+    n = len(runs())
+    moved_in = os.path.realpath(str(roots / "brought"))
+    os.rename(str(far), moved_in)
+    theirs, repo = os.path.join(moved_in, "theirs"), os.path.join(moved_in, "repo")
+    took = until(lambda: any(e.get("real_path") == theirs for e in reg()["projects"].values())
+                 and repo in (reg().get("git_repos") or []))
+    ck(took is not None and "walk" not in "".join(runs()[n:]),
+       f"a folder moved in: the project and the repository in it are found, with no walk "
+       f"({'%.2f s' % took if took else 'not in 8 s'}; {runs()[n:]})")
 finally:
     w.terminate()
     w.wait()
@@ -139,7 +172,7 @@ finally:
 w = start(AHT_ASSUME="Not now")
 try:
     n = len(runs())
-    until(lambda: len(runs()) > n and "the regular look" in runs()[-1])
+    until(lambda: len(runs()) > n and "the start" in runs()[-1])
     time.sleep(0.6)
     n = len(runs())
     projE = os.path.realpath(str(roots / "projE"))

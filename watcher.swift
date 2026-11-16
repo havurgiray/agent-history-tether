@@ -3,13 +3,16 @@
 //
 // It does not search.  aht keeps a short list (~/.aht/run/watch.json) of the
 // tracked projects with each folder's id, and the file system answers where
-// a folder with a given id is now.  So on a change the watcher asks, for
-// each project, "still where the list has it?" (a fraction of a millisecond
-// for a hundred projects) and starts
-//   aht.py reconcile --quick --notify [--look <folders>]
-// only when one is not, or when a marker (.aht/.project-id) or a .git
-// appeared in a folder the list does not know.  Changes inside a project
-// (saving files, a build) are passed over with one look-up each.
+// a folder with a given id is now.  So when a project, or a folder above
+// one, is renamed or goes, the watcher asks for each project "still where
+// the list has it?" (a fraction of a millisecond for a hundred projects),
+// and starts
+//   aht.py reconcile --quick --notify [--look <folders>] [--scan <folders>]
+// only when one is not, when a marker (.aht/.project-id) or a .git appeared
+// in a folder the list does not know, or when a folder appeared outside
+// every project and repository (made, or moved in from elsewhere: aht looks
+// through it, since macOS names only the folder).  Changes inside a project
+// (saving files, a build) are passed over with a look-up or two each.
 //
 // Single-flight: never a second reconcile while one runs (its dialogs must
 // not stack); one more run follows when something came up meanwhile.
@@ -167,41 +170,71 @@ var running = false
 var wantQuick = false
 var wantFull = false
 var look = Set<String>()
+var scan = Set<String>()
 var why = ""
+
+/// The outermost of `dirs`: one looked through is looked through whole.
+func outermost(_ dirs: Set<String>) -> [String] {
+    dirs.filter { d in !dirs.contains { o in o != d && d.hasPrefix(o + "/") } }.sorted()
+}
 
 func launch() {
     pending = nil
     firstAt = nil
-    let full = wantFull, dirs = look.sorted(), reason = why
-    wantQuick = false; wantFull = false; look = []; why = ""
+    let full = wantFull, dirs = look.sorted(), scans = outermost(scan), reason = why
+    wantQuick = false; wantFull = false; look = []; scan = []; why = ""
     handled = mismatch()
     running = true
     let p = Process()
+    current = p
     p.executableURL = URL(fileURLWithPath: PYTHON)
     p.arguments = [PY, "reconcile", "--notify"] + (full ? [] : ["--quick"]) + ["--roots"] + roots
         + (dirs.isEmpty || full ? [] : ["--look"] + dirs)
+        + (scans.isEmpty || full ? [] : ["--scan"] + scans)
     let pipe = Pipe()
     p.standardOutput = pipe
     let began = Date()
+    // its end: both its answer read to the end and its exit seen.  Not
+    // waitUntilExit() on a worker thread: that can miss the exit and wait
+    // for ever, and then no change is acted on again
+    let done = DispatchGroup()
+    var data = Data()
+    done.enter()
+    p.terminationHandler = { _ in
+        queue.async { if current === p { endedAt = Date() } }
+        done.leave()
+    }
     do { try p.run() }
     catch {
         running = false
+        current = nil
         say("reconcile did not start: \(error)")
         return
     }
+    done.enter()
     DispatchQueue.global().async {
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        queue.async {
-            running = false
-            report(data, p.terminationStatus, Date().timeIntervalSince(began), full, reason)
-            loadList()
-            // what aht just saw and left as it is (a move you declined) is
-            // not brought up again; what came up meanwhile is
-            handled = mismatch()
-            if wantQuick || wantFull || !look.isEmpty { schedule() }
-        }
+        data = pipe.fileHandleForReading.readDataToEndOfFile()
+        done.leave()
     }
+    done.notify(queue: queue) {
+        guard current === p else { return }     // given up on already (see the timer)
+        finish(data, p.terminationStatus, Date().timeIntervalSince(began), full, reason)
+    }
+}
+
+var current: Process?                   // the reconcile running now
+var endedAt: Date?                      // when it exited
+
+func finish(_ data: Data, _ status: Int32, _ took: Double, _ full: Bool, _ reason: String) {
+    running = false
+    current = nil
+    endedAt = nil
+    report(data, status, took, full, reason)
+    loadList()
+    // what aht just saw and left as it is (a move you declined) is not
+    // brought up again; what came up meanwhile is
+    handled = mismatch()
+    if wantQuick || wantFull || !look.isEmpty || !scan.isEmpty { schedule() }
 }
 
 /// One line for a run that did or found something, not its whole answer.
@@ -247,36 +280,64 @@ let dropped = UInt32(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEven
     | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped
     | kFSEventStreamEventFlagRootChanged)
 
+let isDir = UInt32(kFSEventStreamEventFlagItemIsDir)
+let made = UInt32(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemRenamed)
+
 let callback: FSEventStreamCallback = { _, _, count, paths, flags, _ in
-    // folder-level events: each path is a folder something changed in
+    // item-level events: each path is what changed, its flags say how
     let list = unsafeBitCast(paths, to: NSArray.self) as! [String]
     loadList()
     var check = false
+    var appeared: [String] = []
     for i in 0..<count {
+        let f = flags[i]
         var p = list[i]
         while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
-        if flags[i] & dropped != 0 {
+        if f & dropped != 0 {
             wantFull = true             // events were lost: only a walk knows what happened
             note("events were dropped")
             continue
         }
         let name = (p as NSString).lastPathComponent
         let up = (p as NSString).deletingLastPathComponent
-        if name == ".aht" || name == ".claude" {
+        let upName = (up as NSString).lastPathComponent
+        if name == ".project-id" && (upName == ".aht" || upName == ".claude") {
             // a marker in a folder the list does not have: a copy, or a project from elsewhere
-            if !projectPaths.contains(fold(up)) && !inTrash(up)
-                && FileManager.default.fileExists(atPath: p + "/.project-id") {
-                look.insert(up)
-                note("a marker in \(up)")
+            let proj = (up as NSString).deletingLastPathComponent
+            if !projectPaths.contains(fold(proj)) && !inTrash(proj)
+                && FileManager.default.fileExists(atPath: p) {
+                look.insert(proj)
+                note("a marker in \(proj)")
             }
-        } else if name == ".git" {
-            if wantGit && !gitRepos.contains(fold(up)) && !passedOver(up) && !insideRepo(up)
-                && !inTrash(up) && FileManager.default.fileExists(atPath: p) {
+            continue
+        }
+        if name == ".git" {
+            if f & made != 0 && wantGit && !gitRepos.contains(fold(up)) && !passedOver(up)
+                && !insideRepo(up) && !inTrash(up) && FileManager.default.fileExists(atPath: p) {
                 look.insert(up)
                 note("a git repository in \(up)")
             }
-        } else if parents.contains(fold(p)) || !insideProject(p) {
-            check = true                // a folder a project could have left or come to
+            continue
+        }
+        if f & isDir == 0 { continue }  // a file: nothing aht follows
+        if projectPaths.contains(fold(p)) || parents.contains(fold(p)) {
+            check = true                // a project, or a folder above one, renamed or gone
+        }
+        if f & made != 0 && !insideProject(p) && !gitRepos.contains(fold(p)) && !insideRepo(p)
+            && !passedOver(p) && !inTrash(p) && FileManager.default.fileExists(atPath: p) {
+            appeared.append(p)          // made, renamed, or moved in from elsewhere
+        }
+    }
+    if !appeared.isEmpty {
+        // a project renamed or moved is found by its id: no need to look through it
+        let at = Set(projects.compactMap { whereNow($0) }.map(fold))
+        for p in appeared {
+            if at.contains(fold(p)) {
+                check = true
+            } else {
+                scan.insert(p)
+                note("a folder appeared: \(p)")
+            }
         }
     }
     if check {
@@ -286,7 +347,7 @@ let callback: FSEventStreamCallback = { _, _, count, paths, flags, _ in
             note(m.isEmpty ? "all in place again" : "moved: " + m.replacingOccurrences(of: "\n", with: "; "))
         }
     }
-    if wantQuick || wantFull || !look.isEmpty { schedule() }
+    if wantQuick || wantFull || !look.isEmpty || !scan.isEmpty { schedule() }
 }
 
 var ctx = FSEventStreamContext()
@@ -294,7 +355,7 @@ guard let stream = FSEventStreamCreate(
     kCFAllocatorDefault, callback, &ctx, roots as CFArray,
     FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.1,
     UInt32(kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagWatchRoot
-           | kFSEventStreamCreateFlagUseCFTypes)
+           | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents)
 ) else {
     FileHandle.standardError.write("failed to create FSEventStream\n".data(using: .utf8)!)
     exit(1)
@@ -304,8 +365,14 @@ FSEventStreamStart(stream)
 
 // the periodic work (Keep in sync, backups, the search index, new history
 // stores) starts from a reconcile; without a change to react to, a timer
-// runs one.  It also finds what moved while this was not running
+// runs one
 func regularLook() {
+    // a run that exited a minute ago and still counts as running (its
+    // answer never came: something it started holds its output open)
+    if running, let t = endedAt, Date().timeIntervalSince(t) > 60 {
+        say("a reconcile ended without its answer; going on")
+        finish(Data(), 0, 0, false, "its answer did not come")
+    }
     loadList()
     wantQuick = true
     note("the regular look")
@@ -316,5 +383,13 @@ let timer = DispatchSource.makeTimerSource(queue: queue)
 timer.schedule(deadline: .now() + TICK, repeating: TICK, leeway: .seconds(Int(min(60, TICK / 10))))
 timer.setEventHandler { regularLook() }
 timer.resume()
-queue.async { regularLook() }           // once at the start, at once
+// at the start, at once: what changed while this was not running.  A project
+// that moved is found by its id, but a copy, or one put here from elsewhere,
+// only by the walk
+queue.async {
+    loadList()
+    wantFull = true
+    note("the start")
+    schedule()
+}
 dispatchMain()

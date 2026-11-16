@@ -140,9 +140,11 @@ try:
     ck(t is not None and (copy / ".aht" / ".project-id").read_text(encoding="utf-8").strip() != uid,
        f"a copy is seen where its marker appeared, and gets its own id ({took(t)})")
 
-    os.rename(projE, projE.with_name("PROJe"))  # only the case
-    t = until(lambda: reg()["projects"].get(uid, {}).get("real_path", "").endswith("PROJe"))
-    ck(t is not None, f"renamed by case only: followed ({took(t)})")
+    time.sleep(1.0)
+    projF = roots / "projF"
+    os.rename(projE, projF)                     # back in: only its new place is told
+    t = until(at(projF))
+    ck(t is not None, f"moved back into the watched folders: relinked ({took(t)})")
 finally:
     w.terminate()
     w.wait()

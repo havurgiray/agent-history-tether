@@ -992,6 +992,10 @@ right, above the taskbar. Turn it on or off in the aht menu (on Windows,
 the tray's menu) with *Sessions in the Corner*, in Settings → Notices, or
 with its ×.
 
+Claude Code's background sessions (`claude --bg`, listed by `claude
+agents`) are not in it: no tab shows them. When a tab's conversation went
+on in the background, that tab's line shows the conversation's state.
+
 > **Example.** Three sessions work on three projects. The list shows
 > *paper* with an orange mark, **waits 2m**: it asks for a permission. A
 > click brings its tab to the front. Later *benchmarks* turns green,

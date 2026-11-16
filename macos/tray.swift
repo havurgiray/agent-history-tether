@@ -11794,18 +11794,37 @@ final class CornerModel: ObservableObject {
         var news: [String: (kind: String, worked: Double)] = [:]
         let fresh = now - lastLook < 10             // after a pause it is old news
         lastLook = now
+        var records: [(Int, [String: Any])] = []
+        var jobs: [String: [String: Any]] = [:]     // background sessions by their job id
         for f in (try? fm.contentsOfDirectory(atPath: sessionsDir)) ?? [] where f.hasSuffix(".json") {
             guard let pid = Int(f.dropLast(5)), pid > 0,
                   kill(pid_t(pid), 0) == 0 || errno == EPERM else { continue }
             guard let d = fm.contents(atPath: sessionsDir + "/" + f),
                   let r = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-                  let sid = r["sessionId"] as? String else {
+                  r["sessionId"] is String else {
                 if let old = byPid[pid] {             // caught mid-write: as it was
                     found[pid] = old
                     status[old.0.id] = old.1
                 }
                 continue
             }
+            // a background session (Claude Code's `--bg`, or one a tab parked)
+            // has no row: no tab to go to
+            if r["kind"] as? String == "bg" {
+                if let j = r["jobId"] as? String { jobs[j] = r }
+                continue
+            }
+            records.append((pid, r))
+        }
+        for (pid, r0) in records {
+            var r = r0
+            // a tab that parked its conversation in the background shows that
+            // conversation's state: its own stopped when it did
+            if let j = r["parkedJobId"] as? String, let job = jobs[j] {
+                r["status"] = job["status"]
+                r["statusUpdatedAt"] = job["statusUpdatedAt"]
+            }
+            let sid = r["sessionId"] as? String ?? ""
             let st = r["status"] as? String ?? "idle"
             let working = st == "busy" || st == "shell"
             let wasWorking = last[sid] == "busy" || last[sid] == "shell"

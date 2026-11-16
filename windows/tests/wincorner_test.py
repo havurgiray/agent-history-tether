@@ -73,6 +73,23 @@ with tempfile.TemporaryDirectory() as td:
     m.seen("s1")
     m.poll()
     ck("looked at: idle, no age", (m.rows[0].state, m.rows[0].age) == ("idle", ""))
+
+    print("\n[background sessions]")
+    mb = C.Model(home, run, records=lambda: live, clock=clock, moving=lambda: [])
+    # a tab that parked its conversation as a background job: its own status
+    # froze ("busy"); the job is where the conversation runs
+    live[:] = [(20, rec("tab", "busy", at=clock.t - 7200, kind="interactive", parkedJobId="j1")),
+               (21, rec("job", "waiting", at=clock.t - 30, kind="bg", jobId="j1")),
+               (22, rec("solo", "busy", at=clock.t - 60, kind="bg", jobId="j2"))]
+    mb.poll()
+    ck("background sessions have no row; the tab that parked one has one",
+       [r.id for r in mb.rows] == ["tab"], [r.id for r in mb.rows])
+    ck("…showing the state of the conversation it parked, not its own frozen one",
+       (mb.rows[0].state, mb.rows[0].status, mb.rows[0].pid) == ("waiting", "waiting", 20),
+       (mb.rows[0].state, mb.rows[0].status, mb.rows[0].pid))
+    live[:] = [(20, rec("tab", "busy", at=clock.t - 7200, kind="interactive", parkedJobId="gone"))]
+    mb.poll()
+    ck("…and its own state when that job is no longer there", mb.rows[0].state == "working")
     live[:] = [(10, rec("s1", "waiting", at=clock.t - 200))]
     m.poll()
     ck("waiting for you, since when it began to", (m.rows[0].state, C.right_text(m.rows[0]))

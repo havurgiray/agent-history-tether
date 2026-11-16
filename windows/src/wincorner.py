@@ -146,6 +146,7 @@ class Model:
         """Look again; whether the rows changed."""
         now = self.clock()
         status, found = {}, {}
+        recs, jobs = [], {}
         for pid, rec in self.records():
             if not rec or not isinstance(rec.get("sessionId"), str):
                 old = self.by_pid.get(pid)                  # caught mid-write: as it was
@@ -153,6 +154,18 @@ class Model:
                     found[pid] = old
                     status[old[0].id] = old[1]
                 continue
+            # a background session (Claude Code's `--bg`, or one a tab parked)
+            # has no row: no tab to go to.  A tab that parked its conversation
+            # shows that conversation's state: its own stopped when it did
+            if rec.get("kind") == "bg":
+                if isinstance(rec.get("jobId"), str):
+                    jobs[rec["jobId"]] = rec
+                continue
+            recs.append((pid, rec))
+        for pid, rec in recs:
+            job = jobs.get(rec.get("parkedJobId")) if isinstance(rec.get("parkedJobId"), str) else None
+            if job:
+                rec = dict(rec, status=job.get("status"), statusUpdatedAt=job.get("statusUpdatedAt"))
             sid = rec["sessionId"]
             st = str(rec.get("status") or "idle")
             at = rec.get("statusUpdatedAt")

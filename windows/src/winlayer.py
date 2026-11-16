@@ -761,6 +761,7 @@ def _run_notify(roots, runner, debounce, stop_h, once=False):
                     a = judge.args()
                 if a is None and now >= next_look:
                     a = ["--quick"]     # the regular look: the periodic work starts from it
+                    judge.looking()
                 if a is not None:
                     runner.run(a)
                     judge.ran()

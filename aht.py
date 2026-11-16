@@ -1749,6 +1749,8 @@ class WatchJudge:
         self._stamp, self._reg = self._NEVER, {"projects": {}}
         self._paths, self._repos = set(), set()
         self.handled = self.mismatch()
+        self._seen = self.handled       # what a run that starts now sees
+        self.again = False              # it changed while aht looked: look again
 
     def _registry(self) -> dict:
         try:
@@ -1836,11 +1838,13 @@ class WatchJudge:
         look = set(self.look)
         scan = sorted(d for d in self.new_dirs if os.path.isdir(d)
                       and not any(d != o and _inside(d, o) for o in self.new_dirs))
-        full, moves = self.full, list(self.moves)
+        full, moves, again = self.full, list(self.moves), self.again
         self.look, self.new_dirs, self.moves, self.full = set(), set(), [], False
+        self.again = False
+        self._seen = self.mismatch()
         if full:
             return []
-        if not look and not scan and not moves and self.mismatch() == self.handled:
+        if not look and not scan and not moves and not again and self._seen == self.handled:
             return None
         out = ["--quick"]
         if look:
@@ -1851,11 +1855,21 @@ class WatchJudge:
             out += ["--renamed", a, b]
         return out
 
+    def looking(self) -> None:
+        """A run starts that args() did not ask for (the regular look)."""
+        self._seen = self.mismatch()
+
     def ran(self) -> None:
-        """aht looked: what it left as it is (a move you declined) is not
-        brought up again."""
+        """aht looked.  What it left as it is (a move you declined) is not
+        brought up again; a change made while it ran is (the next args())."""
         self._stamp = None
-        self.handled = self.mismatch()
+        after = self.mismatch()
+        if not after:
+            self.handled = ""
+        elif after == self._seen:
+            self.handled = after
+        else:
+            self.again = True
 
 def _watch_sig(reg: dict) -> str:
     """What the watchers' list is made of, without a look at the disk."""

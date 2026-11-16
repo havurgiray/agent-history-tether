@@ -182,6 +182,17 @@ J("reconcile", "--apply", *a)
 j.ran()
 ck(reg()["projects"][uid]["real_path"] == projU and j.args() is None,
    "…and once aht looked, nothing is left to run")
+# a move made while aht looked, its word only after: not taken as seen
+outside = Path(os.path.realpath(sb)) / "away-while"
+outside.mkdir()
+a = j.args()                                    # a run begins: all in place
+os.rename(projU, str(outside / "projU"))        # moved while it runs
+j.ran()
+a = j.args()
+ck(a == ["--quick"], f"…a project moved while aht looked: looked at again ({a})")
+os.rename(str(outside / "projU"), projU)
+j.args()
+j.ran()
 other = os.path.realpath(str(roots / "plain"))
 os.makedirs(other)
 j.renamed(other, other + "2")

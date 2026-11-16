@@ -231,9 +231,16 @@ func finish(_ data: Data, _ status: Int32, _ took: Double, _ full: Bool, _ reaso
     endedAt = nil
     report(data, status, took, full, reason)
     loadList()
-    // what aht just saw and left as it is (a move you declined) is not
-    // brought up again; what came up meanwhile is
-    handled = mismatch()
+    // `handled` is what this run saw when it began.  What it left as it is
+    // (a move you declined) is not brought up again; a change made while it
+    // ran is, even when its event comes only now
+    let after = mismatch()
+    if after.isEmpty {
+        handled = ""
+    } else if after != handled {
+        wantQuick = true
+        note("changed while aht looked")
+    }
     if wantQuick || wantFull || !look.isEmpty || !scan.isEmpty { schedule() }
 }
 

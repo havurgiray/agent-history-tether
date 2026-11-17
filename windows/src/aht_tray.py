@@ -574,6 +574,37 @@ def _set_shared(key, value):
 
 # ---- actions ---------------------------------------------------------------
 
+def act_update_claude():
+    """Update Claude Code the way it was installed (winget: once every
+    session is idle and has ended), then each session comes back in its tab
+    (`aht update --claude`).  The core's notice says when it is done."""
+    def work():
+        try:
+            plan = json.loads(_run_cli("update", "--claude", "--json").stdout or "{}")
+        except ValueError:
+            plan = {"blockers": ["aht did not answer"]}
+        if plan.get("blockers"):
+            msgbox("Claude Code is not updated", "\n\n".join(plan["blockers"]),
+                   MB_OK | MB_ICONWARNING)
+            return
+        how = plan.get("how") or "its installer"
+        r = plan.get("restart") or {}
+        text = (f"aht runs {' '.join(plan.get('command') or [])} (Claude Code "
+                f"{plan.get('before') or '?'} came with {how}).\n\n"
+                + ("Then the sessions on an older version start again in their tabs."
+                   if plan.get("while_running", True) else
+                   f"{how} cannot replace Claude Code while it runs, so every session ends "
+                   "first, once its task is over, and starts again in its tab after."))
+        for k, what in (("now", "At once"), ("after", "Once their task is over")):
+            if r.get(k):
+                text += f"\n\n{what}: {', '.join(r[k])}"
+        text += "\n\nA notice says when it is done."
+        if msgbox("Update Claude Code?", text, MB_YESNO | MB_ICONQUESTION) != IDYES:
+            return
+        _run_cli("update", "--claude", "--apply", "--json")
+    _in_thread(work)
+
+
 def act_reconcile():
     def work():
         r = _run_cli("reconcile", "--notify")
@@ -1063,6 +1094,7 @@ def build_menu():
             add(back, f"{name} — Send Back to {frm}…", _send_back(path))
     sep(root)
     add(root, "Reconcile now", act_reconcile)
+    add(root, "Update Claude Code…", act_update_claude)
     add(root, "Pause watching" if running else "Resume watching",
         act_toggle_watch)
     sep(root)

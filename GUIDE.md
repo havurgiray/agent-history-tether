@@ -900,6 +900,19 @@ waiting for you.
 - `aht checkup` — list the open Claude sessions worth a look, and why.
 - `aht checkup --restart <pid> --apply` — end that session and start it
   again in its tab; `--close <pid> --apply` only ends it.
+- `aht checkup --restart-older --apply` — every session that runs an
+  older Claude Code than the one installed starts again in its tab, with
+  the options it had: an idle one at once, a working one once its task is
+  over (`--no-wait` leaves those, `--all` takes every session). The
+  session you run it from, a background session and a tab that moved its
+  conversation to the background are left as they are.
+- `aht update --claude --apply` (the ∞ menu and the Windows tray: **Update
+  Claude Code…**) — update Claude Code the way it was installed (Homebrew,
+  winget, npm or its own installer), then the same restart. winget cannot
+  replace Claude Code while it runs: there every session ends first, once
+  its task is over, and comes back in its tab after the update; one that
+  still works after three hours leaves Claude Code as it is. Without
+  `--apply` it says what it would do.
 
 ## Loose ends
 

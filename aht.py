@@ -22905,7 +22905,47 @@ def _open_page(url: str) -> bool:
     except Exception:
         return False
 
+def _restart_lines(r: dict) -> list:
+    out = []
+    for k, verb in (("now", "restarts now"), ("after", "restarts once its task is over")):
+        if r.get(k):
+            out.append(f"   {verb}: {', '.join(r[k])}")
+    for k, verb in (("restarted", "restarted"), ("not_waited", "not restarted, still working")):
+        if r.get(k):
+            out.append(f"   {verb}: {', '.join(r[k])}")
+    for x in r.get("failed") or []:
+        out.append(f"   not restarted: {x['session']} ({x['why']})")
+    for x in r.get("left_out") or []:
+        out.append(f"   left as it is: {x['session']} ({x['why']})")
+    return out
+
 def cmd_update(args):
+    if getattr(args, "claude", False):
+        talk = (lambda t: print(t, file=sys.stderr, flush=True)) if not args.json else None
+        res = update_claude(args.apply, wait=not args.no_wait, say=talk)
+        if args.json:
+            print(json.dumps(res, indent=2, default=str))
+            return 1 if res["blockers"] else 0
+        if res["blockers"]:
+            print("Claude Code is not updated: " + "; ".join(res["blockers"]))
+            return 1
+        cmd = " ".join(shlex.quote(c) for c in res["command"])
+        if not args.apply:
+            print(f"Claude Code {res['before'] or '?'}, installed with {res['how']}: would run\n"
+                  f"   {cmd}\n"
+                  + ("then start the open sessions on an older version again, each in its tab"
+                     if res["while_running"] else
+                     f"after ending every session ({res['how']} cannot replace it while it "
+                     "runs); each comes back in its tab afterwards"))
+            print("\n".join(_restart_lines(res.get("restart") or {})) or "   (no open session to restart)")
+            print("(dry run — pass --apply to do it)")
+            return 0
+        print(f"Claude Code {res['before'] or '?'} -> {res['after'] or '?'}"
+              + ("" if res["updated"] else " (no newer version)" if not res["warnings"] else ""))
+        for w in res["warnings"]:
+            print("   " + w)
+        print("\n".join(_restart_lines(res.get("restart") or {})))
+        return 0 if not res["warnings"] else 1
     u = check_update(force=args.now or args.upgrade)
     if args.upgrade:
         if not u["newer"]:
@@ -27183,6 +27223,261 @@ def restart_session(pid: int, apply: bool = False) -> dict:
     log(f"SESSION restarted pid {pid} in {row['tty']}: {cmd}")
     return res
 
+# ---- a new Claude Code, and the sessions moved onto it ---------------------- #
+
+SETTLE_SECONDS = 5          # idle this long: a task is over, not a pause between tool calls
+RESTART_WAIT_HOURS = 3      # how long a busy session is waited for
+
+def _brew() -> str:
+    return shutil.which("brew") or next(
+        (b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.path.exists(b)), "brew")
+
+def claude_updater() -> dict:
+    """How the Claude Code that new sessions start gets a newer version:
+    {how, command (the argv to run, or None), why (when None), path,
+    while_running (False: every session must end first, as winget's
+    claude.exe is locked while it runs)}."""
+    exe = find_claude()
+    out = {"how": None, "command": None, "why": "", "path": exe, "while_running": True}
+    if not exe:
+        return dict(out, why="Claude Code is not installed here")
+    real = os.path.realpath(exe)
+    low = real.replace("\\", "/").lower()
+    m = re.search(r"/caskroom/(claude-code(?:@[a-z0-9._-]+)?)/", low)
+    if m:
+        return dict(out, how="Homebrew", command=[_brew(), "upgrade", "--cask", m.group(1)])
+    if "/cellar/claude-code/" in low:
+        return dict(out, how="Homebrew", command=[_brew(), "upgrade", "claude-code"])
+    if "/microsoft/winget/" in low and "anthropic.claudecode" in low:
+        return dict(out, how="winget", while_running=False,
+                    command=["winget", "upgrade", "--id", "Anthropic.ClaudeCode", "--exact",
+                             "--silent", "--accept-source-agreements",
+                             "--accept-package-agreements", "--disable-interactivity"])
+    if "/node_modules/@anthropic-ai/claude-code/" in low:
+        return dict(out, how="npm", command=[shutil.which("npm") or "npm", "install", "-g",
+                                             "@anthropic-ai/claude-code@latest"])
+    if "/.local/share/claude/" in low or "/.local/bin/claude" in low or "/.claude/local/" in low:
+        # Claude Code's own installer: it also updates itself in the background
+        return dict(out, how="its own installer", command=[exe, "update"],
+                    while_running=os.name != "nt")
+    if low.startswith(("/usr/bin/", "/bin/", "/usr/lib/")):
+        return dict(out, how="the system", why="upgrade it with your system's package "
+                                                 "manager (apt, dnf, …)")
+    return dict(out, why=f"aht does not know how the Claude Code at {real} was installed")
+
+def _my_ancestors() -> set:
+    out, pid = set(), os.getpid()
+    for _ in range(64):
+        out.add(pid)
+        try:
+            pp = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True,
+                                text=True, timeout=5, cwd="/").stdout.strip()
+        except Exception:
+            break
+        if not pp.isdigit() or int(pp) <= 1:
+            break
+        pid = int(pp)
+    return out
+
+def _restart_plan(every: bool = False) -> tuple:
+    """(sessions to move onto the installed Claude Code, those left out with
+    why): in a terminal tab, not the one asking."""
+    rows = session_checkup()
+    mine = _my_ancestors() if os.name != "nt" else {os.getpid()}
+    jobs = {r.get("jobId") for r in (_session_record(x["pid"]) for x in running_sessions())
+            if r.get("kind") == "bg" and r.get("jobId")}
+    todo, left = [], []
+    for r in rows:
+        if not (every or "older" in r["issues"]):
+            continue
+        rec = _session_record(r["pid"])
+        label = r.get("name") or os.path.basename(r["project"]) or str(r["pid"])
+        why = None
+        if r["pid"] in mine:
+            why = "it is the session asking"
+        elif rec.get("kind") == "bg":
+            why = "it runs in the background, in no tab (claude attach shows it)"
+        elif rec.get("parkedJobId") in jobs:
+            why = ("its tab moved the conversation to the background; resuming it in the "
+                   "tab would bring back an older copy")
+        elif not r["in_terminal"]:
+            why = f"it is not in a tab of {terminal().name or 'a terminal aht can drive'}"
+        (left if why else todo).append(dict(r, label=label, **({"why": why} if why else {})))
+    return todo, left
+
+def _settled(pid: int) -> str:
+    """"idle" (for SETTLE_SECONDS at least), "busy", or "gone"."""
+    if _gone(pid):
+        return "gone"
+    rec = _session_record(pid)
+    at = rec.get("statusUpdatedAt")
+    age = time.time() - float(at) / 1000 if isinstance(at, (int, float)) else SETTLE_SECONDS
+    return "idle" if rec.get("status") == "idle" and age >= SETTLE_SECONDS else "busy"
+
+def restart_older(apply: bool = False, wait: bool = True, every: bool = False,
+                  say=None) -> dict:
+    """Start every open session that runs an older Claude Code than the one
+    installed (`every`: all of them) again in its own tab, with the options
+    it had: an idle one now, a busy one once it has finished its task
+    (`wait`; else it is left).  The dry run says what would happen."""
+    say = say or (lambda _t: None)
+    todo, left = _restart_plan(every)
+    res = {"applied": False, "installed": installed_claude_version() or None,
+           "now": [r["label"] for r in todo if r["status"] == "idle"],
+           "after": [r["label"] for r in todo if r["status"] != "idle"],
+           "left_out": [{"session": r["label"], "why": r["why"]} for r in left],
+           "restarted": [], "failed": [], "not_waited": []}
+    if not apply:
+        return res
+    res["applied"] = True
+    pending = list(todo)
+    end = time.time() + RESTART_WAIT_HOURS * 3600
+    told = set()
+    try:
+        while pending:
+            for r in list(pending):
+                st = _settled(r["pid"])
+                if st == "gone":
+                    pending.remove(r)
+                elif st == "idle":
+                    pending.remove(r)
+                    got = restart_session(r["pid"], apply=True)
+                    if got["applied"]:
+                        res["restarted"].append(r["label"])
+                        say(f"restarted: {r['label']}")
+                    else:
+                        res["failed"].append({"session": r["label"],
+                                              "why": "; ".join(got["blockers"])})
+                        say(f"not restarted: {r['label']} ({'; '.join(got['blockers'])})")
+                elif not wait:
+                    pending.remove(r)
+                    res["not_waited"].append(r["label"])
+                elif r["pid"] not in told:
+                    told.add(r["pid"])
+                    say(f"waiting: {r['label']} works; it restarts when its task is over")
+            if pending:
+                if time.time() > end:
+                    res["not_waited"] += [r["label"] for r in pending]
+                    break
+                time.sleep(3)
+    except KeyboardInterrupt:
+        res["not_waited"] += [r["label"] for r in pending]
+    if res["restarted"]:
+        log(f"SESSION {len(res['restarted'])} restarted on Claude Code {res['installed']}")
+    return res
+
+def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
+    """Bring Claude Code up to date the way it was installed, then move the
+    open sessions onto it, each in its own tab.  Where the running
+    claude.exe cannot be replaced (winget), every session ends first, once
+    idle, and each comes back in its tab after the update, also when it
+    failed.  The dry run says what would happen."""
+    say = say or (lambda _t: None)
+    up = claude_updater()
+    res = {"applied": False, "how": up["how"], "command": up["command"],
+           "before": installed_claude_version() or None, "after": None,
+           "updated": False, "blockers": [], "warnings": [], "output": "",
+           "while_running": up["while_running"]}
+    if not up["command"]:
+        res["blockers"].append(up["why"] or "aht cannot update this Claude Code")
+        return res
+    if up["while_running"]:
+        res["restart"] = restart_older(apply=False, every=False)
+    else:
+        todo, left = _restart_plan(every=True)
+        res["restart"] = {"now": [r["label"] for r in todo if r["status"] == "idle"],
+                          "after": [r["label"] for r in todo if r["status"] != "idle"],
+                          "left_out": [{"session": r["label"], "why": r["why"]} for r in left]}
+        if left:
+            res["blockers"].append(
+                f"{up['how']} cannot replace Claude Code while it runs, and aht cannot end "
+                "and resume these: " + "; ".join(f"{r['label']} ({r['why']})" for r in left)
+                + " — end them first")
+        busy = [r["label"] for r in todo if r["status"] != "idle"]
+        if busy and not wait:
+            res["blockers"].append(f"{', '.join(busy)} {'is' if len(busy) == 1 else 'are'} "
+                                   f"working, and {up['how']} cannot replace Claude Code while "
+                                   "a session runs: try again once idle, or let aht wait")
+    if not apply or res["blockers"]:
+        return res
+    res["applied"] = True
+    lines, ok, skip = [], False, False
+    if not up["while_running"]:
+        # every session ends first, each once its task is over, its line to
+        # start it again noted; none is ended mid-task
+        pending, end = list(todo), time.time() + RESTART_WAIT_HOURS * 3600
+        term = terminal()
+        told = set()
+        try:
+            while pending:
+                for r in list(pending):
+                    st = _settled(r["pid"])
+                    if st == "busy":
+                        if r["pid"] not in told:
+                            told.add(r["pid"])
+                            say(f"waiting: {r['label']} works; the update follows its task")
+                        continue
+                    pending.remove(r)
+                    if st == "gone":
+                        continue
+                    cmd = term.restart_line(r, _claude_flags(_cmdline(r["pid"])))
+                    if close_session(r["pid"], apply=True)["applied"]:
+                        lines.append((r, cmd))
+                        say(f"ended for the update: {r['label']}")
+                if not pending or time.time() >= end:
+                    break
+                time.sleep(3)
+        except KeyboardInterrupt:
+            pass
+        if pending:
+            skip = True
+            res["warnings"].append(", ".join(r["label"] for r in pending)
+                                   + (" is" if len(pending) == 1 else " are") + " still working, "
+                                   "so nothing was updated; the sessions already ended are back")
+    if skip:
+        res["output"] = ""
+    else:
+        say(f"updating Claude Code with {up['how']} …")
+    try:
+        if skip:
+            raise StopIteration
+
+        p = subprocess.run(up["command"], capture_output=True, text=True, timeout=1800,
+                           stdin=subprocess.DEVNULL, cwd=str(Path.home()),
+                           **({"creationflags": 0x08000000} if os.name == "nt" else {}))
+        res["output"] = redact(((p.stdout or "") + (p.stderr or "")).strip()[-1500:])
+        ok = p.returncode == 0
+    except StopIteration:
+        ok = False
+    except Exception as e:
+        res["output"], ok = _errmsg(e), False
+    res["after"] = installed_claude_version() or None
+    res["updated"] = ok and _version(res["after"]) > _version(res["before"])
+    if not ok and not skip:
+        res["warnings"].append(f"the update did not finish: {res['output'][-300:]}")
+    if lines:
+        time.sleep(0.5)                 # the shells get their prompts back
+        term = terminal()
+        res["restart"] = {"restarted": [], "failed": []}
+        for r, cmd in lines:
+            if cmd and term.type_line(r["tty"], cmd):
+                res["restart"]["restarted"].append(r["label"])
+            else:
+                res["restart"]["failed"].append({"session": r["label"],
+                                                 "why": f"continue it with: {cmd}"})
+    else:
+        res["restart"] = restart_older(apply=True, wait=wait, say=say)
+    log(f"CLAUDE updated with {up['how']}: {res['before']} -> {res['after']} "
+        f"({'ok' if ok else 'failed'}); {len(res['restart'].get('restarted') or [])} "
+        "session(s) restarted")
+    n = len(res["restart"].get("restarted") or [])
+    notify_user("Claude Code",
+                (f"Updated to {res['after']}" if res["updated"] else
+                 f"Already at {res['after']}" if ok else
+                 "Not updated: sessions still worked" if skip else "The update did not finish")
+                + (f"; {n} session(s) restarted on it" if n else ""))
+    return res
+
 # ---- the session corner's menu: a branch beside, a session sent away ------- #
 
 def _descendants_of(pid: int) -> set:
@@ -27474,6 +27769,17 @@ def cmd_corner(args):
     return 0
 
 def cmd_sessions_checkup(args):
+    if getattr(args, "restart_older", False):
+        talk = (lambda t: print(t, file=sys.stderr, flush=True)) if not args.json else None
+        res = restart_older(args.apply, wait=not args.no_wait, every=args.all, say=talk)
+        if args.json:
+            print(json.dumps(res, indent=2, default=str))
+            return 0
+        print(f"Claude Code {res['installed'] or '?'} is installed")
+        print("\n".join(_restart_lines(res)) or "   no session to restart")
+        if not args.apply and (res["now"] or res["after"]):
+            print("(dry run — pass --apply to do it)")
+        return 0
     if args.close:
         res = close_session(args.close, args.apply)
         lines = [("closed" if res["applied"] else "would close") +
@@ -29371,6 +29677,12 @@ def build_parser():
                    "(its conversation stays)")
     s.add_argument("--restart", metavar="PID", type=int, help="end it and start it again "
                    "in its terminal tab")
+    s.add_argument("--restart-older", action="store_true", dest="restart_older",
+                   help="every session on an older Claude Code than the one installed, each "
+                   "in its tab: an idle one now, a working one when its task is over")
+    s.add_argument("--all", action="store_true", help="with --restart-older: every session")
+    s.add_argument("--no-wait", action="store_true", dest="no_wait",
+                   help="with --restart-older: leave sessions that are working")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_sessions_checkup)
@@ -29395,6 +29707,13 @@ def build_parser():
                    "installed: Homebrew, Scoop or winget in a terminal; aht's Windows "
                    "installer is downloaded, checked and run; a checkout says how to "
                    "update it; else the download page opens")
+    s.add_argument("--claude", action="store_true", help="Claude Code instead: update it "
+                   "the way it was installed (Homebrew, winget, npm, its own installer), "
+                   "then start the open sessions again on it, each in its tab")
+    s.add_argument("--apply", action="store_true", help="with --claude: do it (without: "
+                   "what would happen)")
+    s.add_argument("--no-wait", action="store_true", dest="no_wait",
+                   help="with --claude: leave sessions that are working")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_update)
 

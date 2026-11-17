@@ -4369,6 +4369,39 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Update Claude Code the way it was installed, then the open sessions
+    /// on an older version onto it, each in its tab (`aht update --claude`).
+    func updateClaude() {
+        busy("looking at Claude Code…") {
+            let plan = ahtJSON(["update", "--claude", "--json"]) ?? [:]
+            DispatchQueue.main.async {
+                if let why = self.problems(plan) {
+                    _ = alert("Claude Code is not updated", why)
+                    return
+                }
+                let how = plan["how"] as? String ?? "its installer"
+                let r = plan["restart"] as? [String: Any] ?? [:]
+                let now = r["now"] as? [String] ?? [], later = r["after"] as? [String] ?? []
+                let left = (r["left_out"] as? [[String: Any]] ?? []).compactMap { $0["session"] as? String }
+                var text = "aht runs " + ((plan["command"] as? [String])?.joined(separator: " ") ?? how)
+                    + " (Claude Code \(plan["before"] as? String ?? "?") came with \(how))."
+                if plan["while_running"] as? Bool ?? true {
+                    text += "\n\nThen the sessions on an older version start again in their tabs, "
+                        + "where they left off, with the options they had."
+                } else {
+                    text += "\n\n\(how) cannot replace Claude Code while it runs, so every session "
+                        + "ends first, once its task is over, and starts again in its tab after."
+                }
+                if !now.isEmpty { text += "\n\nAt once: " + now.joined(separator: ", ") }
+                if !later.isEmpty { text += "\nOnce their task is over: " + later.joined(separator: ", ") }
+                if !left.isEmpty { text += "\nLeft as they are: " + left.joined(separator: ", ") }
+                text += "\n\nA notice says when it is done."
+                guard alert("Update Claude Code?", text, confirm: "Update") else { return }
+                self.background { _ = ahtJSON(["update", "--claude", "--apply", "--json"]) }
+            }
+        }
+    }
+
     func closeSession(_ r: BoardRow) {
         guard let pid = r.pid,
               alert("End this Claude Code process?",
@@ -13299,6 +13332,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         menu.addItem(.separator())
         add("Find Moved Folders Now", #selector(reconcile), key: "r")
         add(model.running ? "Pause Watching" : "Resume Watching", #selector(toggleWatch))
+        add("Update Claude Code…", #selector(updateClaudeFromMenu))
         menu.addItem(.separator())
         add(model.running ? "Quit aht (the watcher keeps running)" : "Quit aht",
             #selector(quit), key: "q")
@@ -13316,6 +13350,8 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     }
 
     @objc func reconcile() { model.reconcile() }
+
+    @objc func updateClaudeFromMenu() { model.updateClaude() }
 
     @objc func toggleCorner() {
         model.set("session_corner", model.flag("session_corner", false) ? "false" : "true")

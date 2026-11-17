@@ -422,7 +422,8 @@ The guide's *The permission level follows the work* has the details.
 | Workspace (Mac, Windows) | `aht workspace --restore` | the windows, tabs and sessions of iTerm2 or Windows Terminal, saved while you work and opened again after a restart |
 | Your Claude Code setup on another machine | `aht copy-setup <machine>` | a handover carries the project's own rules and settings; this brings your global CLAUDE.md, skills, agents, commands and plugins there too (what it replaces is set aside there; hooks and MCP servers stay) |
 | Branch, send (Mac, Windows) | `aht branch`, `aht send` | the session corner's right-click: a branch of an open session in a new tab beside it, with its tab colour; or the session sent, with its project, to another machine, its tab following it there |
-| Go to a tab, checkup (Mac, Windows) | `aht goto`, `aht checkup` | brings a session's tab to the front; marks sessions open twice, stuck or outside the Claude app, and restarts one in its tab |
+| Go to a tab, checkup (Mac, Windows) | `aht goto`, `aht checkup` | brings a session's tab to the front; marks sessions open twice, stuck or outside the Claude app, and restarts one in its tab, or every one on an older Claude Code |
+| Update Claude Code (Mac, Windows) | `aht update --claude` | updates it the way it was installed (Homebrew, winget, npm, its own installer), then starts the open sessions again on it, each in its tab |
 | Spotlight, links, Finder (Mac) | `aht://search?q=…` | session titles in Spotlight, `aht://` links from Shortcuts or a script, Finder Quick Actions, ⌃⌥⌘A for the search; whatever starts an agent or changes files asks first |
 
 ## Platforms

@@ -1164,6 +1164,13 @@ the installer; only the latest download is kept in `~/.aht/run`.  A
 downloaded copy and a checkout (every Linux install) open the release
 page in your browser instead; aht opens only `https` addresses.
 
+**Update Claude Code…** (`aht update --claude --apply`, only when you ask)
+runs what Claude Code was installed with: Homebrew, winget, npm or Claude
+Code's own updater, which download the new version from where they
+always do; aht sends nothing itself. It notes in `aht.log` which way it
+updated, the versions before and after, and how many sessions it started
+again.
+
 ### Services run by others
 
 These services are run by others, under their own terms and privacy

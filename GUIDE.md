@@ -903,8 +903,9 @@ waiting for you.
 - `aht checkup --restart-older --apply` — every session that runs an
   older Claude Code than the one installed starts again in its tab, with
   the options it had: an idle one at once, a working one once it is idle
-  (`--no-wait` leaves those, `--all` takes every session, as the
-  corner list's **Restart Workspace…** does). The
+  (`--no-wait` leaves those, `--all` takes every session). The terminal
+  stays open (to close it and open everything again, see **Restart
+  Workspace…** in *Sessions in the corner*). The
   session you run it from, a background session and a tab that moved its
   conversation to the background are left as they are. aht looks at a
   session's tab once more before it ends the session, and leaves it
@@ -1065,15 +1066,24 @@ on in the background, that tab's line shows the conversation's state.
     says under the top line how many tabs and sessions it holds.
   - **Restore Workspace…** opens aht's window on the saved workspaces,
     where **Open Them** brings one back.
-  - **Restart Workspace…** starts every open Claude session again in its
-    own tab, where it left off and with the options it had, so all of
-    them run the Claude Code installed now. aht lists first which
-    sessions restart at once, which once they are idle, and which
-    it leaves as they are (a background session, one in no tab), then
-    asks; the safe answer is the default. Text typed into a session but
-    not sent is lost. The list says that it is under way and when it is
-    through, and a message names each session that did not restart, with
-    why and how to continue it.
+  - **Restart Workspace…** closes the terminal and opens the workspace
+    again: aht saves the workspace, ends every Claude session in a tab,
+    closes iTerm2 (on Windows, Windows Terminal), starts it again and
+    opens the same windows and tabs. Each session comes back in its tab,
+    where it left off and with the options it had, on the Claude Code
+    installed now; a plain tab comes back empty, in its folder, with its
+    title. It asks first, and the safe answer is the default. The
+    question names the sessions, those that are working now (their task
+    stops and they resume from the conversation so far), and every other
+    program that runs in a tab (a server, `ssh`): those end and do not
+    start again. Text typed but not sent is lost, and so is the text the
+    tabs show. iTerm2 may ask once more whether to quit: say yes there.
+    A terminal that does not close gets its sessions back as they were.
+    The list says that it is under way and when it is through, and a
+    message says what did not come back. From a terminal: `aht workspace
+    --restart --apply`, but not from a tab of the terminal it closes.
+    To restart only the sessions, each in its tab with the terminal left
+    open, use `aht checkup --restart-older --all --apply`.
 - **On its way:** while a session is sent (or its project taken back), its
   row shows an arrow up (or down), the machine and the percentage
   (**→ homebox 45%**), and under it what is happening: before any data
@@ -2670,6 +2680,11 @@ off.
   the app does every minute).
 - `aht workspace --restore` — show what opening the layout from before
   your terminal last started would open; `--apply` opens it.
+- `aht workspace --restart` — show what closing the terminal and opening
+  the workspace again would do: which sessions come back, which are
+  working, how many plain tabs come back empty, and what ends for good;
+  `--apply` does it (the corner list's **Restart Workspace…**). Run it
+  from outside the terminal it closes.
 - `aht workspace --restore <id> --apply` — open an older layout from the
   list.
 

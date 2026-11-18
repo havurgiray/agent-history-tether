@@ -133,8 +133,11 @@ have sessions in each project it tracks.
   from iTerm2's saved window state (`restorable-state.sqlite`, opened read
   only: never the screen contents it also holds), with whether macOS is in
   dark mode; and for *Getting started*, whether iTerm2's Python API and
-  its new-output indicator are on and whether that saved state exists.
-  aht never changes iTerm2's settings.
+  its new-output indicator are on and whether that saved state exists;
+  for **Restart Workspace…**, whether iTerm2 is set to ask before it
+  quits.  aht never changes iTerm2's settings.  **Restart Workspace…**,
+  once you say yes, quits iTerm2 and starts it again (on Windows, it
+  closes Windows Terminal the way Windows does at a sign-out).
 - **Windows Terminal** (Windows): window and tab titles (through Windows'
   UI Automation) and, for each pane, its id, title, folder and the command
   lines of the programs in it, for saved workspaces. The pane id comes from the program's environment

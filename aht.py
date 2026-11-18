@@ -90,7 +90,7 @@ import unicodedata
 import zlib
 from pathlib import Path
 
-VERSION = "0.17.2"
+VERSION = "0.17.3"
 
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")

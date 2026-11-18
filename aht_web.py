@@ -239,7 +239,10 @@ class Server(ThreadingHTTPServer):
             return _answer(r.returncode, r.stdout, r.stderr)
         except subprocess.TimeoutExpired:
             return _answer(124, "", f"aht {args[0]} took longer than {int(timeout)} s")
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # ValueError: an argument subprocess refuses (a NUL in it).  Left
+            # uncaught it closes the connection unanswered, and the page then
+            # says for good that it lost its connection
             return _answer(127, "", str(e))
 
     def start(self, args: list, follow: str = None) -> str:
@@ -431,6 +434,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(min(n, 1 << 20)) or b"{}")
         except ValueError:
             return self._json(400, {"error": "not JSON"})
+        if not isinstance(body, dict):                      # a list, a number: no .get
+            return self._json(400, {"error": "not a JSON object"})
         path = urllib.parse.urlsplit(self.path).path
         if path in ("/api/run", "/api/start"):
             args = body.get("args")
@@ -452,7 +457,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/log":
             # the page's own uncaught errors and failed commands, into aht's
             # log: masked, cut short and rate-limited there (aht.app_log)
-            body = body if isinstance(body, dict) else {}
             level, msg = body.get("level"), body.get("message")
             if level not in ("warn", "error") or body.get("source", "window") != "window" \
                     or not isinstance(msg, str):
@@ -847,10 +851,18 @@ def serve(open_it: bool = True, port: int = 0) -> int:
         open_window(url)
 
     def idle():
+        tick = time.time()
         while True:
             time.sleep(30)
+            now = time.time()
+            # two 30 s ticks more than 90 s apart: the computer slept (or its
+            # clock was set forward).  An open window could not ask meanwhile,
+            # so the idle time counts from now, not from before the sleep
+            if now - tick > 90:
+                srv.last = now
+            tick = now
             busy = any(not j["done"] for j in srv.jobs.values())
-            if not busy and time.time() - srv.last > IDLE_EXIT:
+            if not busy and now - srv.last > IDLE_EXIT:
                 srv.shutdown()
                 return
     threading.Thread(target=idle, daemon=True).start()
@@ -951,6 +963,11 @@ def selftest() -> int:
     ck(st == 403, "a command outside the list is refused")
     st, body, _ = call("/api/run", ok, {"args": ["attach", "/x"]}, cookie)
     ck(st == 403, "attach only in a new terminal (--window): never in the server's own")
+    st, body, _ = call("/api/run", ok, ["version"], cookie)
+    ck(st == 400, "a body that is no JSON object is refused, with an answer")
+    st, body, _ = call("/api/run", ok, {"args": ["version", "a\0b"]}, cookie)
+    ck(st == 200 and json.loads(body or b"{}").get("ok") is False,
+       "an argument that cannot be run (a NUL in it) still gets an answer")
     st, body, _ = call("/api/run", ok, {"args": ["version"]}, cookie)
     ans = json.loads(body or b"{}")
     ck(st == 200 and ans.get("ok") and aht.VERSION in ans.get("out", ""),

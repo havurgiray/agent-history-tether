@@ -575,9 +575,13 @@ async function refresh() {
   S.status.home = S.status.home || guessHome();
   S.loaded = true;
   drawTop();
-  // not while something is typed (a checkbox just clicked keeps the focus too)
-  if (!document.querySelector("#main input:not([type=checkbox]):not([type=radio]):focus, #main textarea:focus, #main select:focus")) draw();
+  // not while something is typed, and not under an open row menu (Send to ▾):
+  // drawing #main again would take the menu away under the pointer
+  if (!typing() && !document.querySelector(".menu > .items")) draw();
 }
+/** Whether something is being typed in the tab, which drawing it again would
+ * wipe (a checkbox just clicked keeps the focus too, and does not count). */
+const typing = () => !!document.querySelector("#main input:not([type=checkbox]):not([type=radio]):focus, #main textarea:focus, #main select:focus");
 function guessHome() {
   const r = (S.status.watch_roots || [])[0] || "";
   const m = r.match(/^(.*?[\\/](?:Users|home)[\\/][^\\/]+)/i);
@@ -3202,11 +3206,15 @@ async function pickFolder(prompt) {
 // ---- Sessions ---------------------------------------------------------------------
 
 async function loadBoard() {
-  S.boardLoading = true; draw();
+  // only the tabs that show the board, and as refresh() does not while
+  // something is typed: a long Send or Restart that ends while a query is
+  // typed in Search must not wipe it
+  const shown = () => { if ((S.tab === "sessions" || S.tab === "machines") && !typing()) draw(); };
+  S.boardLoading = true; shown();
   const d = await J("board", "--json");
   S.board = d.machines || [];
   S.boardAt = Date.now(); S.boardLoading = false;
-  if (S.tab === "sessions" || S.tab === "machines") draw();
+  shown();
 }
 function drawSessions(m) {
   if (!S.board && !S.boardLoading) return loadBoard();    // it draws the tab again itself
@@ -3242,22 +3250,24 @@ function drawSessions(m) {
           const a = await J("goto", String(s.pid), "--json");
           if (!a.ok) ask("Could not go to its tab", a.why || "aht could not find its tab.", ["OK"]);
         } }) : null,
-        // as the session corner's right-click: Branch…, Send To
+        // as the session corner's right-click: Branch…, Send to
         b.local && s.in_terminal && s.agent === "claude" && s.session ? h("button", { class: "small", text: "Branch…",
           disabled: ["busy", "shell", "waiting"].includes(s.raw_status), title: "A branch of this session in a new tab, with the conversation so far",
           onclick: () => branchSession(s) }) : null,
         b.local && s.in_terminal && s.agent === "claude" && s.session && machineNames().length
-          ? menu("Send To", machineNames().map((n) => [`${n}…`, () => sendSession(s, n)]),
+          ? menu("Send to", machineNames().map((n) => [`${n}…`, () => sendSession(s, n)]),
             { small: true, right: true, disabled: ["busy", "shell", "waiting"].includes(s.raw_status) }) : null,
         b.local && s.can_restart ? h("button", { class: "small", text: "Restart in Its Tab…", onclick: async () => {
-          if (!(await confirmIt("Restart this session in its tab?", "aht ends it and starts it again in the same tab, with the options it had. Its conversation stays.", "Restart"))) return;
+          if (!(await confirmIt("Restart this session in its tab?", "aht ends it and starts it again in the same tab, where it left off, with the options it had. Anything typed into it but not sent is lost.", "Restart"))) return;
           const a = await J("checkup", "--restart", String(s.pid), "--apply", "--json");
           if (!a.applied) ask("Not restarted", (a.blockers || []).join("\n") || "aht could not restart it.", ["OK"]);
           loadBoard();
         } }) : null,
         b.local && s.pid && s.agent === "claude" ? h("button", { class: "small", text: "End Process…", onclick: async () => {
           if (!(await confirmIt("End this session's process?", "Its conversation stays; you can continue it later.", "End It"))) return;
-          await run(["checkup", "--close", String(s.pid), "--apply"]); loadBoard();
+          const a = await J("checkup", "--close", String(s.pid), "--apply", "--json");
+          if (!a.applied) ask("Not ended", (a.blockers || []).join("\n") || "aht could not end it.", ["OK"]);
+          loadBoard();
         } }) : null));
     }
     if (list.childNodes.length) g.append(list);
@@ -3265,18 +3275,19 @@ function drawSessions(m) {
   }
 }
 
-/** The machines set up here, for Send To. */
+/** The machines set up here, for Send to. */
 const machineNames = () => Object.keys((S.status.handover || {}).remotes || {}).sort();
 
 /** Branch… (as the session corner's): its name, then a branch of the
- * session in a new tab beside its own. */
+ * session in a new tab of its window (Windows Terminal puts it at the end,
+ * so nothing says "beside"). */
 async function branchSession(s) {
   const dry = await busy("looking at the session…", () => J("branch", String(s.pid), "--json"));
   if (problems(dry)) return tell("No branch now", problems(dry));
   const label = dry.label || s.title || base(s.project);
   const name = h("input", { type: "text", value: dry.name || "", style: "width:100%" });
   const sh = sheet(`Branch “${label}”`, "Sessions in the corner", 520);
-  sh.body.append(h("p", { text: "The branch opens in a new tab beside this one, with the conversation so far; this session goes on as it is." }),
+  sh.body.append(h("p", { text: "The branch opens in a new tab of this window, with the conversation so far; this session goes on as it is." }),
     h("label", { class: "stack" }, "Name of the new branch", name));
   const go = h("button", { class: "primary", text: "Branch", onclick: async () => {
     const n = name.value.trim();
@@ -3284,14 +3295,14 @@ async function branchSession(s) {
     closeSheet();
     const r = await busy("opening the branch…", () => J("branch", String(s.pid), "--name", n, "--apply", "--json"));
     if (!r.applied) tell("No branch", problems(r) || "aht could not open it.");
-    else { toast(`“${n}” opened beside “${label}”.`); loadBoard(); }
+    else { toast(`“${n}” opened in a new tab.`); loadBoard(); }
   } });
   name.addEventListener("keydown", (e) => { if (e.key === "Enter") go.click(); });
   sh.foot.append(h("span", { class: "spacer" }), h("button", { text: "Cancel", onclick: closeSheet }), go);
   name.focus(); name.select();
 }
 
-/** Send To <machine>… (as the session corner's): the checks, a question,
+/** Send to <machine>… (as the session corner's): the checks, a question,
  * then the session ends here and its tab follows it there. */
 async function sendSession(s, to) {
   const d = await busy(`checking ${to}…`, () => J("send", String(s.pid), "--to", to, "--json"));
@@ -3309,49 +3320,83 @@ async function sendSession(s, to) {
   else { toast(`“${label}” is on its way to ${to}; its tab shows how far it got.`); loadBoard(); }
 }
 
-/** The saved layouts on the left, what the picked one would open on the right. */
+/** The saved workspaces on the left, what the picked one would open on the right. */
 async function openWorkspaces() {
-  const d = await busy("reading the saved layouts…", () => J("workspace", "--json"));
+  // dryRun, here and below: a read that crashed or timed out comes back with
+  // aht's words, not as "No workspace saved yet." or an empty pane
+  const d = await busy("reading the saved workspaces…", () => dryRun(["workspace", "--json"]));
   const rows = d.workspaces || [];
   const terminal = S.status.terminal;
   const s = sheet("Restore Workspace", "Restore my workspace", 860);
   s.body.append(h("p", { class: "dim", text: `${terminal}'s windows and tabs with the sessions in them, as they were. aht saves them while its tray runs and ${terminal} is open.` }));
   const list = h("div", { class: "sessions", style: "width:300px;flex:none" });
   const plan = h("div", { class: "grow", style: "min-width:0" });
-  let pick = null;
+  const failed = (text) => h("p", { class: "warn", style: "white-space:pre-wrap;overflow-wrap:anywhere", text });
+  // can: the plan on screen has something to open and nothing against it
+  let pick = null, applying = false, can = false;
   const open = h("button", { class: "primary", text: "Open Them", disabled: true, onclick: async () => {
-    const a = await busy(`opening them in ${terminal}…`, () => J("workspace", "--restore", pick, "--apply", "--json"));
-    const told = (a.blockers || []).join("\n");
-    if (a.applied) closeSheet();
+    if (applying || !pick) return;      // a double click sends one apply
+    const id = pick;
+    applying = true; open.disabled = true;
+    let a = {};
+    try { a = await busy(`opening them in ${terminal}…`, () => J("workspace", "--restore", id, "--apply", "--json")); }
+    finally { applying = false; open.disabled = !can; }
+    const told = (a.blockers || []).map((b) => said(b)).join("\n");
+    if (a.applied && plan.isConnected) closeSheet();    // not a sheet opened meanwhile
     if (a.applied && !told) toast("Opened.");
     else ask(a.applied ? "Some did not open" : "Not opened", told || "aht could not open them.", ["OK"]);
+    if (!a.applied && pick === id && plan.isConnected) show(id, true);      // the pane then says what is in the way now
   } });
-  const show = async (id) => {
-    pick = id;
-    draw();
-    open.disabled = true;
-    clear(plan).append(h("span", { class: "spin" }));
-    const p = await J("workspace", "--restore", id, "--json");
-    if (pick !== id) return;
+  // Asked when a workspace is picked, and again quietly when the window gets
+  // the focus back (its terminal was closed meanwhile, say).  The newest ask
+  // wins, also for the same id; a quiet one leaves the old plan on screen
+  // until its answer is there, and for good when it gets none.
+  let asked = 0, shownAt = 0;
+  const show = async (id, quiet) => {
+    const mine = ++asked;
+    if (!quiet) { pick = id; draw(); can = false; open.disabled = true; clear(plan).append(h("span", { class: "spin" })); }
+    const p = await dryRun(["workspace", "--restore", id, "--json"]);
+    if (mine !== asked || !plan.isConnected) return;
+    const stops = p.blockers || [];
+    // a quiet answer changes nothing when it is none, or while an apply runs
+    if (quiet && (applying || (!p.plan && !stops.length))) return;
     clear(plan);
+    // what is in the way first: it is why Open Them is off
+    for (const b of stops) plan.append(h("p", { class: "warn", text: said(b) }));
+    const none = p.error || (!p.plan && !stops.length && "aht gave no answer — see the log (Settings).");
+    if (none) plan.append(failed(none));
     const panes = ((p.plan || {}).windows || []).flat(2);
     for (const e of panes) plan.append(h("div", { style: "margin-bottom:8px;min-width:0" }, h("div", { class: "ellipsis" }, h("strong", { text: e.title || e.name || "(no title)" })),
       h("div", { class: "dim small ellipsis", text: [e.agent && (AGENTS[e.agent] || e.agent), e.cwd].filter(Boolean).join(" · ") })));
-    for (const e of (p.plan || {}).skipped || []) plan.append(h("div", { class: "dim small ellipsis", style: "margin-bottom:4px", text: `Skipped: ${e.title || e.name || "(no title)"} (${e.why})` }));
-    for (const b of p.blockers || []) plan.append(h("p", { class: "warn", text: b }));
-    open.disabled = !panes.length || (p.blockers || []).length > 0;
+    for (const e of (p.plan || {}).skipped || []) plan.append(h("div", { class: "dim small ellipsis", style: "margin-bottom:4px",
+      text: e.title || e.name ? `Skipped: ${e.title || e.name} (${e.why})` : "Skipped: a tab without a title" }));
+    can = panes.length > 0 && !stops.length;
+    open.disabled = applying || !can;
+    shownAt = Date.now();
   };
+  // not while a picked workspace is still being read (its spinner shows): a
+  // quiet ask that got no answer would leave the spinner there for good
+  const again = () => {
+    if (!plan.isConnected) return window.removeEventListener("focus", again);    // the sheet is gone
+    if (pick && !applying && !plan.querySelector(".spin") && Date.now() - shownAt > 2000) show(pick, true);
+  };
+  window.addEventListener("focus", again);
   const draw = () => {
     clear(list);
     for (const r of rows) list.append(h("div", { class: "s" + (r.id === pick ? " picked" : ""), style: "cursor:pointer" + (r.id === pick ? ";outline:1px solid var(--line)" : ""), onclick: () => show(r.id) },
       h("div", { class: "grow" }, h("strong", { text: when(r.seen) }),
         h("div", { class: "dim small ellipsis", text: `${plural(r.tabs, "tab")}, ${plural(r.sessions, "session")}${r.titles.length ? ": " + r.titles.slice(0, 4).join(", ") : ""}` }))));
-    if (!rows.length) list.append(h("p", { class: "dim", text: "No saved layout yet." }));
+    if (!rows.length) list.append(h("p", { class: d.error ? "warn" : "dim", text: d.error ? "aht could not read the saved workspaces."
+      : `No workspace saved yet. aht saves one while you work with Claude Code in ${terminal}, or now with Save Now.` }));
   };
   s.body.append(h("div", { class: "row", style: "align-items:flex-start;gap:16px" }, list, plan));
   draw();
+  if (d.error) plan.append(failed(d.error));
   s.foot.append(h("button", { text: "Save Now", onclick: async () => {
-    await busy("saving the layout…", () => J("workspace", "--save", "--json"));
+    const a = await busy("saving the workspace…", () => dryRun(["workspace", "--save", "--json"]));
+    if (!plan.isConnected) return;      // this sheet was closed meanwhile, or another one is open
+    // nothing saved (no terminal window open, say): its reason, and the sheet as it is
+    if (!a.saved) return tell("Workspace not saved", said(a.why || a.error) || "aht gave no answer.");
     closeSheet();
     openWorkspaces();
   } }), h("span", { class: "spacer" }), h("button", { text: "Close", onclick: closeSheet }), open);
@@ -4366,11 +4411,15 @@ async function showWelcome(again) {
 /** The window opened for one project (the tray's Projects brought here ▸
  * Send Back…): that project picked, and with "send-back" Send Back's dry
  * run open; a folder not in the list still gets Send Back. */
-function openOn(go) {
+async function openOn(go) {
   if (go.do === "workspaces") {         // the session corner's Restore Workspace…
     S.tab = "sessions";
     drawTop(); draw();
+    // the status did not load (no version in it): asked once more, and then
+    // nothing is said about this computer's terminal that aht did not say
+    if (!S.status.version) await busy("asking aht again…", refresh);
     if (S.status.terminal) openWorkspaces();
+    else if (!S.status.version) tell("aht gave no answer", "aht did not say which terminal runs here, so this window cannot show the saved workspaces. Close it and open it again. If that does not help, see the log (Settings).");
     else tell("No workspace to restore", "aht found no terminal here whose tabs it can save and open again.");
     return;
   }

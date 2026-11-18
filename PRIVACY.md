@@ -87,7 +87,10 @@ have sessions in each project it tracks.
 - **Running programs.**  On macOS and Linux: the list of running programs
   with their command lines (`ps`), to find the agents and, for saved
   workspaces, what runs in each terminal tab, and the folder each one runs
-  in (`lsof` or `/proc`).  Before a handover, a take-back, Bring Here, Send
+  in (`lsof` or `/proc`).  The options a Claude session was started with
+  are read from that session's own arguments as the system holds them
+  (macOS: `sysctl`; Linux: `/proc`), so a folder with a space in its name
+  stays whole and the words of a prompt are never taken for options.  Before a handover, a take-back, Bring Here, Send
   Back, `aht undo` or a second opinion, the name and folder of every
   program of yours that runs inside the project, to warn you of them.  On
   Windows, before a switch or a Send Back, the names of the running
@@ -438,9 +441,11 @@ or brought to another machine with Bring Here:
   its place on the screen, its width and how many sessions it lists);
 - macOS: the time of the last layout
   save (`workspace-autosave`), the tabs and titles a restore just opened
-  (`workspace-opened.json`), and for a terminal window aht opens, the
+  and when the terminal they are in started (`workspace-opened.json`,
+  also on Windows), and for a terminal window aht opens, the
   command it runs (`<name>.command`: the folder and the command);
-- lock files (`mirror.lock`, `workspace-restore.lock`, and `.lock` and,
+- lock files (`mirror.lock`, `workspace-restore.lock`,
+  `claude-restart.lock`, and `.lock` and,
   on Linux, `.aht-tray.lock` in `~/.aht` itself), backups on their way in
   while a fetch runs (`offsite-in-…`), and for a moment a copy of another
   program's database aht reads (Codex's `state_5.sqlite`, Antigravity's

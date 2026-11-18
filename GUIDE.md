@@ -902,18 +902,26 @@ waiting for you.
   again in its tab; `--close <pid> --apply` only ends it.
 - `aht checkup --restart-older --apply` — every session that runs an
   older Claude Code than the one installed starts again in its tab, with
-  the options it had: an idle one at once, a working one once its task is
-  over (`--no-wait` leaves those, `--all` takes every session, as the
+  the options it had: an idle one at once, a working one once it is idle
+  (`--no-wait` leaves those, `--all` takes every session, as the
   corner list's **Restart Workspace…** does). The
   session you run it from, a background session and a tab that moved its
-  conversation to the background are left as they are.
+  conversation to the background are left as they are. aht looks at a
+  session's tab once more before it ends the session, and leaves it
+  running when the tab is not there. If a session ended and aht then
+  could not type into its tab, it says how to continue that session and
+  leaves the others running. Only one restart or update runs at a time.
 - `aht update --claude --apply` (the ∞ menu and the Windows tray: **Update
   Claude Code…**) — update Claude Code the way it was installed (Homebrew,
-  winget, npm or its own installer), then the same restart. winget cannot
+  winget, npm or its own installer), then the same restart: if the update
+  brought a newer version, that is every open session in a tab, and the
+  question before it names them. winget cannot
   replace Claude Code while it runs: there every session ends first, once
-  its task is over, and comes back in its tab after the update; one that
-  still works after three hours leaves Claude Code as it is. Without
-  `--apply` it says what it would do.
+  it is idle, and comes back in its tab after the update; one that
+  still works after three hours leaves Claude Code as it is. A notice
+  says how the update went as soon as it is through, and a second one
+  when the sessions have started again; what went wrong is shown in a
+  message. Without `--apply` it says what it would do.
 
 ## Loose ends
 
@@ -1033,6 +1041,8 @@ on in the background, that tab's line shows the conversation's state.
     new tab comes right after the session's own; Windows Terminal puts it
     at the end of that window. Show Sessions lists the branch under the
     session it came from (see *A project's sessions*).
+  - **Back Up This Project Now** and **Backups of This Project…** (see
+    *Backups, and bringing a session back*).
   - **Send to <machine>…**, one for each machine you added (see *Hand a
     project over to another machine*): the session goes on over there,
     with its project. aht checks first and says what would stop it, for
@@ -1045,14 +1055,12 @@ on in the background, that tab's line shows the conversation's state.
     something the session started still runs in the folder once it ended
     (a server started with `nohup`), nothing is sent: the session comes
     back in its tab, and aht names what to stop first.
-  - **Back Up This Project Now** and **Backups of This Project…** (see
-    *Backups, and bringing a session back*).
   - Branch and Send wait while a session works or waits for you, and say
     so.
 - **Every right-click on the list**, also one beside the sessions or on
   the top line when no session is open, ends with three lines for the
   workspace, the terminal's tabs with their sessions (see *Restore my
-  workspace*):
+  workspace*), and then **Hide the List**:
   - **Save Workspace Now** keeps the layout as it is this moment, and
     says under the top line how many tabs and sessions it holds.
   - **Restore Workspace…** opens aht's window on the saved workspaces,
@@ -1060,10 +1068,12 @@ on in the background, that tab's line shows the conversation's state.
   - **Restart Workspace…** starts every open Claude session again in its
     own tab, where it left off and with the options it had, so all of
     them run the Claude Code installed now. aht lists first which
-    sessions restart at once, which once their task is over, and which
+    sessions restart at once, which once they are idle, and which
     it leaves as they are (a background session, one in no tab), then
-    asks. Text typed into a session but not sent is lost. The list says
-    when it is through.
+    asks; the safe answer is the default. Text typed into a session but
+    not sent is lost. The list says that it is under way and when it is
+    through, and a message names each session that did not restart, with
+    why and how to continue it.
 - **On its way:** while a session is sent (or its project taken back), its
   row shows an arrow up (or down), the machine and the percentage
   (**→ homebox 45%**), and under it what is happening: before any data
@@ -2592,11 +2602,15 @@ off.
   since), Kimi Code with its last session in that
   folder, and every titled tab with its folder. Untitled plain tabs, tabs
   open now and folders that are gone are skipped. When nothing is left to
-  open, the sheet says why: "everything in it is open already" only when
-  its sessions or tabs are open now; a layout of untitled plain tabs, or
-  of folders that are gone, says that instead. What a restore opened a
-  moment ago counts as open for three minutes, unless the terminal was
-  closed since.
+  open, the sheet says why, first of all: "everything in it is open
+  already" only when every part of it is open now; else it counts what is
+  in it, for example "nothing left to open: 3 open already, 2 plain tabs
+  without a title". A session that still runs while the terminal is
+  closed (in another terminal, or in the background) is named as running
+  outside it. The sheet asks again when you come back to aht's window, so
+  it shows how things are now. What a restore opened a moment ago counts
+  as open for three minutes, unless the terminal was closed or started
+  again since; what it could not open can be opened again at once.
 - **Tab titles:** iTerm2 does not let a script set the title you set with
   *Edit Tab Title*, so aht sets it the way a program does and keeps Claude
   Code from writing over it in those tabs. Session names stay as they were.

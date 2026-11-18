@@ -813,6 +813,24 @@ class WindowsTerminal(aht.Terminal):
         aht.warn(f"TABS could not go to a tab: {(r.stderr or '').strip()[-200:]}")
         return "none"
 
+    def holds_me(self) -> bool:
+        mine = aht._my_ancestors()
+        return any(p in mine for p, _q, e in process_table() if e.lower() == "windowsterminal.exe")
+
+    def quit(self) -> str:
+        """Windows Terminal closed the way Windows closes it at a sign-out:
+        it asks nothing, and keeps its windows for its next start when it is
+        set to.  Then, if it is still there, the way its own × does."""
+        gone = lambda: not self.running()               # noqa: E731
+        _post_to_windows(("Windows Terminal",), 0x0016, 1)      # WM_ENDSESSION
+        if _until(gone, 20):
+            return ""
+        _post_to_windows(("CASCADIA_HOSTING_WINDOW_CLASS",), 0x0010, 0)     # WM_CLOSE
+        if _until(gone, 40):
+            return ""
+        return ("Windows Terminal did not close (it may be asking whether to close its tabs, "
+                "and got no yes)")
+
     def restart_line(self, row: dict, flags: list):
         table = process_table()
         pane = live_panes(table).get(row["tty"])
@@ -942,6 +960,42 @@ class WindowsTerminal(aht.Terminal):
                     why.append(got.get("why") or "no answer from a tab")
                     failed.append(typed_for[t["pid"]])
         return {"opened": opened, "why": "; ".join(why), "failed": failed}
+
+
+def _until(done, secs: float) -> bool:
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        if done():
+            return True
+        time.sleep(0.3)
+    return bool(done())
+
+
+def _post_to_windows(classes: tuple, msg: int, wparam: int) -> int:
+    """Post a message to every top-level window of Windows Terminal whose
+    class starts with one of `classes` (its hidden ones are "Windows
+    Terminal…", its visible ones CASCADIA_HOSTING_WINDOW_CLASS); how many."""
+    u = ctypes.WinDLL("user32")
+    u.GetClassNameW.argtypes = [W.HWND, ctypes.c_wchar_p, ctypes.c_int]
+    u.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
+    u.PostMessageW.argtypes = [W.HWND, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+    proc_t = ctypes.WINFUNCTYPE(ctypes.c_bool, W.HWND, ctypes.c_void_p)
+    u.EnumWindows.argtypes = [proc_t, ctypes.c_void_p]
+    theirs = {p for p, _q, e in process_table() if e.lower() == "windowsterminal.exe"}
+    buf, found = ctypes.create_unicode_buffer(256), []
+
+    def each(hwnd, _):
+        pid = W.DWORD(0)
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in theirs:
+            u.GetClassNameW(hwnd, buf, 256)
+            if buf.value.startswith(classes):
+                found.append(hwnd)
+        return True
+    u.EnumWindows(proc_t(each), None)
+    for h in found:
+        u.PostMessageW(h, msg, wparam, 0)
+    return len(found)
 
 
 def activate() -> None:

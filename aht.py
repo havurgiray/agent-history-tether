@@ -28010,6 +28010,20 @@ class Terminal:
         when the terminal did not answer: a session is not ended on a guess."""
         return True
 
+    def holds_me(self) -> bool:
+        """Whether this aht runs in one of the terminal's own tabs: closing
+        the terminal would end it half-way."""
+        return False
+
+    def asks_before_quit(self) -> bool:
+        """Whether the terminal asks its own question before it closes."""
+        return False
+
+    def quit(self) -> str:
+        """Close the terminal, all of it, and wait until it is gone: "" or
+        why it is still open."""
+        return "aht cannot close this terminal"
+
     def go_to(self, key) -> str:
         """Bring a pane to the front: "ok", "none" (no such pane) or "refused"."""
         return "none"
@@ -28426,11 +28440,14 @@ def _just_opened() -> dict:
         pass                    # no note: none was opened
     return {}
 
-def restore_plan(w: dict, tabs: dict = None) -> dict:
+def restore_plan(w: dict, tabs: dict = None, plain: bool = False, ended=()) -> dict:
     """What a restore opens: every agent session that is not open now, and
     every titled tab that is not there now; the rest is skipped.  What a
     restore opened a moment ago counts as open (a session takes a few
-    seconds to start)."""
+    seconds to start).  `plain`: the plain tabs without a title too, as
+    empty tabs in their folders (a terminal just closed and started again
+    holds none of them).  `ended`: sessions just ended on purpose, which
+    are not open whatever their records still say."""
     term = terminal()
     live = term.running()
     if tabs is None:
@@ -28444,7 +28461,8 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
         if not live or (was is not None and born is not None and abs(born - float(was)) > 1) \
                 or (was is None and (born or 0) > float(opened.get("at") or 0) + 1):
             opened = {}
-    open_ids = {s.get("session") for s in running_sessions()} | set(opened.get("sessions") or [])
+    open_ids = ({s.get("session") for s in running_sessions()}
+                | set(opened.get("sessions") or [])) - set(ended)
     titles_now = ({str(t.get("title") or "") for t in tabs.values()}
                   | set(opened.get("titles") or [])) - {""}
     windows, skipped = {}, []
@@ -28463,7 +28481,7 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
             why = "its session is open" if live else \
                 f"its session still runs outside {term.name or 'the terminal'}"
         elif not e.get("agent") and not e.get("title"):
-            why = "a plain tab without a title"
+            why = None if plain else "a plain tab without a title"
         elif e.get("agent") != "claude" and e.get("title") in titles_now:
             # another agent's tab too: aht knows it only by its title
             why = "a tab with that title is open"
@@ -28500,7 +28518,8 @@ def nothing_to_open(plan: dict) -> str:
         said.append(f"{gone} whose folder is gone")
     return "nothing left to open: " + ", ".join(said)
 
-def restore_workspace(wid: str = None, apply: bool = False) -> dict:
+def restore_workspace(wid: str = None, apply: bool = False, plain: bool = False,
+                      ended=()) -> dict:
     rows = list_workspaces()
     pick = next((r for r in rows if r["id"] == wid), None) if wid else default_workspace(rows)
     res = {"applied": False, "blockers": [], "workspace": pick}
@@ -28513,7 +28532,7 @@ def restore_workspace(wid: str = None, apply: bool = False) -> dict:
                                f"{terminal().name or 'a terminal it can drive'} with Claude Code)")
         return res
     w = json.loads((workspaces_dir() / f"{pick['id']}.json").read_text())
-    plan = restore_plan(w)
+    plan = restore_plan(w, plain=plain, ended=ended)
     res.update(plan=plan)
     if not plan["opens"]:
         res["blockers"].append(nothing_to_open(plan))
@@ -28528,11 +28547,11 @@ def restore_workspace(wid: str = None, apply: bool = False) -> dict:
         res["blockers"].append("a restore is opening tabs right now")
         return res
     try:
-        return _restore_now(res, pick, w)
+        return _restore_now(res, pick, w, plain, ended)
     finally:
         lock.close()
 
-def _restore_now(res: dict, pick: dict, w: dict) -> dict:
+def _restore_now(res: dict, pick: dict, w: dict, plain: bool = False, ended=()) -> dict:
     term = terminal()
     try:
         started, why = term.start(w)
@@ -28544,7 +28563,9 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
     # a fresh look: what the terminal brought back itself when it started is
     # not opened twice, and a double click finds the first restore's tabs
     tabs = term.tabs(max_age=0)
-    plan = restore_plan(w, tabs)
+    # plain tabs only into a terminal that came up empty: one that brought
+    # its own windows back holds them already
+    plan = restore_plan(w, tabs, plain=plain and len(tabs) <= 1, ended=ended)
     res["plan"] = plan
     if not plan["opens"]:
         res["blockers"].append(nothing_to_open(plan))
@@ -28560,6 +28581,7 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
     except Exception as e:              # the terminal, or its command, is not there
         got = {"opened": 0, "why": f"{term.name or 'the terminal'} did not open them: {_errmsg(e)}"}
     res["applied"] = got["opened"] > 0
+    res["opened"] = got["opened"]
     if got["why"]:
         res["blockers"].append(got["why"])
         warn(f"WORKSPACE restored {got['opened']} of {plan['opens']} from {pick['id']}: {got['why']}")
@@ -28583,6 +28605,111 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
         except OSError:
             pass                # gone already
     return res
+
+# ---- Restart Workspace: the terminal closed and started again ---------------- #
+
+_NOT_PROGRAMS = {"login", "conhost", "openconsole", "wsl", "wslhost"}
+
+def _programs_in_tabs(term: Terminal, tabs: dict, own: set) -> list:
+    """What runs in the tabs besides a shell and the Claude sessions that
+    come back: it ends with the terminal and does not start again.  One
+    line for each, with the tab it is in."""
+    out = []
+    try:
+        procs = term.pane_processes()
+    except Exception:
+        return out
+    for key, here in procs.items():
+        if any(pid in own for pid, _a in here):
+            continue            # a Claude session's tab: what it started ends with it
+        t = tabs.get(key) or {}
+        where = t.get("title") or f"window {t.get('window') or 1}, tab {t.get('tab') or 1}"
+        seen = set()
+        for _pid, a in here:
+            words = (a or "").split()
+            if not words:
+                continue
+            name = os.path.basename(words[0].replace("\\", "/")).lstrip("-")
+            low = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
+            if low in _SHELLS or low in _NOT_PROGRAMS or low in seen:
+                continue
+            seen.add(low)
+            out.append(f"{redact(' '.join(words)[:40])} ({redact(where)})")
+    return out
+
+def restart_workspace(apply: bool = False) -> dict:
+    """Restart Workspace: the layout is saved, every Claude session in a tab
+    ends, the terminal closes and starts again, and every tab opens again:
+    each session resumed where it left off, the plain tabs empty in their
+    folders.  The dry run says what would happen, and what would not come
+    back."""
+    term = terminal()
+    name = term.name
+    res = {"applied": False, "terminal": name, "blockers": [], "sessions": [], "working": [],
+           "tabs": 0, "plain": 0, "ending": [], "asks": False}
+    if not name:
+        res["blockers"].append("aht found no terminal here that it can close and open again")
+        return res
+    if not term.running():
+        res["blockers"].append(f"{name} is not open: Restore Workspace opens a saved workspace")
+        return res
+    if term.holds_me():
+        res["blockers"].append(f"this command runs in a tab of {name}, which it would close: use "
+                               "Restart Workspace… in the session corner, or run it from "
+                               "another terminal")
+        return res
+    tabs = term.tabs(max_age=0)
+    snap = workspace_snapshot(tabs)
+    rows = snap.get("tabs") or []
+    if not rows:
+        res["blockers"].append(f"aht found no tabs in {name}")
+        return res
+    live = [r for r in session_checkup() if r["in_terminal"]]
+    label = lambda r: r.get("name") or os.path.basename(r["project"]) or str(r["pid"])   # noqa: E731
+    res.update(sessions=[label(r) for r in live if r["status"] == "idle"],
+               working=[label(r) for r in live if r["status"] != "idle"],
+               tabs=len({(e["window"], e["tab"]) for e in rows}),
+               plain=sum(1 for e in rows if not e.get("agent")),
+               ending=_programs_in_tabs(term, tabs, {r["pid"] for r in live}),
+               asks=term.asks_before_quit())
+    if not apply:
+        return res
+    lock = _restart_lock()
+    if lock is None:
+        res["blockers"].append(RESTART_BUSY)
+        return res
+    try:
+        f = save_workspace(snap)
+        if f is None:
+            res["blockers"].append("the workspace could not be saved, so nothing was closed")
+            return res
+        res["workspace"] = f.stem
+        import signal
+        for r in live:                  # each ends the way it does on /exit, all at once
+            try:
+                os.kill(r["pid"], signal.SIGTERM)
+            except OSError:
+                pass
+        end = time.time() + 20
+        while time.time() < end and any(not _gone(r["pid"]) for r in live):
+            time.sleep(0.3)
+        why = term.quit()
+        if why:
+            # still open: the sessions that ended come back in it, the rest is as it was
+            res["blockers"].append(why + "; the sessions are opened again in it")
+        else:
+            time.sleep(1)
+        got = restore_workspace(f.stem, apply=True, plain=not why,
+                                ended={r["session"] for r in live if r.get("session")})
+        res["applied"] = bool(got.get("applied")) and not why
+        res["opened"] = int(got.get("opened") or 0)
+        res["of"] = int(((got.get("plan") or {}).get("opens")) or 0)
+        res["blockers"] += got.get("blockers") or []
+        log(f"WORKSPACE restarted: {name} {'closed and started again' if not why else 'did not close'}, "
+            f"{res['opened']} of {res['of']} tab(s)/pane(s) opened from {f.stem}")
+        return res
+    finally:
+        lock.close()
 
 # ---- iTerm2 as aht's terminal ------------------------------------------------ #
 
@@ -28778,6 +28905,48 @@ class ITerm2(Terminal):
     def has_pane(self, key) -> bool:
         return bool(key) and bool(iterm_tab(key))
 
+    def holds_me(self) -> bool:
+        if os.environ.get("AHT_ITERM_TABS"):            # tests: as told
+            return bool(os.environ.get("AHT_ITERM_INSIDE"))
+        mine = _my_ancestors()
+        try:
+            r = subprocess.run(["ps", "-Ac", "-o", "pid=,comm="], capture_output=True, text=True,
+                               timeout=10, cwd="/")
+            return any(int(l.split()[0]) in mine for l in r.stdout.splitlines()
+                       if l.strip().endswith(" iTerm2") and l.split()[0].isdigit())
+        except Exception:
+            return bool(os.environ.get("ITERM_SESSION_ID"))     # in doubt, by what a tab sets
+
+    def asks_before_quit(self) -> bool:
+        # iTerm2 > Settings > General > Closing > Confirm "Quit iTerm2": on unless switched off
+        return str(iterm_pref("PromptOnQuit") or "1").strip().lower() not in ("0", "false", "no")
+
+    def quit(self) -> str:
+        if os.environ.get("AHT_ITERM_LOG"):             # tests: noted; a fresh start has one empty window
+            with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
+                fh.write(json.dumps({"what": "quit"}) + "\n")
+            if os.environ.get("AHT_ITERM_STAYS"):
+                return "iTerm2 did not close"
+            if os.environ.get("AHT_ITERM_TABS"):
+                Path(os.environ["AHT_ITERM_TABS"]).write_text(json.dumps({"/dev/ttysNEW": {
+                    "title": "", "override": False, "pane": 1, "panes": 1, "window": 1, "tab": 1}}))
+            return ""
+        try:        # iTerm2's own question, if it asks one, is answered within this time
+            subprocess.run(["/usr/bin/osascript", "-e", 'tell application "iTerm2" to quit'],
+                           capture_output=True, text=True, timeout=120, cwd="/")
+        except Exception as e:
+            warn(f"WORKSPACE iTerm2 was asked to quit: {_errmsg(e)}")
+        end = time.time() + 20
+        while time.time() < end and _iterm_running():
+            time.sleep(0.3)
+        if _iterm_running():
+            return "iTerm2 did not close (it asked whether to quit and got no yes, or it did not answer)"
+        try:
+            tabs_cache_path().unlink()      # the tabs it had are gone with it
+        except OSError:
+            pass
+        return ""
+
     def go_to(self, key) -> str:
         return _iterm_do(key, "goto")
 
@@ -28884,6 +29053,23 @@ def cmd_workspace(args):
         print(json.dumps(res) if args.json else
               (f"saved: {res['saved']}" if res["saved"] else f"nothing to save ({res['why']})"))
         return 0
+    if getattr(args, "restart", False):
+        res = restart_workspace(args.apply)
+        lines = []
+        if not res["blockers"] or res["applied"] or res.get("opened"):
+            said = "closed and started again" if res["applied"] else "would close and start again"
+            lines.append(f"{res['terminal']} {said}: {res['tabs']} tab(s), "
+                         f"{len(res['sessions']) + len(res['working'])} session(s), "
+                         f"{res['plain']} plain tab(s)")
+        if res["working"]:
+            lines.append("   working now, their task stops: " + ", ".join(res["working"]))
+        for x in res["ending"]:
+            lines.append(f"   ends and does not come back: {x}")
+        if res.get("opened") is not None:
+            lines.append(f"   opened again: {res['opened']} of {res.get('of')}")
+        elif not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
     if args.restore is not None:
         res = restore_workspace(args.restore or None, args.apply)
         lines = []
@@ -29946,6 +30132,9 @@ def build_parser():
     s.add_argument("--auto", action="store_true",
                    help="with --save: only when workspace_save_minutes have passed (the app)")
     s.add_argument("--quiet", action="store_true")
+    s.add_argument("--restart", action="store_true",
+                   help="close the terminal and open the workspace again: every session "
+                        "resumed in its tab, the plain tabs empty in their folders")
     s.add_argument("--restore", nargs="?", const="", metavar="ID",
                    help="open a saved one again (default: the one before iTerm2 last "
                         "started)")

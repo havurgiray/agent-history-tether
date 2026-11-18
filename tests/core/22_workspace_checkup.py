@@ -114,6 +114,72 @@ ck(offered.get("workspaces", [{}])[0].get("id") == "20990101-000000"
    f"workspace: the one offered holds a session or a titled tab, not the newest of plain tabs "
    f"({offered.get('default')})")
 
+# Restart Workspace: the terminal closed and started again, every tab back
+kept_tabs, kept_ws = tabs_file.read_text(), set((sb / ".aht" / "workspaces").glob("*.json"))
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
+r1, r2 = fake_claude("r1", title="Paper"), fake_claude("r2", title="Busy one")
+(rec / f"{r2.pid}.json").write_text(json.dumps({"pid": r2.pid, "cwd": projX, "sessionId": "r2",
+                                                "status": "busy"}))
+tabs_file.write_text(json.dumps({
+    "/dev/ttysR1": {"title": "Paper", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 1},
+    "/dev/ttysR2": {"title": "", "override": False, "pane": 1, "panes": 1, "window": 1, "tab": 2},
+    "/dev/ttysR3": {"title": "Notes", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 3},
+    "/dev/ttysR4": {"title": "", "override": False, "pane": 1, "panes": 1, "window": 2, "tab": 1}}))
+prefs = sb / "iterm-prefs.json"
+prefs.write_text(json.dumps({"PromptOnQuit": 0}))
+renv = dict(wenv, AHT_ITERM_PREFS=str(prefs),
+            AHT_TTYS=json.dumps({str(r1.pid): "/dev/ttysR1", str(r2.pid): "/dev/ttysR2"}),
+            AHT_TTY_PROCS=json.dumps({"/dev/ttysR1": [[r1.pid, "claude --model opus"]],
+                                      "/dev/ttysR2": [[r2.pid, "claude"]],
+                                      "/dev/ttysR3": [[shell.pid, "-zsh"]],
+                                      "/dev/ttysR4": [[shell.pid, "-zsh"], [99999991, "npm run dev"]]}),
+            AHT_CMDLINES=json.dumps({str(r1.pid): "claude --model opus", str(r2.pid): "claude"}))
+n_quit = lambda: sum(1 for x in ilines() if x.get("what") == "quit")      # noqa: E731
+dry = JS("workspace", "--restart", "--json", extra_env=renv)
+ins = JS("workspace", "--restart", "--apply", "--json", extra_env=dict(renv, AHT_ITERM_INSIDE="1"))
+ck(dry.get("applied") is False and not dry.get("blockers") and dry.get("sessions") == ["Paper"]
+   and dry.get("working") == ["Busy one"] and (dry.get("tabs"), dry.get("plain")) == (4, 2)
+   and dry.get("ending") == ["npm run dev (window 2, tab 1)"] and dry.get("asks") is False
+   and "runs in a tab of iTerm2" in " ".join(ins.get("blockers") or []) and n_quit() == 0
+   and r1.poll() is None,
+   f"restart workspace, dry run: who comes back, who is working, what ends for good; never "
+   f"from inside the terminal ({ {k: dry.get(k) for k in ('sessions', 'working', 'tabs', 'plain', 'ending')} }, "
+   f"{ins.get('blockers')})")
+n_restore = sum(1 for x in ilines() if x.get("what") == "restore")
+went = JS("workspace", "--restart", "--apply", "--json", extra_env=renv)
+script = [x["script"] for x in ilines() if x.get("what") == "restore"][-1]
+ck(went.get("applied") is True and not went.get("blockers") and n_quit() == 1
+   and (went.get("opened"), went.get("of")) == (4, 4)
+   and r1.wait(5) is not None and r2.wait(5) is not None
+   and "--model opus --resume r1" in script and "--resume r2" in script and "Notes" in script
+   and script.count("write text") == 4
+   and sum(1 for x in ilines() if x.get("what") == "restore") == n_restore + 1,
+   f"restart workspace: saved, the sessions ended, the terminal closed, every tab opened again, "
+   f"the plain ones too ({ {k: went.get(k) for k in ('applied', 'opened', 'of', 'blockers')} })")
+for pr in (r1, r2):
+    (rec / f"{pr.pid}.json").unlink(missing_ok=True)
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
+# a terminal that does not close: the sessions that ended come back in it, the rest stays
+r3 = fake_claude("r3", title="Paper")
+tabs_file.write_text(json.dumps({
+    "/dev/ttysR1": {"title": "Paper", "override": True, "pane": 1, "panes": 1, "window": 1, "tab": 1},
+    "/dev/ttysR4": {"title": "", "override": False, "pane": 1, "panes": 1, "window": 1, "tab": 2}}))
+senv = dict(renv, AHT_ITERM_STAYS="1", AHT_TTYS=json.dumps({str(r3.pid): "/dev/ttysR1"}),
+            AHT_TTY_PROCS=json.dumps({"/dev/ttysR1": [[r3.pid, "claude"]], "/dev/ttysR4": []}),
+            AHT_CMDLINES=json.dumps({str(r3.pid): "claude"}))
+stay = JS("workspace", "--restart", "--apply", "--json", extra_env=senv)
+script = [x["script"] for x in ilines() if x.get("what") == "restore"][-1]
+ck(stay.get("applied") is False and "did not close" in " ".join(stay.get("blockers") or [])
+   and stay.get("opened") == 1 and "--resume r3" in script and script.count("write text") == 1,
+   f"restart workspace: a terminal that stays open gets its ended sessions back, and says so "
+   f"({stay.get('blockers')}, {stay.get('opened')})")
+r3.wait(5)
+(rec / f"{r3.pid}.json").unlink(missing_ok=True)
+(sb / ".aht" / "run" / "workspace-opened.json").unlink(missing_ok=True)
+for f in set((sb / ".aht" / "workspaces").glob("*.json")) - kept_ws:
+    f.unlink()
+tabs_file.write_text(kept_tabs)
+
 # tab colours come from iTerm2's saved window state, profiles from iTerm2
 import plistlib, sqlite3 as _sq
 def keyed(obj):

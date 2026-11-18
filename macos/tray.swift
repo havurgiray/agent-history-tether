@@ -164,6 +164,22 @@ func ahtJSON(_ args: [String]) -> [String: Any]? {
     return j
 }
 
+/// What is said when the core's answer could not be read.
+let AHT_NO_ANSWER = "aht gave no answer — see the log (Settings)."
+
+/// One of the core's reasons as a line of its own: the core sends them in
+/// lower case and without a full stop, to go after a colon.
+func asSentence(_ why: String) -> String {
+    let t = why.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = t.first, let last = t.last else { return t }
+    // a name keeps its own letters: "iTerm2 is not open", "aht gave no answer"
+    let word = t.prefix { !$0.isWhitespace }
+    let named = word == "aht" || word.contains { $0.isUppercase }
+    let start: String = named ? String(first) : first.uppercased()
+    let stop: String = ".!?…".contains(last) ? "" : "."
+    return start + String(t.dropFirst()) + stop
+}
+
 // ---- the app's own errors, into aht's log -------------------------------------
 // An error of the Mac app's own goes to aht's log through `aht _log --level
 // error --source mac-app -- MESSAGE` (the core masks it, keeps it to one line
@@ -308,16 +324,32 @@ func changedFile(_ d: [String: Any]) -> ChangedFile {
                        removed: d["removed"] as? Int ?? 0, diff: d["diff"] as? String ?? "")
 }
 
+/// With `safeDefault`, Return cancels and the confirming button needs a
+/// click: for a question whose yes cannot be taken back.
 func alert(_ title: String, _ body: String, confirm: String? = nil,
-           cancel: String = "Cancel") -> Bool {
+           cancel: String = "Cancel", safeDefault: Bool = false) -> Bool {
     let a = NSAlert()
     a.messageText = title
     a.informativeText = body
     if let c = confirm {
-        a.addButton(withTitle: c)
-        a.addButton(withTitle: cancel).keyEquivalent = "\u{1b}"     // Esc, whatever its name
+        let yes = a.addButton(withTitle: c)
+        let no = a.addButton(withTitle: cancel)
+        no.keyEquivalent = "\u{1b}"                                 // Esc, whatever its name
+        var esc: Any?
+        if safeDefault {
+            yes.keyEquivalent = ""
+            no.keyEquivalent = "\r"
+            // a button has one key only, and Return took it: Esc still cancels
+            esc = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+                guard e.keyCode == UInt16(kVK_Escape) else { return e }
+                no.performClick(nil)
+                return nil
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
-        return a.runModal() == .alertFirstButtonReturn
+        let said = a.runModal()
+        if let esc = esc { NSEvent.removeMonitor(esc) }
+        return said == .alertFirstButtonReturn
     }
     a.addButton(withTitle: "OK")
     NSApp.activate(ignoringOtherApps: true)
@@ -4369,35 +4401,39 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Update Claude Code the way it was installed, then the open sessions
-    /// on an older version onto it, each in its tab (`aht update --claude`).
+    /// Update Claude Code under way, from the click to its result: a second
+    /// click does nothing, and the menu says so.
+    @Published var updatingClaude = false
+
+    /// Update Claude Code the way it was installed; if that brings a newer
+    /// version, every open session starts again on it, each in its tab
+    /// (`aht update --claude`).
     func updateClaude() {
+        guard !updatingClaude else { return }
+        updatingClaude = true
         busy("looking at Claude Code…") {
-            let plan = ahtJSON(["update", "--claude", "--json"]) ?? [:]
+            let plan = ahtJSON(["update", "--claude", "--json"])
             DispatchQueue.main.async {
-                if let why = self.problems(plan) {
-                    _ = alert("Claude Code is not updated", why)
+                if let why = updateClaudeRefusal(plan) {
+                    self.updatingClaude = false
+                    _ = alert("Claude Code was not updated", why)
                     return
                 }
-                let how = plan["how"] as? String ?? "its installer"
-                let r = plan["restart"] as? [String: Any] ?? [:]
-                let now = r["now"] as? [String] ?? [], later = r["after"] as? [String] ?? []
-                let left = (r["left_out"] as? [[String: Any]] ?? []).compactMap { $0["session"] as? String }
-                var text = "aht runs " + ((plan["command"] as? [String])?.joined(separator: " ") ?? how)
-                    + " (Claude Code \(plan["before"] as? String ?? "?") came with \(how))."
-                if plan["while_running"] as? Bool ?? true {
-                    text += "\n\nThen the sessions on an older version start again in their tabs, "
-                        + "where they left off, with the options they had."
-                } else {
-                    text += "\n\n\(how) cannot replace Claude Code while it runs, so every session "
-                        + "ends first, once its task is over, and starts again in its tab after."
+                // Cancel is the default: a yes ends every open session
+                guard alert("Update Claude Code?", updateClaudeQuestion(plan ?? [:]),
+                            confirm: "Update", safeDefault: true) else {
+                    self.updatingClaude = false
+                    return
                 }
-                if !now.isEmpty { text += "\n\nAt once: " + now.joined(separator: ", ") }
-                if !later.isEmpty { text += "\nOnce their task is over: " + later.joined(separator: ", ") }
-                if !left.isEmpty { text += "\nLeft as they are: " + left.joined(separator: ", ") }
-                text += "\n\nA notice says when it is done."
-                guard alert("Update Claude Code?", text, confirm: "Update") else { return }
-                self.background { _ = ahtJSON(["update", "--claude", "--apply", "--json"]) }
+                // not busy(): it can wait hours for a working session
+                self.background {
+                    let res = ahtJSON(["update", "--claude", "--apply", "--json"])
+                    DispatchQueue.main.async {
+                        self.updatingClaude = false
+                        // the core's notice says when it worked; what did not is said here
+                        if let p = updateClaudeProblems(res) { _ = alert(p.title, p.text) }
+                    }
+                }
             }
         }
     }
@@ -4422,17 +4458,33 @@ final class AppModel: ObservableObject {
     @Published var workspacePick: String?
     @Published var workspacePlan: [String: Any] = [:]
     @Published var workspaceDefault: String?
+    @Published var workspaceLoading = false     // the picked one's plan is on its way
+    @Published var workspacesError: String?     // why there is no list to show
     var autosaving = false
 
-    func openWorkspaces() {
-        workspaces = nil
+    /// The sheet with the saved workspaces. With `keepPick` (after Save Now)
+    /// the list stays while it loads again, and so does the one picked if it
+    /// still is there.
+    func openWorkspaces(keepPick: Bool = false) {
+        if !keepPick || workspacesError != nil { workspaces = nil }     // no list to keep
+        workspacesError = nil
         showWorkspace = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let d = ahtJSON(["workspace", "--json"]) ?? [:]
+            let got = ahtJSON(["workspace", "--json"])
             DispatchQueue.main.async {
-                self.workspaces = (d["workspaces"] as? [[String: Any]]) ?? []
+                guard let d = got else {            // not the same as "none saved yet"
+                    self.workspaces = []
+                    self.workspaceDefault = nil
+                    self.workspacesError = AHT_NO_ANSWER
+                    self.pickWorkspace(nil)
+                    return
+                }
+                let ws = (d["workspaces"] as? [[String: Any]]) ?? []
+                self.workspaces = ws
                 self.workspaceDefault = d["default"] as? String
-                self.pickWorkspace(d["default"] as? String)
+                let kept = keepPick ? self.workspacePick : nil
+                let still = kept.map { k in ws.contains { $0["id"] as? String == k } } ?? false
+                self.pickWorkspace(still ? kept : d["default"] as? String)
             }
         }
     }
@@ -4460,17 +4512,28 @@ final class AppModel: ObservableObject {
     func pickWorkspace(_ id: String?) {
         workspacePick = id
         workspacePlan = [:]
+        workspaceLoading = id != nil
         guard let id = id else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            let d = ahtJSON(["workspace", "--restore", id, "--json"]) ?? [:]
-            DispatchQueue.main.async { if self.workspacePick == id { self.workspacePlan = d } }
+            // no answer is said in the pane, where a reason nothing opens goes
+            let got = ahtJSON(["workspace", "--restore", id, "--json"]) ?? [:]
+            let d = got.isEmpty ? ["blockers": [AHT_NO_ANSWER]] : got
+            DispatchQueue.main.async {
+                guard self.workspacePick == id else { return }      // another one was picked since
+                self.workspacePlan = d
+                self.workspaceLoading = false
+            }
         }
     }
 
     func saveWorkspaceNow() {
         busy("saving the workspace…") {
-            aht(["workspace", "--save"])
-            DispatchQueue.main.async { self.openWorkspaces() }
+            let res = ahtJSON(["workspace", "--save", "--json"])
+            DispatchQueue.main.async {
+                // only a sheet still shown loads again: a closed one stays closed
+                if self.showWorkspace { self.openWorkspaces(keepPick: true) }
+                if let why = workspaceNotSavedWhy(res) { _ = alert("Workspace not saved", why) }
+            }
         }
     }
 
@@ -4479,12 +4542,11 @@ final class AppModel: ObservableObject {
         busy("opening the tabs…") {
             let d = ahtJSON(["workspace", "--restore", id, "--apply", "--json"]) ?? [:]
             DispatchQueue.main.async {
-                if let why = self.problems(d) {
-                    _ = alert("Not opened", why)
-                } else {
-                    self.showWorkspace = false
-                }
+                let why = self.problems(d)
+                // tabs that opened are open: the sheet closes also when some did not
+                if why == nil || d["applied"] as? Bool == true { self.showWorkspace = false }
                 self.refreshBoard()
+                if let why = why { _ = alert(workspaceNotOpenedTitle(d), why) }
             }
         }
     }
@@ -9633,12 +9695,7 @@ struct WorkspaceSheet: View {
     }
 
     func savingRule() -> String {
-        let every = m.config["workspace_save_minutes"] as? Int ?? 10
-        return (every > 0 ? "Saved every \(every) minutes while iTerm2 is open, and" : "Saved")
-            + " when a session gets a prompt; a layout that did not change is not saved "
-            + "again. All from the last two hours are kept, then one an hour for a day, "
-            + "one a day for a week, one a week for a month and one a month for a year: "
-            + "the one with the most sessions."
+        return workspaceSavingRule(m.config["workspace_save_minutes"] as? Int ?? 10)
     }
 
     func row(_ w: [String: Any]) -> some View {
@@ -9655,7 +9712,8 @@ struct WorkspaceSheet: View {
                             .background(Capsule().fill(Color.accentColor.opacity(0.18)))
                     }
                 }
-                Text("\(w["tabs"] as? Int ?? 0) tabs, \(w["sessions"] as? Int ?? 0) sessions")
+                Text(counted(w["tabs"] as? Int ?? 0, "tab") + ", "
+                     + counted(w["sessions"] as? Int ?? 0, "session"))
                     .font(.caption).foregroundColor(.secondary)
                 if !titles.isEmpty {
                     Text(titles.prefix(6).joined(separator: ", ")).font(.caption)
@@ -9681,16 +9739,59 @@ struct WorkspaceSheet: View {
             .frame(width: 9, height: 9)
     }
 
+    /// The picked workspace: first why nothing can open (a long list of
+    /// skipped tabs would push it out of view), then what opens and what is
+    /// skipped; a spinner while aht still looks.
+    @ViewBuilder var planPane: some View {
+        if m.workspaceLoading {
+            ProgressView().frame(maxWidth: .infinity).padding(.top, 24)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                let blockers = (m.workspacePlan["blockers"] as? [String]) ?? []
+                ForEach(Array(blockers.enumerated()), id: \.offset) { _, why in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                        Text(asSentence(why)).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.bottom, 4)
+                }
+                let plan = (m.workspacePlan["plan"] as? [String: Any]) ?? [:]
+                let wins = (plan["windows"] as? [[[[String: Any]]]]) ?? []
+                ForEach(Array(wins.enumerated()), id: \.offset) { wi, win in
+                    Text("Window \(wi + 1)").font(.subheadline.bold()).padding(.top, 4)
+                    ForEach(Array(win.joined().enumerated()), id: \.offset) { _, e in
+                        HStack(spacing: 6) {
+                            dot(e)
+                            Text(openLine(e)).lineLimit(1)
+                        }
+                    }
+                }
+                let skipped = (plan["skipped"] as? [[String: Any]]) ?? []
+                if !skipped.isEmpty {
+                    Text("Skipped").font(.subheadline.bold()).padding(.top, 8)
+                    ForEach(Array(skipped.enumerated()), id: \.offset) { _, e in
+                        Text(skipLine(e))
+                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            headed("Restore the workspace", "Restore my workspace")
+            headed("Restore Workspace", "Restore my workspace")
             Text("aht keeps your iTerm2 windows and tabs, their titles, colours and the sessions "
                  + "in them, while you work. Opening one again resumes each session where it was, "
                  + "in a tab with its title and colour, and starts iTerm2 if it is closed. "
                  + "Sessions and titled tabs that are open now are skipped.")
                 .foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             if let ws = m.workspaces {
-                if ws.isEmpty {
+                if let why = m.workspacesError {    // not "none saved yet": aht did not say
+                    Text(why).foregroundColor(.secondary)
+                } else if ws.isEmpty {
                     Text("No workspace saved yet. aht saves one while you work with Claude Code in "
                          + "iTerm2, or now with Save Now.").foregroundColor(.secondary)
                 } else {
@@ -9702,34 +9803,7 @@ struct WorkspaceSheet: View {
                             .padding(4)
                         }
                         .frame(minWidth: 230, idealWidth: 260)
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 4) {
-                                let plan = (m.workspacePlan["plan"] as? [String: Any]) ?? [:]
-                                let wins = (plan["windows"] as? [[[[String: Any]]]]) ?? []
-                                ForEach(Array(wins.enumerated()), id: \.offset) { wi, win in
-                                    Text("Window \(wi + 1)").font(.subheadline.bold()).padding(.top, 4)
-                                    ForEach(Array(win.joined().enumerated()), id: \.offset) { _, e in
-                                        HStack(spacing: 6) {
-                                            dot(e)
-                                            Text(openLine(e)).lineLimit(1)
-                                        }
-                                    }
-                                }
-                                let skipped = (plan["skipped"] as? [[String: Any]]) ?? []
-                                if !skipped.isEmpty {
-                                    Text("Skipped").font(.subheadline.bold()).padding(.top, 8)
-                                    ForEach(Array(skipped.enumerated()), id: \.offset) { _, e in
-                                        Text(skipLine(e))
-                                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
-                                    }
-                                }
-                                if let why = (m.workspacePlan["blockers"] as? [String])?.first {
-                                    Text(why).foregroundColor(.orange).padding(.top, 8)
-                                }
-                            }
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
+                        ScrollView { planPane }
                     }
                 }
             } else {
@@ -11692,6 +11766,30 @@ func workspaceSavedText(_ res: [String: Any]?) -> String {
         + counted(res["sessions"] as? Int ?? 0, "session")
 }
 
+/// Save Now in the Restore Workspace sheet: why nothing was saved, in the
+/// core's words as a sentence; nil when a workspace was saved.
+func workspaceNotSavedWhy(_ res: [String: Any]?) -> String? {
+    guard let res = res, !res.isEmpty else { return AHT_NO_ANSWER }
+    if res["saved"] as? String != nil { return nil }
+    let why = asSentence(res["why"] as? String ?? "")
+    return why.isEmpty ? "There was nothing to save." : why
+}
+
+/// The title over what stood in the way of Open Them: some tabs opened, or none.
+func workspaceNotOpenedTitle(_ d: [String: Any]) -> String {
+    d["applied"] as? Bool == true ? "Some did not open" : "Not opened"
+}
+
+/// How often a workspace is saved, under the Restore Workspace sheet's list.
+func workspaceSavingRule(_ every: Int) -> String {
+    return (every > 0 ? "Saved every " + (every == 1 ? "minute" : "\(every) minutes")
+                        + " while iTerm2 is open, and" : "Saved")
+        + " when a session gets a prompt; a layout that did not change is not saved "
+        + "again. All from the last two hours are kept, then one an hour for a day, "
+        + "one a day for a week, one a week for a month and one a month for a year: "
+        + "the one with the most sessions."
+}
+
 /// What the confirmation of Restart Workspace… says, from the dry run of
 /// `aht checkup --restart-older --all` (as wincorner.restart_question); nil
 /// when no session can restart.
@@ -11703,7 +11801,8 @@ func workspaceRestartQuestion(_ plan: [String: Any]) -> String? {
         + ((plan["installed"] as? String).map { " (\($0))" } ?? "")
         + ". Anything typed into a session but not sent is lost."
     if !now.isEmpty { t += "\n\nAt once: " + now.joined(separator: ", ") }
-    if !after.isEmpty { t += "\n\nOnce their task is over: " + after.joined(separator: ", ") }
+    // "idle", not "their task is over": one that waits for an answer is here too
+    if !after.isEmpty { t += "\n\nOnce they are idle: " + after.joined(separator: ", ") }
     let left = (plan["left_out"] as? [[String: Any]] ?? []).map {
         "\($0["session"] as? String ?? "") (\($0["why"] as? String ?? ""))" }
     if !left.isEmpty { t += "\n\nLeft as they are: " + left.joined(separator: "; ") }
@@ -11717,22 +11816,88 @@ func workspaceNothingToRestart(_ plan: [String: Any]?) -> String {
     if let b = (plan["blockers"] as? [String])?.first { return "Workspace not restarted: " + b }
     let left = plan["left_out"] as? [[String: Any]] ?? []
     guard let one = left.first else { return "No open session to restart" }
-    return "No session to restart: \(one["session"] as? String ?? "") \(one["why"] as? String ?? "")"
+    let why = one["why"] as? String ?? ""
+    return "No session to restart: \(one["session"] as? String ?? "")"
+        + (why.isEmpty ? "" : " (\(why))")
         + (left.count > 1 ? ", and \(left.count - 1) more" : "")
 }
 
-/// What Restart Workspace says once it is through (as wincorner.restarted_text).
+/// What Restart Workspace says once it is through (as wincorner.restarted_text):
+/// how many of the sessions it was about restarted. Which did not, and why,
+/// is workspaceRestartProblems.
 func workspaceRestartedText(_ res: [String: Any]?) -> String {
     guard let res = res else { return "Workspace not restarted: aht gave no answer" }
     if let b = (res["blockers"] as? [String])?.first { return "Workspace not restarted: " + b }
-    let not = (res["failed"] as? [[String: Any]] ?? []).map { $0["session"] as? String ?? "" }
-        + (res["not_waited"] as? [String] ?? [])
-    var t = "Workspace restarted: " + counted((res["restarted"] as? [String] ?? []).count, "session")
-    if !not.isEmpty {
-        t += "; not " + not.prefix(3).joined(separator: ", ")
-            + (not.count > 3 ? " and \(not.count - 3) more" : "")
+    let done = (res["restarted"] as? [String] ?? []).count
+    let not = (res["failed"] as? [[String: Any]] ?? []).count
+        + (res["not_waited"] as? [String] ?? []).count
+    return "Workspace restarted: "
+        + (not == 0 ? counted(done, "session") : "\(done) of " + counted(done + not, "session"))
+}
+
+/// The sessions a restart left as they were, one paragraph each; nil when
+/// every one restarted. A failed one's reason carries the line that
+/// continues it by hand, so it is shown whole.
+func workspaceRestartProblems(_ res: [String: Any]?) -> String? {
+    let failed = (res?["failed"] as? [[String: Any]] ?? []).map {
+        "\($0["session"] as? String ?? ""): \($0["why"] as? String ?? "")" }
+    let working = (res?["not_waited"] as? [String] ?? []).map {
+        $0 + ": it was still working, so aht left it as it is" }
+    let all = failed + working
+    return all.isEmpty ? nil : all.joined(separator: "\n\n")
+}
+
+/// Update Claude Code…: why the question is not asked (no answer, or what
+/// stands in the way in the core's words); nil when it can be.
+func updateClaudeRefusal(_ plan: [String: Any]?) -> String? {
+    guard let plan = plan, !plan.isEmpty else { return AHT_NO_ANSWER }
+    let blockers = plan["blockers"] as? [String] ?? []
+    if !blockers.isEmpty { return blockers.joined(separator: "\n\n") }
+    // without the command the core found no way to update: not a plan to ask about
+    let none = (plan["command"] as? [String])?.isEmpty ?? ((plan["command"] as? String)?.isEmpty ?? true)
+    return none ? AHT_NO_ANSWER : nil
+}
+
+/// What the confirmation of Update Claude Code… says, from the dry run of
+/// `aht update --claude`. In words, without the command line.
+func updateClaudeQuestion(_ plan: [String: Any]) -> String {
+    let named = (plan["how"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    let before = (plan["before"] as? String).flatMap { $0.isEmpty ? nil : " " + $0 } ?? ""
+    var parts = ["aht updates Claude Code\(before) with \(named ?? "its installer"), "
+                 + "the way it was installed."]
+    if plan["while_running"] as? Bool ?? true {
+        parts.append("If that brings a newer version, every open Claude session ends and starts "
+                     + "again in its tab, where it left off, with the options it had: an idle one "
+                     + "at once, a working one once it is idle. Anything typed into a session but "
+                     + "not sent is lost.")
+    } else {
+        parts.append("\(named ?? "Its installer") cannot replace Claude Code while it runs, so "
+                     + "every open Claude session ends first, once it is idle, and starts again in "
+                     + "its tab after the update, where it left off, with the options it had. "
+                     + "Anything typed into a session but not sent is lost.")
     }
-    return t
+    let r = plan["restart"] as? [String: Any] ?? [:]
+    let sessions = (r["now"] as? [String] ?? []) + (r["after"] as? [String] ?? [])
+    if !sessions.isEmpty { parts.append("Sessions: " + sessions.joined(separator: ", ")) }
+    let left = (r["left_out"] as? [[String: Any]] ?? []).map { e -> String in
+        let why = e["why"] as? String ?? ""
+        return (e["session"] as? String ?? "") + (why.isEmpty ? "" : " (\(why))")
+    }
+    if !left.isEmpty { parts.append("Left as they are: " + left.joined(separator: "; ")) }
+    parts.append("A notice says when it is done.")
+    return parts.joined(separator: "\n\n")
+}
+
+/// What Update Claude Code… has to report once it is through, as an alert's
+/// title and text; nil when all went well (the core's notice says that).
+func updateClaudeProblems(_ res: [String: Any]?) -> (title: String, text: String)? {
+    guard let res = res, !res.isEmpty else { return ("Claude Code was not updated", AHT_NO_ANSWER) }
+    var lines = (res["blockers"] as? [String] ?? []) + (res["warnings"] as? [String] ?? [])
+    if let not = workspaceRestartProblems(res["restart"] as? [String: Any]) { lines.append(not) }
+    guard !lines.isEmpty else { return nil }
+    let after = (res["after"] as? String).flatMap { $0.isEmpty ? nil : " to " + $0 } ?? ""
+    return (res["updated"] as? Bool == true ? "Claude Code updated\(after)" : "Claude Code was not updated",
+            lines.joined(separator: "\n\n"))
 }
 
 /// Branch… (the corner's menu and the Sessions tab): the name asked for, then
@@ -11852,6 +12017,7 @@ final class CornerModel: ObservableObject {
     @Published var most = 12                    // how many sessions it lists, the rest "+n more"
     @Published var note: String?                // why a click went nowhere, for a few seconds
     @Published var restarting = false           // Restart Workspace under way
+    @Published var looking = false              // its look ahead or its question is open
     @Published var machines: [String] = []      // set up here, for Send to
     var away: [[String: Any]] = []              // `aht _corner`: the sessions handed over
     var onMovedOn: () -> Void = {}              // a handover or take-back ended
@@ -12096,9 +12262,11 @@ final class CornerModel: ObservableObject {
         return nil
     }
 
-    /// A line under the list's top for a few seconds.
-    func say(_ text: String, for secs: Double = 8) {
+    /// A line under the list's top for a few seconds; with nil, until the
+    /// next one takes its place.
+    func say(_ text: String, for secs: Double? = 8) {
         note = text
+        guard let secs = secs else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
             if self?.note == text { self?.note = nil }
         }
@@ -12172,7 +12340,7 @@ struct CornerView: View {
                         .frame(width: 14, height: 14).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Hide the corner (the aht menu brings it back)")
+                .help("Hide the list (the aht menu brings it back)")
             }
             .foregroundColor(.secondary)
             .padding(.horizontal, 6).padding(.top, 1).padding(.bottom, c.rows.isEmpty ? 1 : 3)
@@ -12282,10 +12450,10 @@ struct CornerView: View {
     @ViewBuilder func listMenu() -> some View {
         Button("Save Workspace Now") { list("save-workspace") }
         Button("Restore Workspace…") { list("workspaces") }
-        Button(c.restarting ? "Restart Workspace (under way)" : "Restart Workspace…") {
+        Button(c.restarting || c.looking ? "Restart Workspace (under way)" : "Restart Workspace…") {
             list("restart-workspace")
         }
-        .disabled(c.restarting)
+        .disabled(c.restarting || c.looking)
         Divider()
         Button("Hide the List") { hide() }
     }
@@ -12606,7 +12774,7 @@ final class CornerPanel {
         }
     }
 
-    private func sayList(_ text: String, for secs: Double = 8) {
+    private func sayList(_ text: String, for secs: Double? = 8) {
         model.say(text, for: secs)
         DispatchQueue.main.async { self.place(force: true) }
     }
@@ -12622,29 +12790,42 @@ final class CornerPanel {
 
     /// Restart Workspace…: the look ahead, the question, then every session
     /// ends and starts again in its tab: an idle one now, a working one once
-    /// its task is over (`aht checkup --restart-older --all`).
+    /// it is idle (`aht checkup --restart-older --all`). From the click to
+    /// the answer a second click does nothing: it would ask twice.
     private func restartWorkspace() {
-        guard !model.restarting else { return }
-        sayList("Looking at the open sessions…", for: 60)
+        guard !model.restarting, !model.looking else { return }
+        model.looking = true
+        let looking = "Looking at the open sessions…"
+        sayList(looking, for: 60)
         DispatchQueue.global(qos: .userInitiated).async {
             let plan = ahtJSON(["checkup", "--restart-older", "--all", "--json"])
             DispatchQueue.main.async {
-                self.model.note = nil
+                // only its own line goes: another note may have come since
+                if self.model.note == looking { self.model.note = nil }
                 self.place(force: true)
                 guard let plan = plan, let q = workspaceRestartQuestion(plan) else {
+                    self.model.looking = false
                     return self.sayList(workspaceNothingToRestart(plan))
                 }
-                guard !self.model.restarting,
-                      alert("Restart every open Claude session in its tab?", q, confirm: "Restart")
-                else { return }
+                // Cancel is the default: a yes ends every session
+                let yes = !self.model.restarting
+                    && alert("Restart the open Claude sessions in their tabs?", q,
+                             confirm: "Restart", safeDefault: true)
+                self.model.looking = false
+                guard yes else { return }
                 self.model.restarting = true
                 let n = (plan["now"] as? [String] ?? []).count + (plan["after"] as? [String] ?? []).count
-                self.sayList("Restarting the workspace: " + counted(n, "session") + "…", for: 30)
+                // it stays until the result: a working session can take hours to be idle
+                self.sayList("Restarting the workspace: " + counted(n, "session") + "…", for: nil)
                 DispatchQueue.global(qos: .userInitiated).async {
                     let res = ahtJSON(["checkup", "--restart-older", "--all", "--apply", "--json"])
                     DispatchQueue.main.async {
                         self.model.restarting = false
                         self.sayList(workspaceRestartedText(res), for: 20)
+                        // the short line has no room for which did not and why
+                        if let not = workspaceRestartProblems(res) {
+                            _ = alert("Not every session restarted", not)
+                        }
                     }
                 }
             }
@@ -13472,7 +13653,11 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         menu.addItem(.separator())
         add("Find Moved Folders Now", #selector(reconcile), key: "r")
         add(model.running ? "Pause Watching" : "Resume Watching", #selector(toggleWatch))
-        add("Update Claude Code…", #selector(updateClaudeFromMenu))
+        if model.updatingClaude {
+            add(disabled: "Update Claude Code (under way)")
+        } else {
+            add("Update Claude Code…", #selector(updateClaudeFromMenu))
+        }
         menu.addItem(.separator())
         add(model.running ? "Quit aht (the watcher keeps running)" : "Quit aht",
             #selector(quit), key: "q")
@@ -15900,22 +16085,119 @@ if CommandLine.arguments.contains("--selftest") {
     }
     let qw = workspaceRestartQuestion(["installed": "2.1.0", "now": ["paper", "notes"], "after": ["build"],
                                        "left_out": [["session": "me", "why": "it is the session asking"]]]) ?? ""
-    if !["At once: paper, notes", "Once their task is over: build",
+    if !["At once: paper, notes", "Once they are idle: build",
          "Left as they are: me (it is the session asking)", "(2.1.0)", "not sent is lost"].allSatisfy(qw.contains)
+        || qw.contains("task is over")
         || workspaceRestartQuestion(["now": [String](), "after": [String]()]) != nil {
         pw.append("question \(qw)")
     }
     if workspaceNothingToRestart(["left_out": [[String: Any]]()]) != "No open session to restart"
         || workspaceNothingToRestart(["left_out": [["session": "a", "why": "it is not in a tab"],
                                                    ["session": "b", "why": "x"]]])
-            != "No session to restart: a it is not in a tab, and 1 more" {
+            != "No session to restart: a (it is not in a tab), and 1 more"
+        || workspaceNothingToRestart(["left_out": [["session": "a", "why": "it is not in a tab"]]])
+            != "No session to restart: a (it is not in a tab)"
+        || workspaceNothingToRestart(["blockers": ["boom"]]) != "Workspace not restarted: boom" {
         pw.append("nothing to restart")
     }
-    if workspaceRestartedText(["restarted": ["a", "b"]]) != "Workspace restarted: 2 sessions"
-        || workspaceRestartedText(["restarted": ["a"], "failed": [["session": "b", "why": "w"]],
-                                   "not_waited": ["c"]]) != "Workspace restarted: 1 session; not b, c"
+    let halfW: [String: Any] = ["restarted": ["a"], "failed": [["session": "b", "why": "run claude --resume x"]],
+                                "not_waited": ["c"]]
+    if workspaceRestartedText(["restarted": ["a", "b", "c"]]) != "Workspace restarted: 3 sessions"
+        || workspaceRestartedText(["restarted": ["a"]]) != "Workspace restarted: 1 session"
+        || workspaceRestartedText(halfW) != "Workspace restarted: 1 of 3 sessions"
+        || workspaceRestartedText(["restarted": ["a", "b"], "not_waited": ["c"]])
+            != "Workspace restarted: 2 of 3 sessions"
         || workspaceRestartedText(["blockers": ["boom"]]) != "Workspace not restarted: boom" {
-        pw.append("restarted \(workspaceRestartedText(["restarted": ["a", "b"]]))")
+        pw.append("restarted \(workspaceRestartedText(halfW))")
+    }
+    if workspaceRestartProblems(halfW)
+        != "b: run claude --resume x\n\nc: it was still working, so aht left it as it is"
+        || workspaceRestartProblems(["restarted": ["a"]]) != nil
+        || workspaceRestartProblems(["restarted": ["a"], "failed": [[String: Any]](), "not_waited": [String]()]) != nil
+        || workspaceRestartProblems(nil) != nil {
+        pw.append("restart problems \(workspaceRestartProblems(halfW) ?? "nil")")
+    }
+    // Update Claude Code…: the question, why it is not asked, what went wrong
+    let planU: [String: Any] = [
+        "how": "npm", "command": ["npm", "install", "-g", "claude"], "before": "2.1.0",
+        "while_running": true, "blockers": [String](),
+        "restart": ["now": ["a", "b"], "after": ["c"],
+                    "left_out": [["session": "d", "why": "it is the session asking"],
+                                 ["session": "e", "why": "it is not in a tab"]]]]
+    let qu: String = updateClaudeQuestion(planU)
+    let quThen: String = "If that brings a newer version, every open Claude session ends and starts "
+        + "again in its tab, where it left off, with the options it had: an idle one at once, a "
+        + "working one once it is idle. Anything typed into a session but not sent is lost."
+    let quParts: [String] = ["aht updates Claude Code 2.1.0 with npm, the way it was installed.", quThen,
+                             "Sessions: a, b, c",
+                             "Left as they are: d (it is the session asking); e (it is not in a tab)",
+                             "A notice says when it is done."]
+    let quWant: String = quParts.joined(separator: "\n\n")
+    if qu != quWant || qu.contains("npm install") { pw.append("update question \(qu)") }
+    let stopsU: [String: Any] = ["how": "Homebrew", "command": ["brew"], "while_running": false]
+    let quStops: String = updateClaudeQuestion(stopsU)
+    let quFirst: String = "Homebrew cannot replace Claude Code while it runs, so every open Claude "
+        + "session ends first, once it is idle, and starts again in its tab after the update, where "
+        + "it left off, with the options it had. Anything typed into a session but not sent is lost."
+    let quStopsParts: [String] = ["aht updates Claude Code with Homebrew, the way it was installed.",
+                                  quFirst, "A notice says when it is done."]
+    let quStopsWant: String = quStopsParts.joined(separator: "\n\n")
+    let bareU: [String: Any] = ["command": ["x"]]
+    let quBare: String = updateClaudeQuestion(bareU)
+    if quStops != quStopsWant { pw.append("update question, stopped first \(quStops)") }
+    if !quBare.hasPrefix("aht updates Claude Code with its installer, the way it was installed.\n\nIf that") {
+        pw.append("update question, bare \(quBare)")
+    }
+    let noCommandU: [String: Any] = ["how": "npm", "blockers": [String]()]
+    let blockedU: [String: Any] = ["command": ["x"], "blockers": ["one", "two"]]
+    let refusals: [String?] = [updateClaudeRefusal(nil), updateClaudeRefusal([:]),
+                               updateClaudeRefusal(noCommandU), updateClaudeRefusal(blockedU),
+                               updateClaudeRefusal(planU)]
+    if refusals != [AHT_NO_ANSWER, AHT_NO_ANSWER, AHT_NO_ANSWER, "one\n\ntwo", nil] {
+        pw.append("update refusal \(refusals)")
+    }
+    let doneU: [String: Any] = ["applied": true, "updated": true, "before": "2.1.0", "after": "2.2.0",
+                                "blockers": [String](), "warnings": ["w1"], "restart": halfW]
+    let notU: [String: Any] = ["applied": false, "updated": false, "blockers": ["b1", "b2"]]
+    let fineU: [String: Any] = ["applied": true, "updated": true, "after": "2.2.0", "blockers": [String](),
+                                "warnings": [String](), "restart": ["restarted": ["a"]]]
+    let pu = updateClaudeProblems(doneU), puNot = updateClaudeProblems(notU)
+    let puNone = updateClaudeProblems(nil), puEmpty = updateClaudeProblems([:])
+    let puTitles: [String?] = [pu?.title, puNot?.title, puNone?.title, puEmpty?.title]
+    let puTexts: [String?] = [pu?.text, puNot?.text, puNone?.text, puEmpty?.text]
+    if puTitles != ["Claude Code updated to 2.2.0", "Claude Code was not updated",
+                    "Claude Code was not updated", "Claude Code was not updated"]
+        || puTexts != ["w1\n\nb: run claude --resume x\n\nc: it was still working, so aht left it as it is",
+                       "b1\n\nb2", AHT_NO_ANSWER, AHT_NO_ANSWER]
+        || updateClaudeProblems(fineU) != nil
+        || AHT_NO_ANSWER != "aht gave no answer — see the log (Settings)." {
+        pw.append("update problems \(puTitles) \(puTexts)")
+    }
+    // the Restore Workspace sheet: the core's reasons as lines of their own
+    let plainTabs: String = "othing left to open: 2 plain tabs without a title (aht opens Claude "
+        + "sessions and titled tabs again)"
+    let sentences: [String] = ["everything in it is open already", "n" + plainTabs,
+                               "is iTerm2 running?", "iTerm2 is not open", AHT_NO_ANSWER, ""].map(asSentence)
+    let sentencesWant: [String] = ["Everything in it is open already.", "N" + plainTabs + ".",
+                                   "Is iTerm2 running?", "iTerm2 is not open.", AHT_NO_ANSWER, ""]
+    if sentences != sentencesWant { pw.append("sentence \(sentences)") }
+    let unsavedW: [[String: Any]?] = [["saved": "/x/w.json", "tabs": 1, "sessions": 3],
+                                      ["saved": NSNull(), "tabs": 0, "sessions": 0,
+                                       "why": "no tab is open in iTerm2"],
+                                      ["saved": NSNull()], nil]
+    let unsaved: [String?] = unsavedW.map(workspaceNotSavedWhy)
+    if unsaved != [nil, "No tab is open in iTerm2.", "There was nothing to save.", AHT_NO_ANSWER] {
+        pw.append("not saved \(unsaved)")
+    }
+    if workspaceNotOpenedTitle(["applied": true, "blockers": ["x"]]) != "Some did not open"
+        || workspaceNotOpenedTitle(["applied": false, "blockers": ["x"]]) != "Not opened"
+        || workspaceNotOpenedTitle(["blockers": ["x"]]) != "Not opened" {
+        pw.append("not opened title")
+    }
+    if !workspaceSavingRule(1).hasPrefix("Saved every minute while iTerm2 is open, and when")
+        || !workspaceSavingRule(10).hasPrefix("Saved every 10 minutes while iTerm2 is open, and when")
+        || !workspaceSavingRule(0).hasPrefix("Saved when a session gets a prompt;") {
+        pw.append("saving rule \(workspaceSavingRule(1))")
     }
     let cornerWsOK = pw.isEmpty
     print("CORNER WORKSPACE \(cornerWsOK ? "OK" : "FAIL — " + pw.joined(separator: "; "))")

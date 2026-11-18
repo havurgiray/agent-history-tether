@@ -11790,54 +11790,84 @@ func workspaceSavingRule(_ every: Int) -> String {
         + "the one with the most sessions."
 }
 
+/// The terminal Restart Workspace… closes and opens again, as the core names
+/// it in its plan and its result.
+private func workspaceTerminal(_ d: [String: Any]) -> String {
+    (d["terminal"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "the terminal"
+}
+
+/// The title over the confirmation of Restart Workspace…: it names what
+/// closes, since that is more than the sessions.
+func workspaceRestartTitle(_ plan: [String: Any]) -> String {
+    "Close \(workspaceTerminal(plan)) and open the workspace again?"
+}
+
 /// What the confirmation of Restart Workspace… says, from the dry run of
-/// `aht checkup --restart-older --all` (as wincorner.restart_question); nil
-/// when no session can restart.
-func workspaceRestartQuestion(_ plan: [String: Any]) -> String? {
-    let now = plan["now"] as? [String] ?? [], after = plan["after"] as? [String] ?? []
-    guard !now.isEmpty || !after.isEmpty else { return nil }
-    var t = "aht ends each session and starts it again in the same tab, where it left off, with "
-        + "the options it had. It then runs the Claude Code installed now"
-        + ((plan["installed"] as? String).map { " (\($0))" } ?? "")
-        + ". Anything typed into a session but not sent is lost."
-    if !now.isEmpty { t += "\n\nAt once: " + now.joined(separator: ", ") }
-    // "idle", not "their task is over": one that waits for an answer is here too
-    if !after.isEmpty { t += "\n\nOnce they are idle: " + after.joined(separator: ", ") }
-    let left = (plan["left_out"] as? [[String: Any]] ?? []).map {
-        "\($0["session"] as? String ?? "") (\($0["why"] as? String ?? ""))" }
-    if !left.isEmpty { t += "\n\nLeft as they are: " + left.joined(separator: "; ") }
-    return t
+/// `aht workspace --restart`: what happens, then what it costs, each on a
+/// line of its own and only when there is something to say.
+func workspaceRestartQuestion(_ plan: [String: Any]) -> String {
+    let terminal = workspaceTerminal(plan)
+    var parts = ["aht saves the workspace, ends every Claude session, closes \(terminal) and starts "
+                 + "it again with the same windows and tabs. Each session comes back in its tab, "
+                 + "where it left off, with the options it had. Anything typed but not sent is lost, "
+                 + "and so is the text the tabs show now."]
+    let sessions = plan["sessions"] as? [String] ?? []
+    if !sessions.isEmpty { parts.append("Sessions: " + sessions.joined(separator: ", ")) }
+    // these do not wait until they are idle: the terminal closes under them
+    let working = plan["working"] as? [String] ?? []
+    if !working.isEmpty { parts.append("Working now, their task stops: " + working.joined(separator: ", ")) }
+    let plain = plan["plain"] as? Int ?? 0
+    if plain == 1 {
+        parts.append("1 plain tab comes back empty, in its folder.")
+    } else if plain > 1 {
+        parts.append("\(plain) plain tabs come back empty, in their folders.")
+    }
+    // a long list would push the buttons off the screen: six, then how many more
+    let ending = plan["ending"] as? [String] ?? []
+    if !ending.isEmpty {
+        parts.append("Ends and does not come back: " + ending.prefix(6).joined(separator: "; ")
+                     + (ending.count > 6 ? " and \(ending.count - 6) more" : ""))
+    }
+    if plan["asks"] as? Bool == true {
+        // the fallback is no name, so it starts the sentence with a capital
+        let who = terminal == "the terminal" ? "The terminal" : terminal
+        parts.append("\(who) asks once more whether to quit: say yes there.")
+    }
+    return parts.joined(separator: "\n\n")
 }
 
-/// Restart Workspace… with no session it can restart: why (as
-/// wincorner.nothing_to_restart).
-func workspaceNothingToRestart(_ plan: [String: Any]?) -> String {
-    guard let plan = plan else { return "Workspace not restarted: aht gave no answer" }
-    if let b = (plan["blockers"] as? [String])?.first { return "Workspace not restarted: " + b }
-    let left = plan["left_out"] as? [[String: Any]] ?? []
-    guard let one = left.first else { return "No open session to restart" }
-    let why = one["why"] as? String ?? ""
-    return "No session to restart: \(one["session"] as? String ?? "")"
-        + (why.isEmpty ? "" : " (\(why))")
-        + (left.count > 1 ? ", and \(left.count - 1) more" : "")
+/// Restart Workspace… when the question is not asked: the core gave no plan,
+/// or something stands in the way (its first reason, after the colon).
+func workspaceNotRestarted(_ plan: [String: Any]?) -> String {
+    guard let plan = plan, !plan.isEmpty else { return "Workspace not restarted: aht gave no answer" }
+    return "Workspace not restarted: " + ((plan["blockers"] as? [String])?.first ?? "aht gave no answer")
 }
 
-/// What Restart Workspace says once it is through (as wincorner.restarted_text):
-/// how many of the sessions it was about restarted. Which did not, and why,
-/// is workspaceRestartProblems.
+/// What Restart Workspace says once it is through: how many of the tabs
+/// opened again. What did not come back, and why, is workspaceRestartTrouble.
 func workspaceRestartedText(_ res: [String: Any]?) -> String {
-    guard let res = res else { return "Workspace not restarted: aht gave no answer" }
-    if let b = (res["blockers"] as? [String])?.first { return "Workspace not restarted: " + b }
-    let done = (res["restarted"] as? [String] ?? []).count
-    let not = (res["failed"] as? [[String: Any]] ?? []).count
-        + (res["not_waited"] as? [String] ?? []).count
+    guard let res = res, !res.isEmpty else { return "Workspace not restarted: aht gave no answer" }
+    let blockers = res["blockers"] as? [String] ?? []
+    let opened = res["opened"] as? Int ?? 0, of = res["of"] as? Int ?? 0
+    guard opened > 0 else { return "Workspace not restarted: " + (blockers.first ?? "nothing opened") }
     return "Workspace restarted: "
-        + (not == 0 ? counted(done, "session") : "\(done) of " + counted(done + not, "session"))
+        + (opened == of && blockers.isEmpty ? "\(opened)" : "\(opened) of \(of)") + " opened again"
 }
 
-/// The sessions a restart left as they were, one paragraph each; nil when
-/// every one restarted. A failed one's reason carries the line that
-/// continues it by hand, so it is shown whole.
+/// What Restart Workspace… has to report beyond its short line, as an
+/// alert's title and text: every reason of the core's as a line of its own;
+/// nil when nothing stood in the way.
+func workspaceRestartTrouble(_ res: [String: Any]?) -> (title: String, text: String)? {
+    guard let res = res, !res.isEmpty else { return ("Workspace not restarted", AHT_NO_ANSWER) }
+    let blockers = res["blockers"] as? [String] ?? []
+    guard !blockers.isEmpty else { return nil }
+    return ((res["opened"] as? Int ?? 0) > 0 ? "Not everything came back" : "Workspace not restarted",
+            blockers.map(asSentence).joined(separator: "\n\n"))
+}
+
+/// The sessions a restart in their tabs left as they were (after Update
+/// Claude Code…), one paragraph each; nil when every one restarted. A failed
+/// one's reason carries the line that continues it by hand, so it is shown whole.
 func workspaceRestartProblems(_ res: [String: Any]?) -> String? {
     let failed = (res?["failed"] as? [[String: Any]] ?? []).map {
         "\($0["session"] as? String ?? ""): \($0["why"] as? String ?? "")" }
@@ -12445,8 +12475,8 @@ struct CornerView: View {
 
     /// What every right-click on the list ends with, and all that one beside
     /// the sessions offers, for the workspace (iTerm2's tabs with their
-    /// sessions): saved now, a saved one opened again, every session started
-    /// again in its tab; and the list hidden.
+    /// sessions): saved now, a saved one opened again, the terminal closed
+    /// and the workspace opened again; and the list hidden.
     @ViewBuilder func listMenu() -> some View {
         Button("Save Workspace Now") { list("save-workspace") }
         Button("Restore Workspace…") { list("workspaces") }
@@ -12788,43 +12818,46 @@ final class CornerPanel {
         }
     }
 
-    /// Restart Workspace…: the look ahead, the question, then every session
-    /// ends and starts again in its tab: an idle one now, a working one once
-    /// it is idle (`aht checkup --restart-older --all`). From the click to
+    /// Restart Workspace…: the look ahead, the question, then the whole
+    /// terminal closes and the workspace opens again: aht saves the layout,
+    /// ends every Claude session, quits the terminal, starts it again and
+    /// opens every tab (`aht workspace --restart`). This app is not inside
+    /// the terminal, so it is still here for the result. From the click to
     /// the answer a second click does nothing: it would ask twice.
     private func restartWorkspace() {
         guard !model.restarting, !model.looking else { return }
         model.looking = true
-        let looking = "Looking at the open sessions…"
+        let looking = "Looking at the workspace…"
         sayList(looking, for: 60)
         DispatchQueue.global(qos: .userInitiated).async {
-            let plan = ahtJSON(["checkup", "--restart-older", "--all", "--json"])
+            let plan = ahtJSON(["workspace", "--restart", "--json"])
             DispatchQueue.main.async {
                 // only its own line goes: another note may have come since
                 if self.model.note == looking { self.model.note = nil }
                 self.place(force: true)
-                guard let plan = plan, let q = workspaceRestartQuestion(plan) else {
+                // no plan, or something in the way: there is nothing to ask about
+                guard let plan = plan, !plan.isEmpty,
+                      (plan["blockers"] as? [String] ?? []).isEmpty else {
                     self.model.looking = false
-                    return self.sayList(workspaceNothingToRestart(plan))
+                    return self.sayList(workspaceNotRestarted(plan))
                 }
-                // Cancel is the default: a yes ends every session
+                // Cancel is the default: a yes closes the terminal and every session in it
                 let yes = !self.model.restarting
-                    && alert("Restart the open Claude sessions in their tabs?", q,
+                    && alert(workspaceRestartTitle(plan), workspaceRestartQuestion(plan),
                              confirm: "Restart", safeDefault: true)
                 self.model.looking = false
                 guard yes else { return }
                 self.model.restarting = true
-                let n = (plan["now"] as? [String] ?? []).count + (plan["after"] as? [String] ?? []).count
-                // it stays until the result: a working session can take hours to be idle
-                self.sayList("Restarting the workspace: " + counted(n, "session") + "…", for: nil)
+                // it stays until the result: the terminal's own question can wait minutes
+                self.sayList("Restarting the workspace: closing \(workspaceTerminal(plan))…", for: nil)
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let res = ahtJSON(["checkup", "--restart-older", "--all", "--apply", "--json"])
+                    let res = ahtJSON(["workspace", "--restart", "--apply", "--json"])
                     DispatchQueue.main.async {
                         self.model.restarting = false
                         self.sayList(workspaceRestartedText(res), for: 20)
-                        // the short line has no room for which did not and why
-                        if let not = workspaceRestartProblems(res) {
-                            _ = alert("Not every session restarted", not)
+                        // the short line has no room for what did not come back and why
+                        if let not = workspaceRestartTrouble(res) {
+                            _ = alert(not.title, not.text)
                         }
                     }
                 }
@@ -16083,33 +16116,79 @@ if CommandLine.arguments.contains("--selftest") {
         || workspaceSavedText(nil) != "Workspace not saved: aht gave no answer" {
         pw.append("saved \(workspaceSavedText(["saved": "/x/w.json", "tabs": 1, "sessions": 3]))")
     }
-    let qw = workspaceRestartQuestion(["installed": "2.1.0", "now": ["paper", "notes"], "after": ["build"],
-                                       "left_out": [["session": "me", "why": "it is the session asking"]]]) ?? ""
-    if !["At once: paper, notes", "Once they are idle: build",
-         "Left as they are: me (it is the session asking)", "(2.1.0)", "not sent is lost"].allSatisfy(qw.contains)
-        || qw.contains("task is over")
-        || workspaceRestartQuestion(["now": [String](), "after": [String]()]) != nil {
-        pw.append("question \(qw)")
+    // Restart Workspace…: the terminal closes and the workspace opens again
+    let planW: [String: Any] = [
+        "applied": false, "terminal": "iTerm2", "blockers": [String](),
+        "sessions": ["paper", "notes"], "working": ["build"], "tabs": 5, "plain": 2,
+        "ending": ["npm run dev (Server)", "b", "c", "d", "e", "f", "g", "h"], "asks": true]
+    let qw: String = workspaceRestartQuestion(planW)
+    let qwThen: String = " and starts it again with the same windows and tabs. Each session comes "
+        + "back in its tab, where it left off, with the options it had. Anything typed but not sent "
+        + "is lost, and so is the text the tabs show now."
+    let qwParts: [String] = ["aht saves the workspace, ends every Claude session, closes iTerm2" + qwThen,
+                             "Sessions: paper, notes", "Working now, their task stops: build",
+                             "2 plain tabs come back empty, in their folders.",
+                             "Ends and does not come back: npm run dev (Server); b; c; d; e; f and 2 more",
+                             "iTerm2 asks once more whether to quit: say yes there."]
+    let qwWant: String = qwParts.joined(separator: "\n\n")
+    if qw != qwWant { pw.append("question \(qw)") }
+    let bareW: [String: Any] = ["plain": 1, "ending": ["x", "y"], "asks": false]
+    let qwBare: String = workspaceRestartQuestion(bareW)
+    let qwBareParts: [String] = ["aht saves the workspace, ends every Claude session, closes the terminal" + qwThen,
+                                 "1 plain tab comes back empty, in its folder.",
+                                 "Ends and does not come back: x; y"]
+    let qwBareWant: String = qwBareParts.joined(separator: "\n\n")
+    if qwBare != qwBareWant { pw.append("question, bare \(qwBare)") }
+    let asksW: [String: Any] = ["asks": true]
+    let qwAsks: String = workspaceRestartQuestion(asksW)
+    if !qwAsks.hasSuffix("\n\nThe terminal asks once more whether to quit: say yes there.") {
+        pw.append("question, asks \(qwAsks)")
     }
-    if workspaceNothingToRestart(["left_out": [[String: Any]]()]) != "No open session to restart"
-        || workspaceNothingToRestart(["left_out": [["session": "a", "why": "it is not in a tab"],
-                                                   ["session": "b", "why": "x"]]])
-            != "No session to restart: a (it is not in a tab), and 1 more"
-        || workspaceNothingToRestart(["left_out": [["session": "a", "why": "it is not in a tab"]]])
-            != "No session to restart: a (it is not in a tab)"
-        || workspaceNothingToRestart(["blockers": ["boom"]]) != "Workspace not restarted: boom" {
-        pw.append("nothing to restart")
+    let titlesW: [String] = [workspaceRestartTitle(planW), workspaceRestartTitle(bareW)]
+    if titlesW != ["Close iTerm2 and open the workspace again?",
+                   "Close the terminal and open the workspace again?"] {
+        pw.append("restart title \(titlesW)")
     }
+    let blockedW: [String: Any] = ["applied": false, "terminal": "iTerm2",
+                                   "blockers": ["iTerm2 is not open", "two"]]
+    let notW: [String] = [workspaceNotRestarted(nil), workspaceNotRestarted([:]),
+                          workspaceNotRestarted(blockedW)]
+    if notW != ["Workspace not restarted: aht gave no answer", "Workspace not restarted: aht gave no answer",
+                "Workspace not restarted: iTerm2 is not open"] {
+        pw.append("not restarted \(notW)")
+    }
+    let allW: [String: Any] = ["applied": true, "terminal": "iTerm2", "blockers": [String](),
+                               "opened": 5, "of": 5, "workspace": "/x/w.json"]
+    let someW: [String: Any] = ["applied": true, "terminal": "iTerm2", "opened": 3, "of": 5,
+                                "blockers": ["two tabs did not open", "is iTerm2 running?"]]
+    let allButW: [String: Any] = ["applied": true, "opened": 5, "of": 5, "blockers": ["x"]]
+    let noneW: [String: Any] = ["applied": false, "opened": 0, "of": 5, "blockers": ["boom", "bang"]]
+    let nothingW: [String: Any] = ["applied": true, "opened": 0, "of": 0, "blockers": [String]()]
+    let resultsW: [[String: Any]?] = [nil, [:], allW, someW, allButW, noneW, nothingW]
+    let saidW: [String] = resultsW.map(workspaceRestartedText)
+    let saidWWant: [String] = ["Workspace not restarted: aht gave no answer",
+                               "Workspace not restarted: aht gave no answer",
+                               "Workspace restarted: 5 opened again",
+                               "Workspace restarted: 3 of 5 opened again",
+                               "Workspace restarted: 5 of 5 opened again",
+                               "Workspace not restarted: boom",
+                               "Workspace not restarted: nothing opened"]
+    if saidW != saidWWant { pw.append("restarted \(saidW)") }
+    let troubleW = resultsW.map(workspaceRestartTrouble)
+    let troubleTitles: [String?] = troubleW.map { $0?.title }
+    let troubleTexts: [String?] = troubleW.map { $0?.text }
+    let troubleTitlesWant: [String?] = ["Workspace not restarted", "Workspace not restarted", nil,
+                                        "Not everything came back", "Not everything came back",
+                                        "Workspace not restarted", nil]
+    let troubleTextsWant: [String?] = [AHT_NO_ANSWER, AHT_NO_ANSWER, nil,
+                                       "Two tabs did not open.\n\nIs iTerm2 running?", "X.",
+                                       "Boom.\n\nBang.", nil]
+    if troubleTitles != troubleTitlesWant || troubleTexts != troubleTextsWant {
+        pw.append("restart trouble \(troubleTitles) \(troubleTexts)")
+    }
+    // the restarts in their tabs, after Update Claude Code…
     let halfW: [String: Any] = ["restarted": ["a"], "failed": [["session": "b", "why": "run claude --resume x"]],
                                 "not_waited": ["c"]]
-    if workspaceRestartedText(["restarted": ["a", "b", "c"]]) != "Workspace restarted: 3 sessions"
-        || workspaceRestartedText(["restarted": ["a"]]) != "Workspace restarted: 1 session"
-        || workspaceRestartedText(halfW) != "Workspace restarted: 1 of 3 sessions"
-        || workspaceRestartedText(["restarted": ["a", "b"], "not_waited": ["c"]])
-            != "Workspace restarted: 2 of 3 sessions"
-        || workspaceRestartedText(["blockers": ["boom"]]) != "Workspace not restarted: boom" {
-        pw.append("restarted \(workspaceRestartedText(halfW))")
-    }
     if workspaceRestartProblems(halfW)
         != "b: run claude --resume x\n\nc: it was still working, so aht left it as it is"
         || workspaceRestartProblems(["restarted": ["a"]]) != nil

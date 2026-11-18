@@ -3,7 +3,8 @@
 imports anywhere; only its window needs Windows): what state a session is in
 and since when, "done" until it is looked at and kept across a restart, a
 record caught mid-write, the name it shows, the order, the sessions handed
-over to another machine, the right-click menu, and what Send to asks.
+over to another machine, the right-click menu, what Send to asks, and what
+the workspace's Save, Restore and Restart say.
 
     python windows/tests/wincorner_test.py
 """
@@ -22,6 +23,7 @@ import aht  # noqa: E402
 import wincorner as C  # noqa: E402
 
 failed = 0
+WS = ["save-workspace", "workspaces", "restart-workspace", "hide"]   # every menu ends so
 
 
 def ck(name, ok, detail=""):
@@ -178,7 +180,7 @@ with tempfile.TemporaryDirectory() as td:
        in m.summary(),
        (C.right_text(r), C.transfer_text(r.transfer)))
     ck("…and nothing to open until it is there",
-       [x[1] for x in C.menu_items(r, ["homebox"]) if x != "-"] == [None, "hide"])
+       [x[1] for x in C.menu_items(r, ["homebox"]) if x != "-"] == [None] + WS)
     moving[:] = []
     m.poll()
     ck("once it is there: the handed-over sessions are listed again", m.away_stale and not m.rows)
@@ -196,21 +198,54 @@ with tempfile.TemporaryDirectory() as td:
     moving[:] = []
 
     print("\n[menu]")
+    ck("beside the sessions: the workspace saved, restored, restarted, and the list hidden",
+       [x[1] for x in C.list_items() if x != "-"] == WS
+       and [x[0] for x in C.list_items() if x != "-"][:3]
+       == ["Save Workspace Now", "Restore Workspace…", "Restart Workspace…"], C.list_items())
+    ck("while a restart is under way it is not offered a second time",
+       [x[1] for x in C.list_items(True) if x != "-"] == WS[:2] + [None, "hide"]
+       and "under way" in C.list_items(True)[2][0])
     idle = C.Row(id="s", pid=5, name="n", kind="here", status="idle", state="idle")
     busy = C.Row(id="s", pid=5, name="n", kind="here", status="busy", state="working")
     acts = [x[1] for x in C.menu_items(idle, ["homebox", "pc"]) if x != "-"]
     ck("an idle session: Go to Tab, Branch, its project's backups, Send to each machine, Hide",
-       acts == ["goto", "branch", "backup-now", "backups", "send:homebox", "send:pc", "hide"], acts)
+       acts == ["goto", "branch", "backup-now", "backups", "send:homebox", "send:pc"] + WS, acts)
     labels = [x[0] for x in C.menu_items(busy, ["homebox"]) if x != "-"]
     grey = [x[1] for x in C.menu_items(busy, ["homebox"]) if x != "-"]
     ck("a working one: Branch and Send wait, and say so",
-       grey == ["goto", None, "backup-now", "backups", None, "hide"]
+       grey == ["goto", None, "backup-now", "backups", None] + WS
        and "once it has finished" in labels[1], labels)
     ck("no machine set up: Send says where to add one",
        any("add one in aht's window" in x[0] for x in C.menu_items(idle, []) if x != "-"))
     away = C.Row(id="away:x", name="paper", kind="away", can_open=False, machine="pc")
     ck("a handed-over one: Open Session (here not possible) and Take Back",
-       [x[1] for x in C.menu_items(away, []) if x != "-"] == [None, "take-back", "hide"])
+       [x[1] for x in C.menu_items(away, []) if x != "-"] == [None, "take-back"] + WS)
+
+    print("\n[workspace]")
+    ck("Save Workspace Now says how much it holds",
+       C.saved_text({"saved": "x.json", "tabs": 1, "sessions": 3})
+       == "Workspace saved: 1 tab, 3 sessions")
+    ck("…or why nothing was saved",
+       C.saved_text({"saved": None, "why": "is Windows Terminal running?"})
+       == "Workspace not saved: is Windows Terminal running?")
+    q = C.restart_question({"installed": "2.1.0", "now": ["paper", "notes"], "after": ["build"],
+                            "left_out": [{"session": "me", "why": "it is the session asking"}]})
+    ck("Restart Workspace asks, naming which restart at once, which later, which not",
+       all(x in q for x in ("At once: paper, notes", "Once their task is over: build",
+                            "Left as they are: me (it is the session asking)", "2.1.0",
+                            "not sent is lost")), q)
+    ck("no session it can restart: no question, and why",
+       C.restart_question({"now": [], "after": [], "left_out": []}) is None
+       and C.nothing_to_restart({"left_out": []}) == "No open session to restart"
+       and C.nothing_to_restart({"left_out": [{"session": "a", "why": "it is not in a tab"},
+                                              {"session": "b", "why": "x"}]})
+       == "No session to restart: a it is not in a tab, and 1 more")
+    ck("once through: how many restarted, and which did not",
+       C.restarted_text({"restarted": ["a", "b"], "failed": [], "not_waited": []})
+       == "Workspace restarted: 2 sessions"
+       and C.restarted_text({"restarted": ["a"], "failed": [{"session": "b", "why": "w"}],
+                             "not_waited": ["c"]}) == "Workspace restarted: 1 session; not b, c"
+       and C.restarted_text({"blockers": ["boom"]}) == "Workspace not restarted: boom")
 
     print("\n[send to]")
     q = C.send_question({"label": "paper", "to": "homebox", "project": "C:\\w\\paper",

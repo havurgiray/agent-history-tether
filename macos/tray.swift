@@ -11679,6 +11679,62 @@ func sendQuestion(_ res: [String: Any], _ name: String, _ to: String) -> String 
     return t
 }
 
+private func counted(_ n: Int, _ what: String) -> String { "\(n) \(what)\(n == 1 ? "" : "s")" }
+
+/// What Save Workspace Now says under the list's top line, from `aht
+/// workspace --save --json` (as wincorner.saved_text).
+func workspaceSavedText(_ res: [String: Any]?) -> String {
+    guard let res = res, res["saved"] as? String != nil else {
+        return "Workspace not saved: " + ((res?["why"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                                          ?? (res == nil ? "aht gave no answer" : "nothing to save"))
+    }
+    return "Workspace saved: " + counted(res["tabs"] as? Int ?? 0, "tab") + ", "
+        + counted(res["sessions"] as? Int ?? 0, "session")
+}
+
+/// What the confirmation of Restart Workspace… says, from the dry run of
+/// `aht checkup --restart-older --all` (as wincorner.restart_question); nil
+/// when no session can restart.
+func workspaceRestartQuestion(_ plan: [String: Any]) -> String? {
+    let now = plan["now"] as? [String] ?? [], after = plan["after"] as? [String] ?? []
+    guard !now.isEmpty || !after.isEmpty else { return nil }
+    var t = "aht ends each session and starts it again in the same tab, where it left off, with "
+        + "the options it had. It then runs the Claude Code installed now"
+        + ((plan["installed"] as? String).map { " (\($0))" } ?? "")
+        + ". Anything typed into a session but not sent is lost."
+    if !now.isEmpty { t += "\n\nAt once: " + now.joined(separator: ", ") }
+    if !after.isEmpty { t += "\n\nOnce their task is over: " + after.joined(separator: ", ") }
+    let left = (plan["left_out"] as? [[String: Any]] ?? []).map {
+        "\($0["session"] as? String ?? "") (\($0["why"] as? String ?? ""))" }
+    if !left.isEmpty { t += "\n\nLeft as they are: " + left.joined(separator: "; ") }
+    return t
+}
+
+/// Restart Workspace… with no session it can restart: why (as
+/// wincorner.nothing_to_restart).
+func workspaceNothingToRestart(_ plan: [String: Any]?) -> String {
+    guard let plan = plan else { return "Workspace not restarted: aht gave no answer" }
+    if let b = (plan["blockers"] as? [String])?.first { return "Workspace not restarted: " + b }
+    let left = plan["left_out"] as? [[String: Any]] ?? []
+    guard let one = left.first else { return "No open session to restart" }
+    return "No session to restart: \(one["session"] as? String ?? "") \(one["why"] as? String ?? "")"
+        + (left.count > 1 ? ", and \(left.count - 1) more" : "")
+}
+
+/// What Restart Workspace says once it is through (as wincorner.restarted_text).
+func workspaceRestartedText(_ res: [String: Any]?) -> String {
+    guard let res = res else { return "Workspace not restarted: aht gave no answer" }
+    if let b = (res["blockers"] as? [String])?.first { return "Workspace not restarted: " + b }
+    let not = (res["failed"] as? [[String: Any]] ?? []).map { $0["session"] as? String ?? "" }
+        + (res["not_waited"] as? [String] ?? [])
+    var t = "Workspace restarted: " + counted((res["restarted"] as? [String] ?? []).count, "session")
+    if !not.isEmpty {
+        t += "; not " + not.prefix(3).joined(separator: ", ")
+            + (not.count > 3 ? " and \(not.count - 3) more" : "")
+    }
+    return t
+}
+
 /// Branch… (the corner's menu and the Sessions tab): the name asked for, then
 /// a branch of the session in a new tab next to its own; `tell` gets why not.
 func branchFlow(pid: Int, name: String, tell: @escaping (String) -> Void) {
@@ -11795,6 +11851,7 @@ final class CornerModel: ObservableObject {
     @Published var width: CGFloat = 252         // how wide the list is
     @Published var most = 12                    // how many sessions it lists, the rest "+n more"
     @Published var note: String?                // why a click went nowhere, for a few seconds
+    @Published var restarting = false           // Restart Workspace under way
     @Published var machines: [String] = []      // set up here, for Send to
     var away: [[String: Any]] = []              // `aht _corner`: the sessions handed over
     var onMovedOn: () -> Void = {}              // a handover or take-back ended
@@ -12086,6 +12143,7 @@ struct CornerView: View {
     @ObservedObject var c: CornerModel
     let open: (CornerRow) -> Void
     var act: (CornerRow, String) -> Void = { _, _ in }   // the right-click menu's
+    var list: (String) -> Void = { _ in }       // the menu's lines about the workspace
     let hide: () -> Void
     var drag: (CGPoint, Bool) -> Void = { _, _ in }   // from where (true: let go)
     var home: () -> Void = {}                   // back to the corner
@@ -12120,18 +12178,22 @@ struct CornerView: View {
             .padding(.horizontal, 6).padding(.top, 1).padding(.bottom, c.rows.isEmpty ? 1 : 3)
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { home() }
+            .contextMenu { listMenu() }         // beside the sessions (each has its own)
             .help("Drag the list anywhere, or its sides and bottom to resize it; "
-                  + "double-click this line to put it back in the corner")
+                  + "double-click this line to put it back in the corner; right-click to "
+                  + "save, restore or restart the workspace")
             if let n = c.note {
                 Text(n).font(.system(size: 10.5)).foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 6).padding(.bottom, 3)
+                    .contextMenu { listMenu() }
             }
             ForEach(c.rows.prefix(c.most)) { r in row(r) }
             if c.rows.count > c.most {
                 Text("+\(c.rows.count - c.most) more").font(.system(size: 10.5))
                     .lineLimit(1)
                     .foregroundColor(.secondary).padding(.horizontal, 6).padding(.top, 1)
+                    .contextMenu { listMenu() }
             }
         }
         .padding(5)
@@ -12213,8 +12275,23 @@ struct CornerView: View {
                  : "A click goes to its tab; right-click for more."))
     }
 
+    /// What every right-click on the list ends with, and all that one beside
+    /// the sessions offers, for the workspace (iTerm2's tabs with their
+    /// sessions): saved now, a saved one opened again, every session started
+    /// again in its tab; and the list hidden.
+    @ViewBuilder func listMenu() -> some View {
+        Button("Save Workspace Now") { list("save-workspace") }
+        Button("Restore Workspace…") { list("workspaces") }
+        Button(c.restarting ? "Restart Workspace (under way)" : "Restart Workspace…") {
+            list("restart-workspace")
+        }
+        .disabled(c.restarting)
+        Divider()
+        Button("Hide the List") { hide() }
+    }
+
     /// Right-click: Go to Tab, Branch…, Send to <machine>…; on a session
-    /// handed over, Open Session and Take Back….
+    /// handed over, Open Session and Take Back…; then the workspace's lines.
     @ViewBuilder func menu(_ r: CornerRow) -> some View {
         if let t = r.transfer {
             Button(t.kind == "reclaim" ? "Go to Tab (once it is back)" : "Open Session (once it is there)") {}
@@ -12239,7 +12316,7 @@ struct CornerView: View {
             }
         }
         Divider()
-        Button("Hide the List") { hide() }
+        listMenu()
     }
 }
 
@@ -12326,6 +12403,7 @@ final class CornerPanel {
     var onHide: () -> Void = {}
     var onTakeBack: (String) -> Void = { _ in }      // the window's Take Back on that project
     var onBackups: (String) -> Void = { _ in }       // the window's Backups of that project
+    var onWorkspaces: () -> Void = {}                // the window's Restore Workspace
 
     var shown: Bool { panel?.isVisible ?? false }
     /// The chimes need the sessions watched while the list is hidden, too.
@@ -12378,6 +12456,7 @@ final class CornerPanel {
                 c: model,
                 open: { [weak self] r in self?.open(r) },
                 act: { [weak self] r, what in self?.act(r, what) },
+                list: { [weak self] what in self?.workspace(what) },
                 hide: { [weak self] in self?.onHide() },
                 drag: { [weak self] at, done in self?.drag(at, done) },
                 home: { [weak self] in
@@ -12514,6 +12593,61 @@ final class CornerPanel {
         case "branch": branch(r)
         default:
             if what.hasPrefix("send:") { send(r, String(what.dropFirst(5))) }
+        }
+    }
+
+    /// The menu's lines about the workspace, the same under every right-click.
+    private func workspace(_ what: String) {
+        switch what {
+        case "workspaces": onWorkspaces()
+        case "save-workspace": saveWorkspace()
+        case "restart-workspace": restartWorkspace()
+        default: break
+        }
+    }
+
+    private func sayList(_ text: String, for secs: Double = 8) {
+        model.say(text, for: secs)
+        DispatchQueue.main.async { self.place(force: true) }
+    }
+
+    /// Save Workspace Now: how much it holds, under the list's top line.
+    private func saveWorkspace() {
+        sayList("Saving the workspace…", for: 60)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = ahtJSON(["workspace", "--save", "--json"])
+            DispatchQueue.main.async { self.sayList(workspaceSavedText(res)) }
+        }
+    }
+
+    /// Restart Workspace…: the look ahead, the question, then every session
+    /// ends and starts again in its tab: an idle one now, a working one once
+    /// its task is over (`aht checkup --restart-older --all`).
+    private func restartWorkspace() {
+        guard !model.restarting else { return }
+        sayList("Looking at the open sessions…", for: 60)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let plan = ahtJSON(["checkup", "--restart-older", "--all", "--json"])
+            DispatchQueue.main.async {
+                self.model.note = nil
+                self.place(force: true)
+                guard let plan = plan, let q = workspaceRestartQuestion(plan) else {
+                    return self.sayList(workspaceNothingToRestart(plan))
+                }
+                guard !self.model.restarting,
+                      alert("Restart every open Claude session in its tab?", q, confirm: "Restart")
+                else { return }
+                self.model.restarting = true
+                let n = (plan["now"] as? [String] ?? []).count + (plan["after"] as? [String] ?? []).count
+                self.sayList("Restarting the workspace: " + counted(n, "session") + "…", for: 30)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let res = ahtJSON(["checkup", "--restart-older", "--all", "--apply", "--json"])
+                    DispatchQueue.main.async {
+                        self.model.restarting = false
+                        self.sayList(workspaceRestartedText(res), for: 20)
+                    }
+                }
+            }
         }
     }
 
@@ -12885,6 +13019,12 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
                 self.model.selection = p.path
                 self.model.openBackups(p)
             }
+        }
+        corner.onWorkspaces = { [weak self] in
+            guard let self = self else { return }
+            self.openWindow()
+            self.model.tab = .sessions
+            self.model.openWorkspaces()
         }
         corner.onTakeBack = { [weak self] path in
             guard let self = self else { return }
@@ -15751,13 +15891,41 @@ if CommandLine.arguments.contains("--selftest") {
     let problemOK = p10.isEmpty
     print("PROBLEM REPORT \(problemOK ? "OK" : "FAIL — " + p10.joined(separator: "; ")) — core: \(core10)")
     try? FileManager.default.removeItem(atPath: tmp)
+    // the corner's right-click, for the workspace: what Save and Restart say
+    var pw: [String] = []
+    if workspaceSavedText(["saved": "/x/w.json", "tabs": 1, "sessions": 3]) != "Workspace saved: 1 tab, 3 sessions"
+        || workspaceSavedText(["saved": NSNull(), "why": "is iTerm2 running?"]) != "Workspace not saved: is iTerm2 running?"
+        || workspaceSavedText(nil) != "Workspace not saved: aht gave no answer" {
+        pw.append("saved \(workspaceSavedText(["saved": "/x/w.json", "tabs": 1, "sessions": 3]))")
+    }
+    let qw = workspaceRestartQuestion(["installed": "2.1.0", "now": ["paper", "notes"], "after": ["build"],
+                                       "left_out": [["session": "me", "why": "it is the session asking"]]]) ?? ""
+    if !["At once: paper, notes", "Once their task is over: build",
+         "Left as they are: me (it is the session asking)", "(2.1.0)", "not sent is lost"].allSatisfy(qw.contains)
+        || workspaceRestartQuestion(["now": [String](), "after": [String]()]) != nil {
+        pw.append("question \(qw)")
+    }
+    if workspaceNothingToRestart(["left_out": [[String: Any]]()]) != "No open session to restart"
+        || workspaceNothingToRestart(["left_out": [["session": "a", "why": "it is not in a tab"],
+                                                   ["session": "b", "why": "x"]]])
+            != "No session to restart: a it is not in a tab, and 1 more" {
+        pw.append("nothing to restart")
+    }
+    if workspaceRestartedText(["restarted": ["a", "b"]]) != "Workspace restarted: 2 sessions"
+        || workspaceRestartedText(["restarted": ["a"], "failed": [["session": "b", "why": "w"]],
+                                   "not_waited": ["c"]]) != "Workspace restarted: 1 session; not b, c"
+        || workspaceRestartedText(["blockers": ["boom"]]) != "Workspace not restarted: boom" {
+        pw.append("restarted \(workspaceRestartedText(["restarted": ["a", "b"]]))")
+    }
+    let cornerWsOK = pw.isEmpty
+    print("CORNER WORKSPACE \(cornerWsOK ? "OK" : "FAIL — " + pw.joined(separator: "; "))")
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
          && releaseOK && pauseOK && backOnOK && offsiteOK && fetchPartialOK && relayOK && dialogOK && samplesOK
          && relaySamplesOK && watchOK && groupsOK && staleOK && searchOK && phase3OK && loginOK
          && pickOK && doneOK && menuOK && twinOK && phase4OK && fix1OK && fix2OK && fix3OK && fix4OK
          && pause5OK && phase5OK && transferOK && phase6OK && bringOK && phase7OK && fix7OK
-         && perm7bOK && phase7bOK && kimi7bOK && opDryOK && problemOK ? 0 : 1)
+         && perm7bOK && phase7bOK && kimi7bOK && opDryOK && problemOK && cornerWsOK ? 0 : 1)
 }
 
 // chimes: aht's own chimes as WAV files in DIR, to hear or look at them

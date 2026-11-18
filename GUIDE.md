@@ -903,7 +903,8 @@ waiting for you.
 - `aht checkup --restart-older --apply` — every session that runs an
   older Claude Code than the one installed starts again in its tab, with
   the options it had: an idle one at once, a working one once its task is
-  over (`--no-wait` leaves those, `--all` takes every session). The
+  over (`--no-wait` leaves those, `--all` takes every session, as the
+  corner list's **Restart Workspace…** does). The
   session you run it from, a background session and a tab that moved its
   conversation to the background are left as they are.
 - `aht update --claude --apply` (the ∞ menu and the Windows tray: **Update
@@ -1048,6 +1049,21 @@ on in the background, that tab's line shows the conversation's state.
     *Backups, and bringing a session back*).
   - Branch and Send wait while a session works or waits for you, and say
     so.
+- **Every right-click on the list**, also one beside the sessions or on
+  the top line when no session is open, ends with three lines for the
+  workspace, the terminal's tabs with their sessions (see *Restore my
+  workspace*):
+  - **Save Workspace Now** keeps the layout as it is this moment, and
+    says under the top line how many tabs and sessions it holds.
+  - **Restore Workspace…** opens aht's window on the saved workspaces,
+    where **Open Them** brings one back.
+  - **Restart Workspace…** starts every open Claude session again in its
+    own tab, where it left off and with the options it had, so all of
+    them run the Claude Code installed now. aht lists first which
+    sessions restart at once, which once their task is over, and which
+    it leaves as they are (a background session, one in no tab), then
+    asks. Text typed into a session but not sent is lost. The list says
+    when it is through.
 - **On its way:** while a session is sent (or its project taken back), its
   row shows an arrow up (or down), the machine and the percentage
   (**→ homebox 45%**), and under it what is happening: before any data
@@ -2558,7 +2574,9 @@ off.
 - **Saving is automatic.** While the aht app runs and iTerm2 is open, aht
   looks at the layout every 10 minutes, and also when a session gets a
   prompt. A layout that did not change is not saved again; its "last seen"
-  time moves on. **Save Now** in the same sheet keeps it at once. For three
+  time moves on. **Save Now** in the same sheet keeps it at once, and so
+  does **Save Workspace Now** in the corner list's right-click menu, which
+  also has **Restore Workspace…** (see *Sessions in the corner*). For three
   minutes after **Open Them** the timer does not save: the sessions are
   still starting. Click a layout on the left to see what it would open.
   Settings → Restore my workspace changes how often.

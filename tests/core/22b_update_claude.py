@@ -106,6 +106,11 @@ try:
        and "not in a tab" in why.get("no-tab", "") and "background" in why.get("parked", ""),
        f"restart, dry run: the old idle one now, the busy one later; the current one, the one "
        f"asking, one in no tab and a tab that parked its conversation are left ({plan})")
+    every = core.restart_older(apply=False, every=True)
+    ck("current" in every["now"] + every["after"] and "idle-old" in every["now"]
+       and {x["session"] for x in every["left_out"]} == set(why),
+       f"restart, every session (the corner's Restart Workspace): the current one too, the "
+       f"same ones left ({every})")
     got = core.restart_older(apply=True)
     ck(got["restarted"] == ["idle-old", "busy-old"] and [d for d in acts if d[0] == "restarted"]
        == [("restarted", 1), ("restarted", 2)] and not polls[2],

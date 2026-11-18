@@ -80,12 +80,13 @@ function bytes(n) {
 
 // What the window opens on, when the tray opened it for one project
 // (Projects brought here ▸ Send Back…, the session corner's Take Back…):
-// p=<its path>&do=show|send-back|take-back|backups
-// after #, read before the address is cleaned below.
+// p=<its path>&do=show|send-back|take-back|backups, or do=workspaces alone
+// (the session corner's Restore Workspace…), after #, read before the
+// address is cleaned below.
 const GO = (() => {
   try {
     const q = new URLSearchParams(location.hash.slice(1));
-    return q.get("p") ? { path: q.get("p"), do: q.get("do") || "show" } : null;
+    return q.get("p") || q.get("do") === "workspaces" ? { path: q.get("p") || "", do: q.get("do") || "show" } : null;
   } catch (e) { return null; }
 })();
 // The key that lets this page use aht's API. aht puts it after # in the
@@ -4366,6 +4367,13 @@ async function showWelcome(again) {
  * Send Back…): that project picked, and with "send-back" Send Back's dry
  * run open; a folder not in the list still gets Send Back. */
 function openOn(go) {
+  if (go.do === "workspaces") {         // the session corner's Restore Workspace…
+    S.tab = "sessions";
+    drawTop(); draw();
+    if (S.status.terminal) openWorkspaces();
+    else tell("No workspace to restore", "aht found no terminal here whose tabs it can save and open again.");
+    return;
+  }
   const p = S.projects.find((x) => sameDir(x.real_path, go.path));
   S.tab = "projects";
   if (p) S.selection = p.real_path;

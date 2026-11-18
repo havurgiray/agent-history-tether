@@ -266,9 +266,12 @@ def save_workspace():
 def act_open_window(project=None, do="show"):
     """aht's window: a page aht.exe serves to this computer only, in an app
     window of Edge or Chrome.  `project`: the folder it opens on, and `do`
-    ("send-back": with Send Back's dry run open), passed to `aht window` in
-    its environment (aht_web.open_hint)."""
-    env = dict(os.environ, AHT_WINDOW_PROJECT=project, AHT_WINDOW_DO=do) if project else None
+    ("send-back": with Send Back's dry run open; "workspaces": Restore
+    Workspace, which needs no project), passed to `aht window` in its
+    environment (aht_web.open_hint)."""
+    env = None
+    if project or do != "show":
+        env = dict(os.environ, AHT_WINDOW_PROJECT=project or "", AHT_WINDOW_DO=do)
     subprocess.Popen(winlayer.self_cmd("window"), creationflags=winlayer.CREATE_NO_WINDOW,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
 

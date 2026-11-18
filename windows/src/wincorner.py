@@ -7,6 +7,8 @@ how long it has been so, under the name the Claude app shows.  A click brings
 the session's Windows Terminal tab to the front.  A right-click offers Go to
 Tab, Branch… (a branch of the session in a new tab) and Send to <machine>…;
 on a session handed over to another machine, Open Session and Take Back….
+Every right-click, also one beside the sessions, offers Save Workspace Now,
+Restore Workspace… and Restart Workspace….
 
 `Model` is plain Python and runs anywhere (windows/tests/wincorner_test.py):
 it reads Claude Code's own records of its sessions (<claude home>/sessions/
@@ -353,17 +355,30 @@ def tip_text(r: Row) -> str:
                else "A click goes to its tab; right-click for more."))
 
 
-def menu_items(r: Row, machines: list) -> list:
+def list_items(restarting: bool = False) -> list:
+    """What every right-click on the list ends with, and all that one beside
+    the sessions offers, for the workspace (the terminal's tabs with their
+    sessions): saved now, a saved one opened again, every session started
+    again in its tab; and the list hidden."""
+    return [("Save Workspace Now", "save-workspace", False),
+            ("Restore Workspace…", "workspaces", False),
+            ("Restart Workspace (under way)", None, False) if restarting else
+            ("Restart Workspace…", "restart-workspace", False), "-",
+            ("Hide the List", "hide", False)]
+
+
+def menu_items(r: Row, machines: list, restarting: bool = False) -> list:
     """The right-click menu of a session: [(label, action or None for grayed,
     is default)], "-" for a line between.  Actions: "goto", "branch",
-    "backup-now", "backups", "send:<machine>", "open", "take-back", "hide"."""
+    "backup-now", "backups", "send:<machine>", "open", "take-back", then
+    list_items()'s "save-workspace", "workspaces", "restart-workspace", "hide"."""
+    rest = list_items(restarting)
     if r.transfer:
         return [("Open Session (once it is there)" if r.transfer.get("kind") != "reclaim"
-                 else "Go to Tab (once it is back)", None, False), "-",
-                ("Hide the List", "hide", False)]
+                 else "Go to Tab (once it is back)", None, False), "-"] + rest
     if r.kind == "away":
         return [("Open Session", "open" if r.can_open else None, True),
-                ("Take Back…", "take-back", False), "-", ("Hide the List", "hide", False)]
+                ("Take Back…", "take-back", False), "-"] + rest
     busy = r.status in WORKING or r.status == "waiting"
     later = " (once it has finished)" if r.status in WORKING else \
         " (answer it first)" if r.status == "waiting" else ""
@@ -375,7 +390,63 @@ def menu_items(r: Row, machines: list) -> list:
         out += [(f"Send to {m}…" + later, None if busy else "send:" + m, False) for m in machines]
     else:
         out.append(("Send to Another Machine (add one in aht's window first)", None, False))
-    return out + ["-", ("Hide the List", "hide", False)]
+    return out + ["-"] + rest
+
+
+def _count(n: int, what: str) -> str:
+    return f"{n} {what}{'' if n == 1 else 's'}"
+
+
+def restart_question(plan: dict):
+    """What the confirmation of Restart Workspace… says, from the dry run of
+    `aht checkup --restart-older --all`; None when no session can restart."""
+    now, after = plan.get("now") or [], plan.get("after") or []
+    if not (now or after):
+        return None
+    lines = ["Restart every open Claude session in its tab?", "",
+             "aht ends each session and starts it again in the same tab, where it left off, "
+             "with the options it had. It then runs the Claude Code installed now"
+             + (f" ({plan['installed']})" if plan.get("installed") else "")
+             + ". Anything typed into a session but not sent is lost."]
+    if now:
+        lines += ["", "At once: " + ", ".join(now)]
+    if after:
+        lines += ["", "Once their task is over: " + ", ".join(after)]
+    left = [f"{x.get('session')} ({x.get('why')})" for x in plan.get("left_out") or []]
+    if left:
+        lines += ["", "Left as they are: " + "; ".join(left)]
+    return "\n".join(lines)
+
+
+def nothing_to_restart(plan: dict) -> str:
+    """Restart Workspace… with no session it can restart: why."""
+    if plan.get("blockers"):
+        return "Workspace not restarted: " + plan["blockers"][0]
+    left = plan.get("left_out") or []
+    if not left:
+        return "No open session to restart"
+    return ("No session to restart: " + left[0].get("session", "") + " " + left[0].get("why", "")
+            + (f", and {len(left) - 1} more" if len(left) > 1 else ""))
+
+
+def restarted_text(res: dict) -> str:
+    """What Restart Workspace says under the top line once it is through."""
+    if res.get("blockers"):
+        return "Workspace not restarted: " + res["blockers"][0]
+    done = len(res.get("restarted") or [])
+    not_done = [x.get("session", "") for x in res.get("failed") or []] + list(res.get("not_waited") or [])
+    t = "Workspace restarted: " + _count(done, "session")
+    if not_done:
+        t += "; not " + ", ".join(not_done[:3]) + (f" and {len(not_done) - 3} more" if len(not_done) > 3 else "")
+    return t
+
+
+def saved_text(res: dict) -> str:
+    """What Save Workspace Now says under the top line."""
+    if not res.get("saved"):
+        return "Workspace not saved: " + (res.get("why") or "nothing to save")
+    return (f"Workspace saved: {_count(int(res.get('tabs') or 0), 'tab')}, "
+            f"{_count(int(res.get('sessions') or 0), 'session')}")
 
 
 def send_question(res: dict) -> str:
@@ -803,6 +874,7 @@ class Corner:
         self.hover_close = False
         self.tracking = False
         self.held = None
+        self.restarting = False         # Restart Workspace under way
         self.queue = []
         self.lock = threading.Lock()
         self.width, self.most, self.spot = 260, 12, None
@@ -956,7 +1028,8 @@ class Corner:
         items = [(self.lay["close"], "Hide the list (the aht tray menu brings it back)"),
                  (self.lay["head"], "Drag the list anywhere, its sides to change its width, "
                                     f"or {corner} to list more or fewer sessions; double-click "
-                                    "this line to put it back in the corner")]
+                                    "this line to put it back in the corner; right-click "
+                                    "to save, restore or restart the workspace")]
         items += [(rect, tip_text(r)) for r, rect in self.lay["rows"]]
         self.tips = []
         for i, (rect, text) in enumerate(items):
@@ -990,10 +1063,20 @@ class Corner:
         if r:
             self.act(r, "open" if r.kind == "away" else "goto")
 
-    def act(self, r: Row, what: str):
-        """Do one thing to a session; what goes wrong shows under the top line."""
+    def act(self, r, what: str):
+        """Do one thing to a session (`r` is None for what is about the whole
+        list); what goes wrong shows under the top line."""
         if what == "hide":
             self.hooks["switch_off"]()
+            return
+        if what == "workspaces":
+            self.hooks["open_window"](None, "workspaces")
+            return
+        if what == "save-workspace":
+            self.save_workspace()
+            return
+        if what == "restart-workspace":
+            self.restart_workspace()
             return
         if what == "take-back":
             self.hooks["open_window"](r.project, "take-back")
@@ -1050,6 +1133,62 @@ class Corner:
         if name is None:
             return
         self._aside(r, lambda: aht.branch_session(str(r.pid), name, apply=True))
+
+    def restart_workspace(self):
+        """Restart Workspace…: the look ahead aside (it asks the terminal),
+        then the question, then every session ends and starts again in its
+        tab: an idle one now, a working one once its task is over."""
+        if self.restarting:
+            return
+        self.say("Looking at the open sessions…", 60)
+
+        def look():
+            try:
+                plan = aht.restart_older(every=True)
+            except Exception as e:
+                self.hooks["note"]("the corner's Restart Workspace failed", e)
+                plan = {"blockers": [f"{type(e).__name__}: {e}"]}
+            self.post(lambda: self._restart_answer(plan))
+        threading.Thread(target=look, daemon=True).start()
+
+    def _restart_answer(self, plan: dict):
+        self.m.note = None
+        self.place()
+        q = restart_question(plan)
+        if q is None:
+            self.say(nothing_to_restart(plan))
+            return
+        if self.restarting or not self.hooks["ask"]("Restart Workspace", q):
+            return
+        self.restarting = True
+        self.say("Restarting the workspace: " + _count(len(plan.get("now") or [])
+                 + len(plan.get("after") or []), "session") + "…", 30)
+
+        def go():
+            try:
+                res = aht.restart_older(apply=True, every=True)
+            except Exception as e:
+                self.hooks["note"]("the corner's Restart Workspace failed", e)
+                res = {"blockers": [f"{type(e).__name__}: {e}"]}
+
+            def done():
+                self.restarting = False
+                self.say(restarted_text(res), 20)
+            self.post(done)
+        threading.Thread(target=go, daemon=True).start()
+
+    def save_workspace(self):
+        """Save Workspace Now: how much it holds, under the top line."""
+        self.say("Saving the workspace…", 60)
+
+        def go():
+            try:
+                res = aht.save_workspace_now()
+            except Exception as e:
+                self.hooks["note"]("the corner's Save Workspace failed", e)
+                res = {"saved": None, "why": f"{type(e).__name__}: {e}"}
+            self.post(lambda: self.say(saved_text(res)))
+        threading.Thread(target=go, daemon=True).start()
 
     def backup_now(self, r: Row):
         """Back Up This Project Now: what it took, under the top line."""
@@ -1118,8 +1257,10 @@ class Corner:
         self.m.say(text, secs)
         self.place()
 
-    def menu(self, r: Row):
-        items = menu_items(r, self.m.machines)
+    def menu(self, r=None):
+        """The right-click menu: a session's, or (r None) the list's own."""
+        items = (menu_items(r, self.m.machines, self.restarting) if r
+                 else list_items(self.restarting))
         h = _u.CreatePopupMenu()
         acts, default = {}, None
         for i, it in enumerate(items, 1):
@@ -1274,10 +1415,8 @@ class Corner:
                     self._save_place()
                     self.place(force=True)
                 return 0
-            if msg == WM_RBUTTONUP:
-                r = self._row_at(_lo(lp), _hi(lp))
-                if r:
-                    self.menu(r)
+            if msg == WM_RBUTTONUP:                 # beside the sessions: the list's own menu
+                self.menu(self._row_at(_lo(lp), _hi(lp)))
                 return 0
             if msg == WM_MOUSELEAVE:
                 self.tracking = False

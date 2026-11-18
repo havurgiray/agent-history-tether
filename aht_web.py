@@ -27,7 +27,8 @@ can read.
 
 With AHT_WINDOW_PROJECT=<folder> (and AHT_WINDOW_DO=send-back) in its
 environment, `aht window` opens on that project (and its Send Back); the
-Windows tray opens it so for a project brought there.
+Windows tray opens it so for a project brought there.  AHT_WINDOW_DO=workspaces
+alone opens it on Restore Workspace (the session corner's menu).
 """
 import json
 import os
@@ -74,17 +75,23 @@ COMMAND_NEEDS = {"attach": ("--window", "--peek", "--print")}
 # what the window may open on (the tray's Projects brought here ▸ Send Back…):
 # AHT_WINDOW_PROJECT=<a folder> and AHT_WINDOW_DO=<one of these> in the
 # environment of `aht window`, passed on through /open to the page, after #
-OPEN_DO = ("show", "send-back", "take-back", "backups")   # the last: the session corner's menu
+# the last two: the session corner's menu
+OPEN_DO = ("show", "send-back", "take-back", "backups", "workspaces")
+OPEN_NO_PROJECT = ("workspaces",)       # these are about no one project
+
+
+def _hint(path: str, do: str) -> str:
+    if do not in OPEN_DO or not (path or do in OPEN_NO_PROJECT):
+        return ""
+    return "&" + urllib.parse.urlencode({"p": path, "do": do} if path else {"do": do})
 
 
 def open_hint(env=None) -> str:
     """The query part that makes the page open on one project, from
-    AHT_WINDOW_PROJECT and AHT_WINDOW_DO ("show" if not given), or ""."""
+    AHT_WINDOW_PROJECT and AHT_WINDOW_DO ("show" if not given), or "";
+    "workspaces" (Restore Workspace) needs no project."""
     env = os.environ if env is None else env
-    path, do = env.get("AHT_WINDOW_PROJECT") or "", env.get("AHT_WINDOW_DO") or "show"
-    if not path or do not in OPEN_DO:
-        return ""
-    return "&" + urllib.parse.urlencode({"p": path, "do": do})
+    return _hint(env.get("AHT_WINDOW_PROJECT") or "", env.get("AHT_WINDOW_DO") or "show")
 
 
 def _own_dirs() -> list:
@@ -362,8 +369,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.sessions[cookie] = key
             self.server.last = time.time()
             # the project the window opens on, quoted: it goes after # too
-            go = {k: (q.get(k) or [""])[0] for k in ("p", "do")}
-            hint = "&" + urllib.parse.urlencode(go) if go["p"] and go["do"] in OPEN_DO else ""
+            hint = _hint((q.get("p") or [""])[0], (q.get("do") or [""])[0])
             return self._send(302, b"", "text/plain", {
                 "Location": "/#k=" + key + hint,
                 "Set-Cookie": f"aht={cookie}; HttpOnly; SameSite=Strict; Path=/"})
@@ -903,6 +909,14 @@ def selftest() -> int:
     ck(where.startswith("/#k=") and len(key) >= 32 and key != cookie,
        "the page's key comes after # in the address, where no server sees it")
     ck(call("/open?code=" + code)[0] == 403, "the same launch code does not work twice")
+    ck(open_hint({"AHT_WINDOW_PROJECT": "/w/p q", "AHT_WINDOW_DO": "backups"}) == "&p=%2Fw%2Fp+q&do=backups"
+       and open_hint({"AHT_WINDOW_DO": "workspaces"}) == "&do=workspaces"
+       and open_hint({"AHT_WINDOW_DO": "backups"}) == ""
+       and open_hint({"AHT_WINDOW_PROJECT": "/w", "AHT_WINDOW_DO": "anything"}) == "",
+       "it opens on a project, or on Restore Workspace, and on nothing else")
+    st, _, hd = call(f"/open?code={srv.new_launch()}&do=workspaces")
+    ck(st == 302 and (hd.get("Location") or "").endswith("&do=workspaces"),
+       "Restore Workspace is passed on to the page, after #")
     st, body, hd = call("/", cookie=cookie)
     ck(st == 200 and b"<html" in body.lower() and "script-src 'self'" in
        (hd.get("Content-Security-Policy") or ""), "the page, with its content policy")

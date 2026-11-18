@@ -28187,6 +28187,19 @@ def save_workspace(snap: dict):
     thin_workspaces(d)
     return f
 
+def save_workspace_now() -> dict:
+    """Save the layout as it is this moment (`aht workspace --save`, Save Now
+    and the session corner's Save Workspace Now): {saved (the file, or None),
+    tabs, sessions, why (when nothing was saved)}."""
+    term = terminal()
+    snap = workspace_snapshot(term.tabs(max_age=0))
+    f = save_workspace(snap)
+    rows = snap.get("tabs") or []
+    return {"saved": str(f) if f else None,
+            "tabs": len({(e["window"], e["tab"]) for e in rows}),
+            "sessions": sum(1 for e in rows if e.get("agent")),
+            "why": "" if f else f"is {term.name or 'a terminal aht can drive'} running?"}
+
 def workspace_autosave_path() -> Path:
     return aht_home() / "run" / "workspace-autosave"
 
@@ -28625,11 +28638,9 @@ def cmd_workspace(args):
                   f"not saved: {res.get('skipped') or 'nothing to save'}")
         return 0
     if args.save:
-        term = terminal()
-        f = save_workspace(workspace_snapshot(term.tabs(max_age=0)))
-        print(json.dumps({"saved": str(f) if f else None}) if args.json else
-              (f"saved: {f}" if f else
-               f"nothing to save (is {term.name or 'a terminal aht can drive'} running?)"))
+        res = save_workspace_now()
+        print(json.dumps(res) if args.json else
+              (f"saved: {res['saved']}" if res["saved"] else f"nothing to save ({res['why']})"))
         return 0
     if args.restore is not None:
         res = restore_workspace(args.restore or None, args.apply)

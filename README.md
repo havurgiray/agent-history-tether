@@ -451,7 +451,7 @@ macOS-first: new features are built and tested there first.
 | Undo a session | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
 | Restore Workspace | ✓ iTerm2 | — | ✓ Windows Terminal |
 | Go to Tab, restart in its tab | ✓ iTerm2 | — | ✓ Windows Terminal |
-| Session corner: the open sessions at a glance; a right-click to Branch or Send to a machine | ✓ top right | — | ✓ bottom right, above the taskbar |
+| Session corner: the open sessions at a glance; a right-click to Branch or Send to a machine, and to save, restore or restart the workspace | ✓ top right | — | ✓ bottom right, above the taskbar |
 | Branch: a branch of a session in a new tab | ✓ iTerm2, right after its tab | — | ✓ Windows Terminal, at the end of its window |
 | iTerm2: session names from tabs | ✓ | — | — |
 | Chimes, Spotlight, `aht://` links, Finder Quick Actions, search shortcut | ✓ | — | — |

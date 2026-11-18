@@ -45,7 +45,9 @@ wenv = {"AHT_ITERM_LOG": str(ilog), "AHT_ITERM_TABS": str(tabs_file),
         "AHT_CWDS": json.dumps({str(shell.pid): projX}),
         "AHT_CMDLINES": json.dumps({str(p1.pid): started}), "AHT_CLAUDE_VERSION": "9.9.9"}
 JS("workspace", "--save", "--json", extra_env=wenv)
-JS("workspace", "--save", "--json", extra_env=wenv)
+sv = JS("workspace", "--save", "--json", extra_env=wenv)
+ck(sv.get("saved") and (sv.get("tabs"), sv.get("sessions")) == (3, 1),
+   f"workspace: saving says how many tabs and sessions it holds ({sv})")
 ws = JS("workspace", "--json", extra_env=wenv).get("workspaces", [])
 snap = json.loads(next((sb / ".aht" / "workspaces").glob("*.json")).read_text())
 e1 = next((e for e in snap["tabs"] if e["title"] == "Paper"), {})

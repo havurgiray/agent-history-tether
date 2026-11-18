@@ -228,6 +228,8 @@ def live_panes(table: list = None) -> dict:
             if pane:
                 out[pane] = {"pid": child, "exe": name, "born": process_born(child) or 0,
                              "busy": [n for _p, n in kids.get(child, [])
+                                      if n.lower() not in CONSOLE_HOSTS],
+                             "kids": [p for p, n in kids.get(child, [])
                                       if n.lower() not in CONSOLE_HOSTS]}
     return out
 
@@ -819,7 +821,14 @@ class WindowsTerminal(aht.Terminal):
         info = _ask_helper({"info": [row["pid"], pane["pid"]]})["info"]
         if not in_its_pane(row["pid"], pane, table, info):
             return None
-        return resume_line({"agent": "claude", "session": row["session"], "cwd": row["project"],
+        # type_line refuses a pane whose shell runs anything else (an editor
+        # started from it, a job): said now, before the session is ended
+        if any(p != row["pid"] for p in pane.get("kids") or []):
+            return None
+        # the conversation's own folder, not the one Claude moved to:
+        # --resume finds it only there
+        home = aht.conversation_folder(row.get("session"), row["project"]) or row["project"]
+        return resume_line({"agent": "claude", "session": row["session"], "cwd": home,
                             "args": flags}, shell_of(pane)) or None
 
     def type_line(self, key, line: str) -> bool:
@@ -888,12 +897,17 @@ class WindowsTerminal(aht.Terminal):
         ready = (lambda p: True) if started else (lambda p: at_prompt(p["line"], shell_of(p)))
         into, windows = assign(plan, live, ready)
         owners = {(i or {}).get("owner") for i in info.values()}
-        jobs, why, opened = list(into), [], 0
+        jobs, why, opened, failed, typed_for = list(into), [], 0, [], {}
         for i, window in enumerate(windows):
             before = set(live_panes())
             entries = [e for panes in window for e in panes]
-            subprocess.Popen(wt_command(window, f"aht-{int(time.time())}-{i}"),
-                             creationflags=CREATE_NO_WINDOW)
+            try:
+                subprocess.Popen(wt_command(window, f"aht-{int(time.time())}-{i}"),
+                                 creationflags=CREATE_NO_WINDOW)
+            except OSError as e:        # wt.exe is not on the PATH (its alias switched off)
+                why.append(f"Windows Terminal's wt.exe could not be started: {e}")
+                failed += entries
+                continue
             wait_for(lambda: live_panes().keys(), lambda now: len(now - before) >= len(entries))
             now = live_panes()
             new = sorted((k for k in now if k not in before), key=lambda k: now[k]["born"])
@@ -912,8 +926,10 @@ class WindowsTerminal(aht.Terminal):
             if not pane or pane["busy"] or line is None:
                 why.append(f"{e.get('name') or e.get('title') or e.get('session')}: "
                            "its tab was in use; open it again")
+                failed.append(e)
             elif line:
                 typing.append({"pid": pane["pid"], "text": line + "\r"})
+                typed_for[pane["pid"]] = e
             else:
                 opened += 1                     # a plain tab: there it is
         if typing:
@@ -924,7 +940,8 @@ class WindowsTerminal(aht.Terminal):
                     opened += 1
                 else:
                     why.append(got.get("why") or "no answer from a tab")
-        return {"opened": opened, "why": "; ".join(why)}
+                    failed.append(typed_for[t["pid"]])
+        return {"opened": opened, "why": "; ".join(why), "failed": failed}
 
 
 def activate() -> None:
@@ -936,4 +953,5 @@ def activate() -> None:
     aht._cmdline = process_cmdline
     aht._proc_started = process_born
     aht._cwds = process_cwds
+    aht._ppid_table = lambda: {p: q for p, q, _e in process_table()}
     aht._SHELLS |= {"powershell", "pwsh", "cmd"}

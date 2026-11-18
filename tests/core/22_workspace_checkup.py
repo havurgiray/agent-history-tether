@@ -74,7 +74,9 @@ ck(d.get("applied") and d["plan"]["opens"] == 2 and "--resume w1" in script
 
 # a second click right away opens nothing twice (a session takes a while to start)
 d2 = JS("workspace", "--restore", "--apply", "--json", extra_env=wenv)
-ck(not d2.get("applied") and "everything in it is open already" in (d2.get("blockers") or [])
+ck(not d2.get("applied") and d2.get("blockers") == [
+       "nothing left to open: 2 open already, 1 plain tab without a title "
+       "(aht opens Claude sessions and titled tabs again)"]
    and sum(1 for x in ilines() if x.get("what") == "restore") == 1,
    f"workspace: a second Open Them right away opens nothing twice ({d2.get('blockers')})")
 # the terminal closed right after: what was just opened is not open any more
@@ -82,7 +84,7 @@ d3 = JS("workspace", "--restore", "--json", extra_env=dict(wenv, AHT_ITERM_CLOSE
 d4 = JS("workspace", "--restore", "--json", extra_env=dict(wenv, AHT_ITERM_BORN=str(time.time() + 60)))
 d5 = JS("workspace", "--restore", "--json", extra_env=dict(wenv, AHT_ITERM_BORN=str(time.time() - 600)))
 ck(d3["plan"]["opens"] == 2 and not d3.get("blockers") and d4["plan"]["opens"] == 2
-   and not d4.get("blockers") and d5.get("blockers") == ["everything in it is open already"],
+   and not d4.get("blockers") and "2 open already" in " ".join(d5.get("blockers") or []),
    "workspace: with the terminal closed or started anew, what a restore just opened "
    f"can be opened again ({d3.get('blockers')}, {d4.get('blockers')}, {d5.get('blockers')})")
 (sb / ".aht" / "run" / "workspace-opened.json").unlink()
@@ -95,9 +97,9 @@ closed = dict(wenv, AHT_ITERM_CLOSED="1")
 n1 = JS("workspace", "--restore", "20200103-000000", "--json", extra_env=closed)
 n2 = JS("workspace", "--restore", "20200104-000000", "--json", extra_env=closed)
 n3 = JS("workspace", "--restore", "20200103-000000", "--apply", "--json", extra_env=closed)
-ck(n1.get("blockers") == ["nothing in it can be opened again: 2 plain tabs without a title "
-                          "(aht opens Claude sessions and tabs you named)"]
-   and n2.get("blockers") == ["nothing in it can be opened again: 1 tab whose folder is gone"]
+ck(n1.get("blockers") == ["nothing left to open: 2 plain tabs without a title "
+                          "(aht opens Claude sessions and titled tabs again)"]
+   and n2.get("blockers") == ["nothing left to open: 1 whose folder is gone"]
    and not n3.get("applied") and n3.get("blockers") == n1.get("blockers")
    and sum(1 for x in ilines() if x.get("what") == "restore") == 1,
    f"workspace: a layout aht can open nothing of says why ({n1.get('blockers')}, {n2.get('blockers')})")

@@ -211,7 +211,8 @@ def main():
        (rows[p_plain].get("title"), rows[p_notes].get("title")))
     lid = Path(res["saved"]).stem
     dry = js("workspace", "--restore", lid)
-    ck("with everything open there is nothing to open", "everything in it is open already" in dry.get("blockers", []), dry)
+    ck("with everything open there is nothing to open",
+       dry.get("plan", {}).get("opens") == 0 and "open already" in " ".join(dry.get("blockers", [])), dry)
     auto = js("workspace", "--save", "--auto")
     ck("the tray's minute: saved at most once in its time", "saved" in auto, auto)
     st = js("status")

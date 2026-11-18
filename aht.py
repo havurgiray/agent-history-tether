@@ -22907,8 +22907,8 @@ def _open_page(url: str) -> bool:
 
 def _restart_lines(r: dict) -> list:
     out = []
-    for k, verb in (("now", "restarts now"), ("after", "restarts once its task is over")):
-        if r.get(k):
+    for k, verb in (("now", "restarts now"), ("after", "restarts once it is idle")):
+        if r.get(k) and not r.get("applied"):       # the plan; once done, what happened
             out.append(f"   {verb}: {', '.join(r[k])}")
     for k, verb in (("restarted", "restarted"), ("not_waited", "not restarted, still working")):
         if r.get(k):
@@ -22933,8 +22933,8 @@ def cmd_update(args):
         if not args.apply:
             print(f"Claude Code {res['before'] or '?'}, installed with {res['how']}: would run\n"
                   f"   {cmd}\n"
-                  + ("then start the open sessions on an older version again, each in its tab"
-                     if res["while_running"] else
+                  + ("then, if that brought a newer version, start every open session again, "
+                     "each in its tab" if res["while_running"] else
                      f"after ending every session ({res['how']} cannot replace it while it "
                      "runs); each comes back in its tab afterwards"))
             print("\n".join(_restart_lines(res.get("restart") or {})) or "   (no open session to restart)")
@@ -24428,7 +24428,9 @@ def _spawn_aht(args: list, gently: bool = False):
 
 def _write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".new")
+    # a name of this process's own: two that write the same file at once
+    # (a hook's refresh, an autosave) do not take each other's away
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.new")
     tmp.write_text(json.dumps(obj, indent=1, default=str))
     os.replace(tmp, path)
 
@@ -27036,13 +27038,60 @@ def _argv(cmdline: str) -> list:
     except ValueError:
         return cmdline.split()
 
-def _claude_flags(cmdline: str) -> list:
+def _mac_argv(pid: int):
+    """A process's arguments exactly as it got them, from the kernel's own
+    copy (macOS); None when that cannot be read (another user's, or gone)."""
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))       # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, ctypes.c_size_t(0)) != 0:
+            return None
+        raw = buf.raw[:size.value]
+        argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+        _exe, _, rest = raw[4:].partition(b"\0")
+        words = rest.lstrip(b"\0").split(b"\0")
+        if argc <= 0 or len(words) < argc:
+            return None
+        return [w.decode("utf-8", "replace") for w in words[:argc]]
+    except Exception:
+        return None
+
+def _claude_argv(pid: int):
+    """What _claude_flags reads for a session: its arguments exactly, where
+    the system gives them.  ps joins them with spaces, so a folder with a
+    space in it would come apart and the words of a first prompt would read
+    as options.  Else its command line."""
+    if os.environ.get("AHT_CMDLINES"):                  # tests: a stand-in
+        return _cmdline(pid)
+    if IS_LINUX:
+        try:
+            raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+            if raw:
+                return [w.decode("utf-8", "replace") for w in raw.rstrip(b"\0").split(b"\0")]
+        except (OSError, ValueError):
+            pass                # ended, or not readable: ps is asked below
+    elif IS_MAC:
+        got = _mac_argv(pid)
+        if got:
+            return got
+    return _cmdline(pid)
+
+def _claude_flags(cmdline) -> list:
     """The options a session was started with that it keeps when it starts
     again (permissions, model, effort, extra folders); a first prompt and the
-    session it resumed are left out."""
-    parts = _argv(cmdline)
+    session it resumed are left out.  `cmdline`: its arguments as a list, or
+    its command line."""
+    parts = list(cmdline) if isinstance(cmdline, (list, tuple)) else _argv(cmdline)
     out, i = [], 1
     while i < len(parts):
+        if parts[i] == "--":            # what follows is the prompt, never an option
+            break
         key = parts[i].split("=", 1)[0]
         if key in KEEP_FLAGS:
             if "=" in parts[i] or KEEP_FLAGS[key] == 0:
@@ -27149,6 +27198,8 @@ def session_checkup() -> list:
 def _gone(pid: int) -> bool:
     if not _pid_alive(pid):
         return True
+    if os.name == "nt":                 # no ps there; a Unix-like one on PATH answers nothing
+        return False
     try:                                # ended, but not yet collected by its parent
         st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
                             text=True, timeout=5, cwd="/").stdout.strip()
@@ -27172,8 +27223,10 @@ def close_session(pid: int, apply: bool = False) -> dict:
     if s is None:
         res["blockers"].append("no open Claude Code session has that process")
         return res
+    # the conversation's own folder: --resume finds it only there
+    home = conversation_folder(s.get("session"), s["cwd"]) or s["cwd"]
     res.update(session=s.get("session"), project=s["cwd"],
-               resume=f"cd {shlex.quote(s['cwd'])} && claude --resume {s.get('session')}")
+               resume=f"cd {shlex.quote(home)} && claude --resume {s.get('session')}")
     if not apply:
         return res
     import signal
@@ -27204,23 +27257,33 @@ def restart_session(pid: int, apply: bool = False) -> dict:
                                "so aht cannot start it there again")
     elif not row["can_restart"]:
         res["blockers"].append("it is working or waiting for you; restart it once it is idle")
-    cmd = term.restart_line(row, _claude_flags(_cmdline(pid))) if row["in_terminal"] else None
+    cmd = term.restart_line(row, _claude_flags(_claude_argv(pid))) if row["in_terminal"] else None
     if row["in_terminal"] and cmd is None:
-        res["blockers"].append("it does not run directly in its tab's shell, so aht leaves it be")
+        res["blockers"].append("it does not run directly in its tab's shell, or another program "
+                               "runs in that tab, so aht leaves it be")
     res.update(session=row["session"], project=row["project"], tab=row.get("tab"),
                command=cmd, issues=row["issues"])
     if not apply or res["blockers"]:
         return res
+    # asked now, before it is ended: the look at all tabs that `in_terminal`
+    # rests on may be old, and an ended session with no tab to type into
+    # stays ended
+    if not term.has_pane(row["tty"]):
+        res["blockers"].append(f"aht could not find its tab in {term.name or 'the terminal'} "
+                               "just now, so it left the session running")
+        return res
     done = close_session(pid, apply=True)
     if not done["applied"]:
         res["blockers"] += done["blockers"]
+        res["blockers"].append("if it ends after all, continue it with: " + cmd)
         return res
     time.sleep(0.5)                     # the shell gets its prompt back
     res["applied"] = term.type_line(row["tty"], cmd)
     if not res["applied"]:
         res["blockers"].append("the session ended, but aht could not type into its tab; "
                                "continue it with: " + cmd)
-    log(f"SESSION restarted pid {pid} in {row['tty']}: {cmd}")
+    log(f"SESSION {'restarted' if res['applied'] else 'ended, not started again:'} "
+        f"pid {pid} in {row['tty']}: {cmd}")
     return res
 
 # ---- a new Claude Code, and the sessions moved onto it ---------------------- #
@@ -27265,8 +27328,23 @@ def claude_updater() -> dict:
                                                  "manager (apt, dnf, …)")
     return dict(out, why=f"aht does not know how the Claude Code at {real} was installed")
 
+_ppid_table = None          # Windows: a function giving {pid: parent pid}
+
 def _my_ancestors() -> set:
     out, pid = set(), os.getpid()
+    if _ppid_table is not None:
+        try:
+            table = _ppid_table()
+        except Exception:
+            table = {}
+        for _ in range(64):
+            out.add(pid)
+            pid = table.get(pid) or 0
+            if pid <= 4 or pid in out:
+                break
+        return out
+    if os.name == "nt":
+        return out | {pid}
     for _ in range(64):
         out.add(pid)
         try:
@@ -27283,7 +27361,7 @@ def _restart_plan(every: bool = False) -> tuple:
     """(sessions to move onto the installed Claude Code, those left out with
     why): in a terminal tab, not the one asking."""
     rows = session_checkup()
-    mine = _my_ancestors() if os.name != "nt" else {os.getpid()}
+    mine = _my_ancestors()
     jobs = {r.get("jobId") for r in (_session_record(x["pid"]) for x in running_sessions())
             if r.get("kind") == "bg" and r.get("jobId")}
     todo, left = [], []
@@ -27314,8 +27392,23 @@ def _settled(pid: int) -> str:
     age = time.time() - float(at) / 1000 if isinstance(at, (int, float)) else SETTLE_SECONDS
     return "idle" if rec.get("status") == "idle" and age >= SETTLE_SECONDS else "busy"
 
+RESTART_BUSY = "a restart or an update of Claude Code is already under way"
+
+def _restart_lock():
+    """One restart or update of Claude Code at a time: two would end the
+    same session and type its line twice.  The open lock file, or None when
+    another one runs."""
+    (aht_home() / "run").mkdir(parents=True, exist_ok=True)
+    fh = open(aht_home() / "run" / "claude-restart.lock", "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
 def restart_older(apply: bool = False, wait: bool = True, every: bool = False,
-                  say=None) -> dict:
+                  say=None, _held: bool = False) -> dict:
     """Start every open session that runs an older Claude Code than the one
     installed (`every`: all of them) again in its own tab, with the options
     it had: an idle one now, a busy one once it has finished its task
@@ -27328,6 +27421,10 @@ def restart_older(apply: bool = False, wait: bool = True, every: bool = False,
            "left_out": [{"session": r["label"], "why": r["why"]} for r in left],
            "restarted": [], "failed": [], "not_waited": []}
     if not apply:
+        return res
+    lock = None if _held else _restart_lock()
+    if lock is None and not _held:
+        res["blockers"] = [RESTART_BUSY]
         return res
     res["applied"] = True
     pending = list(todo)
@@ -27349,6 +27446,15 @@ def restart_older(apply: bool = False, wait: bool = True, every: bool = False,
                         res["failed"].append({"session": r["label"],
                                               "why": "; ".join(got["blockers"])})
                         say(f"not restarted: {r['label']} ({'; '.join(got['blockers'])})")
+                        if any(b.startswith("the session ended, but") for b in got["blockers"]):
+                            # typing into a tab failed after its session was
+                            # ended: the others are not ended into the same
+                            res["failed"] += [
+                                {"session": x["label"],
+                                 "why": f"not tried: aht could not type into the tab of {r['label']}, "
+                                        "so it left the others as they are"} for x in pending]
+                            pending = []
+                            break
                 elif not wait:
                     pending.remove(r)
                     res["not_waited"].append(r["label"])
@@ -27362,6 +27468,9 @@ def restart_older(apply: bool = False, wait: bool = True, every: bool = False,
                 time.sleep(3)
     except KeyboardInterrupt:
         res["not_waited"] += [r["label"] for r in pending]
+    finally:
+        if lock is not None:
+            lock.close()
     if res["restarted"]:
         log(f"SESSION {len(res['restarted'])} restarted on Claude Code {res['installed']}")
     return res
@@ -27382,9 +27491,18 @@ def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
         res["blockers"].append(up["why"] or "aht cannot update this Claude Code")
         return res
     if up["while_running"]:
-        res["restart"] = restart_older(apply=False, every=False)
+        # every session in a tab: after an update each one is older, so the
+        # question names them all, not only those behind already
+        res["restart"] = restart_older(apply=False, every=True)
     else:
         todo, left = _restart_plan(every=True)
+        term = terminal()
+        for r in list(todo):            # none is ended that aht cannot start again
+            r["cmd"] = term.restart_line(r, _claude_flags(_claude_argv(r["pid"])))
+            if r["cmd"] is None:
+                todo.remove(r)
+                left.append(dict(r, why="it does not run directly in its tab's shell, or "
+                                        "another program runs in that tab"))
         res["restart"] = {"now": [r["label"] for r in todo if r["status"] == "idle"],
                           "after": [r["label"] for r in todo if r["status"] != "idle"],
                           "left_out": [{"session": r["label"], "why": r["why"]} for r in left]}
@@ -27400,8 +27518,18 @@ def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
                                    "a session runs: try again once idle, or let aht wait")
     if not apply or res["blockers"]:
         return res
+    lock = _restart_lock()
+    if lock is None:
+        res["blockers"].append(RESTART_BUSY)
+        return res
+    try:
+        return _update_claude_now(res, up, todo if not up["while_running"] else [], wait, say)
+    finally:
+        lock.close()
+
+def _update_claude_now(res: dict, up: dict, todo: list, wait: bool, say) -> dict:
     res["applied"] = True
-    lines, ok, skip = [], False, False
+    lines, ok, skip, stuck = [], False, False, []
     if not up["while_running"]:
         # every session ends first, each once its task is over, its line to
         # start it again noted; none is ended mid-task
@@ -27420,10 +27548,15 @@ def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
                     pending.remove(r)
                     if st == "gone":
                         continue
-                    cmd = term.restart_line(r, _claude_flags(_cmdline(r["pid"])))
+                    cmd = term.restart_line(r, _claude_flags(_claude_argv(r["pid"])))
+                    if cmd is None:     # no line to bring it back with: it stays
+                        stuck.append(r)
+                        continue
                     if close_session(r["pid"], apply=True)["applied"]:
                         lines.append((r, cmd))
                         say(f"ended for the update: {r['label']}")
+                    else:
+                        stuck.append(r)
                 if not pending or time.time() >= end:
                     break
                 time.sleep(3)
@@ -27434,6 +27567,11 @@ def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
             res["warnings"].append(", ".join(r["label"] for r in pending)
                                    + (" is" if len(pending) == 1 else " are") + " still working, "
                                    "so nothing was updated; the sessions already ended are back")
+        if stuck:
+            skip = True
+            res["warnings"].append(", ".join(r["label"] for r in stuck)
+                                   + " could not be ended and brought back by aht, so nothing "
+                                   "was updated; the sessions already ended are back")
     if skip:
         res["output"] = ""
     else:
@@ -27449,12 +27587,21 @@ def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
         ok = p.returncode == 0
     except StopIteration:
         ok = False
+    except KeyboardInterrupt:           # the ended sessions still come back below
+        res["output"], ok = "interrupted", False
     except Exception as e:
         res["output"], ok = _errmsg(e), False
     res["after"] = installed_claude_version() or None
     res["updated"] = ok and _version(res["after"]) > _version(res["before"])
     if not ok and not skip:
         res["warnings"].append(f"the update did not finish: {res['output'][-300:]}")
+        log(f"CLAUDE update with {up['how']} did not finish: {res['output'][-300:]}")
+    # said at once: the sessions may take hours to all start again
+    notify_user("Claude Code",
+                f"Updated to {res['after']}." if res["updated"] else
+                f"Claude Code {res['after']} is the newest: nothing to update." if ok else
+                "Not updated: a session was still working." if skip else
+                "The update did not finish. aht's log says why.")
     if lines:
         time.sleep(0.5)                 # the shells get their prompts back
         term = terminal()
@@ -27466,16 +27613,15 @@ def update_claude(apply: bool = False, wait: bool = True, say=None) -> dict:
                 res["restart"]["failed"].append({"session": r["label"],
                                                  "why": f"continue it with: {cmd}"})
     else:
-        res["restart"] = restart_older(apply=True, wait=wait, say=say)
-    log(f"CLAUDE updated with {up['how']}: {res['before']} -> {res['after']} "
-        f"({'ok' if ok else 'failed'}); {len(res['restart'].get('restarted') or [])} "
-        "session(s) restarted")
+        res["restart"] = restart_older(apply=True, wait=wait, say=say, _held=True)
     n = len(res["restart"].get("restarted") or [])
-    notify_user("Claude Code",
-                (f"Updated to {res['after']}" if res["updated"] else
-                 f"Already at {res['after']}" if ok else
-                 "Not updated: sessions still worked" if skip else "The update did not finish")
-                + (f"; {n} session(s) restarted on it" if n else ""))
+    bad = len(res["restart"].get("failed") or []) + len(res["restart"].get("not_waited") or [])
+    log(f"CLAUDE updated with {up['how']}: {res['before']} -> {res['after']} "
+        f"({'ok' if ok else 'failed'}); {n} session(s) restarted, {bad} not")
+    if n or bad:
+        notify_user("Claude Code",
+                    f"{n} session{'' if n == 1 else 's'} started again on Claude Code {res['after']}"
+                    + (f"; {bad} did not" if bad else "") + ".")
     return res
 
 # ---- the session corner's menu: a branch beside, a session sent away ------- #
@@ -27579,7 +27725,7 @@ def branch_session(target: str, name: str = None, apply: bool = False) -> dict:
         return res
     new = str(_uuid.uuid4())            # the branch's id, so aht knows where it came from
     entry = {"agent": "claude", "session": s["session"], "cwd": s["cwd"], "title": name,
-             "args": _claude_flags(_cmdline(pid)) + ["--fork-session", "--session-id", new,
+             "args": _claude_flags(_claude_argv(pid)) + ["--fork-session", "--session-id", new,
                                                      "--name", name]}
     why = term.open_beside(key, entry)
     res["applied"] = not why
@@ -27776,6 +27922,9 @@ def cmd_sessions_checkup(args):
             print(json.dumps(res, indent=2, default=str))
             return 0
         print(f"Claude Code {res['installed'] or '?'} is installed")
+        if res.get("blockers"):
+            print("not restarted: " + "; ".join(res["blockers"]))
+            return 1
         print("\n".join(_restart_lines(res)) or "   no session to restart")
         if not args.apply and (res["now"] or res["after"]):
             print("(dry run — pass --apply to do it)")
@@ -27855,6 +28004,11 @@ class Terminal:
         """The panes as last seen, quickly: this is asked on every look at
         the sessions.  Only the keys and any "title" count."""
         return {}
+
+    def has_pane(self, key) -> bool:
+        """Whether that pane is there this moment, asked now.  False also
+        when the terminal did not answer: a session is not ended on a guess."""
+        return True
 
     def go_to(self, key) -> str:
         """Bring a pane to the front: "ok", "none" (no such pane) or "refused"."""
@@ -28076,7 +28230,8 @@ def workspace_snapshot(tabs: dict = None) -> dict:
             home = conversation_folder(s.get("session"), s["cwd"]) or s["cwd"]
             tr = _transcript_of(home, s["session"]) if s.get("session") else None
             e.update(agent="claude", session=s.get("session"), cwd=home,
-                     args=_claude_flags(cl[1]),
+                     args=_claude_flags(cl[1] if os.environ.get("AHT_TTY_PROCS")
+                                        else _claude_argv(cl[0])),
                      name=_current_title(tr) or _auto_title(tr) or None)
         elif other:
             e["agent"] = other[1]
@@ -28175,8 +28330,9 @@ def save_workspace(snap: dict):
         try:
             last = json.loads(files[-1].read_text())
             if _ws_key(last) == _ws_key(snap):
-                last["seen"] = snap["seen"]
-                _write_json(files[-1], last)
+                # the same layout: as it is now (a session started again
+                # with other options keeps its place), first seen as before
+                _write_json(files[-1], dict(last, **dict(snap, at=last.get("at") or snap.get("at"))))
                 return files[-1]
         except Exception:
             pass                # not readable: a new one is written
@@ -28198,7 +28354,9 @@ def save_workspace_now() -> dict:
     return {"saved": str(f) if f else None,
             "tabs": len({(e["window"], e["tab"]) for e in rows}),
             "sessions": sum(1 for e in rows if e.get("agent")),
-            "why": "" if f else f"is {term.name or 'a terminal aht can drive'} running?"}
+            "why": "" if f else "aht found no terminal here it can drive" if not term.name
+            else f"{term.name} is not open" if not term.running()
+            else f"aht found no tabs in {term.name}"}
 
 def workspace_autosave_path() -> Path:
     return aht_home() / "run" / "workspace-autosave"
@@ -28233,13 +28391,13 @@ def list_workspaces() -> list:
     for f in reversed(_ws_files(workspaces_dir())):
         try:
             w = json.loads(f.read_text())
+            rows.append({"id": f.stem, "at": w.get("at"), "seen": w.get("seen") or w.get("at"),
+                         "windows": len({e["window"] for e in w["tabs"]}),
+                         "tabs": len({(e["window"], e["tab"]) for e in w["tabs"]}),
+                         "sessions": sum(1 for e in w["tabs"] if e.get("agent")),
+                         "titles": [e["title"] for e in w["tabs"] if e.get("title")]})
         except Exception:
-            continue
-        rows.append({"id": f.stem, "at": w.get("at"), "seen": w.get("seen") or w.get("at"),
-                     "windows": len({e["window"] for e in w["tabs"]}),
-                     "tabs": len({(e["window"], e["tab"]) for e in w["tabs"]}),
-                     "sessions": sum(1 for e in w["tabs"] if e.get("agent")),
-                     "titles": [e["title"] for e in w["tabs"] if e.get("title")]})
+            continue            # not a layout aht wrote: left out, the others still show
     return rows
 
 def default_workspace(rows: list):
@@ -28273,8 +28431,14 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
     if tabs is None:
         tabs = term.tabs() if live else {}
     opened = _just_opened()
-    if opened and (not live or (term.started() or 0) > float(opened.get("at") or 0) + 1):
-        opened = {}             # the terminal they were opened in is closed
+    if opened:
+        # only while the terminal they were opened in is still the one open:
+        # the note says when that one started (a restore that starts the
+        # terminal itself writes the note first, so its time alone cannot tell)
+        born, was = (term.started() if live else None), opened.get("started")
+        if not live or (was is not None and born is not None and abs(born - float(was)) > 1) \
+                or (was is None and (born or 0) > float(opened.get("at") or 0) + 1):
+            opened = {}
     open_ids = {s.get("session") for s in running_sessions()} | set(opened.get("sessions") or [])
     titles_now = ({str(t.get("title") or "") for t in tabs.values()}
                   | set(opened.get("titles") or [])) - {""}
@@ -28289,10 +28453,14 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
                 e = dict(e, cwd=home)
         why = None
         if e.get("agent") == "claude" and e.get("session") in open_ids:
-            why = "its session is open"
+            # with the terminal closed it runs somewhere else: in another
+            # terminal, or in the background
+            why = "its session is open" if live else \
+                f"its session still runs outside {term.name or 'the terminal'}"
         elif not e.get("agent") and not e.get("title"):
             why = "a plain tab without a title"
-        elif not e.get("agent") and e["title"] in titles_now:
+        elif e.get("agent") != "claude" and e.get("title") in titles_now:
+            # another agent's tab too: aht knows it only by its title
             why = "a tab with that title is open"
         elif e.get("cwd") and not os.path.isdir(e["cwd"]):
             why = "its folder is gone"
@@ -28305,27 +28473,36 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
             "opens": sum(len(p) for win in plan for p in win)}
 
 def nothing_to_open(plan: dict) -> str:
-    """Why a layout opens nothing, in one sentence.  Only what is open now is
-    "open already": a layout of plain tabs without a title opens nothing
-    with the terminal closed too."""
+    """Why a layout opens nothing, in one sentence that is true of all of it:
+    "open already" only when every part is open now.  A layout of plain tabs
+    without a title opens nothing with the terminal closed too."""
     why = [e.get("why") or "" for e in plan.get("skipped") or []]
     if not why:
         return "nothing is saved in it"
-    if any(x.endswith(" is open") for x in why):
+    is_open = sum(1 for x in why if x.endswith(" is open"))
+    if is_open == len(why):
         return "everything in it is open already"
+    out = [x.split(" outside ", 1)[1] for x in why if " still runs outside " in x]
     plain, gone = why.count("a plain tab without a title"), why.count("its folder is gone")
-    said = []
+    said = [f"{is_open} open already"] if is_open else []
+    if out:
+        said.append(f"{len(out)} session{' still runs' if len(out) == 1 else 's still run'} "
+                    f"outside {out[0]} (end {'it' if len(out) == 1 else 'them'} there first)")
     if plain:
         said.append(f"{plain} plain tab{'' if plain == 1 else 's'} without a title "
-                    "(aht opens Claude sessions and tabs you named)")
+                    "(aht opens Claude sessions and titled tabs again)")
     if gone:
-        said.append(f"{gone} tab{'' if gone == 1 else 's'} whose folder is gone")
-    return "nothing in it can be opened again: " + ", ".join(said)
+        said.append(f"{gone} whose folder is gone")
+    return "nothing left to open: " + ", ".join(said)
 
 def restore_workspace(wid: str = None, apply: bool = False) -> dict:
     rows = list_workspaces()
     pick = next((r for r in rows if r["id"] == wid), None) if wid else default_workspace(rows)
     res = {"applied": False, "blockers": [], "workspace": pick}
+    if pick is None and wid and rows:
+        res["blockers"].append(f"there is no saved workspace {wid} (any more): choose one of "
+                               "those listed now")
+        return res
     if pick is None:
         res["blockers"].append("no saved workspace yet (aht saves one while you work in "
                                f"{terminal().name or 'a terminal it can drive'} with Claude Code)")
@@ -28352,7 +28529,10 @@ def restore_workspace(wid: str = None, apply: bool = False) -> dict:
 
 def _restore_now(res: dict, pick: dict, w: dict) -> dict:
     term = terminal()
-    started, why = term.start(w)
+    try:
+        started, why = term.start(w)
+    except Exception as e:              # behind a dialog of its own, or it may not be driven
+        started, why = False, f"{term.name or 'the terminal'} did not answer: {_errmsg(e)}"
     if why:
         res["blockers"].append(why)
         return res
@@ -28364,20 +28544,30 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
     if not plan["opens"]:
         res["blockers"].append(nothing_to_open(plan))
         return res
-    _write_json(workspace_opened_path(), {
-        "at": time.time(), "workspace": pick["id"],
-        "sessions": [e["session"] for win in plan["windows"] for panes in win for e in panes
-                     if e.get("session")],
-        "titles": [e["title"] for win in plan["windows"] for panes in win for e in panes
-                   if e.get("title")]})
-    got = term.open_plan(plan, tabs, started, w)
+    note = {"at": time.time(), "workspace": pick["id"],
+            "sessions": [e["session"] for win in plan["windows"] for panes in win for e in panes
+                         if e.get("session")],
+            "titles": [e["title"] for win in plan["windows"] for panes in win for e in panes
+                       if e.get("title")]}
+    _write_json(workspace_opened_path(), note)
+    try:
+        got = term.open_plan(plan, tabs, started, w)
+    except Exception as e:              # the terminal, or its command, is not there
+        got = {"opened": 0, "why": f"{term.name or 'the terminal'} did not open them: {_errmsg(e)}"}
     res["applied"] = got["opened"] > 0
     if got["why"]:
         res["blockers"].append(got["why"])
         warn(f"WORKSPACE restored {got['opened']} of {plan['opens']} from {pick['id']}: {got['why']}")
     if res["applied"]:
         # what did open is starting: the note keeps a second click from
-        # opening it again, also when the rest did not open
+        # opening it again; what did not open can be opened again at once.
+        # It holds for this terminal only: when that one started says which
+        missed = got.get("failed") or []
+        note["sessions"] = [x for x in note["sessions"]
+                            if x not in {e.get("session") for e in missed}]
+        note["titles"] = [x for x in note["titles"] if x not in {e.get("title") for e in missed}]
+        note["started"] = term.started()
+        _write_json(workspace_opened_path(), note)
         log(f"WORKSPACE restored {pick['id']}: {got['opened']} tab(s)/pane(s)"
             + (f", {got['into']} of them in the tabs {term.name} brought back"
                if got.get("into") else "")
@@ -28395,7 +28585,8 @@ def iterm_started():
     """When the running iTerm2 started (seconds since 1970), or None."""
     try:
         r = subprocess.run(["ps", "-Ac", "-o", "lstart=,comm="], capture_output=True,
-                           text=True, timeout=10, cwd="/")
+                           text=True, timeout=10, cwd="/",
+                           env={**os.environ, "LC_ALL": "C"})      # the date in English
         for line in r.stdout.splitlines():
             if line.strip().endswith(" iTerm2"):
                 return time.mktime(time.strptime(" ".join(line.split()[:5]),
@@ -28442,10 +28633,17 @@ def _iterm_last_lines(ttys) -> dict:
             got[tty] = next((x for x in reversed(text.splitlines()) if x.strip()), "")
     return got
 
+# what zsh names in its second prompt while a command is not complete
+_MORE_TO_COME = ("quote|dquote|bquote|heredoc|heredocd|cmdsubst|cmdand|cmdor|pipe|errpipe|for|foreach|"
+                 "while|until|repeat|if|then|else|elif|select|case|function|braceparam|array|"
+                 "subsh|cursh|math|mathsubst|cond|always")
+
 def _at_prompt(line: str) -> bool:
     """A shell waits at its prompt with nothing typed: the line ends in a
     prompt's sign.  One it does not know means no."""
     t = (line or "").rstrip()
+    if t == ">" or re.fullmatch(r"(?:(?:%s) ?)+>" % _MORE_TO_COME, t):
+        return False            # "dquote>", "for>", bash's ">": the rest of a command is awaited
     return bool(t) and not t.endswith(">>") and t[-1] in ">$#%❯➜λ»"
 
 def iterm_reuse(plan: dict, tabs: dict, started: bool) -> tuple:
@@ -28572,13 +28770,19 @@ class ITerm2(Terminal):
     def last_tabs(self) -> dict:
         return iterm_tabs(max_age=10 ** 9)
 
+    def has_pane(self, key) -> bool:
+        return bool(key) and bool(iterm_tab(key))
+
     def go_to(self, key) -> str:
         return _iterm_do(key, "goto")
 
     def restart_line(self, row: dict, flags: list):
         env = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 " if row.get("tab") and not \
             (self.last_tabs().get(row["tty"]) or {}).get("override") else ""
-        return (f"cd {shlex.quote(row['project'])} && {env}claude "
+        # the conversation's own folder, not the one Claude moved to:
+        # --resume finds it only there
+        home = conversation_folder(row.get("session"), row["project"]) or row["project"]
+        return (f"cd {shlex.quote(home)} && {env}claude "
                 + " ".join(shlex.quote(f) for f in flags + ["--resume", row["session"] or ""]))
 
     def type_line(self, key, line: str) -> bool:
@@ -28603,16 +28807,19 @@ class ITerm2(Terminal):
         # or macOS reopening its windows): a session goes back into the tab
         # with its title, while that tab is an idle shell at its prompt
         plan, into = iterm_reuse(plan, tabs, started)
-        typed, why = 0, []
+        typed, why, failed = 0, [], []
         for tty, e in into:
             if _iterm_session(tty, "write", _restore_command(e)):
                 typed += 1
             else:
                 why.append(f"{e.get('title')}: aht could not type into its tab")
+                failed.append(e)
         if not plan["opens"]:
-            return {"opened": typed, "why": "; ".join(why), "into": typed}
+            return {"opened": typed, "why": "; ".join(why), "into": typed, "failed": failed}
         got = self._open_new(plan, tabs, started)
-        return {"opened": typed + got["opened"], "into": typed,
+        if not got["opened"]:
+            failed += [e for win in plan["windows"] for panes in win for e in panes]
+        return {"opened": typed + got["opened"], "into": typed, "failed": failed,
                 "why": "; ".join(why + ([got["why"]] if got["why"] else []))}
 
     def _open_new(self, plan: dict, tabs: dict, started: bool) -> dict:
@@ -28647,8 +28854,13 @@ class ITerm2(Terminal):
             with open(os.environ["AHT_ITERM_LOG"], "a") as fh:
                 fh.write(json.dumps({"what": "restore", "script": "\n".join(L)}) + "\n")
             return {"opened": plan["opens"], "why": ""}
-        r = subprocess.run(["/usr/bin/osascript", "-"], input="\n".join(L), capture_output=True,
-                           text=True, timeout=120, cwd="/")
+        try:
+            r = subprocess.run(["/usr/bin/osascript", "-"], input="\n".join(L), capture_output=True,
+                               text=True, timeout=120, cwd="/")
+        except subprocess.TimeoutExpired:
+            return {"opened": 0, "why": "iTerm2 did not answer within two minutes (is a dialog "
+                                        "of it waiting for you?); look what it opened before "
+                                        "you try again"}
         if r.returncode == 0:
             return {"opened": plan["opens"], "why": ""}
         return {"opened": 0, "why": "iTerm2 said: " + (r.stderr or "").strip()[-300:]}

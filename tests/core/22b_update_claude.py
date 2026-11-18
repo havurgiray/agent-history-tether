@@ -92,6 +92,7 @@ stand = {"session_checkup": lambda: [dict(r) for r in rows],
          "_settled": settled, "restart_session": restart_session, "close_session": close_session,
          "_my_ancestors": lambda: {4}, "terminal": lambda: Term(),
          "installed_claude_version": lambda: "2.1.325", "_cmdline": lambda pid: "claude",
+         "_claude_argv": lambda pid: ["claude"],
          "notify_user": lambda *a, **k: None}
 kept = {k: getattr(core, k) for k in stand}
 sleep_was = core.time.sleep
@@ -124,13 +125,43 @@ try:
           "command": [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]}
     core.claude_updater = lambda: dict(up)
     d = core.update_claude(apply=False)
-    ck(not d["applied"] and not marker.exists() and d["restart"]["now"] == ["idle-old"],
-       f"update, dry run: what it would run, and which sessions follow ({d['command'][:1]}, "
-       f"{d['restart']['now']})")
+    ck(not d["applied"] and not marker.exists() and d["restart"]["now"] == ["idle-old", "current"]
+       and d["restart"]["after"] == ["busy-old"]
+       and "me" in {x["session"] for x in d["restart"]["left_out"]},
+       f"update, dry run: what it would run, and every session that follows if it brings a "
+       f"newer version, the current one too ({d['command'][:1]}, {d['restart']['now']})")
     d = core.update_claude(apply=True)
     ck(marker.exists() and d["restart"]["restarted"] == ["idle-old", "busy-old"]
        and acts[0] == ("restarted", 1),
        f"…with Homebrew: the update runs, then the old sessions restart ({d['restart']['restarted']})")
+
+    # one at a time: a second restart or update while one runs is refused
+    held, n_acts = core._restart_lock(), len(acts)
+    b1 = core.restart_older(apply=True, every=True)
+    b2 = core.update_claude(apply=True)
+    held.close()
+    ck(b1.get("blockers") == [core.RESTART_BUSY] and not b1["applied"] and not b1["restarted"]
+       and core.RESTART_BUSY in b2["blockers"] and not b2["applied"] and len(acts) == n_acts,
+       f"a restart or an update while one is under way: refused, nothing ended ({b1.get('blockers')})")
+    # a tab that cannot be typed into after its session ended: the others are left running
+    core.restart_session = lambda pid, apply=False: {"applied": False, "blockers": [
+        "the session ended, but aht could not type into its tab; continue it with: claude --resume x"]}
+    polls[2] = []
+    f = core.restart_older(apply=True, every=True)
+    core.restart_session = restart_session
+    ck(not f["restarted"] and len(f["failed"]) == 3 and "continue it with" in f["failed"][0]["why"]
+       and all(x["why"].startswith("not tried") for x in f["failed"][1:]),
+       f"a tab aht cannot type into: the session says how to continue, the others are not ended "
+       f"({f['failed']})")
+    # the options a session keeps, from its arguments as they are: a folder with a
+    # space in it stays whole, a prompt's words are never options
+    ck(core._claude_flags(["claude", "--add-dir", "/w/My Project", "--model", "opus",
+                           "why is --dangerously-skip-permissions risky?"])
+       == ["--add-dir", "/w/My Project", "--model", "opus"]
+       and core._claude_flags(["claude", "--dangerously-skip-permissions", "--resume", "x", "--",
+                               "--model", "y"]) == ["--dangerously-skip-permissions"]
+       and core._claude_flags("claude --model opus --resume old fix-it") == ["--model", "opus"],
+       "the options kept: read from the arguments themselves, the prompt and what follows -- left out")
 
     # winget: every session in a tab ends first, the update, then each comes back
     marker.unlink()

@@ -3209,7 +3209,7 @@ async function loadBoard() {
   if (S.tab === "sessions" || S.tab === "machines") draw();
 }
 function drawSessions(m) {
-  if (!S.board && !S.boardLoading) loadBoard();
+  if (!S.board && !S.boardLoading) return loadBoard();    // it draws the tab again itself
   const head = h("div", { class: "row" }, h("span", { class: "dim", text: "Agent sessions that are open now, here and on your other machines." }),
     h("span", { class: "grow" }), S.boardLoading ? h("span", { class: "spin" }) : null,
     S.boardAt ? h("span", { class: "dim small", text: "updated " + ago(S.boardAt / 1000) }) : null,

@@ -3,14 +3,18 @@
 imports anywhere; only its window needs Windows): what state a session is in
 and since when, "done" until it is looked at and kept across a restart, a
 record caught mid-write, the name it shows, the order, the sessions handed
-over to another machine, the right-click menu, what Send to asks, and what
-the workspace's Save, Restore and Restart say.
+over to another machine, the right-click menu, what Send to asks, what the
+workspace's Save, Restore and Restart say, what Update Claude Code asks and
+reports, and that a second click on an action does nothing while its look
+ahead or its question is open (the corner without its window).
 
     python windows/tests/wincorner_test.py
 """
 import json
 import sys
 import tempfile
+import threading
+import types
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -215,8 +219,15 @@ with tempfile.TemporaryDirectory() as td:
     ck("a working one: Branch and Send wait, and say so",
        grey == ["goto", None, "backup-now", "backups", None] + WS
        and "once it has finished" in labels[1], labels)
-    ck("no machine set up: Send says where to add one",
-       any("add one in aht's window" in x[0] for x in C.menu_items(idle, []) if x != "-"))
+    none = C.menu_items(idle, [])
+    at = next((i for i, x in enumerate(none) if x != "-" and x[0].startswith("Send to Another")), 0)
+    ck("no machine set up: Send says where to add one, in a group of its own",
+       none[at] == ("Send to Another Machine (add one in the Machines tab first)", None, False)
+       and none[at - 1] == "-" and none[at + 1] == "-", none)
+    some = C.menu_items(idle, ["homebox"])
+    ck("…as with a machine set up: a line before Send, not two",
+       some[some.index(("Send to homebox…", "send:homebox", False)) - 1] == "-"
+       and not any(a == b == "-" for a, b in zip(some, some[1:])), some)
     away = C.Row(id="away:x", name="paper", kind="away", can_open=False, machine="pc")
     ck("a handed-over one: Open Session (here not possible) and Take Back",
        [x[1] for x in C.menu_items(away, []) if x != "-"] == [None, "take-back"] + WS)
@@ -231,21 +242,237 @@ with tempfile.TemporaryDirectory() as td:
     q = C.restart_question({"installed": "2.1.0", "now": ["paper", "notes"], "after": ["build"],
                             "left_out": [{"session": "me", "why": "it is the session asking"}]})
     ck("Restart Workspace asks, naming which restart at once, which later, which not",
-       all(x in q for x in ("At once: paper, notes", "Once their task is over: build",
+       all(x in q for x in ("At once: paper, notes", "Once they are idle: build",
                             "Left as they are: me (it is the session asking)", "2.1.0",
                             "not sent is lost")), q)
-    ck("no session it can restart: no question, and why",
+    ck("…its first line asks, its last says what Yes and No do",
+       q.split("\n")[0] == "Restart the open Claude sessions in their tabs?"
+       and q.endswith("\n\nYes restarts them. No leaves every session as it is."), q)
+    ck("no session it can restart: no question, and why (the reason in brackets)",
        C.restart_question({"now": [], "after": [], "left_out": []}) is None
        and C.nothing_to_restart({"left_out": []}) == "No open session to restart"
-       and C.nothing_to_restart({"left_out": [{"session": "a", "why": "it is not in a tab"},
-                                              {"session": "b", "why": "x"}]})
-       == "No session to restart: a it is not in a tab, and 1 more")
-    ck("once through: how many restarted, and which did not",
-       C.restarted_text({"restarted": ["a", "b"], "failed": [], "not_waited": []})
-       == "Workspace restarted: 2 sessions"
-       and C.restarted_text({"restarted": ["a"], "failed": [{"session": "b", "why": "w"}],
-                             "not_waited": ["c"]}) == "Workspace restarted: 1 session; not b, c"
+       and C.nothing_to_restart({"left_out": [{"session": "paper", "why": "it is not in a tab "
+                                               "of Windows Terminal"}, {"session": "b", "why": "x"},
+                                              {"session": "c", "why": "y"}]})
+       == "No session to restart: paper (it is not in a tab of Windows Terminal), and 2 more"
+       and C.nothing_to_restart({"left_out": [{"session": "a", "why": "w"}]})
+       == "No session to restart: a (w)"
+       and C.nothing_to_restart({"blockers": ["a restart is under way"], "left_out": []})
+       == "Workspace not restarted: a restart is under way")
+    part = {"restarted": ["a", "b"], "failed": [{"session": "c", "why": "its tab is gone"}],
+            "not_waited": []}
+    ck("once through: how many restarted, of how many",
+       C.restarted_text({"restarted": ["a", "b", "c"], "failed": [], "not_waited": []})
+       == "Workspace restarted: 3 sessions"
+       and C.restarted_text({"restarted": ["a"]}) == "Workspace restarted: 1 session"
+       and C.restarted_text(part) == "Workspace restarted: 2 of 3 sessions"
+       and C.restarted_text({"restarted": [], "failed": [], "not_waited": ["c"]})
+       == "Workspace restarted: 0 of 1 session"
        and C.restarted_text({"blockers": ["boom"]}) == "Workspace not restarted: boom")
+    ck("…and which did not, each with why",
+       C.restart_problems({"restarted": ["a"], "failed": [], "not_waited": []}) is None
+       and C.restart_problems({"blockers": ["boom"]}) is None
+       and C.restart_problems(part) == "c: its tab is gone"
+       and C.restart_problems({"restarted": [], "failed": [{"session": "b", "why": "w"}],
+                               "not_waited": ["c"]})
+       == "b: w\n\nc: it was still working, so aht left it as it is")
+
+    print("\n[update Claude Code]")
+    plan = {"how": "winget", "command": ["winget", "upgrade", "Anthropic.ClaudeCode"],
+            "before": "2.1.0", "while_running": False, "blockers": [],
+            "restart": {"now": ["paper", "notes"], "after": ["build"],
+                        "left_out": [{"session": "me", "why": "it is not in a tab"},
+                                     {"session": "bg", "why": "it runs in the background"}]}}
+    q = C.update_question(plan).split("\n\n")
+    ck("the question: what updates it, what happens to the sessions, which, which not",
+       q[0] == "aht updates Claude Code 2.1.0 with winget, the way it was installed."
+       and q[1].startswith("winget cannot replace Claude Code while it runs, so every open "
+                           "Claude session ends first, once it is idle,")
+       and q[1].endswith("Anything typed into a session but not sent is lost.")
+       and q[2:] == ["Sessions: paper, notes, build",
+                     "Left as they are: me (it is not in a tab); bg (it runs in the background)",
+                     "A notice says when it is done.", "Yes updates. No changes nothing."]
+       and "upgrade" not in "".join(q), q)
+    q = C.update_question({"command": ["x"], "restart": {}}).split("\n\n")
+    ck("…an installer that replaces it while it runs; no version, no name, no session",
+       q == ["aht updates Claude Code with its installer, the way it was installed.",
+             "If that brings a newer version, every open Claude session ends and starts again "
+             "in its tab, where it left off, with the options it had: an idle one at once, a "
+             "working one once it is idle. Anything typed into a session but not sent is lost.",
+             "A notice says when it is done.", "Yes updates. No changes nothing."], q)
+    ck("…and the same with while_running true",
+       C.update_question(dict(plan, while_running=True)).split("\n\n")[1] == q[1])
+    ck("no question when aht gave no answer, refuses, or names no command",
+       [C.update_refusal(x) for x in (None, {}, [1], "x", {"how": "winget"})] == [C.NO_ANSWER] * 5
+       and C.NO_ANSWER == "aht gave no answer — see the log (Settings)."
+       and C.NOT_UPDATED == "Claude Code was not updated"
+       and C.update_refusal({"command": ["x"], "blockers": ["one", "two"]}) == "one\n\ntwo"
+       and C.update_refusal(plan) is None)
+    ck("the result: nothing to say when all went well (the core's notice says it)",
+       C.update_problems({"applied": True, "updated": True, "before": "2.1.0", "after": "2.2.0",
+                          "blockers": [], "warnings": [],
+                          "restart": {"restarted": ["a"], "failed": [], "not_waited": []}}) is None
+       and C.update_problems({"applied": True, "updated": False, "restart": None}) is None)
+    ck("…no answer at all is said",
+       [C.update_problems(x) for x in (None, {}, [], "x")] == [(C.NOT_UPDATED, C.NO_ANSWER)] * 4)
+    ck("…a refusal, under “was not updated”",
+       C.update_problems({"applied": False, "updated": False, "blockers": ["a restart or an update "
+                          "of Claude Code is already under way"]})
+       == ("Claude Code was not updated",
+           "a restart or an update of Claude Code is already under way"))
+    ck("…updated, yet not every session came back: the warnings and each session with why",
+       C.update_problems({"applied": True, "updated": True, "after": "2.2.0", "blockers": [],
+                          "warnings": ["w1"],
+                          "restart": {"restarted": ["a"], "failed": [{"session": "b", "why": "y"}],
+                                      "not_waited": ["c"]}})
+       == ("Claude Code updated to 2.2.0",
+           "w1\n\nb: y\n\nc: it was still working, so aht left it as it is"))
+
+    print("\n[a second click]")
+    # the corner without its window: nothing is drawn, a thread's work runs
+    # at once, and what it hands to the window's thread waits in `handed`
+    if not hasattr(C, "WNDPROC"):
+        C.WNDPROC = lambda fn: fn
+    handed, asked, told, noted, calls = [], [], [], [], []
+
+    class Quiet(C.Corner):
+        def place(self, force=False):
+            pass
+
+        def post(self, fn):
+            handed.append(fn)
+
+    class Inline:
+        def __init__(self, target, daemon=None):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    def ask(title, text, no_default=False):
+        # the question is open: what the menu says now, and a second click
+        asked.append((title, no_default, c.items()[2]))
+        c.restart_workspace()
+        return answers.pop(0)
+
+    def restart_older(apply=False, every=False):
+        calls.append(("apply" if apply else "plan", every))
+        if isinstance(plans[0], Exception):
+            raise plans.pop(0)
+        return plans.pop(0)
+
+    def looked(what, **kw):
+        calls.append(what)
+        return {"blockers": ["not now"]}
+
+    live[:] = []
+    m.note = None
+    c = Quiet(m, {"ask": ask, "tell": lambda t, x: told.append((t, x)),
+                  "note": lambda what, e: noted.append((what, type(e).__name__))}, run)
+    kept = (C.threading, aht.restart_older, aht.branch_session, aht.send_session)
+    C.threading = types.SimpleNamespace(Thread=Inline, Lock=threading.Lock)
+    aht.restart_older = restart_older
+    aht.branch_session = lambda pid, *a, **kw: looked(("branch", pid))
+    aht.send_session = lambda pid, to, **kw: looked(("send", pid, to))
+    GREY = ("Restart Workspace (under way)", None, False)
+    try:
+        plans = [{"installed": "2.1.0", "now": ["a", "b"], "after": ["c"], "left_out": []},
+                 {"applied": True, "restarted": ["a", "b"], "not_waited": ["c"],
+                  "failed": []}]
+        answers = [True]
+        c.restart_workspace()
+        ck("Restart Workspace: while it looks at the sessions the menu shows it under way",
+           c.items()[2] == GREY and c.items(idle)[-3] == GREY
+           and m.note == "Looking at the open sessions…", (c.items(), m.note))
+        c.restart_workspace()
+        ck("…and a second click does nothing", len(handed) == 1 and calls == [("plan", True)],
+           (len(handed), calls))
+        handed.pop(0)()
+        ck("…nor one while its question is open; No is what Enter presses",
+           asked == [("Restart Workspace", True, GREY)] and calls == [("plan", True), ("apply", True)],
+           (asked, calls))
+        ck("…then it restarts: its note stays, however long a working session takes",
+           c.restarting and c.items()[2] == GREY
+           and m.note == "Restarting the workspace: 3 sessions…", (c.restarting, m.note))
+        clock.t += 3 * 3600
+        c.tick()
+        c.restart_workspace()
+        ck("…hours later too, and it is still not offered again",
+           m.note == "Restarting the workspace: 3 sessions…" and len(handed) == 1, m.note)
+        c.say("Workspace saved: 1 tab, 3 sessions")
+        clock.t += 9
+        c.tick()
+        ck("…and it comes back after another action's note",
+           m.note == "Restarting the workspace: 3 sessions…", m.note)
+        handed.pop(0)()
+        ck("…the result: how many of how many, and which did not, in a message and the log",
+           not c.restarting and m.note == "Workspace restarted: 2 of 3 sessions"
+           and told == [("Not every session restarted",
+                         "c: it was still working, so aht left it as it is")]
+           and len(noted) == 1 and "c: it was still working" in noted[0][0]
+           and c.items()[2] == ("Restart Workspace…", "restart-workspace", False),
+           (m.note, told, noted))
+        clock.t += 21
+        c.tick()
+        ck("…a note that then goes, as any other", m.note is None, m.note)
+
+        plans = [{"now": ["a"], "after": [], "left_out": []}]
+        answers = [False]
+        c.restart_workspace()
+        handed.pop(0)()
+        ck("No: nothing restarts, and it is offered again",
+           not c.restarting and not c.looking and not handed and m.note is None
+           and c.items()[2][1] == "restart-workspace", (c.restarting, c.looking, m.note))
+        plans = [{"now": [], "after": [], "left_out": [{"session": "a", "why": "w"}]}]
+        c.restart_workspace()
+        handed.pop(0)()
+        ck("no session to restart: said, and offered again",
+           m.note == "No session to restart: a (w)" and not c.looking and len(asked) == 2,
+           (m.note, c.looking))
+        plans = [RuntimeError("boom")]
+        c.restart_workspace()
+        handed.pop(0)()
+        ck("the look ahead failed: said, noted, and offered again",
+           m.note == "Workspace not restarted: RuntimeError: boom" and not c.looking
+           and noted[-1] == ("the corner's Restart Workspace failed", "RuntimeError"),
+           (m.note, noted))
+        plans = [{"now": ["a"], "after": [], "left_out": []}, RuntimeError("bang")]
+        answers = [True]
+        c.restart_workspace()
+        handed.pop(0)()
+        handed.pop(0)()
+        ck("the restart failed: said, and offered again",
+           m.note == "Workspace not restarted: RuntimeError: bang" and not c.restarting
+           and not c.looking and len(told) == 1, (m.note, c.restarting))
+
+        del calls[:]
+        row = C.Row(id="s", pid=5, name="n", kind="here", status="idle", state="idle")
+        other = C.Row(id="t", pid=6, name="o", kind="here", status="idle", state="idle")
+        c.branch(row)
+        c.branch(row)
+        c.branch(other)
+        ck("Branch: a second click while it gets ready does nothing; another session's does",
+           calls == [("branch", "5"), ("branch", "6")] and len(handed) == 2, calls)
+        handed.pop(0)()
+        handed.pop(0)()
+        said = m.note
+        c.branch(row)
+        ck("…why it cannot branch is said, and Branch is there again",
+           said == "o: not now" and calls[-1] == ("branch", "5") and len(handed) == 1,
+           (said, calls))
+        handed.pop(0)()
+        del calls[:]
+        c.send(row, "homebox")
+        c.send(row, "homebox")
+        c.send(row, "pc")
+        ck("Send to: one look ahead for a session, whatever is clicked meanwhile",
+           calls == [("send", "5", "homebox")] and len(handed) == 1, calls)
+        handed.pop(0)()
+        ck("…why it cannot go is told, and Send is there again",
+           told[-1] == ("“n” cannot go to homebox now", "not now") and not c.looking
+           and m.note is None, (told[-1], c.looking, m.note))
+    finally:
+        C.threading, aht.restart_older, aht.branch_session, aht.send_session = kept
 
     print("\n[send to]")
     q = C.send_question({"label": "paper", "to": "homebox", "project": "C:\\w\\paper",

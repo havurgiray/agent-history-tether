@@ -359,7 +359,8 @@ def list_items(restarting: bool = False) -> list:
     """What every right-click on the list ends with, and all that one beside
     the sessions offers, for the workspace (the terminal's tabs with their
     sessions): saved now, a saved one opened again, every session started
-    again in its tab; and the list hidden."""
+    again in its tab; and the list hidden.  `restarting`: a restart, its look
+    ahead or its question is under way, so it is not offered a second time."""
     return [("Save Workspace Now", "save-workspace", False),
             ("Restore Workspace…", "workspaces", False),
             ("Restart Workspace (under way)", None, False) if restarting else
@@ -385,11 +386,11 @@ def menu_items(r: Row, machines: list, restarting: bool = False) -> list:
     out = [("Go to Tab", "goto", True), ("Branch…" + later, None if busy else "branch", False),
            "-", ("Back Up This Project Now", "backup-now", False),
            ("Backups of This Project…", "backups", False)]
+    out.append("-")                     # sending is not a backup: a group of its own
     if machines:
-        out.append("-")
         out += [(f"Send to {m}…" + later, None if busy else "send:" + m, False) for m in machines]
     else:
-        out.append(("Send to Another Machine (add one in aht's window first)", None, False))
+        out.append(("Send to Another Machine (add one in the Machines tab first)", None, False))
     return out + ["-"] + rest
 
 
@@ -403,7 +404,7 @@ def restart_question(plan: dict):
     now, after = plan.get("now") or [], plan.get("after") or []
     if not (now or after):
         return None
-    lines = ["Restart every open Claude session in its tab?", "",
+    lines = ["Restart the open Claude sessions in their tabs?", "",
              "aht ends each session and starts it again in the same tab, where it left off, "
              "with the options it had. It then runs the Claude Code installed now"
              + (f" ({plan['installed']})" if plan.get("installed") else "")
@@ -411,11 +412,17 @@ def restart_question(plan: dict):
     if now:
         lines += ["", "At once: " + ", ".join(now)]
     if after:
-        lines += ["", "Once their task is over: " + ", ".join(after)]
-    left = [f"{x.get('session')} ({x.get('why')})" for x in plan.get("left_out") or []]
+        lines += ["", "Once they are idle: " + ", ".join(after)]
+    left = _left_out(plan)
     if left:
-        lines += ["", "Left as they are: " + "; ".join(left)]
+        lines += ["", "Left as they are: " + left]
+    lines += ["", "Yes restarts them. No leaves every session as it is."]
     return "\n".join(lines)
+
+
+def _left_out(plan: dict) -> str:
+    """The sessions a restart leaves as they are, each with why."""
+    return "; ".join(f"{x.get('session')} ({x.get('why')})" for x in plan.get("left_out") or [])
 
 
 def nothing_to_restart(plan: dict) -> str:
@@ -425,20 +432,91 @@ def nothing_to_restart(plan: dict) -> str:
     left = plan.get("left_out") or []
     if not left:
         return "No open session to restart"
-    return ("No session to restart: " + left[0].get("session", "") + " " + left[0].get("why", "")
+    why = left[0].get("why")
+    return ("No session to restart: " + str(left[0].get("session") or "") + (f" ({why})" if why else "")
             + (f", and {len(left) - 1} more" if len(left) > 1 else ""))
 
 
 def restarted_text(res: dict) -> str:
-    """What Restart Workspace says under the top line once it is through."""
+    """What Restart Workspace says under the top line once it is through:
+    how many restarted, of how many (restart_problems() has which did not)."""
     if res.get("blockers"):
         return "Workspace not restarted: " + res["blockers"][0]
     done = len(res.get("restarted") or [])
-    not_done = [x.get("session", "") for x in res.get("failed") or []] + list(res.get("not_waited") or [])
-    t = "Workspace restarted: " + _count(done, "session")
-    if not_done:
-        t += "; not " + ", ".join(not_done[:3]) + (f" and {len(not_done) - 3} more" if len(not_done) > 3 else "")
-    return t
+    total = done + len(res.get("failed") or []) + len(res.get("not_waited") or [])
+    if total == done:
+        return "Workspace restarted: " + _count(done, "session")
+    return f"Workspace restarted: {done} of " + _count(total, "session")
+
+
+def restart_problems(res: dict):
+    """The sessions a restart did not restart, each with why, a paragraph
+    each; None when every one restarted."""
+    out = [f"{x.get('session')}: {x.get('why')}" for x in res.get("failed") or []]
+    out += [f"{name}: it was still working, so aht left it as it is"
+            for name in res.get("not_waited") or []]
+    return "\n\n".join(out) or None
+
+
+NOT_UPDATED = "Claude Code was not updated"
+NO_ANSWER = "aht gave no answer — see the log (Settings)."
+
+
+def update_refusal(plan):
+    """Why Update Claude Code… cannot ask its question, from what `aht update
+    --claude --json` answered (None when it printed nothing a program can
+    read); None when it can ask."""
+    if not plan or not isinstance(plan, dict):
+        return NO_ANSWER
+    if plan.get("blockers"):
+        return "\n\n".join(str(b) for b in plan["blockers"])
+    return None if plan.get("command") else NO_ANSWER
+
+
+def update_question(plan: dict) -> str:
+    """What the confirmation of Update Claude Code… says, from the dry run of
+    `aht update --claude`.  Its buttons are Yes and No."""
+    how = plan.get("how") or "its installer"
+    r = plan.get("restart") or {}
+    out = ["aht updates Claude Code " + (f"{plan['before']} " if plan.get("before") else "")
+           + f"with {how}, the way it was installed."]
+    if plan.get("while_running") is False:
+        # an installer's name stays as it is written (winget); the stand-in starts the sentence
+        out.append(f"{how if plan.get('how') else 'Its installer'} cannot replace "
+                   "Claude Code while it runs, so every open Claude session ends first, once it "
+                   "is idle, and starts again in its tab after the update, where it left off, "
+                   "with the options it had. Anything typed into a session but not sent is lost.")
+    else:
+        out.append("If that brings a newer version, every open Claude session ends and starts "
+                   "again in its tab, where it left off, with the options it had: an idle one "
+                   "at once, a working one once it is idle. Anything typed into a session but "
+                   "not sent is lost.")
+    names = list(r.get("now") or []) + list(r.get("after") or [])
+    if names:
+        out.append("Sessions: " + ", ".join(str(x) for x in names))
+    left = _left_out(r)
+    if left:
+        out.append("Left as they are: " + left)
+    out += ["A notice says when it is done.", "Yes updates. No changes nothing."]
+    return "\n\n".join(out)
+
+
+def update_problems(res):
+    """What went wrong in `aht update --claude --apply`, from what it
+    answered: (title, text) for a message, or None when nothing did (the
+    core's notice then says it is done)."""
+    if not res or not isinstance(res, dict):
+        return NOT_UPDATED, NO_ANSWER
+    lines = [str(x) for x in (res.get("blockers") or []) + (res.get("warnings") or [])]
+    restart = res.get("restart")
+    left = restart_problems(restart if isinstance(restart, dict) else {})
+    if left:
+        lines.append(left)
+    if not lines:
+        return None
+    title = (f"Claude Code updated to {res['after']}" if res.get("after") else "Claude Code updated") \
+        if res.get("updated") is True else NOT_UPDATED
+    return title, "\n\n".join(lines)
 
 
 def saved_text(res: dict) -> str:
@@ -587,7 +665,7 @@ if os.name == "nt":
             ("EnableWindow", W.BOOL, [H, W.BOOL]), ("SetFocus", H, [H]),
             ("GetWindowTextW", ctypes.c_int, [H, W.LPWSTR, ctypes.c_int]),
             ("GetWindowTextLengthW", ctypes.c_int, [H]),
-            ("IsWindow", W.BOOL, [H])):
+            ("IsWindow", W.BOOL, [H]), ("PostQuitMessage", None, [ctypes.c_int])):
         f = getattr(_u, fn)
         f.restype, f.argtypes = res, args
     try:
@@ -640,6 +718,7 @@ TPM_RIGHTBUTTON, TPM_RETURNCMD, TPM_NONOTIFY = 0x2, 0x100, 0x80
 SM_CXDRAG, SM_CYDRAG = 68, 69
 TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH, TTM_ACTIVATE = WM_USER + 50, WM_USER + 51, \
     WM_USER + 24, WM_USER + 1
+TTM_NEWTOOLRECTW, TTM_UPDATETIPTEXTW = WM_USER + 52, WM_USER + 57
 TTS_ALWAYSTIP, TTS_NOPREFIX, TTF_SUBCLASS = 0x1, 0x2, 0x10
 ES_AUTOHSCROLL, BS_DEFPUSHBUTTON, BS_PUSHBUTTON = 0x80, 0x1, 0x0
 EM_SETSEL = 0xB1
@@ -701,10 +780,13 @@ class Painter:
         for f in (self.text, self.bold, self.small, self.head, self.icons, self.x):
             _g.DeleteObject(f)
 
+    # Windows counts a text in UTF-16 units, Python in characters: an emoji is
+    # two units, so len(text) would leave the last letter of its name out.
+    # DrawTextW takes -1 (up to the text's end); the measure takes the units
     def measure(self, dc, font, text) -> int:
         old = _g.SelectObject(dc, font)
         sz = SIZE()
-        _g.GetTextExtentPoint32W(dc, text, len(text), ctypes.byref(sz))
+        _g.GetTextExtentPoint32W(dc, text, len(text.encode("utf-16-le")) // 2, ctypes.byref(sz))
         _g.SelectObject(dc, old)
         return sz.cx
 
@@ -723,13 +805,13 @@ class Painter:
         old = _g.SelectObject(dc, font)
         _g.SetTextColor(dc, rgb(color))
         r = W.RECT(*rect)
-        _u.DrawTextW(dc, text, len(text), ctypes.byref(r), flags | DT_NOPREFIX)
+        _u.DrawTextW(dc, text, -1, ctypes.byref(r), flags | DT_NOPREFIX)
         _g.SelectObject(dc, old)
 
     def wrapped_height(self, dc, font, text, width) -> int:
         old = _g.SelectObject(dc, font)
         r = W.RECT(0, 0, width, 0)
-        _u.DrawTextW(dc, text, len(text), ctypes.byref(r), DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX)
+        _u.DrawTextW(dc, text, -1, ctypes.byref(r), DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX)
         _g.SelectObject(dc, old)
         return r.bottom
 
@@ -859,8 +941,9 @@ def snapshot(m: Model, path: str, dark: bool = False, width: int = 260, most: in
 
 class Corner:
     """The list's window.  `hooks`: what the tray lends it — open_window(path,
-    do), switch_off(), ask(title, text) -> bool, tell(title, text),
-    note(what, exc) for its log."""
+    do), switch_off(), ask(title, text, no_default=False) -> bool (Yes or No;
+    No is the button Enter presses when no_default), tell(title, text),
+    note(what, exc) for its log (exc None: `what` alone)."""
 
     def __init__(self, model: Model, hooks: dict, run_dir):
         self.m, self.hooks = model, hooks
@@ -875,6 +958,10 @@ class Corner:
         self.tracking = False
         self.held = None
         self.restarting = False         # Restart Workspace under way
+        self.restart_note = None        # … and what the list says of it until it is through
+        # the actions whose look ahead or question is open: "restart",
+        # ("branch", pid), ("send", pid).  A second click on one does nothing
+        self.looking = set()
         self.queue = []
         self.lock = threading.Lock()
         self.width, self.most, self.spot = 260, 12, None
@@ -978,6 +1065,7 @@ class Corner:
         w, h = self._layout()["size"]
         if not force and old == (w, h):
             _u.InvalidateRect(self.hwnd, None, False)
+            self._tips()                # the same size, yet other rows: reordered, renamed
             return
         if self.spot:
             wa = self._work_area(self.spot)
@@ -1018,30 +1106,48 @@ class Corner:
         return e
 
     def _tips(self):
-        """A note over each session, the top line and the ×."""
+        """A note over each session, the top line and the ×.  Only what
+        changed is told to the tooltip, in place: a note that shows stays
+        up, and follows its session's text."""
         if not self.tip or not self.lay:
             return
-        for i in range(len(self.tips)):
-            ti = TOOLINFOW(ctypes.sizeof(TOOLINFOW), 0, self.hwnd, i + 1)
-            _u.SendMessageW(self.tip, TTM_DELTOOLW, 0, ctypes.addressof(ti))
         corner = "its top" if self.spot is None else "its bottom"
         items = [(self.lay["close"], "Hide the list (the aht tray menu brings it back)"),
                  (self.lay["head"], "Drag the list anywhere, its sides to change its width, "
                                     f"or {corner} to list more or fewer sessions; double-click "
                                     "this line to put it back in the corner; right-click "
                                     "to save, restore or restart the workspace")]
-        items += [(rect, tip_text(r)) for r, rect in self.lay["rows"]]
-        self.tips = []
+        items += [(tuple(rect), tip_text(r)) for r, rect in self.lay["rows"]]
+        was = self.tips
+        if items == was:
+            return
         for i, (rect, text) in enumerate(items):
+            old = was[i] if i < len(was) else None
+            if old == (rect, text):
+                continue
             buf = ctypes.create_unicode_buffer(text)
-            self.tips.append(buf)
             ti = TOOLINFOW(ctypes.sizeof(TOOLINFOW), TTF_SUBCLASS, self.hwnd, i + 1, W.RECT(*rect),
                            None, ctypes.cast(buf, ctypes.c_wchar_p), 0)
-            _u.SendMessageW(self.tip, TTM_ADDTOOLW, 0, ctypes.addressof(ti))
+            if old is None:
+                _u.SendMessageW(self.tip, TTM_ADDTOOLW, 0, ctypes.addressof(ti))
+                continue
+            if old[1] != text:
+                _u.SendMessageW(self.tip, TTM_UPDATETIPTEXTW, 0, ctypes.addressof(ti))
+            if old[0] != rect:
+                _u.SendMessageW(self.tip, TTM_NEWTOOLRECTW, 0, ctypes.addressof(ti))
+        for i in range(len(items), len(was)):
+            ti = TOOLINFOW(ctypes.sizeof(TOOLINFOW), 0, self.hwnd, i + 1)
+            _u.SendMessageW(self.tip, TTM_DELTOOLW, 0, ctypes.addressof(ti))
+        self.tips = items
 
     # -- what happens -------------------------------------------------------
     def tick(self):
-        if self.m.poll():
+        changed = self.m.poll()
+        if self.restart_note and not self.m.note:
+            # another note took its place and went: a restart can wait hours
+            self.m.say(self.restart_note, float("inf"))
+            changed = True
+        if changed:
             self.place()
 
     def _row_at(self, x, y):
@@ -1106,23 +1212,55 @@ class Corner:
         elif what.startswith("send:"):
             self.send(r, what[5:])
 
+    def _ahead(self, key, note, secs, look, answer, what):
+        """An action's look ahead: `look()` aside (it asks the terminal or
+        another machine), `note` under the top line meanwhile, then
+        `answer(what it found)` on the window's thread.  `key` is in
+        self.looking until `answer` returns, so a second click while the look
+        ahead runs or its question is open does nothing: no second question."""
+        if key in self.looking:
+            return
+        self.looking.add(key)
+
+        def over(res):
+            try:
+                self._unsay(note)
+                answer(res)
+            finally:
+                self.looking.discard(key)
+
+        def run():
+            try:
+                res = look()
+            except Exception as e:
+                self.hooks["note"](what, e)
+                res = {"blockers": [f"{type(e).__name__}: {e}"]}
+            self.post(lambda: over(res))
+        try:
+            self.say(note, secs)
+            threading.Thread(target=run, daemon=True).start()
+        except Exception:
+            self.looking.discard(key)
+            raise
+
+    def _unsay(self, note):
+        """Take a note away, if it still is the one that shows (another
+        action's may have taken its place)."""
+        if self.m.note == note:
+            self.m.note = None
+            self.place()
+
     def branch(self, r: Row):
         """Branch…: its look ahead asks the terminal (PowerShell), so it runs
-        aside; the name box then opens on the window's thread."""
-        self.say(f"Getting “{r.name}” ready to branch…", 60)
-
-        def look():
-            try:
-                dry = aht.branch_session(str(r.pid))
-            except Exception as e:
-                self.hooks["note"]("the corner's Branch failed", e)
-                dry = {"blockers": [f"{type(e).__name__}: {e}"]}
-            self.post(lambda: self._branch_name(r, dry))
-        threading.Thread(target=look, daemon=True).start()
+        aside; the name box then opens on the window's thread.  One name box
+        at a time: with one open, that one comes to the front."""
+        if ask_front():
+            return
+        self._ahead(("branch", r.pid), f"Getting “{r.name}” ready to branch…", 60,
+                    lambda: aht.branch_session(str(r.pid)),
+                    lambda dry: self._branch_name(r, dry), "the corner's Branch failed")
 
     def _branch_name(self, r: Row, dry: dict):
-        self.m.note = None
-        self.place()
         if dry.get("blockers"):
             self.say(f"{r.name}: {dry['blockers'][0]}")
             return
@@ -1137,32 +1275,30 @@ class Corner:
     def restart_workspace(self):
         """Restart Workspace…: the look ahead aside (it asks the terminal),
         then the question, then every session ends and starts again in its
-        tab: an idle one now, a working one once its task is over."""
+        tab: an idle one now, a working one once it is idle."""
         if self.restarting:
             return
-        self.say("Looking at the open sessions…", 60)
-
-        def look():
-            try:
-                plan = aht.restart_older(every=True)
-            except Exception as e:
-                self.hooks["note"]("the corner's Restart Workspace failed", e)
-                plan = {"blockers": [f"{type(e).__name__}: {e}"]}
-            self.post(lambda: self._restart_answer(plan))
-        threading.Thread(target=look, daemon=True).start()
+        self._ahead("restart", "Looking at the open sessions…", 60,
+                    lambda: aht.restart_older(every=True), self._restart_answer,
+                    "the corner's Restart Workspace failed")
 
     def _restart_answer(self, plan: dict):
-        self.m.note = None
-        self.place()
         q = restart_question(plan)
         if q is None:
             self.say(nothing_to_restart(plan))
             return
-        if self.restarting or not self.hooks["ask"]("Restart Workspace", q):
+        if self.restarting:
+            return
+        yes = self.hooks["ask"]("Restart Workspace", q, no_default=True)
+        # the question's own loop runs what else was handed to this thread:
+        # look again now that it is answered
+        if not yes or self.restarting:
             return
         self.restarting = True
-        self.say("Restarting the workspace: " + _count(len(plan.get("now") or [])
-                 + len(plan.get("after") or []), "session") + "…", 30)
+        # it stays until the result: a working session is waited for, hours if need be
+        self.restart_note = ("Restarting the workspace: " + _count(
+            len(plan.get("now") or []) + len(plan.get("after") or []), "session") + "…")
+        self.say(self.restart_note, float("inf"))
 
         def go():
             try:
@@ -1170,12 +1306,23 @@ class Corner:
             except Exception as e:
                 self.hooks["note"]("the corner's Restart Workspace failed", e)
                 res = {"blockers": [f"{type(e).__name__}: {e}"]}
+            self.post(lambda: self._restarted(res))
+        try:
+            threading.Thread(target=go, daemon=True).start()
+        except Exception:
+            self._restarted({"blockers": ["the restart could not start"]})
+            raise
 
-            def done():
-                self.restarting = False
-                self.say(restarted_text(res), 20)
-            self.post(done)
-        threading.Thread(target=go, daemon=True).start()
+    def _restarted(self, res: dict):
+        """Restart Workspace is through: how many restarted under the top
+        line; which did not, and why, in a message and in the log."""
+        self.restarting, self.restart_note = False, None
+        self.say(restarted_text(res), 20)
+        left = restart_problems(res)
+        if left:
+            self.hooks["note"]("Restart Workspace did not restart every session: "
+                               + left.replace("\n\n", "; "), None)
+            self.hooks["tell"]("Not every session restarted", left)
 
     def save_workspace(self):
         """Save Workspace Now: how much it holds, under the top line."""
@@ -1212,21 +1359,11 @@ class Corner:
         threading.Thread(target=go, daemon=True).start()
 
     def send(self, r: Row, to: str):
-        self.say(f"Checking {to} for “{r.name}”…", 300)
-        self.place()
-
-        def look():
-            try:
-                res = aht.send_session(str(r.pid), to)
-            except Exception as e:
-                self.hooks["note"]("the corner's Send to failed", e)
-                res = {"blockers": [f"{type(e).__name__}: {e}"]}
-            self.post(lambda: self._send_answer(r, to, res))
-        threading.Thread(target=look, daemon=True).start()
+        self._ahead(("send", r.pid), f"Checking {to} for “{r.name}”…", 300,
+                    lambda: aht.send_session(str(r.pid), to),
+                    lambda res: self._send_answer(r, to, res), "the corner's Send to failed")
 
     def _send_answer(self, r, to, res):
-        self.m.note = None
-        self.place()
         if res.get("blockers"):
             self.hooks["tell"](f"“{r.name}” cannot go to {to} now",
                                "\n\n".join(res["blockers"]))
@@ -1257,10 +1394,16 @@ class Corner:
         self.m.say(text, secs)
         self.place()
 
+    def items(self, r=None) -> list:
+        """What the right-click menu holds: a session's, or (r None) the
+        list's own.  Restart Workspace is not offered while one runs, or
+        while its look ahead or its question is open."""
+        busy = self.restarting or "restart" in self.looking
+        return menu_items(r, self.m.machines, busy) if r else list_items(busy)
+
     def menu(self, r=None):
         """The right-click menu: a session's, or (r None) the list's own."""
-        items = (menu_items(r, self.m.machines, self.restarting) if r
-                 else list_items(self.restarting))
+        items = self.items(r)
         h = _u.CreatePopupMenu()
         acts, default = {}, None
         for i, it in enumerate(items, 1):
@@ -1431,7 +1574,10 @@ class Corner:
                 with self.lock:
                     todo, self.queue = self.queue, []
                 for fn in todo:
-                    fn()
+                    try:
+                        fn()
+                    except Exception as e:      # the rest still runs: it may end a look ahead
+                        self.hooks["note"]("the session corner's handed-over work", e)
                 return 0
             if msg in (WM_DPICHANGED, WM_SETTINGCHANGE, WM_DISPLAYCHANGE):
                 self._painter()
@@ -1446,38 +1592,57 @@ class Corner:
         return _u.DefWindowProcW(hwnd, msg, wp, lp)
 
 
-def ask_text(owner, title: str, prompt: str, value: str, ok: str, s: float = 1.0):
-    """A small window that asks for one line of text: what was typed, or None
-    for Cancel."""
-    hinst = _k.GetModuleHandleW(None)
-    got = {"text": None, "done": False}
-    ctl = {}
+ASK_CLASS = "aht_corner_ask"
+_asking = {}            # the name box that is open: {its window: what it holds}
+_ask_proc = None        # its window procedure: made once, kept as long as the tray runs
 
-    def proc(hwnd, msg, wp, lp):
+
+def _ask_wndproc(hwnd, msg, wp, lp):
+    """Every name box's window procedure.  The class is registered once, so
+    it must not be one call's own: what a box holds is found by its window."""
+    st = _asking.get(hwnd)
+    if st is not None:
         if msg == WM_COMMAND and (wp & 0xFFFF) in (IDOK, IDCANCEL):
             if (wp & 0xFFFF) == IDOK:
-                n = _u.GetWindowTextLengthW(ctl["edit"])
+                n = _u.GetWindowTextLengthW(st["edit"])
                 buf = ctypes.create_unicode_buffer(n + 1)
-                _u.GetWindowTextW(ctl["edit"], buf, n + 1)
-                got["text"] = buf.value.strip() or None
-            got["done"] = True
+                _u.GetWindowTextW(st["edit"], buf, n + 1)
+                st["text"] = buf.value.strip() or None
+            st["done"] = True
             return 0
         if msg == WM_CLOSE:
-            got["done"] = True
+            st["done"] = True
             return 0
-        return _u.DefWindowProcW(hwnd, msg, wp, lp)
+    return _u.DefWindowProcW(hwnd, msg, wp, lp)
 
-    wproc = WNDPROC(proc)
-    wc = WNDCLASSW()
-    wc.lpfnWndProc = wproc
-    wc.hInstance = hinst
-    wc.hCursor = _u.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
-    wc.hbrBackground = ctypes.c_void_p(16)          # COLOR_BTNFACE + 1
-    wc.lpszClassName = "aht_corner_ask"
-    _u.RegisterClassW(ctypes.byref(wc))
+
+def ask_front() -> bool:
+    """Whether a name box is open; it then comes to the front."""
+    for hwnd in list(_asking):
+        _u.SetForegroundWindow(hwnd)
+        return True
+    return False
+
+
+def ask_text(owner, title: str, prompt: str, value: str, ok: str, s: float = 1.0):
+    """A small window that asks for one line of text: what was typed, or None
+    for Cancel.  One at a time: while one is open a second call brings that
+    one to the front and returns None."""
+    global _ask_proc
+    if ask_front():
+        return None
+    hinst = _k.GetModuleHandleW(None)
+    if _ask_proc is None:
+        _ask_proc = WNDPROC(_ask_wndproc)
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = _ask_proc
+        wc.hInstance = hinst
+        wc.hCursor = _u.LoadCursorW(None, ctypes.c_void_p(IDC_ARROW))
+        wc.hbrBackground = ctypes.c_void_p(16)      # COLOR_BTNFACE + 1
+        wc.lpszClassName = ASK_CLASS
+        _u.RegisterClassW(ctypes.byref(wc))
     px = lambda v: round(v * s)                     # noqa: E731
     w, h = px(420), px(170)
-    wa = W.RECT()
     pt = W.POINT()
     _u.GetCursorPos(ctypes.byref(pt))
     mon = _u.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
@@ -1486,37 +1651,56 @@ def ask_text(owner, title: str, prompt: str, value: str, ok: str, s: float = 1.0
     _u.GetMonitorInfoW(mon, ctypes.byref(mi))
     wa = mi.rcWork
     x, y = (wa.left + wa.right - w) // 2, (wa.top + wa.bottom - h) // 2
-    dlg = _u.CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "aht_corner_ask", title,
+    dlg = _u.CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, ASK_CLASS, title,
                              WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, w, h, None, None, hinst, None)
+    if not dlg:
+        aht.warn(f"CORNER the name box did not open (error {ctypes.get_last_error()})")
+        return None
+    st = _asking[dlg] = {"text": None, "done": False, "edit": None}
     font = _g.CreateFontW(-px(12), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI")
-    m = px(14)
-    cw = w - 2 * m - px(6)
-    ctl["text"] = _u.CreateWindowExW(0, "STATIC", prompt, WS_CHILD | WS_VISIBLE, m, m, cw, px(44),
-                                     dlg, None, hinst, None)
-    ctl["edit"] = _u.CreateWindowExW(WS_EX_CLIENTEDGE, "EDIT", value,
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                     m, m + px(50), cw, px(24), dlg, None, hinst, None)
-    bw, bh = px(88), px(26)
-    by = m + px(86)
-    ctl["ok"] = _u.CreateWindowExW(0, "BUTTON", ok, WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+    quit_code = None
+    try:
+        m = px(14)
+        cw = w - 2 * m - px(6)
+        ctl = [_u.CreateWindowExW(0, "STATIC", prompt, WS_CHILD | WS_VISIBLE, m, m, cw, px(44),
+                                  dlg, None, hinst, None)]
+        st["edit"] = _u.CreateWindowExW(WS_EX_CLIENTEDGE, "EDIT", value,
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                        m, m + px(50), cw, px(24), dlg, None, hinst, None)
+        bw, bh = px(88), px(26)
+        by = m + px(86)
+        ctl += [st["edit"],
+                _u.CreateWindowExW(0, "BUTTON", ok, WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                                    BS_DEFPUSHBUTTON, m + cw - 2 * bw - px(8), by, bw, bh, dlg,
-                                   ctypes.c_void_p(IDOK), hinst, None)
-    ctl["cancel"] = _u.CreateWindowExW(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-                                       BS_PUSHBUTTON, m + cw - bw, by, bw, bh, dlg,
-                                       ctypes.c_void_p(IDCANCEL), hinst, None)
-    for c in ctl.values():
-        _u.SendMessageW(c, WM_SETFONT, font or 0, 1)
-    _u.ShowWindow(dlg, 5)
-    _u.SetForegroundWindow(dlg)
-    _u.SetFocus(ctl["edit"])
-    _u.SendMessageW(ctl["edit"], EM_SETSEL, 0, -1)
-    msg = W.MSG()
-    while not got["done"] and _u.IsWindow(dlg) and _u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-        if not _u.IsDialogMessageW(dlg, ctypes.byref(msg)):
-            _u.TranslateMessage(ctypes.byref(msg))
-            _u.DispatchMessageW(ctypes.byref(msg))
-    if _u.IsWindow(dlg):
-        _u.DestroyWindow(dlg)
-    if font:
-        _g.DeleteObject(font)
-    return got["text"]
+                                   ctypes.c_void_p(IDOK), hinst, None),
+                _u.CreateWindowExW(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                   BS_PUSHBUTTON, m + cw - bw, by, bw, bh, dlg,
+                                   ctypes.c_void_p(IDCANCEL), hinst, None)]
+        for c in ctl:
+            _u.SendMessageW(c, WM_SETFONT, font or 0, 1)
+        _u.ShowWindow(dlg, 5)
+        _u.SetForegroundWindow(dlg)
+        _u.SetFocus(st["edit"])
+        _u.SendMessageW(st["edit"], EM_SETSEL, 0, -1)
+        msg = W.MSG()
+        while not st["done"] and _u.IsWindow(dlg):
+            got = _u.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if got == 0:                    # the tray was told to quit while the box is open
+                quit_code = int(msg.wParam) & 0x7FFFFFFF
+                break
+            if got < 0:
+                break
+            if not _u.IsDialogMessageW(dlg, ctypes.byref(msg)):
+                _u.TranslateMessage(ctypes.byref(msg))
+                _u.DispatchMessageW(ctypes.byref(msg))
+    finally:
+        _asking.pop(dlg, None)
+        if _u.IsWindow(dlg):
+            _u.DestroyWindow(dlg)
+        if font:
+            _g.DeleteObject(font)
+        if quit_code is not None:
+            # this loop took the quit that was meant for the tray's own: hand
+            # it on, or the tray would stay, with no icon
+            _u.PostQuitMessage(quit_code)
+    return st["text"]

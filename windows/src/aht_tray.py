@@ -72,6 +72,7 @@ NIIF_INFO = 0x1
 MB_OK, MB_YESNO, MB_ICONINFORMATION, MB_ICONQUESTION = 0x0, 0x4, 0x40, 0x20
 MB_OKCANCEL, MB_YESNOCANCEL, MB_ICONWARNING = 0x1, 0x3, 0x30
 MB_SETFOREGROUND, MB_TOPMOST = 0x10000, 0x40000
+MB_DEFBUTTON2 = 0x100                           # Enter presses the second button (No)
 IDOK, IDCANCEL, IDYES = 1, 2, 6
 ERROR_ALREADY_EXISTS = 183
 
@@ -526,7 +527,9 @@ def _corner():
     if CORNER[0] is None:
         run = aht.aht_home() / "run"
         hooks = {"open_window": act_open_window, "switch_off": corner_off,
-                 "ask": lambda t, x: msgbox(t, x, MB_YESNO | MB_ICONQUESTION) == IDYES,
+                 "ask": lambda t, x, no_default=False: msgbox(
+                     t, x, MB_YESNO | MB_ICONQUESTION
+                     | (MB_DEFBUTTON2 if no_default else 0)) == IDYES,
                  "tell": lambda t, x: msgbox(t, x, MB_OK | MB_ICONWARNING),
                  "note": lambda what, e: tray_log(what, e)}
         CORNER[0] = wincorner.Corner(wincorner.Model(aht.claude_home(), run), hooks, run)
@@ -577,35 +580,54 @@ def _set_shared(key, value):
 
 # ---- actions ---------------------------------------------------------------
 
+UPDATING = [False]      # Update Claude Code… under way: its look ahead, question or update
+
+
+def _answer(r):
+    """What a `--json` command printed, as a dict; None when it printed
+    nothing a program can read."""
+    try:
+        j = json.loads(r.stdout or "")
+    except ValueError:
+        return None
+    return j if isinstance(j, dict) else None
+
+
+def _update_claude():
+    """Update Claude Code…: the look ahead, the question, the update.
+    -> (title, text) of what went wrong, None when nothing did or you said No."""
+    plan = _answer(_run_cli("update", "--claude", "--json"))
+    no = wincorner.update_refusal(plan)
+    if no:
+        return wincorner.NOT_UPDATED, no
+    if msgbox("Update Claude Code?", wincorner.update_question(plan),
+              MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES:
+        return None
+    return wincorner.update_problems(_answer(_run_cli("update", "--claude", "--apply", "--json")))
+
+
 def act_update_claude():
     """Update Claude Code the way it was installed (winget: once every
     session is idle and has ended), then each session comes back in its tab
-    (`aht update --claude`).  The core's notice says when it is done."""
+    (`aht update --claude`).  The core's notice says when it is done; what
+    went wrong shows in a message.  A second click while one is under way
+    does nothing."""
+    if UPDATING[0]:
+        return
+
     def work():
         try:
-            plan = json.loads(_run_cli("update", "--claude", "--json").stdout or "{}")
-        except ValueError:
-            plan = {"blockers": ["aht did not answer"]}
-        if plan.get("blockers"):
-            msgbox("Claude Code is not updated", "\n\n".join(plan["blockers"]),
-                   MB_OK | MB_ICONWARNING)
-            return
-        how = plan.get("how") or "its installer"
-        r = plan.get("restart") or {}
-        text = (f"aht runs {' '.join(plan.get('command') or [])} (Claude Code "
-                f"{plan.get('before') or '?'} came with {how}).\n\n"
-                + ("Then the sessions on an older version start again in their tabs."
-                   if plan.get("while_running", True) else
-                   f"{how} cannot replace Claude Code while it runs, so every session ends "
-                   "first, once its task is over, and starts again in its tab after."))
-        for k, what in (("now", "At once"), ("after", "Once their task is over")):
-            if r.get(k):
-                text += f"\n\n{what}: {', '.join(r[k])}"
-        text += "\n\nA notice says when it is done."
-        if msgbox("Update Claude Code?", text, MB_YESNO | MB_ICONQUESTION) != IDYES:
-            return
-        _run_cli("update", "--claude", "--apply", "--json")
-    _in_thread(work)
+            said = _update_claude()
+        finally:
+            UPDATING[0] = False         # before the message: it may stay open for long
+        if said:
+            msgbox(said[0], said[1], MB_OK | MB_ICONWARNING)
+    UPDATING[0] = True
+    try:
+        _in_thread(work)
+    except Exception:
+        UPDATING[0] = False
+        raise
 
 
 def act_reconcile():
@@ -1097,7 +1119,10 @@ def build_menu():
             add(back, f"{name} — Send Back to {frm}…", _send_back(path))
     sep(root)
     add(root, "Reconcile now", act_reconcile)
-    add(root, "Update Claude Code…", act_update_claude)
+    if UPDATING[0]:
+        add(root, "Update Claude Code (under way)")
+    else:
+        add(root, "Update Claude Code…", act_update_claude)
     add(root, "Pause watching" if running else "Resume watching",
         act_toggle_watch)
     sep(root)

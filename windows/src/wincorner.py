@@ -358,9 +358,10 @@ def tip_text(r: Row) -> str:
 def list_items(restarting: bool = False) -> list:
     """What every right-click on the list ends with, and all that one beside
     the sessions offers, for the workspace (the terminal's tabs with their
-    sessions): saved now, a saved one opened again, every session started
-    again in its tab; and the list hidden.  `restarting`: a restart, its look
-    ahead or its question is under way, so it is not offered a second time."""
+    sessions): saved now, a saved one opened again, the terminal closed and
+    the workspace opened again; and the list hidden.  `restarting`: a restart,
+    its look ahead or its question is under way, so it is not offered a second
+    time."""
     return [("Save Workspace Now", "save-workspace", False),
             ("Restore Workspace…", "workspaces", False),
             ("Restart Workspace (under way)", None, False) if restarting else
@@ -398,26 +399,33 @@ def _count(n: int, what: str) -> str:
     return f"{n} {what}{'' if n == 1 else 's'}"
 
 
-def restart_question(plan: dict):
+def restart_question(plan: dict) -> str:
     """What the confirmation of Restart Workspace… says, from the dry run of
-    `aht checkup --restart-older --all`; None when no session can restart."""
-    now, after = plan.get("now") or [], plan.get("after") or []
-    if not (now or after):
-        return None
-    lines = ["Restart the open Claude sessions in their tabs?", "",
-             "aht ends each session and starts it again in the same tab, where it left off, "
-             "with the options it had. It then runs the Claude Code installed now"
-             + (f" ({plan['installed']})" if plan.get("installed") else "")
-             + ". Anything typed into a session but not sent is lost."]
-    if now:
-        lines += ["", "At once: " + ", ".join(now)]
-    if after:
-        lines += ["", "Once they are idle: " + ", ".join(after)]
-    left = _left_out(plan)
-    if left:
-        lines += ["", "Left as they are: " + left]
-    lines += ["", "Yes restarts them. No leaves every session as it is."]
-    return "\n".join(lines)
+    `aht.restart_workspace()`: the terminal closes and the workspace opens
+    again, so it names what comes back and what does not."""
+    term = plan.get("terminal") or "the terminal"
+    out = [f"Close {term} and open the workspace again?",
+           f"aht saves the workspace, ends every Claude session, closes {term} and starts it "
+           "again with the same windows and tabs. Each session comes back in its tab, where it "
+           "left off, with the options it had. Anything typed but not sent is lost, and so is "
+           "the text the tabs show now."]
+    if plan.get("sessions"):
+        out.append("Sessions: " + ", ".join(str(x) for x in plan["sessions"]))
+    if plan.get("working"):
+        out.append("Working now, their task stops: " + ", ".join(str(x) for x in plan["working"]))
+    plain = int(plan.get("plain") or 0)
+    if plain > 0:
+        out.append("1 plain tab comes back empty, in its folder." if plain == 1 else
+                   f"{plain} plain tabs come back empty, in their folders.")
+    ending = [str(x) for x in plan.get("ending") or []]
+    if ending:
+        # a long list would push the buttons off the screen: the first few, then how many more
+        out.append("Ends and does not come back: " + "; ".join(ending[:6])
+                   + (f" and {len(ending) - 6} more" if len(ending) > 6 else ""))
+    if plan.get("asks"):
+        out.append(f"{term} asks once more whether to quit: say yes there.")
+    out.append(f"Yes closes {term} and opens the workspace again. No leaves everything as it is.")
+    return "\n\n".join(out)
 
 
 def _left_out(plan: dict) -> str:
@@ -425,33 +433,62 @@ def _left_out(plan: dict) -> str:
     return "; ".join(f"{x.get('session')} ({x.get('why')})" for x in plan.get("left_out") or [])
 
 
-def nothing_to_restart(plan: dict) -> str:
-    """Restart Workspace… with no session it can restart: why."""
-    if plan.get("blockers"):
-        return "Workspace not restarted: " + plan["blockers"][0]
-    left = plan.get("left_out") or []
-    if not left:
-        return "No open session to restart"
-    why = left[0].get("why")
-    return ("No session to restart: " + str(left[0].get("session") or "") + (f" ({why})" if why else "")
-            + (f", and {len(left) - 1} more" if len(left) > 1 else ""))
+NOT_RESTARTED = "Workspace not restarted"
 
 
-def restarted_text(res: dict) -> str:
+def not_restarted(plan) -> str:
+    """Restart Workspace… cannot ask its question: why, under the top line
+    (the terminal is not open, say, or aht answered nothing)."""
+    if not plan or not isinstance(plan, dict) or not plan.get("blockers"):
+        return NOT_RESTARTED + ": aht gave no answer"
+    return f"{NOT_RESTARTED}: {plan['blockers'][0]}"
+
+
+def restarted_text(res) -> str:
     """What Restart Workspace says under the top line once it is through:
-    how many restarted, of how many (restart_problems() has which did not)."""
-    if res.get("blockers"):
-        return "Workspace not restarted: " + res["blockers"][0]
-    done = len(res.get("restarted") or [])
-    total = done + len(res.get("failed") or []) + len(res.get("not_waited") or [])
-    if total == done:
-        return "Workspace restarted: " + _count(done, "session")
-    return f"Workspace restarted: {done} of " + _count(total, "session")
+    how many tabs opened again, of how many (restart_trouble() has what did
+    not come back)."""
+    if not res or not isinstance(res, dict):
+        return NOT_RESTARTED + ": aht gave no answer"
+    blockers = res.get("blockers") or []
+    opened, of = int(res.get("opened") or 0), int(res.get("of") or 0)
+    if opened > 0 and opened == of and not blockers:
+        return f"Workspace restarted: {opened} opened again"
+    if opened > 0:
+        return f"Workspace restarted: {opened} of {of} opened again"
+    return f"{NOT_RESTARTED}: {blockers[0] if blockers else 'nothing opened'}"
+
+
+def _sentence(text) -> str:
+    """A blocker as a sentence of its own in a message: a capital first and a
+    full stop last.  A first word that has a capital in it (iTerm2, a
+    RuntimeError) or is aht's own name stays as it is written."""
+    s = str(text).strip()
+    first = s.split(None, 1)[0] if s else ""
+    own = first.rstrip(".,:;!?") == "aht" or first.startswith(("aht'", "aht’"))
+    if first and not own and first == first.lower():
+        s = s[0].upper() + s[1:]
+    return s + ("" if not s or s[-1] in ".!?…" else ".")
+
+
+def restart_trouble(res):
+    """What went wrong in Restart Workspace, from what `aht.restart_workspace(
+    apply=True)` answered: (title, text) for a message, or None when nothing
+    did.  The terminal was closed by then, so it says whether anything came
+    back."""
+    if not res or not isinstance(res, dict):
+        return NOT_RESTARTED, NO_ANSWER
+    blockers = res.get("blockers") or []
+    if not blockers:
+        return None
+    title = "Not everything came back" if int(res.get("opened") or 0) > 0 else NOT_RESTARTED
+    return title, "\n\n".join(_sentence(b) for b in blockers)
 
 
 def restart_problems(res: dict):
-    """The sessions a restart did not restart, each with why, a paragraph
-    each; None when every one restarted."""
+    """The sessions a restart in their tabs (the one after an update of Claude
+    Code) did not restart, each with why, a paragraph each; None when every
+    one restarted."""
     out = [f"{x.get('session')}: {x.get('why')}" for x in res.get("failed") or []]
     out += [f"{name}: it was still working, so aht left it as it is"
             for name in res.get("not_waited") or []]
@@ -1144,7 +1181,7 @@ class Corner:
     def tick(self):
         changed = self.m.poll()
         if self.restart_note and not self.m.note:
-            # another note took its place and went: a restart can wait hours
+            # another note took its place and went: the restart's stays until it is through
             self.m.say(self.restart_note, float("inf"))
             changed = True
         if changed:
@@ -1274,35 +1311,35 @@ class Corner:
 
     def restart_workspace(self):
         """Restart Workspace…: the look ahead aside (it asks the terminal),
-        then the question, then every session ends and starts again in its
-        tab: an idle one now, a working one once it is idle."""
+        then the question, then aht saves the workspace, closes the terminal
+        and opens it again with every tab.  The tray is no tab of the
+        terminal, so its thread lives through that."""
         if self.restarting:
             return
-        self._ahead("restart", "Looking at the open sessions…", 60,
-                    lambda: aht.restart_older(every=True), self._restart_answer,
+        self._ahead("restart", "Looking at the workspace…", 60,
+                    aht.restart_workspace, self._restart_answer,
                     "the corner's Restart Workspace failed")
 
     def _restart_answer(self, plan: dict):
-        q = restart_question(plan)
-        if q is None:
-            self.say(nothing_to_restart(plan))
+        if not plan or not isinstance(plan, dict) or plan.get("blockers"):
+            self.say(not_restarted(plan))
             return
         if self.restarting:
             return
-        yes = self.hooks["ask"]("Restart Workspace", q, no_default=True)
+        yes = self.hooks["ask"]("Restart Workspace", restart_question(plan), no_default=True)
         # the question's own loop runs what else was handed to this thread:
         # look again now that it is answered
         if not yes or self.restarting:
             return
         self.restarting = True
-        # it stays until the result: a working session is waited for, hours if need be
-        self.restart_note = ("Restarting the workspace: " + _count(
-            len(plan.get("now") or []) + len(plan.get("after") or []), "session") + "…")
+        # it stays until the result: closing and opening the terminal can take a minute
+        self.restart_note = ("Restarting the workspace: closing "
+                             + (plan.get("terminal") or "the terminal") + "…")
         self.say(self.restart_note, float("inf"))
 
         def go():
             try:
-                res = aht.restart_older(apply=True, every=True)
+                res = aht.restart_workspace(apply=True)
             except Exception as e:
                 self.hooks["note"]("the corner's Restart Workspace failed", e)
                 res = {"blockers": [f"{type(e).__name__}: {e}"]}
@@ -1314,15 +1351,15 @@ class Corner:
             raise
 
     def _restarted(self, res: dict):
-        """Restart Workspace is through: how many restarted under the top
-        line; which did not, and why, in a message and in the log."""
+        """Restart Workspace is through: how many tabs opened again under the
+        top line; what did not come back, and why, in a message and in the
+        log."""
         self.restarting, self.restart_note = False, None
         self.say(restarted_text(res), 20)
-        left = restart_problems(res)
-        if left:
-            self.hooks["note"]("Restart Workspace did not restart every session: "
-                               + left.replace("\n\n", "; "), None)
-            self.hooks["tell"]("Not every session restarted", left)
+        bad = restart_trouble(res)
+        if bad:
+            self.hooks["note"](f"Restart Workspace: {bad[0]}: " + bad[1].replace("\n\n", " "), None)
+            self.hooks["tell"](*bad)
 
     def save_workspace(self):
         """Save Workspace Now: how much it holds, under the top line."""

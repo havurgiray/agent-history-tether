@@ -239,37 +239,99 @@ with tempfile.TemporaryDirectory() as td:
     ck("…or why nothing was saved",
        C.saved_text({"saved": None, "why": "is Windows Terminal running?"})
        == "Workspace not saved: is Windows Terminal running?")
-    q = C.restart_question({"installed": "2.1.0", "now": ["paper", "notes"], "after": ["build"],
-                            "left_out": [{"session": "me", "why": "it is the session asking"}]})
-    ck("Restart Workspace asks, naming which restart at once, which later, which not",
-       all(x in q for x in ("At once: paper, notes", "Once they are idle: build",
-                            "Left as they are: me (it is the session asking)", "2.1.0",
-                            "not sent is lost")), q)
-    ck("…its first line asks, its last says what Yes and No do",
-       q.split("\n")[0] == "Restart the open Claude sessions in their tabs?"
-       and q.endswith("\n\nYes restarts them. No leaves every session as it is."), q)
-    ck("no session it can restart: no question, and why (the reason in brackets)",
-       C.restart_question({"now": [], "after": [], "left_out": []}) is None
-       and C.nothing_to_restart({"left_out": []}) == "No open session to restart"
-       and C.nothing_to_restart({"left_out": [{"session": "paper", "why": "it is not in a tab "
-                                               "of Windows Terminal"}, {"session": "b", "why": "x"},
-                                              {"session": "c", "why": "y"}]})
-       == "No session to restart: paper (it is not in a tab of Windows Terminal), and 2 more"
-       and C.nothing_to_restart({"left_out": [{"session": "a", "why": "w"}]})
-       == "No session to restart: a (w)"
-       and C.nothing_to_restart({"blockers": ["a restart is under way"], "left_out": []})
-       == "Workspace not restarted: a restart is under way")
+    WT = "Windows Terminal"
+    OPENING = ("aht saves the workspace, ends every Claude session, closes Windows Terminal and "
+               "starts it again with the same windows and tabs. Each session comes back in its "
+               "tab, where it left off, with the options it had. Anything typed but not sent is "
+               "lost, and so is the text the tabs show now.")
+    CLOSING = "Yes closes Windows Terminal and opens the workspace again. No leaves everything as it is."
+    full = {"applied": False, "terminal": WT, "blockers": [], "sessions": ["paper", "notes"],
+            "working": ["build", "tests"], "tabs": 6, "plain": 2,
+            "ending": ["npm run dev (Server)", "ssh homebox (Remote)"], "asks": True}
+    q = C.restart_question(full).split("\n\n")
+    ck("Restart Workspace asks: the terminal closes and the workspace opens again; what "
+       "comes back, what stops, what does not come back",
+       q == ["Close Windows Terminal and open the workspace again?", OPENING,
+             "Sessions: paper, notes", "Working now, their task stops: build, tests",
+             "2 plain tabs come back empty, in their folders.",
+             "Ends and does not come back: npm run dev (Server); ssh homebox (Remote)",
+             "Windows Terminal asks once more whether to quit: say yes there.", CLOSING], q)
+    bare = {"applied": False, "terminal": WT, "blockers": [], "sessions": [], "working": [],
+            "tabs": 1, "plain": 0, "ending": [], "asks": False}
+    ck("…nothing to name: what happens, and what Yes and No do",
+       C.restart_question(bare).split("\n\n")
+       == ["Close Windows Terminal and open the workspace again?", OPENING, CLOSING],
+       C.restart_question(bare))
+    ck("…each paragraph only when there is something for it",
+       [C.restart_question(dict(bare, **{k: full[k]})).split("\n\n")[2:-1]
+        for k in ("sessions", "working", "plain", "ending", "asks")]
+       == [["Sessions: paper, notes"], ["Working now, their task stops: build, tests"],
+           ["2 plain tabs come back empty, in their folders."],
+           ["Ends and does not come back: npm run dev (Server); ssh homebox (Remote)"],
+           ["Windows Terminal asks once more whether to quit: say yes there."]])
+    ck("…one plain tab, in its folder",
+       C.restart_question(dict(bare, plain=1)).split("\n\n")[2:-1]
+       == ["1 plain tab comes back empty, in its folder."])
+    many = [f"p{i} (T{i})" for i in range(1, 10)]
+    ck("…six programs that end are named, the others counted; six fit as they are",
+       C.restart_question(dict(bare, ending=many)).split("\n\n")[2]
+       == "Ends and does not come back: p1 (T1); p2 (T2); p3 (T3); p4 (T4); p5 (T5); p6 (T6) "
+          "and 3 more"
+       and C.restart_question(dict(bare, ending=many[:6])).split("\n\n")[2]
+       == "Ends and does not come back: " + "; ".join(many[:6])
+       and C.restart_question(dict(bare, ending=many[:7])).split("\n\n")[2].endswith(
+           "p6 (T6) and 1 more"))
+    q = C.restart_question({"sessions": ["a"]}).split("\n\n")
+    ck("…a terminal without a name is “the terminal”",
+       q[0] == "Close the terminal and open the workspace again?"
+       and "closes the terminal and starts it again" in q[1]
+       and q[-1] == "Yes closes the terminal and opens the workspace again. "
+                    "No leaves everything as it is.", q)
+    ck("it cannot restart: why, or that aht gave no answer",
+       [C.not_restarted(x) for x in (None, {})] == ["Workspace not restarted: aht gave no answer"] * 2
+       and C.not_restarted({"terminal": WT, "blockers": [
+           "Windows Terminal is not open: Restore Workspace opens a saved workspace", "two"]})
+       == "Workspace not restarted: Windows Terminal is not open: Restore Workspace opens a "
+          "saved workspace")
+    ck("once through: how many opened again, of how many",
+       C.restarted_text({"applied": True, "terminal": WT, "blockers": [], "opened": 5, "of": 5,
+                         "workspace": "x.json"}) == "Workspace restarted: 5 opened again"
+       and C.restarted_text({"applied": True, "blockers": ["tab 3 did not open"], "opened": 4,
+                             "of": 5}) == "Workspace restarted: 4 of 5 opened again"
+       and C.restarted_text({"applied": True, "blockers": [], "opened": 4, "of": 5})
+       == "Workspace restarted: 4 of 5 opened again"
+       and C.restarted_text({"applied": True, "blockers": ["a tab is slow"], "opened": 5, "of": 5})
+       == "Workspace restarted: 5 of 5 opened again")
+    ck("…none: the first reason, or that nothing opened; no answer is said",
+       C.restarted_text({"applied": False, "blockers": ["boom", "bang"], "opened": 0, "of": 5})
+       == "Workspace not restarted: boom"
+       and C.restarted_text({"blockers": ["boom"]}) == "Workspace not restarted: boom"
+       and C.restarted_text({"applied": True, "blockers": [], "opened": 0, "of": 5})
+       == "Workspace not restarted: nothing opened"
+       and [C.restarted_text(x) for x in (None, {})]
+       == ["Workspace not restarted: aht gave no answer"] * 2)
+    ck("what went wrong, for a message: nothing when all came back",
+       C.restart_trouble({"applied": True, "blockers": [], "opened": 5, "of": 5}) is None
+       and C.restart_trouble({"applied": True, "opened": 4, "of": 5}) is None)
+    ck("…no answer at all is said",
+       [C.restart_trouble(x) for x in (None, {})]
+       == [("Workspace not restarted", "aht gave no answer — see the log (Settings).")] * 2)
+    ck("…some came back: each reason a sentence of its own",
+       C.restart_trouble({"applied": True, "opened": 4, "of": 5, "blockers": [
+           "tab 3 (notes) did not open", "aht could not end build.", "Windows Terminal took long",
+           "iTerm2 is not here", "RuntimeError: bang", "aht's copy is old", "is it running?"]})
+       == ("Not everything came back",
+           "Tab 3 (notes) did not open.\n\naht could not end build.\n\nWindows Terminal took "
+           "long.\n\niTerm2 is not here.\n\nRuntimeError: bang.\n\naht's copy is old.\n\n"
+           "Is it running?"))
+    ck("…nothing came back: under “not restarted”",
+       C.restart_trouble({"applied": False, "opened": 0, "of": 5, "blockers": ["the terminal "
+                          "did not start again"]})
+       == ("Workspace not restarted", "The terminal did not start again.")
+       and C.restart_trouble({"blockers": ["boom"]}) == ("Workspace not restarted", "Boom."))
     part = {"restarted": ["a", "b"], "failed": [{"session": "c", "why": "its tab is gone"}],
             "not_waited": []}
-    ck("once through: how many restarted, of how many",
-       C.restarted_text({"restarted": ["a", "b", "c"], "failed": [], "not_waited": []})
-       == "Workspace restarted: 3 sessions"
-       and C.restarted_text({"restarted": ["a"]}) == "Workspace restarted: 1 session"
-       and C.restarted_text(part) == "Workspace restarted: 2 of 3 sessions"
-       and C.restarted_text({"restarted": [], "failed": [], "not_waited": ["c"]})
-       == "Workspace restarted: 0 of 1 session"
-       and C.restarted_text({"blockers": ["boom"]}) == "Workspace not restarted: boom")
-    ck("…and which did not, each with why",
+    ck("a restart in the tabs (after an update): which did not restart, each with why",
        C.restart_problems({"restarted": ["a"], "failed": [], "not_waited": []}) is None
        and C.restart_problems({"blockers": ["boom"]}) is None
        and C.restart_problems(part) == "c: its tab is gone"
@@ -351,12 +413,12 @@ with tempfile.TemporaryDirectory() as td:
 
     def ask(title, text, no_default=False):
         # the question is open: what the menu says now, and a second click
-        asked.append((title, no_default, c.items()[2]))
+        asked.append((title, text, no_default, c.items()[2]))
         c.restart_workspace()
         return answers.pop(0)
 
-    def restart_older(apply=False, every=False):
-        calls.append(("apply" if apply else "plan", every))
+    def restart_workspace(apply=False):
+        calls.append("apply" if apply else "plan")
         if isinstance(plans[0], Exception):
             raise plans.pop(0)
         return plans.pop(0)
@@ -369,81 +431,112 @@ with tempfile.TemporaryDirectory() as td:
     m.note = None
     c = Quiet(m, {"ask": ask, "tell": lambda t, x: told.append((t, x)),
                   "note": lambda what, e: noted.append((what, type(e).__name__))}, run)
-    kept = (C.threading, aht.restart_older, aht.branch_session, aht.send_session)
+    kept = (C.threading, aht.restart_workspace, aht.branch_session, aht.send_session)
     C.threading = types.SimpleNamespace(Thread=Inline, Lock=threading.Lock)
-    aht.restart_older = restart_older
+    aht.restart_workspace = restart_workspace
     aht.branch_session = lambda pid, *a, **kw: looked(("branch", pid))
     aht.send_session = lambda pid, to, **kw: looked(("send", pid, to))
     GREY = ("Restart Workspace (under way)", None, False)
+    CLOSES = "Restarting the workspace: closing Windows Terminal…"
     try:
-        plans = [{"installed": "2.1.0", "now": ["a", "b"], "after": ["c"], "left_out": []},
-                 {"applied": True, "restarted": ["a", "b"], "not_waited": ["c"],
-                  "failed": []}]
+        plan = {"applied": False, "terminal": WT, "blockers": [], "sessions": ["a", "b"],
+                "working": ["c"], "tabs": 4, "plain": 1, "ending": [], "asks": False}
+        plans = [plan, {"applied": True, "terminal": WT, "opened": 3, "of": 4,
+                        "workspace": "x.json", "blockers": ["tab 4 (notes) did not open"]}]
         answers = [True]
         c.restart_workspace()
-        ck("Restart Workspace: while it looks at the sessions the menu shows it under way",
+        ck("Restart Workspace: while it looks at the workspace the menu shows it under way",
            c.items()[2] == GREY and c.items(idle)[-3] == GREY
-           and m.note == "Looking at the open sessions…", (c.items(), m.note))
+           and m.note == "Looking at the workspace…", (c.items(), m.note))
         c.restart_workspace()
-        ck("…and a second click does nothing", len(handed) == 1 and calls == [("plan", True)],
+        ck("…and a second click does nothing", len(handed) == 1 and calls == ["plan"],
            (len(handed), calls))
         handed.pop(0)()
         ck("…nor one while its question is open; No is what Enter presses",
-           asked == [("Restart Workspace", True, GREY)] and calls == [("plan", True), ("apply", True)],
-           (asked, calls))
-        ck("…then it restarts: its note stays, however long a working session takes",
-           c.restarting and c.items()[2] == GREY
-           and m.note == "Restarting the workspace: 3 sessions…", (c.restarting, m.note))
-        clock.t += 3 * 3600
+           asked == [("Restart Workspace", C.restart_question(plan), True, GREY)]
+           and calls == ["plan", "apply"], (asked, calls))
+        ck("…then it restarts: its note says the terminal closes, and stays",
+           c.restarting and c.items()[2] == GREY and m.note == CLOSES, (c.restarting, m.note))
+        clock.t += 90
         c.tick()
         c.restart_workspace()
-        ck("…hours later too, and it is still not offered again",
-           m.note == "Restarting the workspace: 3 sessions…" and len(handed) == 1, m.note)
+        ck("…a minute and more later too, and it is still not offered again",
+           m.note == CLOSES and len(handed) == 1, m.note)
         c.say("Workspace saved: 1 tab, 3 sessions")
         clock.t += 9
         c.tick()
-        ck("…and it comes back after another action's note",
-           m.note == "Restarting the workspace: 3 sessions…", m.note)
+        ck("…and it comes back after another action's note", m.note == CLOSES, m.note)
         handed.pop(0)()
-        ck("…the result: how many of how many, and which did not, in a message and the log",
-           not c.restarting and m.note == "Workspace restarted: 2 of 3 sessions"
-           and told == [("Not every session restarted",
-                         "c: it was still working, so aht left it as it is")]
-           and len(noted) == 1 and "c: it was still working" in noted[0][0]
+        ck("…the result: how many of how many, and what did not come back, in a message and the log",
+           not c.restarting and m.note == "Workspace restarted: 3 of 4 opened again"
+           and told == [("Not everything came back", "Tab 4 (notes) did not open.")]
+           and noted == [("Restart Workspace: Not everything came back: "
+                          "Tab 4 (notes) did not open.", "NoneType")]
            and c.items()[2] == ("Restart Workspace…", "restart-workspace", False),
            (m.note, told, noted))
         clock.t += 21
         c.tick()
         ck("…a note that then goes, as any other", m.note is None, m.note)
 
-        plans = [{"now": ["a"], "after": [], "left_out": []}]
+        plans = [plan]
         answers = [False]
         c.restart_workspace()
         handed.pop(0)()
         ck("No: nothing restarts, and it is offered again",
            not c.restarting and not c.looking and not handed and m.note is None
+           and calls.count("apply") == 1
            and c.items()[2][1] == "restart-workspace", (c.restarting, c.looking, m.note))
-        plans = [{"now": [], "after": [], "left_out": [{"session": "a", "why": "w"}]}]
+        plans = [dict(plan, blockers=["Windows Terminal is not open: Restore Workspace opens "
+                                      "a saved workspace"])]
         c.restart_workspace()
         handed.pop(0)()
-        ck("no session to restart: said, and offered again",
-           m.note == "No session to restart: a (w)" and not c.looking and len(asked) == 2,
-           (m.note, c.looking))
+        ck("it cannot restart: no question, why is said, and it is offered again",
+           m.note == "Workspace not restarted: Windows Terminal is not open: Restore Workspace "
+                     "opens a saved workspace"
+           and not c.looking and len(asked) == 2 and len(told) == 1, (m.note, c.looking))
+        plans = [None]
+        c.restart_workspace()
+        handed.pop(0)()
+        ck("aht gave no answer: no question, said, and offered again",
+           m.note == "Workspace not restarted: aht gave no answer" and not c.looking
+           and len(asked) == 2, (m.note, c.looking))
         plans = [RuntimeError("boom")]
         c.restart_workspace()
         handed.pop(0)()
         ck("the look ahead failed: said, noted, and offered again",
            m.note == "Workspace not restarted: RuntimeError: boom" and not c.looking
-           and noted[-1] == ("the corner's Restart Workspace failed", "RuntimeError"),
+           and len(asked) == 2 and noted[-1] == ("the corner's Restart Workspace failed", "RuntimeError"),
            (m.note, noted))
-        plans = [{"now": ["a"], "after": [], "left_out": []}, RuntimeError("bang")]
+        plans = [dict(plan, terminal=None), RuntimeError("bang")]
+        answers = [True]
+        c.restart_workspace()
+        handed.pop(0)()
+        said = m.note
+        handed.pop(0)()
+        ck("the restart failed: said, told, and offered again",
+           said == "Restarting the workspace: closing the terminal…"
+           and m.note == "Workspace not restarted: RuntimeError: bang" and not c.restarting
+           and not c.looking and told[1:] == [("Workspace not restarted", "RuntimeError: bang.")],
+           (said, m.note, c.restarting, told))
+        plans = [plan, {"applied": True, "terminal": WT, "blockers": [], "opened": 4, "of": 4,
+                        "workspace": "x.json"}]
+        answers = [True]
+        was = len(noted)
+        c.restart_workspace()
+        handed.pop(0)()
+        handed.pop(0)()
+        ck("all came back: said under the top line, and no message",
+           m.note == "Workspace restarted: 4 opened again" and not c.restarting
+           and len(told) == 2 and len(noted) == was, (m.note, told, noted))
+        plans = [plan, None]
         answers = [True]
         c.restart_workspace()
         handed.pop(0)()
         handed.pop(0)()
-        ck("the restart failed: said, and offered again",
-           m.note == "Workspace not restarted: RuntimeError: bang" and not c.restarting
-           and not c.looking and len(told) == 1, (m.note, c.restarting))
+        ck("the restart gave no answer: said, and told where to look",
+           m.note == "Workspace not restarted: aht gave no answer" and not c.restarting
+           and told[2:] == [("Workspace not restarted",
+                             "aht gave no answer — see the log (Settings).")], (m.note, told))
 
         del calls[:]
         row = C.Row(id="s", pid=5, name="n", kind="here", status="idle", state="idle")
@@ -472,7 +565,7 @@ with tempfile.TemporaryDirectory() as td:
            told[-1] == ("“n” cannot go to homebox now", "not now") and not c.looking
            and m.note is None, (told[-1], c.looking, m.note))
     finally:
-        C.threading, aht.restart_older, aht.branch_session, aht.send_session = kept
+        C.threading, aht.restart_workspace, aht.branch_session, aht.send_session = kept
 
     print("\n[send to]")
     q = C.send_question({"label": "paper", "to": "homebox", "project": "C:\\w\\paper",

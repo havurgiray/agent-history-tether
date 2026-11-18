@@ -2591,7 +2591,12 @@ off.
   even when Claude had moved to another folder or the folder was renamed
   since), Kimi Code with its last session in that
   folder, and every titled tab with its folder. Untitled plain tabs, tabs
-  open now and folders that are gone are skipped.
+  open now and folders that are gone are skipped. When nothing is left to
+  open, the sheet says why: "everything in it is open already" only when
+  its sessions or tabs are open now; a layout of untitled plain tabs, or
+  of folders that are gone, says that instead. What a restore opened a
+  moment ago counts as open for three minutes, unless the terminal was
+  closed since.
 - **Tab titles:** iTerm2 does not let a script set the title you set with
   *Edit Tab Title*, so aht sets it the way a program does and keeps Claude
   Code from writing over it in those tabs. Session names stay as they were.

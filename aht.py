@@ -28268,10 +28268,13 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
     every titled tab that is not there now; the rest is skipped.  What a
     restore opened a moment ago counts as open (a session takes a few
     seconds to start)."""
+    term = terminal()
+    live = term.running()
     if tabs is None:
-        term = terminal()
-        tabs = term.tabs() if term.running() else {}
+        tabs = term.tabs() if live else {}
     opened = _just_opened()
+    if opened and (not live or (term.started() or 0) > float(opened.get("at") or 0) + 1):
+        opened = {}             # the terminal they were opened in is closed
     open_ids = {s.get("session") for s in running_sessions()} | set(opened.get("sessions") or [])
     titles_now = ({str(t.get("title") or "") for t in tabs.values()}
                   | set(opened.get("titles") or [])) - {""}
@@ -28301,6 +28304,24 @@ def restore_plan(w: dict, tabs: dict = None) -> dict:
     return {"windows": plan, "skipped": skipped,
             "opens": sum(len(p) for win in plan for p in win)}
 
+def nothing_to_open(plan: dict) -> str:
+    """Why a layout opens nothing, in one sentence.  Only what is open now is
+    "open already": a layout of plain tabs without a title opens nothing
+    with the terminal closed too."""
+    why = [e.get("why") or "" for e in plan.get("skipped") or []]
+    if not why:
+        return "nothing is saved in it"
+    if any(x.endswith(" is open") for x in why):
+        return "everything in it is open already"
+    plain, gone = why.count("a plain tab without a title"), why.count("its folder is gone")
+    said = []
+    if plain:
+        said.append(f"{plain} plain tab{'' if plain == 1 else 's'} without a title "
+                    "(aht opens Claude sessions and tabs you named)")
+    if gone:
+        said.append(f"{gone} tab{'' if gone == 1 else 's'} whose folder is gone")
+    return "nothing in it can be opened again: " + ", ".join(said)
+
 def restore_workspace(wid: str = None, apply: bool = False) -> dict:
     rows = list_workspaces()
     pick = next((r for r in rows if r["id"] == wid), None) if wid else default_workspace(rows)
@@ -28313,7 +28334,7 @@ def restore_workspace(wid: str = None, apply: bool = False) -> dict:
     plan = restore_plan(w)
     res.update(plan=plan)
     if not plan["opens"]:
-        res["blockers"].append("everything in it is open already")
+        res["blockers"].append(nothing_to_open(plan))
     if not apply or res["blockers"]:
         return res
     (aht_home() / "run").mkdir(parents=True, exist_ok=True)
@@ -28341,7 +28362,7 @@ def _restore_now(res: dict, pick: dict, w: dict) -> dict:
     plan = restore_plan(w, tabs)
     res["plan"] = plan
     if not plan["opens"]:
-        res["blockers"].append("everything in it is open already")
+        res["blockers"].append(nothing_to_open(plan))
         return res
     _write_json(workspace_opened_path(), {
         "at": time.time(), "workspace": pick["id"],
@@ -28530,10 +28551,14 @@ class ITerm2(Terminal):
     refused = ITERM_REFUSED
 
     def running(self) -> bool:
+        if os.environ.get("AHT_ITERM_CLOSED"):          # tests: iTerm2 is not open
+            return False
         return bool(os.environ.get("AHT_ITERM_TABS")) or (IS_MAC and _iterm_running())
 
     def started(self):
-        return None if os.environ.get("AHT_ITERM_TABS") else iterm_started()
+        if os.environ.get("AHT_ITERM_TABS"):            # tests: when it started, if told
+            return float(os.environ.get("AHT_ITERM_BORN") or 0) or None
+        return iterm_started()
 
     def tabs(self, max_age: float = None) -> dict:
         return iterm_tabs() if max_age is None else iterm_tabs(max_age=max_age)

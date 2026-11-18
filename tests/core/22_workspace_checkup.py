@@ -77,7 +77,32 @@ d2 = JS("workspace", "--restore", "--apply", "--json", extra_env=wenv)
 ck(not d2.get("applied") and "everything in it is open already" in (d2.get("blockers") or [])
    and sum(1 for x in ilines() if x.get("what") == "restore") == 1,
    f"workspace: a second Open Them right away opens nothing twice ({d2.get('blockers')})")
+# the terminal closed right after: what was just opened is not open any more
+d3 = JS("workspace", "--restore", "--json", extra_env=dict(wenv, AHT_ITERM_CLOSED="1"))
+d4 = JS("workspace", "--restore", "--json", extra_env=dict(wenv, AHT_ITERM_BORN=str(time.time() + 60)))
+d5 = JS("workspace", "--restore", "--json", extra_env=dict(wenv, AHT_ITERM_BORN=str(time.time() - 600)))
+ck(d3["plan"]["opens"] == 2 and not d3.get("blockers") and d4["plan"]["opens"] == 2
+   and not d4.get("blockers") and d5.get("blockers") == ["everything in it is open already"],
+   "workspace: with the terminal closed or started anew, what a restore just opened "
+   f"can be opened again ({d3.get('blockers')}, {d4.get('blockers')}, {d5.get('blockers')})")
 (sb / ".aht" / "run" / "workspace-opened.json").unlink()
+# a layout with nothing aht opens again says so, and never "open already"
+only_plain = dict(snap, tabs=[dict(e, title="", agent=None, session=None) for e in snap["tabs"][:2]])
+gone_dir = dict(snap, tabs=[dict(e2, cwd=str(sb / "no-such-folder"))])
+(sb / ".aht" / "workspaces" / "20200103-000000.json").write_text(json.dumps(only_plain))
+(sb / ".aht" / "workspaces" / "20200104-000000.json").write_text(json.dumps(gone_dir))
+closed = dict(wenv, AHT_ITERM_CLOSED="1")
+n1 = JS("workspace", "--restore", "20200103-000000", "--json", extra_env=closed)
+n2 = JS("workspace", "--restore", "20200104-000000", "--json", extra_env=closed)
+n3 = JS("workspace", "--restore", "20200103-000000", "--apply", "--json", extra_env=closed)
+ck(n1.get("blockers") == ["nothing in it can be opened again: 2 plain tabs without a title "
+                          "(aht opens Claude sessions and tabs you named)"]
+   and n2.get("blockers") == ["nothing in it can be opened again: 1 tab whose folder is gone"]
+   and not n3.get("applied") and n3.get("blockers") == n1.get("blockers")
+   and sum(1 for x in ilines() if x.get("what") == "restore") == 1,
+   f"workspace: a layout aht can open nothing of says why ({n1.get('blockers')}, {n2.get('blockers')})")
+(sb / ".aht" / "workspaces" / "20200103-000000.json").unlink()
+(sb / ".aht" / "workspaces" / "20200104-000000.json").unlink()
 
 # tab colours come from iTerm2's saved window state, profiles from iTerm2
 import plistlib, sqlite3 as _sq

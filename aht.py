@@ -28405,7 +28405,12 @@ def default_workspace(rows: list):
     (what a restart or an update closed), else the newest."""
     start = terminal().started()
     before = [r for r in rows if start and (r["seen"] or 0) < start - 5]
-    return (before or rows or [None])[0]
+    # one that holds something aht opens again, a session or a tab with a
+    # title: a layout saved while only a plain tab was left is the newest,
+    # and opens nothing
+    holds = lambda r: r.get("sessions") or r.get("titles")      # noqa: E731
+    return next((r for r in before if holds(r)), None) or next((r for r in rows if holds(r)), None) \
+        or (before or rows or [None])[0]
 
 def workspace_opened_path() -> Path:
     return aht_home() / "run" / "workspace-opened.json"

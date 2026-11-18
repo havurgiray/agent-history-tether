@@ -2577,7 +2577,8 @@ off.
 > **Example.** You work with a dozen titled tabs: *Paper*, *Server*,
 > *Slides* … macOS restarts for an update. Afterwards: Sessions tab →
 > **Restore Workspace…**. aht offers the workspace as it was before iTerm2
-> last started, and lists what it opens. **Open Them**: a window with the
+> last started (the newest one that holds a session or a titled tab, not
+> one of plain tabs only), and lists what it opens. **Open Them**: a window with the
 > same tabs, titled and coloured as before, each resuming its session with
 > the options it was started with. iTerm2 does not need to be open first.
 

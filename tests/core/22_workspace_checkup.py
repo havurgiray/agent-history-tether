@@ -105,6 +105,14 @@ ck(n1.get("blockers") == ["nothing left to open: 2 plain tabs without a title "
    f"workspace: a layout aht can open nothing of says why ({n1.get('blockers')}, {n2.get('blockers')})")
 (sb / ".aht" / "workspaces" / "20200103-000000.json").unlink()
 (sb / ".aht" / "workspaces" / "20200104-000000.json").unlink()
+# the one offered first holds something to open: not a newer layout of plain tabs only
+(sb / ".aht" / "workspaces" / "20990101-000000.json").write_text(json.dumps(only_plain))
+offered = JS("workspace", "--json", extra_env=closed)
+(sb / ".aht" / "workspaces" / "20990101-000000.json").unlink()
+ck(offered.get("workspaces", [{}])[0].get("id") == "20990101-000000"
+   and offered.get("default") == ws[0]["id"],
+   f"workspace: the one offered holds a session or a titled tab, not the newest of plain tabs "
+   f"({offered.get('default')})")
 
 # tab colours come from iTerm2's saved window state, profiles from iTerm2
 import plistlib, sqlite3 as _sq

@@ -424,6 +424,7 @@ The guide's *The permission level follows the work* has the details.
 | Branch, send (Mac, Windows) | `aht branch`, `aht send` | the session corner's right-click: a branch of an open session in a new tab beside it, with its tab colour; or the session sent, with its project, to another machine, its tab following it there |
 | Go to a tab, checkup (Mac, Windows) | `aht goto`, `aht checkup` | brings a session's tab to the front; marks sessions open twice, stuck or outside the Claude app, and restarts one in its tab, or every one on an older Claude Code |
 | Update Claude Code (Mac, Windows) | `aht update --claude` | updates it the way it was installed (Homebrew, winget, npm, its own installer), then starts the open sessions again on it, each in its tab |
+| Vault (Mac) | `aht vault setup` | Claude Code's folder, aht's backups of the histories and the search index in encrypted disk images that your password opens; locked, nobody reads them, an administrator of the Mac included (off unless you set it up) |
 | Spotlight, links, Finder (Mac) | `aht://search?q=…` | session titles in Spotlight, `aht://` links from Shortcuts or a script, Finder Quick Actions, ⌃⌥⌘A for the search; whatever starts an agent or changes files asks first |
 
 ## Platforms
@@ -450,6 +451,7 @@ macOS-first: new features are built and tested there first.
 | Notices | every 30 s; a click goes to the session | every 30 s while the tray runs | every 30 s while the tray runs; a click opens the window |
 | Undo a session | on: copy-on-write copies cost no room | off: real copies up to 100 MB once `checkpoints=true` | as Linux |
 | Restore Workspace | ✓ iTerm2 | — | ✓ Windows Terminal |
+| Vault: Claude's history behind a password | ✓ encrypted disk images | — | — |
 | Go to Tab, restart in its tab | ✓ iTerm2 | — | ✓ Windows Terminal |
 | Session corner: the open sessions at a glance; a right-click to Branch or Send to a machine, and to save, restore or restart the workspace | ✓ top right | — | ✓ bottom right, above the taskbar |
 | Branch: a branch of a session in a new tab | ✓ iTerm2, right after its tab | — | ✓ Windows Terminal, at the end of its window |

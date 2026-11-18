@@ -164,6 +164,52 @@ func ahtJSON(_ args: [String]) -> [String: Any]? {
     return j
 }
 
+/// One core command that reads `input` on its stdin (a password: never an
+/// argument, which other programs can see), its JSON answer.
+func ahtJSON(_ args: [String], input: String) -> [String: Any]? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: PY)
+    p.arguments = [ahtScript()] + args
+    let out = Pipe(), inp = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = inp
+    do { try p.run() } catch { return nil }
+    inp.fileHandleForWriting.write(Data(input.utf8))
+    try? inp.fileHandleForWriting.close()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+/// The vault (Claude's history behind a password, `aht vault`): what the ∞
+/// menu shows for it, from `aht status`: a line, and what it offers
+/// ("unlock", "lock" or nothing).  Off: neither.
+func vaultMenu(_ status: [String: Any]) -> (line: String?, offer: String?) {
+    switch (status["vault"] as? [String: Any])?["state"] as? String {
+    case "locked", "partly": return ("🔒 Claude's history is locked", "unlock")
+    case "unlocked": return (nil, "lock")
+    case "setting-up": return ("Claude's history is moving into the vault…", nil)
+    case "cut-short": return ("⚠ The vault's setup was cut short: run aht vault repair", nil)
+    default: return (nil, nil)
+    }
+}
+
+/// A password asked for in a small window: what was typed, or nil.
+func askPassword(_ title: String, _ body: String, confirm: String) -> String? {
+    let a = NSAlert()
+    a.messageText = title
+    a.informativeText = body
+    let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+    a.accessoryView = field
+    a.addButton(withTitle: confirm)
+    a.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+    a.window.initialFirstResponder = field
+    NSApp.activate(ignoringOtherApps: true)
+    guard a.runModal() == .alertFirstButtonReturn else { return nil }
+    return field.stringValue.isEmpty ? nil : field.stringValue
+}
+
 // ---- the app's own errors, into aht's log -------------------------------------
 // An error of the Mac app's own goes to aht's log through `aht _log --level
 // error --source mac-app -- MESSAGE` (the core masks it, keeps it to one line
@@ -13452,6 +13498,9 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         if let v = model.newVersion {
             add("aht \(v) is out — What's New…", #selector(showUpdateFromMenu))
         }
+        let vault = vaultMenu(st)
+        if let line = vault.line { add(disabled: line) }
+        if vault.offer == "unlock" { add("Unlock Claude's History…", #selector(unlockVault)) }
         add("Search Sessions…", #selector(searchFromMenu))
         add("Sessions in the Corner", #selector(toggleCorner))
         menu.items.last?.state = model.flag("session_corner", false) ? .on : .off
@@ -13473,6 +13522,7 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
         add("Find Moved Folders Now", #selector(reconcile), key: "r")
         add(model.running ? "Pause Watching" : "Resume Watching", #selector(toggleWatch))
         add("Update Claude Code…", #selector(updateClaudeFromMenu))
+        if vault.offer == "lock" { add("Lock Claude's History…", #selector(lockVault)) }
         menu.addItem(.separator())
         add(model.running ? "Quit aht (the watcher keeps running)" : "Quit aht",
             #selector(quit), key: "q")
@@ -13492,6 +13542,67 @@ final class TrayApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDe
     @objc func reconcile() { model.reconcile() }
 
     @objc func updateClaudeFromMenu() { model.updateClaude() }
+
+    /// Unlock Claude's History…: the password, then the folders are back
+    /// (`aht vault unlock`); a wrong one asks again.
+    @objc func unlockVault() {
+        var body = "Claude Code's folder, aht's backups of the histories and the search index "
+            + "are in encrypted disk images. Your password opens them."
+        while true {
+            guard let pw = askPassword("Unlock Claude's history", body, confirm: "Unlock") else { return }
+            let d = ahtJSON(["vault", "unlock", "--password-stdin", "--json"], input: pw + "\n")
+            if d?["applied"] as? Bool == true { break }
+            let why = (d?["blockers"] as? [String])?.joined(separator: "\n\n") ?? "aht gave no answer"
+            if why == "wrong password" {
+                body = "That was not the password. Try again."
+                continue
+            }
+            _ = alert("Not unlocked", why)
+            return
+        }
+        model.refresh()
+        syncCorner()
+        if model.itermInstalled, alert("Claude's history is unlocked",
+                                       "Restore Workspace brings the sessions back that were open "
+                                       + "when it was locked.", confirm: "Restore Workspace…",
+                                       cancel: "Not Now") {
+            openWindow()
+            model.tab = .sessions
+            model.openWorkspaces()
+        }
+    }
+
+    /// Lock Claude's History…: the folders close (`aht vault lock`). Open
+    /// sessions stop it; aht then offers to save the workspace and end them.
+    @objc func lockVault() { lockVaultNow(endSessions: false) }
+
+    func lockVaultNow(endSessions: Bool) {
+        let args: [String] = endSessions ? ["vault", "lock", "--end-sessions", "--json"]
+            : ["vault", "lock", "--json"]
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = ahtJSON(args) ?? [:]
+            DispatchQueue.main.async {
+                let why = (d["blockers"] as? [String]) ?? []
+                if !endSessions, why.contains(where: { $0.contains("--end-sessions") }) {
+                    let said = (why.first ?? "").components(separatedBy: ": end them first").first ?? ""
+                    if alert("End the open sessions and lock?",
+                             said + ".\n\naht saves the workspace, ends each session the way "
+                             + "/exit does, and locks Claude's history. After you unlock it, "
+                             + "Restore Workspace brings them back. Only idle sessions are "
+                             + "ended: one that works or waits for you stops the lock.",
+                             confirm: "End Them and Lock") {
+                        self.lockVaultNow(endSessions: true)
+                    }
+                    return
+                }
+                if d["applied"] as? Bool != true {
+                    _ = alert("Not locked", why.isEmpty ? "aht gave no answer" : why.joined(separator: "\n\n"))
+                }
+                self.model.refresh()
+                self.syncCorner()
+            }
+        }
+    }
 
     @objc func toggleCorner() {
         model.set("session_corner", model.flag("session_corner", false) ? "false" : "true")
@@ -15917,8 +16028,17 @@ if CommandLine.arguments.contains("--selftest") {
         || workspaceRestartedText(["blockers": ["boom"]]) != "Workspace not restarted: boom" {
         pw.append("restarted \(workspaceRestartedText(["restarted": ["a", "b"]]))")
     }
+    // the vault in the ∞ menu: locked offers Unlock, unlocked offers Lock, off nothing
+    let vm = [vaultMenu(["vault": ["state": "locked"]]), vaultMenu(["vault": ["state": "unlocked"]]),
+              vaultMenu(["vault": ["state": "off"]]), vaultMenu([:]),
+              vaultMenu(["vault": ["state": "cut-short"]])]
+    if vm.map({ $0.offer ?? "-" }) != ["unlock", "lock", "-", "-", "-"]
+        || vm[0].line?.contains("locked") != true || vm[1].line != nil || vm[2].line != nil
+        || vm[4].line?.contains("aht vault repair") != true {
+        pw.append("vault menu \(vm.map { $0.offer ?? "-" })")
+    }
     let cornerWsOK = pw.isEmpty
-    print("CORNER WORKSPACE \(cornerWsOK ? "OK" : "FAIL — " + pw.joined(separator: "; "))")
+    print("CORNER WORKSPACE AND VAULT MENU \(cornerWsOK ? "OK" : "FAIL — " + pw.joined(separator: "; "))")
     print("WELCOME LOGIN ANSWER \(loginOK ? "OK" : "FAIL — \(said), \(step ?? [:])")")
     exit(r.ok && bad.isEmpty && setupOK && apartOK && plistOK && marksOK && namesOK && handingOK
          && releaseOK && pauseOK && backOnOK && offsiteOK && fetchPartialOK && relayOK && dialogOK && samplesOK

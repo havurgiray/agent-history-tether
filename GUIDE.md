@@ -27,7 +27,9 @@ first, and acts only with `--apply`.
   Claude stopped at its usage limit), **Open aht…**, **Guide**, **Search
   Sessions…**, **Sessions in the Corner** and **Chimes** (each on or off),
   **Find Moved Folders Now**, **Pause / Resume Watching** and **Quit**. It
-  changes nothing on its own, so a stray click is harmless.
+  changes nothing on its own, so a stray click is harmless. With a vault
+  set up it also has **Lock Claude's History…** or **Unlock Claude's
+  History…** (see *Lock Claude's history behind a password*).
 - **From anywhere:** ⌃⌥⌘A opens the search. **In Finder**, right-click a
   project folder: under **Quick Actions** (or **Services**) are *aht: Show
   in aht*, *What Changed*, *Journal*, *Search This Project* and *Continue
@@ -1654,6 +1656,111 @@ appendix.
   session, or one of another agent.
 - `aht share ~/Desktop/paper --tools` — also list the tools the agent used
   (their commands and files masked before they are shortened).
+
+## Lock Claude's history behind a password
+
+On a Mac, aht can keep what you and Claude said in encrypted disk images
+that only your password opens. While they are locked nobody can read
+them: not another account on this Mac, not an administrator, not someone
+who copies your disk or a backup of it. It is off unless you set it up.
+
+> **Example.** You share an office Mac whose administrator can open every
+> folder. Once, in a terminal: `aht vault setup --apply`, and a password.
+> From then on you end the day with ∞ → **Lock Claude's History…**: aht
+> saves the workspace, ends the open sessions and locks. `~/.claude` is
+> now an empty folder with a note in it. Next morning: ∞ → **Unlock
+> Claude's History…**, the password, then **Restore Workspace…**, and
+> every session is back in its tab.
+
+- **What goes into the vault:** Claude Code's whole folder (`~/.claude`:
+  the conversations, your prompt history, memory, plans, settings),
+  aht's backups of the histories, and aht's search index. Each moves into
+  an encrypted disk image of its own (AES-256, made by macOS itself)
+  that lies beside it: `~/.claude.aht-vault.sparsebundle`, and two more
+  in `~/.aht`. The image is then shown in the folder's old place, so
+  every path stays what it was, for Claude Code and for aht.
+- **Locked** means the images are closed: the three folders are empty and
+  read-only, each with a `LOCKED.txt` that says how to unlock. aht stands
+  down until you unlock it: the watcher, the backups and the notices wait,
+  and a command says *Claude's history is locked*. What touches no
+  history still answers: `aht vault`, `status`, `config`, `logs`, `guide`
+  and the update check.
+  Claude Code started while it is locked finds an empty folder: it has no
+  settings there and cannot save the conversation. Unlock first.
+- **Unlocked** means the images are open and the files are as readable as
+  before, also to an administrator of this Mac. The protection is for the
+  time it is locked: lock it when you leave. A restart of the Mac always
+  locks it; signing out without a restart may not.
+- **Lock** needs every Claude session ended, since they write into that
+  folder. **Lock Claude's History…** offers to save the workspace and end
+  them for you (`aht vault lock --end-sessions`): only idle sessions, the
+  way `/exit` ends them; one that works or waits for you stops the lock.
+  If another program still has a file of the folder open, aht names it.
+- **Setting it up** (`aht vault setup`, then `--apply`) lists the folders
+  and their sizes first. With `--apply` it asks for a password twice (8
+  characters or more), copies each folder into its image and reads every
+  file back against its checksum. Only then does the image take the
+  folder's place. It needs free room for one more copy of the folders,
+  and takes about half a minute a gigabyte. It needs every Claude session
+  ended, too (`--end-sessions` does that), and no other program writing
+  into the folders. If a step fails, every folder goes back as it was;
+  after a crash or a power cut in the middle, `aht vault repair` does that.
+- **The folders from before stay beside the new ones**, readable, as
+  `~/.claude.aht-plain-<date>` and `~/.aht/backups.aht-plain-<date>`: a
+  safety net while you see that everything is there. `aht vault` reminds
+  you of them. **`aht vault finish --apply` removes them**; until then the
+  history is still readable there.
+- **There is no way in without the password.** aht does not keep it,
+  cannot reset it and cannot open the images without it. Write it down
+  somewhere safe. `aht vault password` changes it (while locked).
+- **Without aht** the images still open: double-click
+  `~/.claude.aht-vault.sparsebundle` in Finder (⇧⌘. shows it) and give
+  the password; its files then show as a disk named *aht claude*.
+  `aht uninstall` waits until the vault is off, so Claude Code's folder
+  is never left inside an image by accident.
+- **`aht vault off --apply`** makes the three folders plain folders again
+  (while unlocked). The images stay, encrypted, until `aht vault finish
+  --apply`.
+- **What it does not cover:**
+  - Your project folders themselves, and aht's checkpoints of them
+    (`~/.aht/checkpoints`): they are your files, not the history.
+  - `~/.claude.json`, which Claude Code keeps beside its folder: it lists
+    your project folders and holds the first prompt of each project's
+    last session.
+  - aht's log and saved workspaces: folder paths, session names and tab
+    titles, no conversations.
+  - The other agents' histories (Codex, Kimi Code and the rest).
+  - Copies elsewhere: a project you handed over or keep in sync is on
+    that machine too, and Claude's servers keep what you sent them.
+  - Someone who can run programs as you while it is unlocked, or who
+    watches your keyboard: the password protects what is stored, not a
+    computer somebody else controls while you work on it.
+  - A file that was readable before stays so in a Time Machine backup or
+    a local snapshot made before the setup.
+- **macOS may ask once** whether your terminal (or aht) may access files
+  on a removable volume: the images count as one. Allow it.
+- **On Windows and Linux** there is no vault yet; `aht vault` says so.
+
+**In the terminal:**
+
+- `aht vault` — say whether the vault is off, locked or unlocked, which
+  folders it holds, and whether readable folders from before are left.
+- `aht vault setup` — list what would move into the vault; with `--apply`
+  ask for a password and do it (`--end-sessions` saves the workspace and
+  ends the open sessions first).
+- `aht vault lock` — close the images (`--end-sessions` as above;
+  `--force` also when a program still has a file open, which then loses
+  it).
+- `aht vault unlock` — ask for the password and open them.
+- `aht vault password` — change the password, while locked.
+- `aht vault finish --apply` — remove the readable folders from before
+  the vault, and the images of a vault that was switched off.
+- `aht vault off --apply` — plain folders again.
+- `aht vault repair` — put every folder back after a setup that was cut
+  short.
+- A program can hand the password over on stdin: `--password-stdin` (for
+  setup, the password on two lines; for `password`, the old one, then the
+  new one twice). It is never given as an argument.
 
 ## Secrets check
 

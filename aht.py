@@ -4730,6 +4730,7 @@ def cmd_status(args):
         # what the core uses, its default included (a setting the user never
         # chose differs by system): the front-ends show this, not their own guess
         "effective": {"checkpoint_on_start": checkpoints_on()},
+        "vault": vault_status(),
     }
     if args.json:
         print(json.dumps(st, indent=2))
@@ -4750,6 +4751,8 @@ def cmd_status(args):
         print(f"  history backups  : {'on' if bk['enabled'] else 'OFF'}   "
               f"{bk['snapshots']} snapshot(s) of {bk['projects']} project(s), "
               f"last run {bk['last_run'] or 'never'}")
+        if st["vault"]["state"] != "off":
+            print(f"  vault            : {st['vault']['state']}   (aht vault)")
         ho = st["handover"]
         if ho["remotes"]:
             print(f"  other machines   : {', '.join(sorted(ho['remotes']))}   "
@@ -6273,6 +6276,10 @@ def cmd_uninstall(args):
     if script is None:
         print("no uninstaller found next to aht.py — run uninstall.sh from a checkout")
         return 2
+    if vault_on():
+        print("  ✗ a vault is set up: Claude Code's folder is in an encrypted image that aht "
+              "shows in its place. Make it a plain folder again first: aht vault off --apply")
+        return 3
     flags = [f for f, on in (("--remove-icons", args.remove_icons),
                              ("--purge", args.purge)) if on]
     return subprocess.call([sys.executable, str(script)] + flags)
@@ -17657,7 +17664,8 @@ def resume_command(agent: str, sid: str, project: str = None) -> str:
 # ---- search -------------------------------------------------------------------- #
 
 def search_db() -> Path:
-    return aht_home() / "search.db"
+    """The search index; inside the vault once one is set up (see the vault)."""
+    return (vault_private_dir() if vault_on() else aht_home()) / "search.db"
 
 _SEARCH_SCHEMA = """
 create table if not exists files (path text primary key, size integer, mtime real,
@@ -28672,6 +28680,945 @@ def cmd_workspace(args):
               + ", ".join(r["titles"][:8]))
     return 0
 
+# ---- the vault: Claude's history behind a password -------------------------- #
+# Off unless set up (`aht vault setup`).  Each folder that holds what was said
+# (Claude Code's own folder, aht's backups of the histories, aht's search
+# index) moves into an encrypted disk image of its own, beside it, and the
+# image is then mounted over the folder's old place, so every path stays
+# what it was.
+# Locked = not mounted: the folders are empty and read-only, the images are
+# ciphertext, and aht stands down until `aht vault unlock`.  A restart locks
+# it.  While it is unlocked the files are as readable as before, also to an
+# administrator of this computer: lock it when you leave.
+# macOS only for now: hdiutil's encrypted sparse bundles (AES-256, no admin
+# rights needed).  The password is read from the terminal or from stdin,
+# handed to hdiutil on its stdin, and never written anywhere.
+
+VAULT_LOCKED_SAYS = ("Claude's history is locked. Unlock it first: aht vault unlock "
+                     "(the ∞ menu: Unlock Claude's History…)")
+VAULT_NOTE = "LOCKED.txt"
+VAULT_NOTE_TEXT = ("This folder is locked by aht: what belongs here is in an encrypted disk\n"
+                   "image, and shows again once you unlock it:\n\n    aht vault unlock\n")
+VAULT_MIN_PASSWORD = 8
+
+def vault_dir() -> Path:
+    return aht_home() / "vault"
+
+def vault_state_path() -> Path:
+    return vault_dir() / "vault.json"
+
+def vault_private_dir() -> Path:
+    """aht's own folder inside the vault (the search index)."""
+    return aht_home() / "private"
+
+def vault_on() -> bool:
+    return vault_state_path().is_file()
+
+def vault_state() -> dict:
+    try:
+        st = json.loads(vault_state_path().read_text())
+        return st if isinstance(st, dict) and isinstance(st.get("folders"), list) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _vault_save(st: dict) -> None:
+    vault_dir().mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(vault_dir(), 0o700)
+    except OSError:
+        pass
+    _write_json(vault_state_path(), st)
+
+def vault_image(folder: Path, keeper) -> Path:
+    """A folder's image lies beside it, under its name: Claude Code's
+    outside aht's own folder, so that deleting ~/.aht never takes it along,
+    and it opens without aht too (a double click, and the password)."""
+    folder = Path(folder)
+    return folder.with_name(folder.name + ".aht-vault" + keeper.ext)
+
+def vault_folders() -> list:
+    """(name, folder, what it is) of what a vault holds."""
+    return [("claude", claude_home(), "Claude Code's folder: conversations, prompts, memory, "
+                                      "settings"),
+            ("backups", backups_root(), "aht's backups of the histories"),
+            ("private", vault_private_dir(), "aht's search index")]
+
+
+class _DiskImages:
+    """macOS: one encrypted sparse bundle a folder (hdiutil; AES-256, APFS)."""
+    name, ext = "hdiutil", ".sparsebundle"
+    label = "an encrypted disk image (AES-256)"
+
+    def available(self) -> str:
+        if not IS_MAC:
+            return "it needs macOS for now (encrypted disk images)"
+        return "" if os.path.exists("/usr/bin/hdiutil") else "hdiutil is missing on this Mac"
+
+    def _run(self, args, secret: str = None, timeout=600):
+        try:
+            r = subprocess.run(["/usr/bin/hdiutil"] + args, capture_output=True, timeout=timeout,
+                               input=(secret + "\0").encode() if secret is not None else None,
+                               cwd="/")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return f"{type(e).__name__}: {e}"
+        said = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()
+        return "" if r.returncode == 0 else (said.splitlines() or ["hdiutil failed"])[-1]
+
+    def create(self, image: Path, password: str, title: str, room: int) -> str:
+        # sparse: only what is written takes room, so the limit is far away
+        return self._run(["create", "-size", "1t", "-type", "SPARSEBUNDLE", "-fs", "APFS",
+                          "-encryption", "AES-256", "-stdinpass", "-volname", title,
+                          "-nospotlight", str(image)], password)
+
+    def mount(self, image: Path, at: Path, password: str) -> str:
+        why = self._run(["attach", "-stdinpass", "-nobrowse", "-owners", "on",
+                         "-mountpoint", str(at), str(image)], password)
+        return "wrong password" if "Authentication error" in why else why
+
+    def unmount(self, image: Path, at: Path, force: bool = False) -> str:
+        why = ""
+        for _ in range(3):              # a reader of a moment ago may still hold it
+            why = self._run(["detach", str(at)] + (["-force"] if force else []))
+            if not os.path.ismount(str(at)):
+                return ""
+            time.sleep(1)
+        return why or "it is in use"
+
+    def mounted(self, image: Path, at: Path) -> bool:
+        return os.path.ismount(str(at))
+
+    def chpass(self, image: Path, old: str, new: str) -> str:
+        why = self._run(["chpass", "-oldstdinpass", "-newstdinpass", str(image)], old + "\0" + new)
+        return "wrong password" if "Authentication error" in why or "authentication" in why.lower() \
+            else why
+
+    def remove(self, image: Path) -> None:
+        shutil.rmtree(image, ignore_errors=True)
+
+
+class _StandInImages:
+    """The tests' keeper, on any system: a plain folder plays the image, and
+    "mounting" swaps it in.  NOT encrypted; only AHT_VAULT_KEEPER=stand-in
+    picks it."""
+    name, ext = "stand-in", ".standin"
+    label = "a stand-in for tests (NOT encrypted)"
+
+    def available(self) -> str:
+        return ""
+
+    def _pw(self, password: str) -> str:
+        import hashlib
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def create(self, image: Path, password: str, title: str, room: int) -> str:
+        if os.environ.get("AHT_VAULT_FAIL") == image.name.split(".")[0]:
+            return "made to fail"
+        (image / "data").mkdir(parents=True)
+        (image / "pw").write_text(self._pw(password))
+        return ""
+
+    def mount(self, image: Path, at: Path, password: str) -> str:
+        if os.environ.get("AHT_VAULT_CRASH") == image.name.split(".")[0] \
+                and not at.name.startswith("mnt-"):
+            os._exit(70)                    # the tests' power cut, at the worst moment
+        if (image / "pw").read_text() != self._pw(password):
+            return "wrong password"
+        if self.mounted(image, at):
+            return "it is mounted already"
+        os.chmod(at, 0o700)
+        os.rename(at, image / "under")
+        os.rename(image / "data", at)
+        (image / "at").write_text(str(at))
+        return ""
+
+    def unmount(self, image: Path, at: Path, force: bool = False) -> str:
+        if os.environ.get("AHT_VAULT_BUSY") and not force:
+            return "Resource busy"
+        os.rename(at, image / "data")
+        os.rename(image / "under", at)
+        os.chmod(at, 0o500)
+        (image / "at").unlink()
+        return ""
+
+    def mounted(self, image: Path, at: Path) -> bool:
+        try:
+            return (image / "at").read_text() == str(at)
+        except OSError:
+            return False
+
+    def chpass(self, image: Path, old: str, new: str) -> str:
+        if (image / "pw").read_text() != self._pw(old):
+            return "wrong password"
+        (image / "pw").write_text(self._pw(new))
+        return ""
+
+    def remove(self, image: Path) -> None:
+        shutil.rmtree(image, ignore_errors=True)
+
+
+def vault_keeper(name: str = None):
+    name = name or (os.environ.get("AHT_VAULT_KEEPER") or "hdiutil")
+    return _StandInImages() if name == "stand-in" else _DiskImages()
+
+def _vault_rows(st: dict = None) -> list:
+    """Each folder of the vault that is set up: {name, path, image, mounted}."""
+    st = vault_state() if st is None else st
+    k = vault_keeper(st.get("keeper"))
+    return [dict(f, mounted=k.mounted(Path(f["image"]), Path(f["path"])))
+            for f in st.get("folders", [])]
+
+def vault_journal_path() -> Path:
+    """What a setup under way has done so far, for the way back."""
+    return vault_dir() / "setup.json"
+
+def vault_locked() -> bool:
+    """Set up, and a folder of it is not there now; or a setup is under way
+    or was cut short: aht stands down."""
+    if vault_journal_path().is_file():
+        return True
+    if not vault_on():
+        return False
+    return any(not r["mounted"] for r in _vault_rows())
+
+def _vault_leftovers(st: dict = None) -> tuple:
+    """(the readable folders from before the vault, the images of a vault
+    switched off) that `aht vault finish` still has to remove.  Only names
+    setup and off give, whatever the lists say."""
+    st = vault_state() if st is None else st
+    plain, old = list(st.get("plain", [])), list(st.get("old_images", []))
+    try:                                        # after `off`: what it left
+        left = json.loads((aht_home() / "vault-removed.json").read_text())
+        plain += left.get("plain", [])
+        old += left.get("old_images", [])
+    except (OSError, ValueError, AttributeError):
+        pass
+    plain = [p for p in plain if isinstance(p, str) and os.path.lexists(p)
+             and re.search(r"\.aht-plain-\d{8}-\d{6}$", p)]
+    old = [p for p in old if isinstance(p, str) and os.path.lexists(p)
+           and re.search(r"\.aht-vault-old-\d{8}-\d{6}\.[a-z]+$", p)]
+    return sorted(set(plain)), sorted(set(old))
+
+def vault_status() -> dict:
+    st = vault_state()
+    k = vault_keeper(st.get("keeper"))
+    plain, old = _vault_leftovers(st)
+    out = {"state": "off", "keeper": k.name, "how": k.label, "folders": [], "plain": plain,
+           "old_images": old, "available": not k.available(), "why": k.available()}
+    if vault_journal_path().is_file():
+        j = _vault_journal()
+        out.update(state="setting-up" if _vault_setting_up(j) else "cut-short")
+        return out
+    if not st:
+        return out
+    rows = _vault_rows(st)
+    up = [r["mounted"] for r in rows]
+    out.update(state="unlocked" if all(up) else "locked" if not any(up) else "partly",
+               folders=rows, since=st.get("created"))
+    return out
+
+def _tree_bytes(d: Path) -> int:
+    n = 0
+    for root, _dirs, files in os.walk(d):
+        for f in files:
+            try:
+                n += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return n
+
+def _vault_copy(src: Path, dst: Path) -> dict:
+    """Copy a folder's contents, then read every copied file back against
+    its checksum: {files, bytes, skipped (sockets and the like), wrong}."""
+    import hashlib
+    import stat as _stat
+    res = {"files": 0, "bytes": 0, "skipped": [], "wrong": []}
+    dirs = []
+    for root, dnames, fnames in os.walk(src):
+        rel = os.path.relpath(root, src)
+        there = dst if rel == "." else dst / rel
+        there.mkdir(exist_ok=True)
+        dirs.append((root, there))
+        for d in list(dnames):                  # a link to a folder: kept as a link
+            p = os.path.join(root, d)
+            if os.path.islink(p):
+                dnames.remove(d)
+                os.symlink(os.readlink(p), there / d)
+        for f in fnames:
+            p, q = os.path.join(root, f), there / f
+            st = os.lstat(p)
+            if _stat.S_ISLNK(st.st_mode):
+                os.symlink(os.readlink(p), q)
+                continue
+            if not _stat.S_ISREG(st.st_mode):
+                res["skipped"].append(os.path.join(rel, f))
+                continue
+            h = hashlib.blake2b(digest_size=16)
+            with open(p, "rb") as a, open(q, "wb") as b:
+                for chunk in iter(lambda: a.read(1 << 20), b""):
+                    h.update(chunk)
+                    b.write(chunk)
+                b.flush()
+                os.fsync(b.fileno())
+            shutil.copystat(p, q)
+            g = hashlib.blake2b(digest_size=16)
+            with open(q, "rb") as b:
+                for chunk in iter(lambda: b.read(1 << 20), b""):
+                    g.update(chunk)
+            if g.digest() != h.digest():
+                res["wrong"].append(os.path.join(rel, f))
+            res["files"] += 1
+            res["bytes"] += st.st_size
+    for root, there in reversed(dirs):          # last, so the copies do not touch the times
+        try:
+            shutil.copystat(root, there)
+        except OSError:
+            pass
+    return res
+
+def _vault_cover(at: Path) -> None:
+    """The folder an image mounts over: empty, read-only, with a note."""
+    at.mkdir(parents=True, exist_ok=True)
+    os.chmod(at, 0o700)
+    (at / VAULT_NOTE).write_text(VAULT_NOTE_TEXT)
+    os.chmod(at, 0o500)
+
+def _vault_uncover(at: Path) -> None:
+    """Take the empty folder under an image away again."""
+    os.chmod(at, 0o700)
+    (at / VAULT_NOTE).unlink(missing_ok=True)
+    os.rmdir(at)
+
+def _vault_sessions() -> list:
+    return [s.get("name") or os.path.basename(s["cwd"]) or str(s["pid"])
+            for s in running_sessions()]
+
+def _password_problem(pw) -> str:
+    if not pw or len(pw) < VAULT_MIN_PASSWORD:
+        return f"the password needs {VAULT_MIN_PASSWORD} characters or more"
+    if "\0" in pw or "\n" in pw or "\r" in pw:
+        return "the password cannot hold a line break"
+    return ""
+
+def _vault_open_files(folders: list) -> list:
+    """The programs of this user that have a file inside one of `folders`
+    open right now ("claude (123)"); none known where lsof is missing."""
+    try:
+        r = subprocess.run(["lsof", "-w", "-u", str(os.getuid()), "-Fpcn"], capture_output=True,
+                           text=True, timeout=60, cwd="/")
+    except (OSError, AttributeError, subprocess.TimeoutExpired):
+        return []
+    roots = [os.path.realpath(str(f)) + os.sep for f in folders]
+    names, pid, cmd = [], "", ""
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            pid, cmd = line[1:], ""
+        elif line.startswith("c"):
+            cmd = line[1:]
+        elif line.startswith("n") and pid != str(os.getpid()):
+            if any((line[1:] + os.sep).startswith(x) for x in roots):
+                n = f"{cmd} ({pid})"
+                if n not in names:
+                    names.append(n)
+    return names
+
+def _vault_end_sessions(res: dict) -> bool:
+    """Save the workspace and end every open Claude session the way /exit
+    does; only idle ones.  False (with a blocker) when one stays."""
+    sessions = running_sessions()
+    busy = [s.get("name") or os.path.basename(s["cwd"]) for s in sessions if s["status"] != "idle"]
+    if busy:
+        res["blockers"].append(f"{', '.join(busy[:5])} {'is' if len(busy) == 1 else 'are'} "
+                               "working or waiting for you: aht ends only idle sessions")
+        return False
+    try:
+        res["workspace"] = save_workspace_now().get("saved")
+    except Exception as e:
+        warn(f"VAULT the workspace was not saved first: {type(e).__name__}: {e}")
+    for s in sessions:
+        got = close_session(s["pid"], apply=True)
+        if got["applied"]:
+            res.setdefault("ended", []).append(s.get("name") or os.path.basename(s["cwd"]))
+        else:
+            res["blockers"].append(f"{s.get('name') or s['cwd']} did not end: "
+                                   + "; ".join(got["blockers"]))
+    return not res["blockers"]
+
+def _vault_journal() -> dict:
+    try:
+        j = json.loads(vault_journal_path().read_text())
+        return j if isinstance(j, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _vault_setting_up(j: dict) -> bool:
+    """The setup that wrote this journal still runs (the same process, not
+    another one that got its number since)."""
+    pid = int(j.get("pid") or 0)
+    if not pid or pid == os.getpid() or not _pid_alive(pid):
+        return False
+    try:
+        seen = _proc_started(pid)
+    except Exception:
+        seen = None
+    return seen is None or j.get("started") is None or abs(seen - float(j["started"])) < 3
+
+def _vault_back_out(j: dict) -> list:
+    """Undo a setup that did not finish, from its journal: every folder back
+    where it was, the images gone.  The folder from before is whole in each
+    case, since nothing is written while a setup runs.  What went wrong."""
+    k = vault_keeper(j.get("keeper"))
+    wrong = []
+    for f in reversed(j.get("folders") or []):
+        image, at, plain = Path(f["image"]), Path(f["path"]), f.get("plain")
+        tmp = vault_dir() / ("mnt-" + f["name"])
+        try:
+            for m in (at, tmp):
+                if k.mounted(image, m):
+                    k.unmount(image, m, force=True)
+            if tmp.is_dir() and not os.path.ismount(str(tmp)):
+                _vault_uncover(tmp)
+            if plain and os.path.lexists(plain):    # it was moved aside: back it goes
+                if at.is_dir() and not os.path.ismount(str(at)):
+                    _vault_uncover(at)          # only ever the empty cover: rmdir refuses more
+                os.rename(plain, at)
+            elif f.get("fresh") and at.is_dir() and not os.path.ismount(str(at)):
+                _vault_uncover(at)              # a folder that was not there before
+        except OSError as e:
+            wrong.append(f"{at}: {e}" + (f"; the folder from before is at {plain}" if plain else ""))
+        k.remove(image)
+    if not wrong:
+        vault_journal_path().unlink(missing_ok=True)
+        try:
+            vault_dir().rmdir()
+        except OSError:
+            pass
+    return wrong
+
+def vault_repair() -> dict:
+    """A setup that was cut short (a crash, the power): put back what it left."""
+    j = _vault_journal()
+    res = {"applied": False, "blockers": []}
+    if not vault_journal_path().is_file():
+        res["applied"] = True
+        return res
+    if _vault_setting_up(j):
+        res["blockers"].append("a setup is under way (aht vault setup): wait for it")
+        return res
+    res["blockers"] = _vault_back_out(j)
+    res["applied"] = not res["blockers"]
+    log("VAULT a setup that was cut short was undone" if res["applied"] else
+        "VAULT a setup that was cut short could not be undone: " + "; ".join(res["blockers"]),
+        "info" if res["applied"] else "error")
+    return res
+
+def vault_setup(password: str = None, apply: bool = False, end_sessions: bool = False,
+                say=None) -> dict:
+    """Move the folders into encrypted images and mount each over its old
+    place.  The folders as they were stay beside them, readable, until
+    `aht vault finish`: nothing is deleted here.  All of them, or none: a
+    step that fails puts every folder back."""
+    say = say or (lambda _t: None)
+    k = vault_keeper()
+    res = {"applied": False, "keeper": k.name, "how": k.label, "blockers": [], "warnings": [],
+           "folders": [], "plain": []}
+    if vault_on():
+        res["blockers"].append("the vault is set up already (aht vault)")
+        return res
+    if k.available():
+        res["blockers"].append(k.available())
+        return res
+    if vault_journal_path().is_file():
+        res["blockers"].append("an earlier setup was cut short: aht vault repair puts every "
+                               "folder back first")
+        return res
+    open_now = _vault_sessions()
+    if open_now and not end_sessions:
+        res["blockers"].append(f"{len(open_now)} Claude session(s) are open ({', '.join(open_now[:5])}"
+                               f"{' …' if len(open_now) > 5 else ''}): end them first, or let aht "
+                               "save the workspace and end them (--end-sessions); Restore "
+                               "Workspace brings them back after")
+    todo, need = [], 0
+    for name, path, what in vault_folders():
+        path = Path(path)
+        if path.is_symlink():
+            res["blockers"].append(f"{path} is a link to another place: aht leaves it alone")
+        elif path.exists() and (not path.is_dir() or os.path.ismount(str(path))):
+            res["blockers"].append(f"{path} is not a plain folder")
+        size = _tree_bytes(path) if path.is_dir() else 0
+        need += size
+        todo.append({"name": name, "path": str(path), "what": what, "bytes": size,
+                     "image": str(vault_image(path, k))})
+    res["folders"] = todo
+    res["bytes"] = need
+    try:
+        vault_dir().parent.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(str(vault_dir().parent)).free
+    except OSError:
+        free = None
+    res["free_bytes"] = free
+    if free is not None and free < need * 1.1 + (512 << 20):
+        res["blockers"].append(f"not enough room: the copies need {_human(need)} and "
+                               f"{_human(free)} is free (the folders as they were stay until "
+                               "aht vault finish)")
+    if not apply or res["blockers"]:
+        return res
+    why = _password_problem(password)
+    if why:
+        res["blockers"].append(why)
+        return res
+    if open_now and not _vault_end_sessions(res):
+        return res
+    users = _vault_open_files([f["path"] for f in todo])
+    if users:
+        res["blockers"].append(f"{', '.join(users[:6])} still {'has' if len(users) == 1 else 'have'} "
+                               "files of these folders open: quit them first (what is written "
+                               "during the move would be lost)")
+        return res
+    stamp = _stamp()
+    try:
+        born = _proc_started(os.getpid())
+    except Exception:
+        born = None
+    j = {"pid": os.getpid(), "started": born, "keeper": k.name, "stamp": stamp, "folders": []}
+
+    def note(f=None, **kv):
+        if f is not None:
+            f.update(kv)
+        _write_json(vault_journal_path(), j)
+
+    def stop(why: str):
+        wrong = _vault_back_out(j)
+        res["warnings"] += wrong
+        res["blockers"].append(why + (" — nothing was changed: every folder is as it was"
+                                      if not wrong else " — and not every folder could be put "
+                                      "back: see the notes, then aht vault repair"))
+        error("VAULT setup failed: " + why)
+        return res
+
+    vault_dir().mkdir(parents=True, exist_ok=True)
+    os.chmod(vault_dir(), 0o700)
+    note()                                  # from here on aht stands down until it is through
+    for f in todo:
+        image, at = Path(f["image"]), Path(f["path"])
+        tmp = vault_dir() / ("mnt-" + f["name"])
+        entry = {"name": f["name"], "path": f["path"], "image": f["image"], "plain": None,
+                 "fresh": False}
+        j["folders"].append(entry)
+        note()
+        try:
+            say(f"{at}: making its image")
+            why = k.create(image, password, "aht " + f["name"], f["bytes"])
+            if why:
+                return stop(f"the image for {at} was not made: {why}")
+            _vault_cover(tmp)
+            why = k.mount(image, tmp, password)
+            if why:
+                return stop(f"the image for {at} did not open: {why}")
+            copied = {"files": 0, "bytes": 0, "skipped": [], "wrong": []}
+            if at.is_dir():
+                say(f"{at}: copying {_human(f['bytes'])} into it, and reading it back")
+                copied = _vault_copy(at, tmp)
+            os.chmod(tmp, 0o700)            # the image's top folder: yours alone
+            why = k.unmount(image, tmp)
+            if why or copied["wrong"]:
+                why = why or (f"{len(copied['wrong'])} file(s) read back differently "
+                              f"({copied['wrong'][0]})")
+                return stop(f"the copy of {at} did not hold: {why}")
+            _vault_uncover(tmp)
+            if at.is_dir():                 # noted first, so a crash right after is undone too
+                note(entry, plain=str(at.with_name(f"{at.name}.aht-plain-{stamp}")))
+                os.rename(at, entry["plain"])
+            else:
+                note(entry, fresh=True)
+            _vault_cover(at)
+            why = k.mount(image, at, password)
+            if why:
+                return stop(f"the image did not open over {at}: {why}")
+        except OSError as e:
+            return stop(f"{at}: {type(e).__name__}: {e}")
+        f.update(files=copied["files"], skipped=copied["skipped"][:20])
+        if copied["skipped"]:
+            res["warnings"].append(f"{at}: {len(copied['skipped'])} socket(s) or the like were not "
+                                   "copied (programs make them again)")
+    st = {"keeper": k.name, "created": time.time(),
+          "folders": [{"name": e["name"], "path": e["path"], "image": e["image"]}
+                      for e in j["folders"]],
+          "plain": [e["plain"] for e in j["folders"] if e["plain"]]}
+    _vault_save(st)
+    vault_journal_path().unlink(missing_ok=True)
+    old = aht_home() / "search.db"          # the search index, into aht's folder of the vault
+    for end in ("", "-wal", "-shm"):
+        p = Path(str(old) + end)
+        try:
+            if p.is_file():
+                shutil.move(str(p), str(vault_private_dir() / p.name))
+        except OSError as e:
+            res["warnings"].append(f"the search index stayed where it was ({e}): aht makes a new one")
+    res.update(applied=True, plain=st["plain"])
+    log(f"VAULT set up with {k.name}: {len(st['folders'])} folder(s), {_human(need)}")
+    return res
+
+def vault_unlock(password: str) -> dict:
+    st = vault_state()
+    res = {"applied": False, "blockers": [], "opened": []}
+    if not st:
+        res["blockers"].append("no vault is set up here (aht vault setup)")
+        return res
+    k = vault_keeper(st.get("keeper"))
+    for r in _vault_rows(st):
+        if r["mounted"]:
+            continue
+        image, at = Path(r["image"]), Path(r["path"])
+        if not os.path.lexists(image):
+            res["blockers"].append(f"the image of {at} is gone: {image}")
+            continue
+        try:
+            if not at.is_dir():
+                _vault_cover(at)
+            why = k.mount(image, at, password or "")
+        except OSError as e:
+            why = f"{type(e).__name__}: {e}"
+        if why:
+            res["blockers"].append(why if why == "wrong password" else f"{at} did not open: {why}")
+            if why == "wrong password":
+                break
+            continue
+        res["opened"].append(str(at))
+    res["applied"] = not res["blockers"]
+    if res["opened"]:
+        log(f"VAULT unlocked: {len(res['opened'])} folder(s)")
+    return res
+
+def _vault_users(at: Path) -> list:
+    """The programs that hold files of a mounted folder open (macOS, Linux)."""
+    try:
+        r = subprocess.run(["lsof", "-Fpc", "+f", "--", str(at)], capture_output=True, text=True,
+                           timeout=30, cwd="/")
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    names, pid = [], ""
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c") and pid != str(os.getpid()):
+            n = f"{line[1:]} ({pid})"
+            if n not in names:
+                names.append(n)
+    return names
+
+def vault_lock(end_sessions: bool = False, force: bool = False) -> dict:
+    """Unmount every folder of the vault.  Open Claude sessions stop it,
+    unless `end_sessions`: then the workspace is saved and each idle
+    session ends the way /exit ends it (Restore Workspace brings them back)."""
+    st = vault_state()
+    res = {"applied": False, "blockers": [], "closed": [], "ended": [], "workspace": None}
+    if not st:
+        res["blockers"].append("no vault is set up here (aht vault setup)")
+        return res
+    k = vault_keeper(st.get("keeper"))
+    rows = [r for r in _vault_rows(st) if r["mounted"]]
+    if not rows:
+        res["applied"] = True
+        return res
+    sessions = running_sessions()
+    if sessions and not end_sessions:
+        names = _vault_sessions()
+        res["blockers"].append(f"{len(names)} Claude session(s) are open ({', '.join(names[:5])}"
+                               f"{' …' if len(names) > 5 else ''}): end them first, or let aht "
+                               "save the workspace and end them (aht vault lock --end-sessions)")
+        return res
+    if sessions and not _vault_end_sessions(res):
+        return res
+    for r in rows:
+        image, at = Path(r["image"]), Path(r["path"])
+        why = k.unmount(image, at, force=force)
+        if why:
+            users = _vault_users(at)
+            res["blockers"].append(f"{at} is still in use" + (f" by {', '.join(users[:5])}" if users
+                                   else f" ({why})") + ": close what uses it and lock again"
+                                   + ("" if force else ", or aht vault lock --force"))
+        else:
+            res["closed"].append(str(at))
+    res["applied"] = not res["blockers"]
+    if res["closed"]:
+        log(f"VAULT locked: {len(res['closed'])} folder(s)")
+    return res
+
+def vault_chpass(old: str, new: str) -> dict:
+    st = vault_state()
+    res = {"applied": False, "blockers": []}
+    if not st:
+        res["blockers"].append("no vault is set up here (aht vault setup)")
+        return res
+    why = _password_problem(new)
+    if why:
+        res["blockers"].append(why)
+        return res
+    k = vault_keeper(st.get("keeper"))
+    if any(r["mounted"] for r in _vault_rows(st)):
+        res["blockers"].append("lock it first (aht vault lock): the password of an image "
+                               "changes only while it is closed")
+        return res
+    changed = []
+    for f in st["folders"]:
+        why = k.chpass(Path(f["image"]), old or "", new)
+        if why:
+            for g in changed:               # all of them, or none
+                k.chpass(Path(g["image"]), new, old)
+            res["blockers"].append(why if why == "wrong password" else
+                                   f"{f['path']}: {why}")
+            return res
+        changed.append(f)
+    res["applied"] = True
+    log("VAULT password changed")
+    return res
+
+def vault_finish(apply: bool = False) -> dict:
+    """Remove what setup and off left for safety: the folders as they were
+    before the vault (readable!) and the images of a vault switched off."""
+    st = vault_state()
+    plain, old = _vault_leftovers(st)
+    stray = aht_home() / "vault-removed.json"   # after `off`: what it left
+    res = {"applied": False, "blockers": [], "plain": plain, "old_images": old,
+           "bytes": sum(_tree_bytes(Path(p)) for p in plain)}
+    if st and vault_locked() and plain:
+        res["blockers"].append("unlock the vault first, and see that everything is there: "
+                               "what goes now is the only readable copy besides it")
+    if not apply or res["blockers"]:
+        return res
+    for p in plain + old:
+        shutil.rmtree(p, ignore_errors=True)
+        if os.path.lexists(p):
+            res["blockers"].append(f"{p} could not be removed")
+    if st:
+        st["plain"] = [p for p in st.get("plain", []) if os.path.lexists(p)]
+        st["old_images"] = [p for p in st.get("old_images", []) if os.path.lexists(p)]
+        _vault_save(st)
+    if not res["blockers"]:
+        stray.unlink(missing_ok=True)
+    res["applied"] = not res["blockers"]
+    log(f"VAULT finished: {len(plain)} folder(s) from before and {len(old)} old image(s) removed")
+    return res
+
+def vault_off(apply: bool = False) -> dict:
+    """Every folder back to a plain one, as before the vault.  The images
+    stay (encrypted) until `aht vault finish`."""
+    st = vault_state()
+    res = {"applied": False, "blockers": [], "warnings": [], "folders": [], "old_images": []}
+    if not st:
+        res["blockers"].append("no vault is set up here")
+        return res
+    k = vault_keeper(st.get("keeper"))
+    rows = _vault_rows(st)
+    if any(not r["mounted"] for r in rows):
+        res["blockers"].append("unlock it first (aht vault unlock): the folders come out of it")
+    open_now = _vault_sessions() if not res["blockers"] else []
+    if open_now:
+        res["blockers"].append(f"{len(open_now)} Claude session(s) are open: end them first")
+    need = sum(_tree_bytes(Path(r["path"])) for r in rows) if not res["blockers"] else 0
+    res.update(folders=[r["path"] for r in rows], bytes=need)
+    try:
+        free = shutil.disk_usage(str(aht_home())).free
+    except OSError:
+        free = None
+    if free is not None and need and free < need * 1.1 + (512 << 20):
+        res["blockers"].append(f"not enough room: the folders need {_human(need)} and "
+                               f"{_human(free)} is free")
+    if not apply or res["blockers"]:
+        return res
+    stamp = _stamp()
+    for r in rows:
+        image, at = Path(r["image"]), Path(r["path"])
+        out = at.with_name(f"{at.name}.aht-out-{stamp}")
+        try:
+            out.mkdir()
+            copied = _vault_copy(at, out)
+            if copied["wrong"]:
+                shutil.rmtree(out, ignore_errors=True)
+                res["blockers"].append(f"{at}: {len(copied['wrong'])} file(s) read back "
+                                       "differently; it stays in the vault")
+                break
+            why = k.unmount(image, at)
+            if why:
+                shutil.rmtree(out, ignore_errors=True)
+                users = _vault_users(at)
+                res["blockers"].append(f"{at} is in use" + (f" by {', '.join(users[:5])}" if users
+                                       else f" ({why})") + "; it stays in the vault")
+                break
+            _vault_uncover(at)
+            os.rename(out, at)
+        except OSError as e:
+            res["blockers"].append(f"{at}: {type(e).__name__}: {e}")
+            break
+        st["folders"] = [f for f in st["folders"] if f["name"] != r["name"]]
+        _vault_save(st)
+        kept = image.with_name(f"{at.name}.aht-vault-old-{stamp}{k.ext}")
+        try:
+            os.rename(image, kept)
+            res["old_images"].append(str(kept))
+        except OSError as e:
+            res["warnings"].append(f"{image} stayed where it was: {e}")
+    if res["blockers"]:
+        return res
+    new = aht_home() / "search.db"          # the search index, back to its old place
+    for end in ("", "-wal", "-shm"):
+        p = vault_private_dir() / ("search.db" + end)
+        try:
+            if p.is_file():
+                shutil.move(str(p), str(new) + end)
+        except OSError:
+            pass
+    try:
+        if vault_private_dir().is_dir() and not any(vault_private_dir().iterdir()):
+            vault_private_dir().rmdir()
+    except OSError:
+        pass
+    _write_json(aht_home() / "vault-removed.json",
+                {"plain": [p for p in st.get("plain", []) if os.path.lexists(p)],
+                 "old_images": res["old_images"]})
+    vault_state_path().unlink(missing_ok=True)
+    try:
+        vault_dir().rmdir()
+    except OSError:
+        pass
+    res["applied"] = True
+    log(f"VAULT switched off: {len(rows)} folder(s) are plain folders again")
+    return res
+
+def _read_passwords(args, n: int, prompts: list) -> list:
+    """`n` passwords: one a line from stdin with --password-stdin, else asked
+    for at the terminal without showing them.  Never from the command line."""
+    if getattr(args, "password_stdin", False):
+        got = [sys.stdin.readline().rstrip("\r\n") for _ in range(n)]
+        return got
+    if not sys.stdin.isatty():
+        return [None] * n
+    import getpass
+    return [getpass.getpass(p) for p in prompts]
+
+def cmd_vault(args):
+    do = args.do or "status"
+    if do == "status":
+        v = vault_status()
+        if args.json:
+            print(json.dumps(v, indent=2, default=str))
+            return 0
+        if v["state"] == "off":
+            print("the vault is off: Claude's history is in plain folders"
+                  + (f"\n   ({v['why']})" if v["why"] else "\n   set it up with: aht vault setup"))
+        elif v["state"] in ("setting-up", "cut-short"):
+            print("a setup is under way" if v["state"] == "setting-up" else
+                  "a setup was cut short: aht vault repair puts every folder back")
+        else:
+            print({"locked": "LOCKED", "unlocked": "unlocked (readable now, also to an "
+                   "administrator of this computer; aht vault lock)",
+                   "partly": "partly locked (aht vault unlock, or aht vault lock)"}[v["state"]]
+                  + f" — {v['how']}")
+            for r in v["folders"]:
+                print(f"   {'open  ' if r['mounted'] else 'locked'}  {r['path']}")
+        for p in v["plain"]:
+            print(f"  ! still readable, from before the vault: {p}\n"
+                  "    once you have seen that everything is there: aht vault finish --apply")
+        for p in v["old_images"]:
+            print(f"  ! an image of the vault that was switched off (encrypted): {p}\n"
+                  "    remove it with: aht vault finish --apply")
+        return 0
+    if do == "setup":
+        pw = None
+        if args.apply and not vault_setup(None, apply=False, end_sessions=args.end_sessions)["blockers"]:
+            a, b = _read_passwords(args, 2, ["A password for Claude's history: ", "Once more: "])
+            if a is None:
+                return _emit(args, {"blockers": ["no password given (a terminal, or --password-stdin "
+                                                 "with the password on two lines)"]}, [])
+            if a != b:
+                return _emit(args, {"blockers": ["the two passwords differ"]}, [])
+            pw = a
+        talk = (lambda t: print("   " + t, file=sys.stderr, flush=True)) if not args.json else None
+        res = vault_setup(pw, args.apply, end_sessions=args.end_sessions, say=talk)
+        lines = [("moved into the vault" if res["applied"] else "would move into the vault")
+                 + f" ({res['how']}):"]
+        lines += [f"   {f['path']}  ({_human(f['bytes'])}; {f['what']})" for f in res["folders"]]
+        if res["applied"]:
+            lines += ["It is unlocked now. Lock it with: aht vault lock",
+                      "There is no way back in without the password: aht cannot recover it."]
+            lines += [f"  ! still readable, from before: {p}" for p in res["plain"]]
+            if res["plain"]:
+                lines.append("    once you have seen that everything is there: aht vault finish --apply")
+        elif not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it; it asks for the password then)")
+        return _emit(args, res, lines)
+    if do == "repair":
+        res = vault_repair()
+        return _emit(args, res, ["every folder is as it was before the setup" if res["applied"]
+                                 else "not repaired"])
+    if do == "unlock":
+        if not vault_on():
+            return _emit(args, {"blockers": ["no vault is set up here (aht vault setup)"]}, [])
+        if not vault_locked():
+            return _emit(args, {"applied": True, "opened": []}, ["it is unlocked already"])
+        (pw,) = _read_passwords(args, 1, ["Password: "])
+        if pw is None:
+            return _emit(args, {"blockers": ["no password given (a terminal, or --password-stdin)"]}, [])
+        res = vault_unlock(pw)
+        return _emit(args, res, ["unlocked" if res["applied"] else "not unlocked"])
+    if do == "lock":
+        res = vault_lock(end_sessions=args.end_sessions, force=args.force)
+        lines = ["locked" if res["applied"] else "not locked"]
+        if res["ended"]:
+            lines.append(f"   ended: {', '.join(res['ended'])} (Restore Workspace brings them back)")
+        return _emit(args, res, lines)
+    if do == "password":
+        old, new, again = _read_passwords(args, 3, ["The password now: ", "The new password: ",
+                                                    "Once more: "])
+        if old is None:
+            return _emit(args, {"blockers": ["no password given (a terminal, or --password-stdin "
+                                             "with the old one, then the new one twice)"]}, [])
+        if new != again:
+            return _emit(args, {"blockers": ["the two new passwords differ"]}, [])
+        res = vault_chpass(old, new)
+        return _emit(args, res, ["password changed" if res["applied"] else "not changed"])
+    if do == "finish":
+        res = vault_finish(args.apply)
+        lines = [("removed" if res["applied"] else "would remove") + f": {p}"
+                 for p in res["plain"] + res["old_images"]] or ["nothing left to remove"]
+        if not args.apply and not res["blockers"] and (res["plain"] or res["old_images"]):
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+    if do == "off":
+        res = vault_off(args.apply)
+        lines = [("plain folders again" if res["applied"] else "would become plain folders again")
+                 + ": " + ", ".join(res["folders"])]
+        if res["applied"]:
+            lines.append("the encrypted images stay until: aht vault finish --apply")
+        elif not res["blockers"]:
+            lines.append("(dry run — pass --apply to do it)")
+        return _emit(args, res, lines)
+    return 2
+
+def _vault_gate(args):
+    """While the vault is locked aht stands down: None to go on, else the
+    exit code.  What runs by itself (the hook, the watcher's look, the
+    notices) says nothing."""
+    fn = args.fn
+    if fn in (cmd_vault, cmd_version, cmd_status, cmd_config, cmd_guide, cmd_logs, cmd_update,
+              cmd_window, cmd_app_log, cmd_core, cmd_awake, cmd_getting_started, cmd_autostart):
+        return None
+    if not vault_locked():
+        return None
+    quiet = fn in (cmd_hook, cmd_notices, cmd_reconcile) \
+        or getattr(args, "auto", False) or getattr(args, "quiet", False)
+    says = VAULT_LOCKED_SAYS
+    if vault_journal_path().is_file():
+        says = ("aht is moving Claude's history into the vault: wait until it is through"
+                if _vault_setting_up(_vault_journal()) else
+                "Setting up the vault was cut short. Put every folder back first: aht vault repair")
+    if getattr(args, "json", False):
+        print(json.dumps({"locked": True, "applied": False, "ok": False,
+                          "why": says, "blockers": [says]}))
+    elif not quiet:
+        print("  ✗ " + says, file=sys.stderr)
+    return 0 if quiet else 3
+
 # ---- getting started: what lets aht do more on this computer ---------------- #
 
 def tray_starts_at_login() -> bool:
@@ -29711,6 +30658,27 @@ def build_parser():
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_workspace)
 
+    s = sub.add_parser("vault", help="Claude's history behind a password (macOS): its folder, "
+                       "aht's backups of the histories and the search index in encrypted "
+                       "disk images; locked, nobody reads them, an administrator included")
+    s.add_argument("do", nargs="?", choices=("status", "setup", "unlock", "lock", "password",
+                                             "finish", "off", "repair"),
+                   help="status (default); setup: move the folders in; unlock / lock; "
+                        "password: change it (while locked); finish: remove the readable "
+                        "folders from before; off: plain folders again; repair: undo a setup "
+                        "that was cut short")
+    s.add_argument("--password-stdin", action="store_true", dest="password_stdin",
+                   help="read the password from stdin, one a line (setup: twice; password: "
+                        "the old one, then the new one twice); never give it as an argument")
+    s.add_argument("--end-sessions", action="store_true", dest="end_sessions",
+                   help="with lock and setup: save the workspace and end the open (idle) "
+                        "sessions first")
+    s.add_argument("--force", action="store_true", help="with lock: also when a program still "
+                   "has a file of it open (that program loses the file)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_vault)
+
     s = sub.add_parser("update", help="whether a new version of aht is out (asks GitHub "
                        "once a day when update_check is on), what's new, and the upgrade")
     s.add_argument("--now", action="store_true", help="ask GitHub now")
@@ -29776,6 +30744,9 @@ def main(argv=None):
     if args.fn not in (cmd_agent, cmd_core, cmd_awake):
         _mark_install()                 # not the copy another machine runs here
     try:
+        stop = _vault_gate(args)        # locked: aht stands down
+        if stop is not None:
+            return stop
         return args.fn(args) or 0
     except (SystemExit, KeyboardInterrupt, BrokenPipeError):
         raise

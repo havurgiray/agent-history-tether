@@ -1,6 +1,6 @@
 # Privacy policy
 
-**agent-history-tether (aht)** · effective 2026-11-06
+**agent-history-tether (aht)** · effective 2026-11-18
 
 This policy applies to every version of aht on macOS, Windows and Linux,
 however it was installed: from source, from the release downloads, or
@@ -310,6 +310,17 @@ have sessions in each project it tracks.
   sizes, the session corner's place and size, whether *Also on my other
   machines* stays ticked, which welcome screens you saw, and the versions
   of setup and of updates you declined).
+- **macOS, only once you set up the vault** (`aht vault setup --apply`):
+  aht copies Claude Code's folder (`~/.claude`), its backups of the
+  histories and its search index each into an encrypted disk image
+  beside it (`~/.claude.aht-vault.sparsebundle`, and two in `~/.aht`) and
+  shows the image in the folder's old place.  The
+  folders as they were stay beside them, readable, as
+  `~/.claude.aht-plain-<date>` and `backups.aht-plain-<date>`, until you
+  run `aht vault finish --apply`.  While it is locked, each of the three
+  places is an empty read-only folder with a note (`LOCKED.txt`).  With
+  **Lock** and its `--end-sessions`, aht saves the workspace and ends your
+  open Claude Code sessions the way `/exit` does.
 - **Only when you bring a project here** (`aht bring`): the project's
   folder, its Claude Code history (filed under the folder's path here),
   the plans of its sessions and, when the folder has the same path on
@@ -325,7 +336,8 @@ have sessions in each project it tracks.
 
 All of this stays on your computer, in `~/.aht` (Windows:
 `%USERPROFILE%\.aht`), readable by your user account.  aht does not
-encrypt it.
+encrypt it, except what you put into the vault (macOS, off unless you set
+it up; see [Security](#security)).
 
 | File or folder | What it holds | How long it is kept |
 |---|---|---|
@@ -338,6 +350,7 @@ encrypt it.
 | `aht-watcher.log` (macOS, Windows), `aht-watcher.err` and `aht-notices.err` (macOS) | the background watcher's and the notices check's own output and errors, which can name project folders; on Linux this goes to your user journal (`journalctl --user -u aht-watcher`) | not rotated; delete them any time |
 | `backups/` | see [Backups](#backups) | all from the last two days, then one a day for two weeks, one a week for three months, one a month for a year |
 | `search.db` | a search index: the text of messages (up to 4,000 characters each), what each tool call worked on (its command, file path, web address or search, up to 400 characters) and session titles, with keys masked whole before anything is cut (see [Security](#security)), plus agents, project paths and times | until you delete it; rebuilt when needed.  An index made by an earlier version is built anew once, keeping none of its old rows; a session whose history file is gone and that no backup holds then drops out |
+| `vault/`, `private/`, `*.aht-vault.sparsebundle` | macOS, only once you set up the vault (`aht vault setup`): the encrypted disk images that hold aht's backups of the histories and aht's own folder `private/` (the search index moves there), each beside its folder (the image of Claude Code's folder lies beside that folder, in your home: `~/.claude.aht-vault.sparsebundle`); `vault/vault.json`: which folders are in the vault, where their images are, when it was set up, and the folders from before that are still there; `setup.json` while a setup runs: what it has done so far, so a setup cut short can be undone.  Never the password.  After `aht vault off`: the images, still encrypted, as `*.aht-vault-old-<date>.sparsebundle`, and `vault-removed.json` (what is left to remove) | until `aht vault finish --apply` (the old images and the folders from before) or `aht vault off` |
 | `checkpoints/` | a copy of a project folder made when a Claude Code session starts (`checkpoints`: on by default on macOS, where the copies take no room, off elsewhere), without `.git` and rebuilt folders, so `aht undo` can put it back | the newest 10 per project (`checkpoint_keep`), none older than 30 days |
 | `workspaces/` | macOS and Windows: saved iTerm2 or Windows Terminal layouts: this computer's name; windows, tab titles and colours, profiles, folders, which agent runs in each pane, session ids, on Windows pane ids, each Claude session's name (keys masked), and the options it was started with that it keeps when it starts again (permission mode or skipping permissions, model, effort, extra folders, `--agent`, `--chrome` or `--no-chrome`, `--verbose`; never a first prompt).  Tab titles are kept as the terminal has them, so that restoring a layout sets them back; on Windows that can be a title a program set, which aht tells from one you chose only by its look | all from the last two hours, then one an hour for a day, one a day for a week, one a week for a month and one a month for a year; older ones are removed |
 | `undo/`, `changes-backups/`, `redacted/`, `rules-backups/` | files aht set aside before replacing them at your request | until you delete them |
@@ -1223,7 +1236,13 @@ over them.
 2. Delete the `~/.aht` folder (Windows: `%USERPROFILE%\.aht`) to remove
    the backups, logs, search index, checkpoints, `machine.json` and
    everything else aht kept, and the folder you set in `backup_dir`, if
-   any.  The copies of Claude Code's settings file that aht kept lie next
+   any.  With a vault set up, run `aht vault off --apply` first
+   (`aht uninstall` asks for that): Claude Code's folder is then a plain
+   folder again.  Its image lies in your home, not in `~/.aht`
+   (`~/.claude.aht-vault.sparsebundle`); after `off`, delete the old
+   images with `aht vault finish --apply`.  The folders from before the
+   vault, if you never ran `aht vault finish --apply`, lie beside the
+   originals (`~/.claude.aht-plain-<date>`).  The copies of Claude Code's settings file that aht kept lie next
    to it: `~/.claude/settings.json.bak-aht` and
    `settings.json.bak-aht-uninstall`; delete them too, and
    `~/.claude.json.bak-aht` if a Bring Here left one.  Projects you
@@ -1257,7 +1276,25 @@ over them.
 ## Security
 
 aht's files are protected only by your user account, like the agents' own
-histories.
+histories, unless you set up the vault.
+
+**The vault (macOS).**  `aht vault setup` puts Claude Code's folder, aht's
+backups of the histories and aht's search index into encrypted disk images
+(AES-256, made and opened by macOS's own `hdiutil`) that only your
+password opens.  aht reads the password from the terminal or from the
+app's password field, hands it to `hdiutil` on its standard input, and
+keeps it nowhere: not in a file, not in the Keychain, not in its log, not
+on a command line.  It cannot recover a forgotten password.  While the
+vault is locked, the images are ciphertext for everyone, an administrator
+of the computer included.  While it is unlocked, the files are as readable
+as before: an administrator, or a program running as you, can read them.
+What the vault does not hold stays as described in this policy: your
+project folders and aht's checkpoints of them, Claude Code's
+`~/.claude.json` (your project folders' paths and the first prompt of each
+project's last session), aht's log and saved workspaces (paths, session
+names, tab titles), the other agents' histories, and every copy on your
+other machines.  A copy that Time Machine or a local snapshot made before
+the setup stays readable there.
 
 **What aht masks.**  Wherever aht copies text out of a history, it masks
 what it recognises as a key, a token or a password.  This is best effort:

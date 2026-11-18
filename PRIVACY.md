@@ -1,6 +1,6 @@
 # Privacy policy
 
-**agent-history-tether (aht)** · effective 2026-11-06
+**agent-history-tether (aht)** · effective 2026-11-18
 
 This policy applies to every version of aht on macOS, Windows and Linux,
 however it was installed: from source, from the release downloads, or
